@@ -253,10 +253,6 @@ impl ConversationHistory {
         self.token_info = None;
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.items.len()
-    }
-
     /// Removes the corresponding paired item for the provided `item`, if any.
     ///
     /// Pairs:
