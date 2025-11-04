@@ -16,6 +16,7 @@ use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::find_conversation_path_by_id_str;
+use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
 use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
@@ -144,22 +145,12 @@ pub async fn run_main(
         config_profile: cli.config_profile.clone(),
         codex_linux_sandbox_exe,
         base_instructions: None,
-        include_plan_tool: None,
+        developer_instructions: None,
+        compact_prompt: None,
         include_apply_patch_tool: None,
-        include_view_image_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: cli.web_search.then_some(true),
         experimental_sandbox_command_assessment: None,
-        disable_command_timeouts: (cli.dangerously_disable_timeouts
-            || cli.dangerously_disable_environment_wrapping
-            || cli.dangerously_passthrough_stdio)
-            .then_some(true),
-        passthrough_shell_environment: (cli.dangerously_disable_environment_wrapping
-            || cli.dangerously_passthrough_stdio)
-            .then_some(true),
-        passthrough_shell_stdio: cli.dangerously_passthrough_stdio.then_some(true),
-        auto_next_steps: cli.auto_next_steps.then_some(true),
-        auto_next_idea: cli.auto_next_idea.then_some(true),
         additional_writable_roots: additional_dirs,
     };
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
@@ -326,7 +317,11 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_manager = AuthManager::shared(initial_config.codex_home.clone(), false);
+    let auth_manager = AuthManager::shared(
+        initial_config.codex_home.clone(),
+        false,
+        initial_config.cli_auth_credentials_store_mode,
+    );
     let login_status = get_login_status(&initial_config);
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
     let should_show_windows_wsl_screen =
@@ -402,11 +397,14 @@ async fn run_ratatui_app(
             }
         }
     } else if cli.resume_last {
+        let provider_filter = vec![config.model_provider_id.clone()];
         match RolloutRecorder::list_conversations(
             &config.codex_home,
             1,
             None,
             INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            &config.model_provider_id,
         )
         .await
         {
@@ -418,7 +416,13 @@ async fn run_ratatui_app(
             Err(_) => resume_picker::ResumeSelection::StartFresh,
         }
     } else if cli.resume_picker {
-        match resume_picker::run_resume_picker(&mut tui, &config.codex_home).await? {
+        match resume_picker::run_resume_picker(
+            &mut tui,
+            &config.codex_home,
+            &config.model_provider_id,
+        )
+        .await?
+        {
             resume_picker::ResumeSelection::Exit => {
                 restore();
                 session_log::log_session_end();
@@ -434,13 +438,7 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    let Cli {
-        prompt,
-        images,
-        auto_next_steps,
-        auto_next_idea,
-        ..
-    } = cli;
+    let Cli { prompt, images, .. } = cli;
 
     let app_result = App::run(
         &mut tui,
@@ -451,8 +449,6 @@ async fn run_ratatui_app(
         images,
         resume_selection,
         feedback,
-        auto_next_steps,
-        auto_next_idea,
     )
     .await;
 
@@ -486,7 +482,7 @@ fn get_login_status(config: &Config) -> LoginStatus {
         // Reading the OpenAI API key is an async operation because it may need
         // to refresh the token. Block on it.
         let codex_home = config.codex_home.clone();
-        match CodexAuth::from_codex_home(&codex_home) {
+        match CodexAuth::from_auth_storage(&codex_home, config.cli_auth_credentials_store_mode) {
             Ok(Some(auth)) => LoginStatus::AuthMode(auth.mode),
             Ok(None) => LoginStatus::NotAuthenticated,
             Err(err) => {
@@ -517,14 +513,16 @@ async fn load_config_or_exit(
 /// or if the current cwd project is already trusted. If not, we need to
 /// show the trust screen.
 fn should_show_trust_screen(config: &Config) -> bool {
-    if config.did_user_set_custom_approval_policy_or_sandbox_mode {
-        // if the user has overridden either approval policy or sandbox mode,
-        // skip the trust flow
-        false
-    } else {
-        // otherwise, skip iff the active project is trusted
-        !config.active_project.is_trusted()
+    if cfg!(target_os = "windows") && get_platform_sandbox().is_none() {
+        // If the experimental sandbox is not enabled, Native Windows cannot enforce sandboxed write access without WSL; skip the trust prompt entirely.
+        return false;
     }
+    if config.did_user_set_custom_approval_policy_or_sandbox_mode {
+        // Respect explicit approval/sandbox overrides made by the user.
+        return false;
+    }
+    // otherwise, skip iff the active project is trusted
+    !config.active_project.is_trusted()
 }
 
 fn should_show_onboarding(
@@ -552,4 +550,70 @@ fn should_show_login_screen(login_status: LoginStatus, config: &Config) -> bool 
     }
 
     login_status == LoginStatus::NotAuthenticated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::config::ConfigOverrides;
+    use codex_core::config::ConfigToml;
+    use codex_core::config::ProjectConfig;
+    use codex_core::set_windows_sandbox_enabled;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    #[test]
+    #[serial]
+    fn windows_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            temp_dir.path().to_path_buf(),
+        )?;
+        config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+        config.active_project = ProjectConfig { trust_level: None };
+        set_windows_sandbox_enabled(false);
+
+        let should_show = should_show_trust_screen(&config);
+        if cfg!(target_os = "windows") {
+            assert!(
+                !should_show,
+                "Windows trust prompt should always be skipped on native Windows"
+            );
+        } else {
+            assert!(
+                should_show,
+                "Non-Windows should still show trust prompt when project is untrusted"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    #[serial]
+    fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            temp_dir.path().to_path_buf(),
+        )?;
+        config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+        config.active_project = ProjectConfig { trust_level: None };
+        set_windows_sandbox_enabled(true);
+
+        let should_show = should_show_trust_screen(&config);
+        if cfg!(target_os = "windows") {
+            assert!(
+                should_show,
+                "Windows trust prompt should be shown on native Windows with sandbox enabled"
+            );
+        } else {
+            assert!(
+                should_show,
+                "Non-Windows should still show trust prompt when project is untrusted"
+            );
+        }
+        Ok(())
+    }
 }

@@ -24,7 +24,6 @@ use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::SessionSource;
-use codex_core::protocol::TaskCompleteEvent;
 use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::user_input::UserInput;
@@ -61,12 +60,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         config_profile,
         full_auto,
         dangerously_bypass_approvals_and_sandbox,
-        dangerously_disable_timeouts,
-        dangerously_disable_environment_wrapping,
-        dangerously_passthrough_stdio,
-        auto_next_steps,
-        auto_next_idea,
-        include_plan_tool,
         cwd,
         skip_git_repo_check,
         color,
@@ -181,22 +174,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         model_provider,
         codex_linux_sandbox_exe,
         base_instructions: None,
-        include_plan_tool: Some(include_plan_tool),
+        developer_instructions: None,
+        compact_prompt: None,
         include_apply_patch_tool: None,
-        include_view_image_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
         experimental_sandbox_command_assessment: None,
-        disable_command_timeouts: (dangerously_disable_timeouts
-            || dangerously_disable_environment_wrapping
-            || dangerously_passthrough_stdio)
-            .then_some(true),
-        passthrough_shell_environment: (dangerously_disable_environment_wrapping
-            || dangerously_passthrough_stdio)
-            .then_some(true),
-        passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
-        auto_next_steps: auto_next_steps.then_some(true),
-        auto_next_idea: auto_next_idea.then_some(true),
         additional_writable_roots: Vec::new(),
     };
     // Parse `-c` overrides.
@@ -266,7 +249,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         std::process::exit(1);
     }
 
-    let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        true,
+        config.cli_auth_credentials_store_mode,
+    );
     let conversation_manager = ConversationManager::new(auth_manager.clone(), SessionSource::Exec);
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
@@ -336,30 +323,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         });
     }
 
-    // Send images first, if any.
-    if !images.is_empty() {
-        let items: Vec<UserInput> = images
-            .into_iter()
-            .map(|path| UserInput::LocalImage { path })
-            .collect();
-        let initial_images_event_id = conversation.submit(Op::UserInput { items }).await?;
-        info!("Sent images with event ID: {initial_images_event_id}");
-        while let Ok(event) = conversation.next_event().await {
-            if event.id == initial_images_event_id
-                && matches!(
-                    event.msg,
-                    EventMsg::TaskComplete(TaskCompleteEvent {
-                        last_agent_message: _,
-                    })
-                )
-            {
-                break;
-            }
-        }
-    }
-
-    // Send the prompt.
-    let items: Vec<UserInput> = vec![UserInput::Text { text: prompt }];
+    // Package images and prompt into a single user input turn.
+    let mut items: Vec<UserInput> = images
+        .into_iter()
+        .map(|path| UserInput::LocalImage { path })
+        .collect();
+    items.push(UserInput::Text { text: prompt });
     let initial_prompt_task_id = conversation
         .submit(Op::UserTurn {
             items,
@@ -406,8 +375,16 @@ async fn resolve_resume_path(
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<PathBuf>> {
     if args.last {
-        match codex_core::RolloutRecorder::list_conversations(&config.codex_home, 1, None, &[])
-            .await
+        let default_provider_filter = vec![config.model_provider_id.clone()];
+        match codex_core::RolloutRecorder::list_conversations(
+            &config.codex_home,
+            1,
+            None,
+            &[],
+            Some(default_provider_filter.as_slice()),
+            &config.model_provider_id,
+        )
+        .await
         {
             Ok(page) => Ok(page.items.first().map(|it| it.path.clone())),
             Err(e) => {

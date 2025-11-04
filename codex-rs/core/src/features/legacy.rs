@@ -61,7 +61,6 @@ pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
 pub struct LegacyFeatureToggles {
     pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
-    pub include_view_image_tool: Option<bool>,
     pub experimental_sandbox_command_assessment: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
     pub experimental_use_exec_command_tool: Option<bool>,
@@ -124,12 +123,6 @@ impl LegacyFeatureToggles {
         set_if_some(
             features,
             Feature::ViewImageTool,
-            self.include_view_image_tool,
-            "include_view_image_tool",
-        );
-        set_if_some(
-            features,
-            Feature::ViewImageTool,
             self.tools_view_image,
             "tools.view_image",
         );
@@ -145,6 +138,7 @@ fn set_if_some(
     if let Some(enabled) = maybe_value {
         set_feature(features, feature, enabled);
         log_alias(alias_key, feature);
+        features.record_legacy_usage(alias_key, feature);
     }
 }
 
