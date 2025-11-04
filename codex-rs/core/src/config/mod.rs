@@ -112,6 +112,11 @@ pub struct Config {
     pub forced_auto_mode_downgraded_on_windows: bool,
 
     pub shell_environment_policy: ShellEnvironmentPolicy,
+    pub disable_command_timeouts: bool,
+    pub passthrough_shell_environment: bool,
+    pub passthrough_shell_stdio: bool,
+    pub auto_next_steps: bool,
+    pub auto_next_idea: bool,
 
     /// When `true`, `AgentReasoning` events emitted by the backend will be
     /// suppressed from the frontend output. This can reduce visual noise when
@@ -531,6 +536,21 @@ pub struct ConfigToml {
     #[serde(default)]
     pub shell_environment_policy: ShellEnvironmentPolicyToml,
 
+    /// Disable command timeouts. EXTREMELY DANGEROUS.
+    pub disable_command_timeouts: Option<bool>,
+
+    /// Pass the full host environment through unchanged. EXTREMELY DANGEROUS.
+    pub passthrough_shell_environment: Option<bool>,
+
+    /// Stream shell stdout/stderr directly to the user terminal.
+    pub passthrough_shell_stdio: Option<bool>,
+
+    /// Continue automatically by prompting for detailed next steps.
+    pub auto_next_steps: Option<bool>,
+
+    /// Continue autonomously by scouting for fresh work once current tasks complete.
+    pub auto_next_idea: Option<bool>,
+
     /// Sandbox mode to use.
     pub sandbox_mode: Option<SandboxMode>,
 
@@ -636,6 +656,9 @@ pub struct ConfigToml {
     /// Centralized feature flags (new). Prefer this over individual toggles.
     #[serde(default)]
     pub features: Option<FeaturesToml>,
+
+    /// Include the plan tool in conversations.
+    pub include_plan_tool: Option<bool>,
 
     /// When true, disables burst-paste detection for typed input entirely.
     /// All characters are inserted as they are received, and no buffering
@@ -843,6 +866,11 @@ pub struct ConfigOverrides {
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
     pub experimental_sandbox_command_assessment: Option<bool>,
+    pub disable_command_timeouts: Option<bool>,
+    pub passthrough_shell_environment: Option<bool>,
+    pub passthrough_shell_stdio: Option<bool>,
+    pub auto_next_steps: Option<bool>,
+    pub auto_next_idea: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
 }
@@ -874,6 +902,11 @@ impl Config {
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
             experimental_sandbox_command_assessment: sandbox_command_assessment_override,
+            disable_command_timeouts,
+            passthrough_shell_environment,
+            passthrough_shell_stdio,
+            auto_next_steps,
+            auto_next_idea,
             additional_writable_roots,
         } = overrides;
 
@@ -899,6 +932,7 @@ impl Config {
             include_apply_patch_tool: include_apply_patch_tool_override,
             web_search_request: override_tools_web_search_request,
             experimental_sandbox_command_assessment: sandbox_command_assessment_override,
+            plan_tool: None,
         };
 
         let features = Features::from_config(&cfg, &config_profile, feature_overrides);
@@ -1102,6 +1136,26 @@ impl Config {
             did_user_set_custom_approval_policy_or_sandbox_mode,
             forced_auto_mode_downgraded_on_windows,
             shell_environment_policy,
+            disable_command_timeouts: disable_command_timeouts
+                .or(config_profile.disable_command_timeouts)
+                .or(cfg.disable_command_timeouts)
+                .unwrap_or(false),
+            passthrough_shell_environment: passthrough_shell_environment
+                .or(config_profile.passthrough_shell_environment)
+                .or(cfg.passthrough_shell_environment)
+                .unwrap_or(false),
+            passthrough_shell_stdio: passthrough_shell_stdio
+                .or(config_profile.passthrough_shell_stdio)
+                .or(cfg.passthrough_shell_stdio)
+                .unwrap_or(false),
+            auto_next_steps: auto_next_steps
+                .or(config_profile.auto_next_steps)
+                .or(cfg.auto_next_steps)
+                .unwrap_or(false),
+            auto_next_idea: auto_next_idea
+                .or(config_profile.auto_next_idea)
+                .or(cfg.auto_next_idea)
+                .unwrap_or(false),
             notify: cfg.notify,
             user_instructions,
             base_instructions,

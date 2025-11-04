@@ -23,6 +23,7 @@ pub struct ConfigProfile {
     pub chatgpt_base_url: Option<String>,
     pub experimental_instructions_file: Option<PathBuf>,
     pub experimental_compact_prompt_file: Option<PathBuf>,
+    pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_exec_command_tool: Option<bool>,
@@ -31,6 +32,11 @@ pub struct ConfigProfile {
     pub experimental_sandbox_command_assessment: Option<bool>,
     pub tools_web_search: Option<bool>,
     pub tools_view_image: Option<bool>,
+    pub disable_command_timeouts: Option<bool>,
+    pub passthrough_shell_environment: Option<bool>,
+    pub passthrough_shell_stdio: Option<bool>,
+    pub auto_next_steps: Option<bool>,
+    pub auto_next_idea: Option<bool>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
     pub features: Option<crate::features::FeaturesToml>,

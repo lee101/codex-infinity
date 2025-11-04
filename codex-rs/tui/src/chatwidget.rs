@@ -228,6 +228,8 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
+    pub(crate) auto_next_steps: bool,
+    pub(crate) auto_next_idea: bool,
 }
 
 pub(crate) struct ChatWidget {
@@ -237,6 +239,8 @@ pub(crate) struct ChatWidget {
     active_cell: Option<Box<dyn HistoryCell>>,
     config: Config,
     auth_manager: Arc<AuthManager>,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
@@ -985,6 +989,8 @@ impl ChatWidget {
             enhanced_keys_supported,
             auth_manager,
             feedback,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
@@ -1005,6 +1011,8 @@ impl ChatWidget {
             active_cell: None,
             config: config.clone(),
             auth_manager,
+            auto_next_steps,
+            auto_next_idea,
             session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
@@ -1049,6 +1057,8 @@ impl ChatWidget {
             enhanced_keys_supported,
             auth_manager,
             feedback,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
@@ -1071,6 +1081,8 @@ impl ChatWidget {
             active_cell: None,
             config: config.clone(),
             auth_manager,
+            auto_next_steps,
+            auto_next_idea,
             session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
@@ -2351,6 +2363,10 @@ impl ChatWidget {
     /// runtime overrides applied via TUI, e.g., model or approval policy).
     pub(crate) fn config_ref(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn auto_prompt_flags(&self) -> (bool, bool) {
+        (self.auto_next_steps, self.auto_next_idea)
     }
 
     pub(crate) fn clear_token_usage(&mut self) {

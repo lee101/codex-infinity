@@ -151,6 +151,11 @@ pub async fn run_main(
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: cli.web_search.then_some(true),
         experimental_sandbox_command_assessment: None,
+        disable_command_timeouts: cli.dangerously_disable_timeouts.then_some(true),
+        passthrough_shell_environment: cli.dangerously_disable_environment_wrapping.then_some(true),
+        passthrough_shell_stdio: cli.dangerously_passthrough_stdio.then_some(true),
+        auto_next_steps: cli.auto_next_steps.then_some(true),
+        auto_next_idea: cli.auto_next_idea.then_some(true),
         additional_writable_roots: additional_dirs,
     };
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
@@ -438,7 +443,7 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    let Cli { prompt, images, .. } = cli;
+    let Cli { prompt, images, auto_next_steps, auto_next_idea, .. } = cli;
 
     let app_result = App::run(
         &mut tui,
@@ -449,6 +454,8 @@ async fn run_ratatui_app(
         images,
         resume_selection,
         feedback,
+        auto_next_steps,
+        auto_next_idea,
     )
     .await;
 
