@@ -168,8 +168,11 @@ impl Session {
             *active = None;
         }
         drop(active);
+        let follow_up_summary = last_agent_message.clone();
+        let follow_up_context = Arc::clone(&turn_context);
         let event = EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message });
         self.send_event(turn_context.as_ref(), event).await;
+        self.maybe_schedule_autonomy_follow_up(follow_up_context, follow_up_summary);
     }
 
     async fn register_new_active_task(&self, task: RunningTask) {

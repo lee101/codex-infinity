@@ -58,7 +58,7 @@ use crate::client_common::ResponseEvent;
 use crate::config::Config;
 use crate::config::types::McpServerTransportConfig;
 use crate::config::types::ShellEnvironmentPolicy;
-use crate::conversation_history::ConversationHistory;
+use crate::context_manager::ContextManager;
 use crate::environment_context::EnvironmentContext;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -101,6 +101,7 @@ use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::tasks::GhostSnapshotTask;
+use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -255,7 +256,58 @@ pub(crate) struct Session {
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
+    autonomy: AutonomySettings,
     next_internal_sub_id: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct AutonomySettings {
+    auto_next_steps: bool,
+    auto_next_idea: bool,
+}
+
+struct AutonomyPrompt {
+    background_message: &'static str,
+    prompt: String,
+}
+
+impl AutonomySettings {
+    fn is_enabled(self) -> bool {
+        self.auto_next_steps || self.auto_next_idea
+    }
+
+    fn plan_for_summary(self, summary: &str) -> Option<AutonomyPrompt> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return None;
+        }
+        let background_message = match (self.auto_next_steps, self.auto_next_idea) {
+            (true, true) => "Autonomy: continuing with next steps and fresh ideas.",
+            (true, false) => "Auto-next-steps: queuing detailed follow-up tasks.",
+            (false, true) => "Auto-next-idea: proposing new high-impact work.",
+            (false, false) => return None,
+        };
+        let mut sections = Vec::new();
+        if self.auto_next_steps {
+            sections.push("Continue working autonomously on the current objectives. Break the overall goal into concrete next steps, execute them carefully in order, and run relevant tests as needed.");
+        }
+        if self.auto_next_idea {
+            sections.push("After finishing the current plan, shift into ideation mode and brainstorm at least three concrete improvements for this project. Pick the highest-impact idea and start executing it immediately.");
+        }
+        if self.auto_next_steps && self.auto_next_idea {
+            sections.push("Repeat this cycle indefinitely until a human interrupts you.");
+        }
+        sections.push("Use the latest summary of work below as context when outlining your follow-up actions.");
+        let instructions = sections.join("\n\n");
+        let prompt = format!("{instructions}\n\nLatest summary of work:\n{summary}");
+        Some(AutonomyPrompt {
+            background_message,
+            prompt,
+        })
+    }
 }
 
 /// The context needed for a single turn of the conversation.
@@ -559,7 +611,7 @@ impl Session {
                 None
             } else {
                 Some(format!(
-                    "You can either enable it using the CLI with `--enable {canonical}` or through the config.toml file with `[features].{canonical}`"
+                    "Enable it with `--enable {canonical}` or `[features].{canonical}` in config.toml. See https://github.com/openai/codex/blob/main/docs/config.md#feature-flags for details."
                 ))
             };
             post_session_configured_events.push(Event {
@@ -613,6 +665,10 @@ impl Session {
             state: Mutex::new(state),
             active_turn: Mutex::new(None),
             services,
+            autonomy: AutonomySettings {
+                auto_next_steps: config.auto_next_steps,
+                auto_next_idea: config.auto_next_idea,
+            },
             next_internal_sub_id: AtomicU64::new(0),
         });
 
@@ -665,6 +721,58 @@ impl Session {
             .next_internal_sub_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         format!("auto-compact-{id}")
+    }
+
+    fn next_autonomy_sub_id(&self) -> String {
+        let id = self
+            .next_internal_sub_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("autonomy-{id}")
+    }
+
+    pub(crate) fn maybe_schedule_autonomy_follow_up(
+        self: &Arc<Self>,
+        completed_context: Arc<TurnContext>,
+        last_agent_message: Option<String>,
+    ) {
+        let Some(summary) = last_agent_message else {
+            return;
+        };
+        let Some(plan) = self.autonomy.plan_for_summary(&summary) else {
+            return;
+        };
+
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            let notify_context = Arc::clone(&completed_context);
+            session
+                .notify_background_event(notify_context.as_ref(), plan.background_message)
+                .await;
+            session
+                .spawn_autonomy_turn(completed_context, plan.prompt)
+                .await;
+        });
+    }
+
+    async fn spawn_autonomy_turn(
+        self: &Arc<Self>,
+        previous_context: Arc<TurnContext>,
+        prompt: String,
+    ) {
+        let sub_id = self.next_autonomy_sub_id();
+        let next_context = self
+            .new_turn_with_sub_id(sub_id, SessionSettingsUpdate::default())
+            .await;
+
+        if let Some(env_item) =
+            self.build_environment_update_item(Some(&previous_context), &next_context)
+        {
+            self.record_conversation_items(&next_context, std::slice::from_ref(&env_item))
+                .await;
+        }
+
+        let items = vec![UserInput::Text { text: prompt }];
+        self.spawn_task(next_context, items, RegularTask).await;
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
@@ -951,7 +1059,7 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> Vec<ResponseItem> {
-        let mut history = ConversationHistory::new();
+        let mut history = ContextManager::new();
         for item in rollout_items {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
@@ -1038,7 +1146,7 @@ impl Session {
         }
     }
 
-    pub(crate) async fn clone_history(&self) -> ConversationHistory {
+    pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
     }
@@ -1937,6 +2045,7 @@ async fn run_turn(
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(CodexErr::UsageNotIncluded) => return Err(CodexErr::UsageNotIncluded),
+            Err(e @ CodexErr::RefreshTokenFailed(_)) => return Err(e),
             Err(e) => {
                 // Use the configured provider-specific stream retry budget.
                 let max_retries = turn_context.client.get_provider().stream_max_retries();
@@ -1955,7 +2064,7 @@ async fn run_turn(
                     // at a seemingly frozen screen.
                     sess.notify_stream_error(
                         &turn_context,
-                        format!("Re-connecting... {retries}/{max_retries}"),
+                        format!("Reconnecting... {retries}/{max_retries}"),
                     )
                     .await;
 
@@ -2573,6 +2682,10 @@ mod tests {
             state: Mutex::new(state),
             active_turn: Mutex::new(None),
             services,
+            autonomy: AutonomySettings {
+                auto_next_steps: config.auto_next_steps,
+                auto_next_idea: config.auto_next_idea,
+            },
             next_internal_sub_id: AtomicU64::new(0),
         };
 
@@ -2649,6 +2762,10 @@ mod tests {
             state: Mutex::new(state),
             active_turn: Mutex::new(None),
             services,
+            autonomy: AutonomySettings {
+                auto_next_steps: config.auto_next_steps,
+                auto_next_idea: config.auto_next_idea,
+            },
             next_internal_sub_id: AtomicU64::new(0),
         });
 
@@ -2843,7 +2960,7 @@ mod tests {
         turn_context: &TurnContext,
     ) -> (Vec<RolloutItem>, Vec<ResponseItem>) {
         let mut rollout_items = Vec::new();
-        let mut live_history = ConversationHistory::new();
+        let mut live_history = ContextManager::new();
 
         let initial_context = session.build_initial_context(turn_context);
         for item in &initial_context {
@@ -2974,6 +3091,8 @@ mod tests {
             with_escalated_permissions: Some(true),
             justification: Some("test".to_string()),
             arg0: None,
+            disable_timeout: false,
+            passthrough_stdio: false,
         };
 
         let params2 = ExecParams {
