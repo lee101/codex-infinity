@@ -452,6 +452,42 @@ impl ChatWidget {
         self.running_commands.clear();
         self.request_redraw();
 
+        // Auto-prompt logic: if auto_next_steps or auto_next_idea is enabled and we're not in review mode,
+        // automatically queue a follow-up prompt to continue working.
+        if !self.is_review_mode {
+            let summary = last_agent_message.as_deref().unwrap_or("(no summary provided)");
+
+            if self.auto_next_steps {
+                // Queue a prompt to continue with natural next steps
+                let auto_prompt = format!(
+                    "Continue working autonomously on the natural next steps for this project. \
+                    Consider testing, documentation, edge cases, and any remaining work.\n\n\
+                    Initial summary of work: {}",
+                    summary
+                );
+                self.add_to_history(history_cell::new_info_event(
+                    "Auto-next-steps: queuing detailed follow-up tasks.".to_string(),
+                    None
+                ));
+                self.request_redraw();
+                self.submit_text_message(auto_prompt);
+            } else if self.auto_next_idea {
+                // Queue a prompt to brainstorm new improvement ideas
+                let auto_prompt = format!(
+                    "Brainstorm and autonomously implement new follow-on improvement ideas for this project. \
+                    Consider enhancements, optimizations, new features, or technical debt that could be addressed.\n\n\
+                    Previous work summary: {}",
+                    summary
+                );
+                self.add_to_history(history_cell::new_info_event(
+                    "Auto-next-idea: queuing autonomous ideation and implementation.".to_string(),
+                    None
+                ));
+                self.request_redraw();
+                self.submit_text_message(auto_prompt);
+            }
+        }
+
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
