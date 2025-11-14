@@ -291,7 +291,7 @@ impl UnifiedExecSessionManager {
             .split_first()
             .ok_or(UnifiedExecError::MissingCommandLine)?;
         let spawned =
-            codex_utils_pty::spawn_pty_process(program, args, env.cwd.as_path(), &env.env)
+            codex_utils_pty::spawn_pty_process(program, args, env.cwd.as_path(), &env.env, &env.arg0)
                 .await
                 .map_err(|err| UnifiedExecError::create_session(err.to_string()))?;
         UnifiedExecSession::from_spawned(spawned, env.sandbox).await

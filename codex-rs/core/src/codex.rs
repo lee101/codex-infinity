@@ -2293,6 +2293,7 @@ async fn try_run_turn(
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
                         delta: delta.clone(),
+                        summary_index: 0,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
@@ -2301,8 +2302,11 @@ async fn try_run_turn(
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded => {
-                let event =
-                    EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {});
+                let item_id = active_item.as_ref().map(|item| item.id()).unwrap_or_default();
+                let event = EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                    item_id,
+                    summary_index: 0,
+                });
                 sess.send_event(&turn_context, event).await;
             }
             ResponseEvent::ReasoningContentDelta(delta) => {
@@ -2312,6 +2316,7 @@ async fn try_run_turn(
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
                         delta: delta.clone(),
+                        content_index: 0,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
