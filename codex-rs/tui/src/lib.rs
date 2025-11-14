@@ -97,12 +97,24 @@ pub async fn run_main(
     mut cli: Cli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<AppExitInfo> {
+    // Handle yolo flag hierarchy: yolo4 implies yolo3, yolo3 implies yolo2, yolo2 implies yolo
+    let dangerously_bypass_approvals_and_sandbox = cli.dangerously_bypass_approvals_and_sandbox
+        || cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+    let dangerously_disable_timeouts = cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+    let dangerously_disable_environment_wrapping =
+        cli.dangerously_disable_environment_wrapping || cli.dangerously_passthrough_stdio;
+    let dangerously_passthrough_stdio = cli.dangerously_passthrough_stdio;
+
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
             Some(AskForApproval::OnRequest),
         )
-    } else if cli.dangerously_bypass_approvals_and_sandbox {
+    } else if dangerously_bypass_approvals_and_sandbox {
         (
             Some(SandboxMode::DangerFullAccess),
             Some(AskForApproval::Never),
@@ -158,9 +170,9 @@ pub async fn run_main(
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: None,
         experimental_sandbox_command_assessment: None,
-        disable_command_timeouts: cli.dangerously_disable_timeouts.then_some(true),
-        passthrough_shell_environment: cli.dangerously_disable_environment_wrapping.then_some(true),
-        passthrough_shell_stdio: cli.dangerously_passthrough_stdio.then_some(true),
+        disable_command_timeouts: dangerously_disable_timeouts.then_some(true),
+        passthrough_shell_environment: dangerously_disable_environment_wrapping.then_some(true),
+        passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
         auto_next_steps: cli.auto_next_steps.then_some(true),
         auto_next_idea: cli.auto_next_idea.then_some(true),
         additional_writable_roots: additional_dirs,

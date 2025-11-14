@@ -168,6 +168,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         None // No specific model provider override.
     };
 
+    // Handle yolo flag hierarchy: yolo4 implies yolo3, yolo3 implies yolo2, yolo2 implies yolo
+    let dangerously_disable_timeouts = dangerously_disable_timeouts
+        || dangerously_disable_environment_wrapping
+        || dangerously_passthrough_stdio;
+    let dangerously_disable_environment_wrapping =
+        dangerously_disable_environment_wrapping || dangerously_passthrough_stdio;
+
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
