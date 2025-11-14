@@ -107,6 +107,22 @@ const PROVIDER_MODEL_DEFAULTS: &[(&str, ProviderModelDefaults)] = &[
     ),
 ];
 
+/// Infer the provider ID from a model name if no explicit provider is set.
+fn infer_provider_from_model(model: &str) -> Option<&'static str> {
+    if model.starts_with("grok-") {
+        Some("xai")
+    } else if model.starts_with("gemini-") {
+        Some("gemini")
+    } else if model.contains('/') {
+        // Models with / prefix (like openrouter/polaris-alpha, moonshotai/kimi-linear-48b-a3b-instruct)
+        Some("openrouter")
+    } else if model.starts_with("gpt-oss") {
+        Some(BUILT_IN_OSS_MODEL_PROVIDER_ID)
+    } else {
+        None
+    }
+}
+
 fn provider_model_defaults(provider_id: &str) -> ProviderModelDefaults {
     PROVIDER_MODEL_DEFAULTS
         .iter()
@@ -1066,10 +1082,31 @@ impl Config {
             model_providers.entry(key).or_insert(provider);
         }
 
-        let model_provider_id = model_provider
-            .or(config_profile.model_provider)
-            .or(cfg.model_provider)
-            .unwrap_or_else(|| "openai".to_string());
+        // Auto-infer provider from model name if no explicit provider is set
+        let model_provider_id = {
+            let explicit_provider = model_provider
+                .or(config_profile.model_provider.clone())
+                .or(cfg.model_provider.clone());
+
+            if explicit_provider.is_some() {
+                explicit_provider.unwrap()
+            } else {
+                // Peek at the model to auto-infer provider
+                let peek_model = model
+                    .clone()
+                    .or(config_profile.model.clone())
+                    .or(cfg.model.clone());
+
+                if let Some(ref model_name) = peek_model {
+                    infer_provider_from_model(model_name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "openai".to_string())
+                } else {
+                    "openai".to_string()
+                }
+            }
+        };
+
         let model_provider = model_providers
             .get(&model_provider_id)
             .ok_or_else(|| {
