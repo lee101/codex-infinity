@@ -490,7 +490,7 @@ impl ChatWidget {
                     None
                 ));
                 self.request_redraw();
-                self.submit_text_message(auto_prompt);
+                self.submit_user_message(auto_prompt.into());
             } else if self.auto_next_idea {
                 // Queue a prompt to brainstorm new improvement ideas
                 let auto_prompt = format!(
@@ -504,7 +504,7 @@ impl ChatWidget {
                     None
                 ));
                 self.request_redraw();
-                self.submit_text_message(auto_prompt);
+                self.submit_user_message(auto_prompt.into());
             }
         }
 
