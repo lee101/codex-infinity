@@ -18,12 +18,11 @@ Use this example configuration as a starting point. For an explanation of each f
 # Core Model Selection
 ################################################################################
 
-# Primary model used by Codex. Default differs by OS; non-Windows defaults here.
-# Linux/macOS default: "gpt-5-codex"; Windows default: "gpt-5".
-model = "gpt-5-codex"
+# Primary model used by Codex. Default follows the provider (OpenAI defaults to "o4-mini").
+model = "o4-mini"
 
-# Model used by the /review feature (code reviews). Default: "gpt-5-codex".
-review_model = "gpt-5-codex"
+# Model used by the /review feature (code reviews). Default: "o3".
+review_model = "o3"
 
 # Provider id selected from [model_providers]. Default: "openai".
 model_provider = "openai"
@@ -275,6 +274,9 @@ mcp_oauth_credentials_store = "auto"
 
 # Built-ins include:
 # - openai (Responses API; requires login or OPENAI_API_KEY via auth flow)
+# - gemini (OpenAI-compatible Gemini endpoint; requires GOOGLE_GENERATIVE_AI_API_KEY)
+# - openrouter (OpenRouter relay; requires OPENROUTER_API_KEY)
+# - xai (api.x.ai Grok endpoints; requires XAI_API_KEY)
 # - oss (Chat Completions API; defaults to http://localhost:11434/v1)
 
 [model_providers]
@@ -307,6 +309,30 @@ mcp_oauth_credentials_store = "auto"
 # base_url = "http://localhost:11434/v1"
 # wire_api = "chat"
 
+# --- Example: Google Gemini ---
+# [model_providers.gemini]
+# name = "Google Gemini"
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# env_key = "GOOGLE_GENERATIVE_AI_API_KEY"
+# wire_api = "chat"
+
+# --- Example: OpenRouter ---
+# [model_providers.openrouter]
+# name = "OpenRouter"
+# base_url = "https://openrouter.ai/api/v1"
+# env_key = "OPENROUTER_API_KEY"
+# http_headers = { "HTTP-Referer" = "https://github.com/openai/codex", "X-Title" = "Codex CLI" }
+# wire_api = "chat"
+# # Example models: "openrouter/polaris-alpha", "moonshotai/kimi-linear-48b-a3b-instruct"
+
+# --- Example: xAI ---
+# [model_providers.xai]
+# name = "xAI"
+# base_url = "https://api.x.ai/v1"
+# env_key = "XAI_API_KEY"
+# wire_api = "chat"
+# # Suggested models: "grok-code-fast-1" for day-to-day, "grok-4-fast-reasoning" for review/full-context jobs
+
 ################################################################################
 # Profiles (named presets)
 ################################################################################
@@ -317,7 +343,7 @@ mcp_oauth_credentials_store = "auto"
 [profiles]
 
 # [profiles.default]
-# model = "gpt-5-codex"
+# model = "o4-mini"
 # model_provider = "openai"
 # approval_policy = "on-request"
 # sandbox_mode = "read-only"

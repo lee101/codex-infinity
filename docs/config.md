@@ -64,7 +64,7 @@ Notes:
 The model that Codex should use.
 
 ```toml
-model = "gpt-5"  # overrides the default ("gpt-5-codex" on macOS/Linux, "gpt-5" on Windows)
+model = "o4-mini"  # overrides the provider default (see table below)
 ```
 
 ### model_providers
@@ -73,6 +73,52 @@ This option lets you add to the default set of model providers bundled with Code
 
 > [!NOTE]
 > Built-in providers are not overwritten when you reuse their key. Entries you add only take effect when the key is **new**; for example `[model_providers.openai]` leaves the original OpenAI definition untouched. To customize the bundled OpenAI provider, prefer the dedicated knobs (for example the `OPENAI_BASE_URL` environment variable) or register a new provider key and point `model_provider` at it.
+
+Codex ships with the following providers ready to use:
+
+- `openai` (Responses API; use the ChatGPT login flow or set `OPENAI_API_KEY`)
+- `gemini` (Google Gemini’s OpenAI-compatible endpoint; set `GOOGLE_GENERATIVE_AI_API_KEY`)
+- `openrouter` (OpenRouter relay; set `OPENROUTER_API_KEY`)
+- `xai` (Grok via api.x.ai; set `XAI_API_KEY`)
+- `oss` (Ollama/OSS-compatible endpoint; defaults to `http://localhost:11434/v1`)
+
+Each provider carries two default models—an “agentic” default used for day-to-day turns and a “full context” default used for `/review` and other long-form tasks. Override them by setting `model` or `review_model`.
+
+| Provider     | Environment Variable Required        | Default Agentic Model            | Default Full Context Model  |
+| ------------ | ------------------------------------ | -------------------------------- | --------------------------- |
+| `openai`     | `OPENAI_API_KEY` (or ChatGPT login)  | `o4-mini`                        | `o3`                        |
+| `gemini`     | `GOOGLE_GENERATIVE_AI_API_KEY`       | `gemini-2.5-pro-preview-03-25`   | `gemini-2.0-flash`          |
+| `openrouter` | `OPENROUTER_API_KEY`                 | `openai/o4-mini`                 | `openai/o3`                 |
+| `ollama`     | _Not required_                       | _User must specify_              | _User must specify_         |
+| `xai`        | `XAI_API_KEY`                        | `grok-code-fast-1`               | `grok-4-fast-reasoning`     |
+
+> [!TIP]
+> OpenRouter exposes hundreds of community models. Two popular coding picks are `openrouter/polaris-alpha` and `moonshotai/kimi-linear-48b-a3b-instruct`. For xAI, refer to https://docs.x.ai/docs/models/grok-code-fast-1 and https://docs.x.ai/docs/models/grok-4-fast-reasoning for the latest Grok variants.
+
+To switch providers, either edit your config:
+
+```toml
+# ~/.codex/config.toml
+model_provider = "gemini"
+model = "gemini-2.5-pro-preview-03-25"
+review_model = "gemini-2.0-flash"
+```
+
+…or pass a one-off override when launching Codex:
+
+```bash
+codex --config model_provider="gemini"
+```
+
+Then export the matching API key(s):
+
+```bash
+export OPENAI_API_KEY="sk-your-openai-key"
+export GOOGLE_GENERATIVE_AI_API_KEY="your-gemini-key"
+export OPENROUTER_API_KEY="your-openrouter-key"
+export XAI_API_KEY="your-xai-key"
+# Ollama runs locally, so no key is required.
+```
 
 For example, if you wanted to add a provider that uses the OpenAI 4o model via the chat completions API, then you could add the following configuration:
 
@@ -802,7 +848,7 @@ Users can specify config values at multiple levels. Order of precedence is as fo
 1. custom command-line argument, e.g., `--model o3`
 2. as part of a profile, where the `--profile` is specified via a CLI (or in the config file itself)
 3. as an entry in `config.toml`, e.g., `model = "o3"`
-4. the default value that comes with Codex CLI (i.e., Codex CLI defaults to `gpt-5-codex`)
+4. the default value that comes with Codex CLI (for example, the bundled OpenAI provider defaults to `o4-mini`)
 
 ### history
 
@@ -905,7 +951,7 @@ Valid values:
 
 | Key                                              | Type / Values                                                     | Notes                                                                                                                      |
 | ------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `model`                                          | string                                                            | Model to use (e.g., `gpt-5-codex`).                                                                                        |
+| `model`                                          | string                                                            | Model to use (default follows the selected provider; e.g., `o4-mini` for the bundled OpenAI provider).                     |
 | `model_provider`                                 | string                                                            | Provider id from `model_providers` (default: `openai`).                                                                    |
 | `model_context_window`                           | number                                                            | Context window tokens.                                                                                                     |
 | `model_max_output_tokens`                        | number                                                            | Max output tokens.                                                                                                         |

@@ -245,6 +245,18 @@ async fn prompt_tools_are_consistent_across_requests() {
                 "view_image",
             ],
         ),
+        (
+            "o4-mini",
+            vec![
+                "shell",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+                "update_plan",
+                "apply_patch",
+                "view_image",
+            ],
+        ),
     ]);
     let expected_tools_names = tools_by_model
         .get(OPENAI_DEFAULT_MODEL)

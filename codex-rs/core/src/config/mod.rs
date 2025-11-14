@@ -25,6 +25,7 @@ use crate::git_info::resolve_root_git_project_for_trust;
 use crate::model_family::ModelFamily;
 use crate::model_family::derive_default_model_family;
 use crate::model_family::find_family_for_model;
+use crate::model_provider_info::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
@@ -58,12 +59,64 @@ pub mod edit;
 pub mod profile;
 pub mod types;
 
-#[cfg(target_os = "windows")]
-pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
-#[cfg(not(target_os = "windows"))]
-pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5-codex";
-const OPENAI_DEFAULT_REVIEW_MODEL: &str = "gpt-5-codex";
+pub const OPENAI_DEFAULT_MODEL: &str = "o4-mini";
+const OPENAI_DEFAULT_REVIEW_MODEL: &str = "o3";
 pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5-codex";
+
+#[derive(Clone, Copy)]
+struct ProviderModelDefaults {
+    agentic: &'static str,
+    full_context: &'static str,
+}
+
+const PROVIDER_MODEL_DEFAULTS: &[(&str, ProviderModelDefaults)] = &[
+    (
+        "openai",
+        ProviderModelDefaults {
+            agentic: OPENAI_DEFAULT_MODEL,
+            full_context: OPENAI_DEFAULT_REVIEW_MODEL,
+        },
+    ),
+    (
+        "gemini",
+        ProviderModelDefaults {
+            agentic: "gemini-2.5-pro-preview-03-25",
+            full_context: "gemini-2.0-flash",
+        },
+    ),
+    (
+        "openrouter",
+        ProviderModelDefaults {
+            agentic: "openai/o4-mini",
+            full_context: "openai/o3",
+        },
+    ),
+    (
+        "xai",
+        ProviderModelDefaults {
+            agentic: "grok-code-fast-1",
+            full_context: "grok-4-fast-reasoning",
+        },
+    ),
+    (
+        BUILT_IN_OSS_MODEL_PROVIDER_ID,
+        ProviderModelDefaults {
+            agentic: "gpt-oss:20b",
+            full_context: "gpt-oss:20b",
+        },
+    ),
+];
+
+fn provider_model_defaults(provider_id: &str) -> ProviderModelDefaults {
+    PROVIDER_MODEL_DEFAULTS
+        .iter()
+        .find(|(id, _)| *id == provider_id)
+        .map(|(_, defaults)| *defaults)
+        .unwrap_or(ProviderModelDefaults {
+            agentic: OPENAI_DEFAULT_MODEL,
+            full_context: OPENAI_DEFAULT_REVIEW_MODEL,
+        })
+}
 
 /// Maximum number of bytes of the documentation that will be embedded. Larger
 /// files are *silently truncated* to this size so we do not take up too much of
@@ -1026,6 +1079,7 @@ impl Config {
                 )
             })?
             .clone();
+        let provider_model_defaults = provider_model_defaults(&model_provider_id);
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
 
@@ -1054,7 +1108,7 @@ impl Config {
         let model = model
             .or(config_profile.model)
             .or(cfg.model)
-            .unwrap_or_else(default_model);
+            .unwrap_or_else(|| provider_model_defaults.agentic.to_string());
 
         let mut model_family =
             find_family_for_model(&model).unwrap_or_else(|| derive_default_model_family(&model));
@@ -1119,7 +1173,7 @@ impl Config {
         // Default review model when not set in config; allow CLI override to take precedence.
         let review_model = override_review_model
             .or(cfg.review_model)
-            .unwrap_or_else(default_review_model);
+            .unwrap_or_else(|| provider_model_defaults.full_context.to_string());
 
         let config = Self {
             model,
@@ -1288,14 +1342,6 @@ impl Config {
             Ok(Some(s))
         }
     }
-}
-
-fn default_model() -> String {
-    OPENAI_DEFAULT_MODEL.to_string()
-}
-
-fn default_review_model() -> String {
-    OPENAI_DEFAULT_REVIEW_MODEL.to_string()
 }
 
 /// Returns the path to the Codex configuration directory, which can be

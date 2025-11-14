@@ -311,6 +311,79 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 requires_openai_auth: true,
             },
         ),
+        (
+            "gemini",
+            P {
+                name: "Google Gemini".into(),
+                base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
+                env_key: Some("GOOGLE_GENERATIVE_AI_API_KEY".into()),
+                env_key_instructions: Some(
+                    "Create a Gemini API key at https://ai.google.dev/gemini-api/docs/api-key and export GOOGLE_GENERATIVE_AI_API_KEY."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Chat,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+            },
+        ),
+        (
+            "openrouter",
+            P {
+                name: "OpenRouter".into(),
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                env_key: Some("OPENROUTER_API_KEY".into()),
+                env_key_instructions: Some(
+                    "Generate a key at https://openrouter.ai/settings/keys and export OPENROUTER_API_KEY."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Chat,
+                query_params: None,
+                http_headers: Some(
+                    [
+                        (
+                            "HTTP-Referer".to_string(),
+                            "https://github.com/openai/codex".to_string(),
+                        ),
+                        ("X-Title".to_string(), "Codex CLI".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+            },
+        ),
+        (
+            "xai",
+            P {
+                name: "xAI".into(),
+                base_url: Some("https://api.x.ai/v1".into()),
+                env_key: Some("XAI_API_KEY".into()),
+                env_key_instructions: Some(
+                    "Create a key via https://docs.x.ai/docs/getting-started and export XAI_API_KEY."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+            },
+        ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
     ]
     .into_iter()

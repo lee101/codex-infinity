@@ -50,7 +50,7 @@ const PRESETS: &[ModelPreset] = &[
                 description: "Maximizes reasoning depth for complex or ambiguous problems",
             },
         ],
-        is_default: true,
+        is_default: false,
     },
     ModelPreset {
         id: "gpt-5-codex-mini",
@@ -96,13 +96,203 @@ const PRESETS: &[ModelPreset] = &[
         ],
         is_default: false,
     },
+    ModelPreset {
+        id: "o4-mini",
+        model: "o4-mini",
+        display_name: "o4-mini",
+        description: "OpenAI’s fast agentic model (default for most CLI sessions).",
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Fastest hand-offs with minimal deliberation",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Balances speed with solid lightweight reasoning",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Great general-purpose autonomy",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Max reasoning depth for tricky refactors",
+            },
+        ],
+        is_default: true,
+    },
+    ModelPreset {
+        id: "o3",
+        model: "o3",
+        display_name: "o3",
+        description: "OpenAI’s long-context reasoning model.",
+        default_reasoning_effort: ReasoningEffort::High,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Balanced output quality for large files",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Full-depth reasoning for complex audits",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "gemini-2-5-pro-preview-03-25",
+        model: "gemini-2.5-pro-preview-03-25",
+        display_name: "Gemini 2.5 Pro (Preview)",
+        description: "Google Gemini’s most capable public model via OpenAI-compatible API.",
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Prioritize latency when drafting or ideating",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Balanced option for everyday coding help",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Extra deliberation for multi-step plans",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Deep dives when troubleshooting tough bugs",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "gemini-2-0-flash",
+        model: "gemini-2.0-flash",
+        display_name: "Gemini 2.0 Flash",
+        description: "Fast Gemini model for quick iterations and reviews.",
+        default_reasoning_effort: ReasoningEffort::Low,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Ultra-fast responses for simple edits",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Use when you want quick summaries or reviews",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Adds deliberation while staying responsive",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "openrouter-polaris-alpha",
+        model: "openrouter/polaris-alpha",
+        display_name: "Polaris Alpha (OpenRouter)",
+        description: "Community-favorite reasoning model hosted via OpenRouter.",
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Quick rough drafts or shell plans",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Everyday work with solid stability",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Recommended for longer coding sessions",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Dig deep into gnarly issues (slower/pricey)",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "moonshotai-kimi-linear-48b-a3b-instruct",
+        model: "moonshotai/kimi-linear-48b-a3b-instruct",
+        display_name: "Kimi Linear 48B (OpenRouter)",
+        description: "Moonshot’s linear-algebra-focused instruct model via OpenRouter.",
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Tight latency for small patches",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Adds reasoning for testing or refactors",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Best overall mix of reasoning and speed",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "grok-code-fast-1",
+        model: "grok-code-fast-1",
+        display_name: "Grok Code Fast 1 (xAI)",
+        description: "xAI’s streamlined Grok variant tuned for coding throughput.",
+        default_reasoning_effort: ReasoningEffort::Low,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Minimal,
+                description: "Extremely fast single-file edits",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Recommended default for day-to-day work",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Adds deliberation for multi-step plans",
+            },
+        ],
+        is_default: false,
+    },
+    ModelPreset {
+        id: "grok-4-fast-reasoning",
+        model: "grok-4-fast-reasoning",
+        display_name: "Grok 4 Fast Reasoning (xAI)",
+        description: "Structured-output capable Grok model that excels at document extraction.",
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: &[
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Low,
+                description: "Keep latency low while parsing reports",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Best balance for long-lived autonomy",
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Maximum reasoning depth when accuracy matters most",
+            },
+        ],
+        is_default: false,
+    },
 ];
 
 pub fn builtin_model_presets(auth_mode: Option<AuthMode>) -> Vec<ModelPreset> {
-    let allow_codex_mini = matches!(auth_mode, Some(AuthMode::ChatGPT));
+    let is_chatgpt = matches!(auth_mode, Some(AuthMode::ChatGPT));
     PRESETS
         .iter()
-        .filter(|preset| allow_codex_mini || preset.id != "gpt-5-codex-mini")
+        .filter(|preset| {
+            if is_chatgpt {
+                !matches!(preset.id, "o3" | "o4-mini")
+            } else {
+                preset.id != "gpt-5-codex-mini"
+            }
+        })
         .copied()
         .collect()
 }
