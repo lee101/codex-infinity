@@ -12,7 +12,6 @@ use std::time::Instant;
 use async_channel::Sender;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 
@@ -56,19 +55,11 @@ pub struct ExecParams {
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
     pub arg0: Option<String>,
-    pub disable_timeout: bool,
-    pub passthrough_stdio: bool,
 }
 
 impl ExecParams {
-    pub fn timeout_duration(&self) -> Option<Duration> {
-        if self.disable_timeout {
-            None
-        } else {
-            Some(Duration::from_millis(
-                self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            ))
-        }
+    pub fn timeout_duration(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))
     }
 }
 
@@ -109,8 +100,6 @@ pub async fn process_exec_tool_call(
         with_escalated_permissions,
         justification,
         arg0: _,
-        disable_timeout,
-        passthrough_stdio,
     } = params;
 
     let (program, args) = command.split_first().ok_or_else(|| {
@@ -128,8 +117,6 @@ pub async fn process_exec_tool_call(
         timeout_ms,
         with_escalated_permissions,
         justification,
-        disable_timeout,
-        passthrough_stdio,
     };
 
     let manager = SandboxManager::new();
@@ -161,8 +148,6 @@ pub(crate) async fn execute_exec_env(
         with_escalated_permissions,
         justification,
         arg0,
-        disable_timeout,
-        passthrough_stdio,
     } = env;
 
     let params = ExecParams {
@@ -173,8 +158,6 @@ pub(crate) async fn execute_exec_env(
         with_escalated_permissions,
         justification,
         arg0,
-        disable_timeout,
-        passthrough_stdio,
     };
 
     let start = Instant::now();
@@ -461,7 +444,6 @@ async fn exec(
         return exec_windows_sandbox(params, sandbox_policy).await;
     }
     let timeout = params.timeout_duration();
-    let passthrough_stdio = params.passthrough_stdio;
     let ExecParams {
         command,
         cwd,
@@ -477,35 +459,25 @@ async fn exec(
         ))
     })?;
     let arg0_ref = arg0.as_deref();
-    let stdio_policy = if passthrough_stdio {
-        StdioPolicy::Inherit
-    } else {
-        StdioPolicy::RedirectForShellTool
-    };
     let child = spawn_child_async(
         PathBuf::from(program),
         args.into(),
         arg0_ref,
         cwd,
         sandbox_policy,
-        stdio_policy,
+        StdioPolicy::RedirectForShellTool,
         env,
     )
     .await?;
-    if passthrough_stdio {
-        consume_passthrough_output(child, timeout).await
-    } else {
-        consume_truncated_output(child, timeout, stdout_stream, false).await
-    }
+    consume_truncated_output(child, timeout, stdout_stream).await
 }
 
 /// Consumes the output of a child process, truncating it so it is suitable for
 /// use as the output of a `shell` tool call. Also enforces specified timeout.
 async fn consume_truncated_output(
     mut child: Child,
-    timeout: Option<Duration>,
+    timeout: Duration,
     stdout_stream: Option<StdoutStream>,
-    passthrough_stdio: bool,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -528,57 +500,84 @@ async fn consume_truncated_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         false,
-        passthrough_stdio,
         Some(agg_tx.clone()),
     ));
     let stderr_handle = tokio::spawn(read_capped(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         true,
-        passthrough_stdio,
         Some(agg_tx.clone()),
     ));
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    let (exit_status, timed_out) = match timeout {
-        Some(timeout) => {
-            tokio::select! {
-                result = tokio::time::timeout(timeout, child.wait()) => {
-                    match result {
-                        Ok(status_result) => {
-                            let exit_status = status_result?;
-                            (exit_status, false)
-                        }
-                        Err(_) => {
-                            child.start_kill()?;
-                            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
-                        }
-                    }
+    let (exit_status, timed_out) = tokio::select! {
+        result = tokio::time::timeout(timeout, child.wait()) => {
+            match result {
+                Ok(status_result) => {
+                    let exit_status = status_result?;
+                    (exit_status, false)
                 }
-                _ = &mut ctrl_c => {
+                Err(_) => {
+                    // timeout
+                    kill_child_process_group(&mut child)?;
                     child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
+                    // Debatable whether `child.wait().await` should be called here.
+                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
                 }
             }
         }
-        None => {
-            tokio::select! {
-                result = child.wait() => {
-                    let exit_status = result?;
-                    (exit_status, false)
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
+        _ = tokio::signal::ctrl_c() => {
+            kill_child_process_group(&mut child)?;
+            child.start_kill()?;
+            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
         }
     };
 
-    let stdout = stdout_handle.await??;
-    let stderr = stderr_handle.await??;
+    // Wait for the stdout/stderr collection tasks but guard against them
+    // hanging forever. In the normal case, both pipes are closed once the child
+    // terminates so the tasks exit quickly. However, if the child process
+    // spawned grandchildren that inherited its stdout/stderr file descriptors
+    // those pipes may stay open after we `kill` the direct child on timeout.
+    // That would cause the `read_capped` tasks to block on `read()`
+    // indefinitely, effectively hanging the whole agent.
+
+    const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pipes
+
+    // We need mutable bindings so we can `abort()` them on timeout.
+    use tokio::task::JoinHandle;
+
+    async fn await_with_timeout(
+        handle: &mut JoinHandle<std::io::Result<StreamOutput<Vec<u8>>>>,
+        timeout: Duration,
+    ) -> std::io::Result<StreamOutput<Vec<u8>>> {
+        match tokio::time::timeout(timeout, &mut *handle).await {
+            Ok(join_res) => match join_res {
+                Ok(io_res) => io_res,
+                Err(join_err) => Err(std::io::Error::other(join_err)),
+            },
+            Err(_elapsed) => {
+                // Timeout: abort the task to avoid hanging on open pipes.
+                handle.abort();
+                Ok(StreamOutput {
+                    text: Vec::new(),
+                    truncated_after_lines: None,
+                })
+            }
+        }
+    }
+
+    let mut stdout_handle = stdout_handle;
+    let mut stderr_handle = stderr_handle;
+
+    let stdout = await_with_timeout(
+        &mut stdout_handle,
+        Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+    )
+    .await?;
+    let stderr = await_with_timeout(
+        &mut stderr_handle,
+        Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+    )
+    .await?;
 
     drop(agg_tx);
 
@@ -600,71 +599,10 @@ async fn consume_truncated_output(
     })
 }
 
-async fn consume_passthrough_output(
-    mut child: Child,
-    timeout: Option<Duration>,
-) -> Result<RawExecToolCallOutput> {
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    let (exit_status, timed_out) = match timeout {
-        Some(timeout) => {
-            tokio::select! {
-                result = tokio::time::timeout(timeout, child.wait()) => {
-                    match result {
-                        Ok(status_result) => {
-                            let exit_status = status_result?;
-                            (exit_status, false)
-                        }
-                        Err(_) => {
-                            child.start_kill()?;
-                            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
-                        }
-                    }
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
-        }
-        None => {
-            tokio::select! {
-                result = child.wait() => {
-                    let exit_status = result?;
-                    (exit_status, false)
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
-        }
-    };
-
-    Ok(RawExecToolCallOutput {
-        exit_status,
-        stdout: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        stderr: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        aggregated_output: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        timed_out,
-    })
-}
-
 async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
-    passthrough_stdio: bool,
     aggregate_tx: Option<Sender<Vec<u8>>>,
 ) -> io::Result<StreamOutput<Vec<u8>>> {
     let mut buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
@@ -680,7 +618,7 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
         }
 
         if let Some(stream) = &stream
-            && (passthrough_stdio || emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL)
+            && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
             let chunk = tmp[..n].to_vec();
             let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
@@ -698,9 +636,7 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
             };
             #[allow(clippy::let_unit_value)]
             let _ = stream.tx_event.send(event).await;
-            if !passthrough_stdio {
-                emitted_deltas += 1;
-            }
+            emitted_deltas += 1;
         }
 
         if let Some(tx) = &aggregate_tx {
@@ -708,17 +644,6 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
         }
 
         append_all(&mut buf, &tmp[..n]);
-        if passthrough_stdio {
-            if is_stderr {
-                let mut stderr = tokio::io::stderr();
-                stderr.write_all(&tmp[..n]).await?;
-                stderr.flush().await?;
-            } else {
-                let mut stdout = tokio::io::stdout();
-                stdout.write_all(&tmp[..n]).await?;
-                stdout.flush().await?;
-            }
-        }
         // Continue reading to EOF to avoid back-pressure
     }
 
@@ -740,6 +665,38 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     // On Windows the raw status is a u32. Use a direct cast to avoid
     // panicking on negative i32 values produced by prior narrowing casts.
     std::process::ExitStatus::from_raw(code as u32)
+}
+
+#[cfg(unix)]
+fn kill_child_process_group(child: &mut Child) -> io::Result<()> {
+    use std::io::ErrorKind;
+
+    if let Some(pid) = child.id() {
+        let pid = pid as libc::pid_t;
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::NotFound {
+                return Err(err);
+            }
+            return Ok(());
+        }
+
+        let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::NotFound {
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_: &mut Child) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -813,5 +770,52 @@ mod tests {
         let exit_code = EXIT_CODE_SIGNAL_BASE + libc::SIGSYS;
         let output = make_exec_output(exit_code, "", "", "");
         assert!(is_likely_sandbox_denied(SandboxType::LinuxSeccomp, &output));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()> {
+        let command = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            "sleep 60 & echo $!; sleep 60".to_string(),
+        ];
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let params = ExecParams {
+            command,
+            cwd: std::env::current_dir()?,
+            timeout_ms: Some(500),
+            env,
+            with_escalated_permissions: None,
+            justification: None,
+            arg0: None,
+        };
+
+        let output = exec(params, SandboxType::None, &SandboxPolicy::ReadOnly, None).await?;
+        assert!(output.timed_out);
+
+        let stdout = output.stdout.from_utf8_lossy().text;
+        let pid_line = stdout.lines().next().unwrap_or("").trim();
+        let pid: i32 = pid_line.parse().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse pid from stdout '{pid_line}': {error}"),
+            )
+        })?;
+
+        let mut killed = false;
+        for _ in 0..20 {
+            // Use kill(pid, 0) to check if the process is alive.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
+            {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(killed, "grandchild process with pid {pid} is still alive");
+        Ok(())
     }
 }

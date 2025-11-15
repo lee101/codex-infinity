@@ -67,6 +67,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         auto_next_idea,
         cwd,
         skip_git_repo_check,
+        add_dir,
         color,
         last_message_file,
         json: json_mode,
@@ -198,7 +199,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
         auto_next_steps: auto_next_steps.then_some(true),
         auto_next_idea: auto_next_idea.then_some(true),
-        additional_writable_roots: Vec::new(),
+        additional_writable_roots: add_dir,
     };
     // Parse `-c` overrides.
     let cli_kv_overrides = match config_overrides.parse_overrides() {

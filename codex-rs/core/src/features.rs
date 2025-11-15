@@ -29,8 +29,9 @@ pub enum Stage {
 pub enum Feature {
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
-    /// Use the streamable exec-command/write-stdin tool pair.
-    StreamableShell,
+    /// Use the shell command tool that takes `command` as a single string of
+    /// shell instead of an array of args passed to `execvp(3)`.
+    ShellCommandTool,
     /// Enable experimental RMCP features such as OAuth login.
     RmcpClient,
     /// Include the freeform apply_patch tool.
@@ -122,8 +123,9 @@ impl Features {
         self.enabled.contains(&f)
     }
 
-    pub fn enable(&mut self, f: Feature) {
+    pub fn enable(&mut self, f: Feature) -> &mut Self {
         self.enabled.insert(f);
+        self
     }
 
     pub fn disable(&mut self, f: Feature) -> &mut Self {
@@ -183,7 +185,6 @@ impl Features {
             include_plan_tool: cfg.include_plan_tool,
             experimental_sandbox_command_assessment: cfg.experimental_sandbox_command_assessment,
             experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
-            experimental_use_exec_command_tool: cfg.experimental_use_exec_command_tool,
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
             experimental_use_rmcp_client: cfg.experimental_use_rmcp_client,
             tools_web_search: cfg.tools.as_ref().and_then(|t| t.web_search),
@@ -203,7 +204,7 @@ impl Features {
                 .experimental_sandbox_command_assessment,
             experimental_use_freeform_apply_patch: config_profile
                 .experimental_use_freeform_apply_patch,
-            experimental_use_exec_command_tool: config_profile.experimental_use_exec_command_tool,
+
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
             experimental_use_rmcp_client: config_profile.experimental_use_rmcp_client,
             tools_web_search: config_profile.tools_web_search,
@@ -259,8 +260,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::StreamableShell,
-        key: "streamable_shell",
+        id: Feature::ShellCommandTool,
+        key: "shell_command_tool",
         stage: Stage::Experimental,
         default_enabled: false,
     },
@@ -304,7 +305,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::GhostCommit,
         key: "ghost_commit",
         stage: Stage::Experimental,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::WindowsSandbox,

@@ -35,8 +35,6 @@ pub struct CommandSpec {
     pub timeout_ms: Option<u64>,
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
-    pub disable_timeout: bool,
-    pub passthrough_stdio: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -49,8 +47,6 @@ pub struct ExecEnv {
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
     pub arg0: Option<String>,
-    pub disable_timeout: bool,
-    pub passthrough_stdio: bool,
 }
 
 pub enum SandboxPreference {
@@ -165,8 +161,6 @@ impl SandboxManager {
             with_escalated_permissions: spec.with_escalated_permissions,
             justification: spec.justification.clone(),
             arg0: arg0_override,
-            disable_timeout: spec.disable_timeout,
-            passthrough_stdio: spec.passthrough_stdio,
         })
     }
 
