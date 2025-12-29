@@ -2,14 +2,17 @@
 source: tui/src/model_migration.rs
 expression: terminal.backend()
 ---
-> Introducing our gpt-5.1 models
 
-  We've upgraded our family of models supported in Codex to
-  gpt-5.1, gpt-5.1-codex and gpt-5.1-codex-mini.
+> Codex just got an upgrade. Introducing gpt-5.1-codex-max.
 
-  You can continue using legacy models by specifying them
-  directly with the -m option or in your config.toml.
+  Upgrade to gpt-5.2-codex for the latest and greatest
+  agentic coding model.
 
-  Learn more at www.openai.com/index/gpt-5-1.
+  You can continue using gpt-5.1-codex-mini if you prefer.
 
-  Press enter to continue
+  Choose how you'd like Codex to proceed.
+
+› 1. Try new model
+  2. Use existing model
+
+  Use ↑/↓ to move, press enter to confirm

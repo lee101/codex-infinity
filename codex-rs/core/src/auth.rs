@@ -23,7 +23,6 @@ pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
 use crate::config::Config;
-use crate::default_client::CodexHttpClient;
 use crate::error::RefreshTokenFailedError;
 use crate::error::RefreshTokenFailedReason;
 use crate::token_data::KnownPlan as InternalKnownPlan;
@@ -31,8 +30,13 @@ use crate::token_data::PlanType as InternalPlanType;
 use crate::token_data::TokenData;
 use crate::token_data::parse_id_token;
 use crate::util::try_parse_error_message;
+use codex_client::CodexHttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
+#[cfg(any(test, feature = "test-support"))]
+use once_cell::sync::Lazy;
 use serde_json::Value;
+#[cfg(any(test, feature = "test-support"))]
+use tempfile::TempDir;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,9 @@ const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_AUTH_TEMP_DIRS: Lazy<Mutex<Vec<TempDir>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -225,23 +232,6 @@ impl CodexAuth {
                 InternalPlanType::Known(k) => map_known(&k),
                 InternalPlanType::Unknown(_) => AccountPlanType::Unknown,
             })
-    }
-
-    /// Raw plan string from the ID token (including unknown/new plan types).
-    pub fn raw_plan_type(&self) -> Option<String> {
-        self.get_plan_type().map(|plan| match plan {
-            InternalPlanType::Known(k) => format!("{k:?}"),
-            InternalPlanType::Unknown(raw) => raw,
-        })
-    }
-
-    /// Raw internal plan value from the ID token.
-    /// Exposes the underlying `token_data::PlanType` without mapping it to the
-    /// public `AccountPlanType`. Use this when downstream code needs to inspect
-    /// internal/unknown plan strings exactly as issued in the token.
-    pub(crate) fn get_plan_type(&self) -> Option<InternalPlanType> {
-        self.get_current_token_data()
-            .and_then(|t| t.id_token.chatgpt_plan_type)
     }
 
     fn get_current_auth_json(&self) -> Option<AuthDotJson> {
@@ -646,8 +636,7 @@ mod tests {
     use crate::auth::storage::FileAuthStorage;
     use crate::auth::storage::get_auth_file;
     use crate::config::Config;
-    use crate::config::ConfigOverrides;
-    use crate::config::ConfigToml;
+    use crate::config::ConfigBuilder;
     use crate::token_data::IdTokenInfo;
     use crate::token_data::KnownPlan as InternalKnownPlan;
     use crate::token_data::PlanType as InternalPlanType;
@@ -872,17 +861,16 @@ mod tests {
         Ok(fake_jwt)
     }
 
-    fn build_config(
+    async fn build_config(
         codex_home: &Path,
         forced_login_method: Option<ForcedLoginMethod>,
         forced_chatgpt_workspace_id: Option<String>,
     ) -> Config {
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            codex_home.to_path_buf(),
-        )
-        .expect("config should load");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .build()
+            .await
+            .expect("config should load");
         config.forced_login_method = forced_login_method;
         config.forced_chatgpt_workspace_id = forced_chatgpt_workspace_id;
         config
@@ -925,7 +913,7 @@ mod tests {
         login_with_api_key(codex_home.path(), "sk-test", AuthCredentialsStoreMode::File)
             .expect("seed api key");
 
-        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None);
+        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None).await;
 
         let err = super::enforce_login_restrictions(&config)
             .await
@@ -951,7 +939,7 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
         let err = super::enforce_login_restrictions(&config)
             .await
@@ -977,7 +965,7 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
         super::enforce_login_restrictions(&config)
             .await
@@ -995,7 +983,7 @@ mod tests {
         login_with_api_key(codex_home.path(), "sk-test", AuthCredentialsStoreMode::File)
             .expect("seed api key");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
         super::enforce_login_restrictions(&config)
             .await
@@ -1012,7 +1000,7 @@ mod tests {
         let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
         let codex_home = tempdir().unwrap();
 
-        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None);
+        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None).await;
 
         let err = super::enforce_login_restrictions(&config)
             .await
@@ -1041,10 +1029,6 @@ mod tests {
             .expect("auth available");
 
         pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
-        pretty_assertions::assert_eq!(
-            auth.get_plan_type(),
-            Some(InternalPlanType::Known(InternalKnownPlan::Pro))
-        );
     }
 
     #[test]
@@ -1065,10 +1049,6 @@ mod tests {
             .expect("auth available");
 
         pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
-        pretty_assertions::assert_eq!(
-            auth.get_plan_type(),
-            Some(InternalPlanType::Unknown("mystery-tier".to_string()))
-        );
     }
 }
 
@@ -1113,11 +1093,31 @@ impl AuthManager {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[expect(clippy::expect_used)]
     /// Create an AuthManager with a specific CodexAuth, for testing only.
     pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
         let cached = CachedAuth { auth: Some(auth) };
+        let temp_dir = tempfile::tempdir().expect("temp codex home");
+        let codex_home = temp_dir.path().to_path_buf();
+        TEST_AUTH_TEMP_DIRS
+            .lock()
+            .expect("lock test codex homes")
+            .push(temp_dir);
         Arc::new(Self {
-            codex_home: PathBuf::new(),
+            codex_home,
+            inner: RwLock::new(cached),
+            enable_codex_api_key_env: false,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
+    pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
+        let cached = CachedAuth { auth: Some(auth) };
+        Arc::new(Self {
+            codex_home,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1127,6 +1127,10 @@ impl AuthManager {
     /// Current cached auth (clone). May be `None` if not logged in or load failed.
     pub fn auth(&self) -> Option<CodexAuth> {
         self.inner.read().ok().and_then(|c| c.auth.clone())
+    }
+
+    pub fn codex_home(&self) -> &Path {
+        &self.codex_home
     }
 
     /// Force a reload of the auth information from auth.json. Returns
@@ -1200,5 +1204,9 @@ impl AuthManager {
         // Always reload to clear any cached auth (even if file absent).
         self.reload();
         Ok(removed)
+    }
+
+    pub fn get_auth_mode(&self) -> Option<AuthMode> {
+        self.auth().map(|a| a.mode)
     }
 }

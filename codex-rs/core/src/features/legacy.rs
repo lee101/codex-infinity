@@ -10,16 +10,12 @@ struct Alias {
 
 const ALIASES: &[Alias] = &[
     Alias {
-        legacy_key: "experimental_sandbox_command_assessment",
-        feature: Feature::SandboxCommandAssessment,
+        legacy_key: "enable_experimental_windows_sandbox",
+        feature: Feature::WindowsSandbox,
     },
     Alias {
         legacy_key: "experimental_use_unified_exec_tool",
         feature: Feature::UnifiedExec,
-    },
-    Alias {
-        legacy_key: "experimental_use_rmcp_client",
-        feature: Feature::RmcpClient,
     },
     Alias {
         legacy_key: "experimental_use_freeform_apply_patch",
@@ -57,10 +53,8 @@ pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
 pub struct LegacyFeatureToggles {
     pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
-    pub experimental_sandbox_command_assessment: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
-    pub experimental_use_rmcp_client: Option<bool>,
     pub tools_web_search: Option<bool>,
     pub tools_view_image: Option<bool>,
 }
@@ -81,12 +75,6 @@ impl LegacyFeatureToggles {
         );
         set_if_some(
             features,
-            Feature::SandboxCommandAssessment,
-            self.experimental_sandbox_command_assessment,
-            "experimental_sandbox_command_assessment",
-        );
-        set_if_some(
-            features,
             Feature::ApplyPatchFreeform,
             self.experimental_use_freeform_apply_patch,
             "experimental_use_freeform_apply_patch",
@@ -96,12 +84,6 @@ impl LegacyFeatureToggles {
             Feature::UnifiedExec,
             self.experimental_use_unified_exec_tool,
             "experimental_use_unified_exec_tool",
-        );
-        set_if_some(
-            features,
-            Feature::RmcpClient,
-            self.experimental_use_rmcp_client,
-            "experimental_use_rmcp_client",
         );
         set_if_some(
             features,

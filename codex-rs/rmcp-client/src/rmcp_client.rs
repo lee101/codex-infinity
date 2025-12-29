@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::anyhow;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
 use mcp_types::InitializeRequestParams;
@@ -21,11 +22,20 @@ use mcp_types::ListToolsRequestParams;
 use mcp_types::ListToolsResult;
 use mcp_types::ReadResourceRequestParams;
 use mcp_types::ReadResourceResult;
+use mcp_types::RequestId;
 use reqwest::header::HeaderMap;
 use rmcp::model::CallToolRequestParam;
+use rmcp::model::ClientNotification;
+use rmcp::model::ClientRequest;
+use rmcp::model::CreateElicitationRequestParam;
+use rmcp::model::CreateElicitationResult;
+use rmcp::model::CustomNotification;
+use rmcp::model::CustomRequest;
+use rmcp::model::Extensions;
 use rmcp::model::InitializeRequestParam;
 use rmcp::model::PaginatedRequestParam;
 use rmcp::model::ReadResourceRequestParam;
+use rmcp::model::ServerResult;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::service::{self};
@@ -47,6 +57,7 @@ use crate::logging_client_handler::LoggingClientHandler;
 use crate::oauth::OAuthCredentialsStoreMode;
 use crate::oauth::OAuthPersistor;
 use crate::oauth::StoredOAuthTokens;
+use crate::program_resolver;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
 use crate::utils::convert_call_tool_result;
@@ -76,6 +87,14 @@ enum ClientState {
     },
 }
 
+pub type Elicitation = CreateElicitationRequestParam;
+pub type ElicitationResponse = CreateElicitationResult;
+
+/// Interface for sending elicitation requests to the UI and awaiting a response.
+pub type SendElicitation = Box<
+    dyn Fn(RequestId, Elicitation) -> BoxFuture<'static, Result<ElicitationResponse>> + Send + Sync,
+>;
+
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
@@ -91,13 +110,20 @@ impl RmcpClient {
         cwd: Option<PathBuf>,
     ) -> io::Result<Self> {
         let program_name = program.to_string_lossy().into_owned();
-        let mut command = Command::new(&program);
+
+        // Build environment for program resolution and subprocess
+        let envs = create_env_for_mcp_server(env, env_vars);
+
+        // Resolve program to executable path (platform-specific)
+        let resolved_program = program_resolver::resolve(program, &envs)?;
+
+        let mut command = Command::new(resolved_program);
         command
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .env_clear()
-            .envs(create_env_for_mcp_server(env, env_vars))
+            .envs(envs)
             .args(&args);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -192,9 +218,10 @@ impl RmcpClient {
         &self,
         params: InitializeRequestParams,
         timeout: Option<Duration>,
+        send_elicitation: SendElicitation,
     ) -> Result<InitializeResult> {
         let rmcp_params: InitializeRequestParam = convert_to_rmcp(params.clone())?;
-        let client_handler = LoggingClientHandler::new(rmcp_params);
+        let client_handler = LoggingClientHandler::new(rmcp_params, send_elicitation);
 
         let (transport, oauth_persistor) = {
             let mut guard = self.state.lock().await;
@@ -259,6 +286,7 @@ impl RmcpClient {
         params: Option<ListToolsRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListToolsResult> {
+        self.refresh_oauth_if_needed().await;
         let service = self.service().await?;
         let rmcp_params = params
             .map(convert_to_rmcp::<_, PaginatedRequestParam>)
@@ -276,6 +304,7 @@ impl RmcpClient {
         params: Option<ListResourcesRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListResourcesResult> {
+        self.refresh_oauth_if_needed().await;
         let service = self.service().await?;
         let rmcp_params = params
             .map(convert_to_rmcp::<_, PaginatedRequestParam>)
@@ -293,6 +322,7 @@ impl RmcpClient {
         params: Option<ListResourceTemplatesRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListResourceTemplatesResult> {
+        self.refresh_oauth_if_needed().await;
         let service = self.service().await?;
         let rmcp_params = params
             .map(convert_to_rmcp::<_, PaginatedRequestParam>)
@@ -310,6 +340,7 @@ impl RmcpClient {
         params: ReadResourceRequestParams,
         timeout: Option<Duration>,
     ) -> Result<ReadResourceResult> {
+        self.refresh_oauth_if_needed().await;
         let service = self.service().await?;
         let rmcp_params: ReadResourceRequestParam = convert_to_rmcp(params)?;
         let fut = service.read_resource(rmcp_params);
@@ -325,6 +356,7 @@ impl RmcpClient {
         arguments: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
+        self.refresh_oauth_if_needed().await;
         let service = self.service().await?;
         let params = CallToolRequestParams { arguments, name };
         let rmcp_params: CallToolRequestParam = convert_to_rmcp(params)?;
@@ -333,6 +365,36 @@ impl RmcpClient {
         let converted = convert_call_tool_result(rmcp_result)?;
         self.persist_oauth_tokens().await;
         Ok(converted)
+    }
+
+    pub async fn send_custom_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let service: Arc<RunningService<RoleClient, LoggingClientHandler>> = self.service().await?;
+        service
+            .send_notification(ClientNotification::CustomNotification(CustomNotification {
+                method: method.to_string(),
+                params,
+                extensions: Extensions::new(),
+            }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn send_custom_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<ServerResult> {
+        let service: Arc<RunningService<RoleClient, LoggingClientHandler>> = self.service().await?;
+        let response = service
+            .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                method, params,
+            )))
+            .await?;
+        Ok(response)
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, LoggingClientHandler>>> {
@@ -361,6 +423,14 @@ impl RmcpClient {
             && let Err(error) = runtime.persist_if_needed().await
         {
             warn!("failed to persist OAuth tokens: {error}");
+        }
+    }
+
+    async fn refresh_oauth_if_needed(&self) {
+        if let Some(runtime) = self.oauth_persistor().await
+            && let Err(error) = runtime.refresh_if_needed().await
+        {
+            warn!("failed to refresh OAuth tokens: {error}");
         }
     }
 }

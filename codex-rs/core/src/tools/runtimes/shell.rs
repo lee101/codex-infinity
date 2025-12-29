@@ -4,23 +4,25 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds a CommandSpec, and runs it under the current SandboxAttempt.
 */
-use crate::command_safety::is_dangerous_command::requires_initial_appoval;
 use crate::exec::ExecToolCallOutput;
-use crate::protocol::SandboxPolicy;
+use crate::features::Feature;
+use crate::powershell::prefix_powershell_script_with_utf8;
+use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
+use crate::shell::ShellType;
 use crate::tools::runtimes::build_command_spec;
+use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
-use crate::tools::sandboxing::ProvidesSandboxRetryData;
+use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::SandboxAttempt;
-use crate::tools::sandboxing::SandboxRetryData;
+use crate::tools::sandboxing::SandboxOverride;
 use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::SandboxablePreference;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use futures::future::BoxFuture;
 use std::path::PathBuf;
@@ -31,19 +33,9 @@ pub struct ShellRequest {
     pub cwd: PathBuf,
     pub timeout_ms: Option<u64>,
     pub env: std::collections::HashMap<String, String>,
-    pub with_escalated_permissions: Option<bool>,
+    pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
-}
-
-impl ProvidesSandboxRetryData for ShellRequest {
-    fn sandbox_retry_data(&self) -> Option<SandboxRetryData> {
-        Some(SandboxRetryData {
-            command: self.command.clone(),
-            cwd: self.cwd.clone(),
-            with_escalated_permissions: self.with_escalated_permissions,
-            justification: self.justification.clone(),
-        })
-    }
+    pub exec_approval_requirement: ExecApprovalRequirement,
 }
 
 #[derive(Default)]
@@ -53,7 +45,7 @@ pub struct ShellRuntime;
 pub(crate) struct ApprovalKey {
     command: Vec<String>,
     cwd: PathBuf,
-    escalated: bool,
+    sandbox_permissions: SandboxPermissions,
 }
 
 impl ShellRuntime {
@@ -86,7 +78,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
         ApprovalKey {
             command: req.command.clone(),
             cwd: req.cwd.clone(),
-            escalated: req.with_escalated_permissions.unwrap_or(false),
+            sandbox_permissions: req.sandbox_permissions,
         }
     }
 
@@ -102,36 +94,46 @@ impl Approvable<ShellRequest> for ShellRuntime {
             .retry_reason
             .clone()
             .or_else(|| req.justification.clone());
-        let risk = ctx.risk.clone();
         let session = ctx.session;
         let turn = ctx.turn;
         let call_id = ctx.call_id.to_string();
         Box::pin(async move {
             with_cached_approval(&session.services, key, move || async move {
                 session
-                    .request_command_approval(turn, call_id, command, cwd, reason, risk)
+                    .request_command_approval(
+                        turn,
+                        call_id,
+                        command,
+                        cwd,
+                        reason,
+                        req.exec_approval_requirement
+                            .proposed_execpolicy_amendment()
+                            .cloned(),
+                    )
                     .await
             })
             .await
         })
     }
 
-    fn wants_initial_approval(
-        &self,
-        req: &ShellRequest,
-        policy: AskForApproval,
-        sandbox_policy: &SandboxPolicy,
-    ) -> bool {
-        requires_initial_appoval(
-            policy,
-            sandbox_policy,
-            &req.command,
-            req.with_escalated_permissions.unwrap_or(false),
-        )
+    fn exec_approval_requirement(&self, req: &ShellRequest) -> Option<ExecApprovalRequirement> {
+        Some(req.exec_approval_requirement.clone())
     }
 
-    fn wants_escalated_first_attempt(&self, req: &ShellRequest) -> bool {
-        req.with_escalated_permissions.unwrap_or(false)
+    fn sandbox_mode_for_first_attempt(&self, req: &ShellRequest) -> SandboxOverride {
+        if req.sandbox_permissions.requires_escalated_permissions()
+            || matches!(
+                req.exec_approval_requirement,
+                ExecApprovalRequirement::Skip {
+                    bypass_sandbox: true,
+                    ..
+                }
+            )
+        {
+            SandboxOverride::BypassSandboxFirstAttempt
+        } else {
+            SandboxOverride::NoOverride
+        }
     }
 }
 
@@ -142,18 +144,29 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx<'_>,
     ) -> Result<ExecToolCallOutput, ToolError> {
+        let base_command = &req.command;
+        let session_shell = ctx.session.user_shell();
+        let command = maybe_wrap_shell_lc_with_snapshot(base_command, session_shell.as_ref());
+        let command = if matches!(session_shell.shell_type, ShellType::PowerShell)
+            && ctx.session.features().enabled(Feature::PowershellUtf8)
+        {
+            prefix_powershell_script_with_utf8(&command)
+        } else {
+            command
+        };
+
         let spec = build_command_spec(
-            &req.command,
+            &command,
             &req.cwd,
             &req.env,
-            req.timeout_ms,
-            req.with_escalated_permissions,
+            req.timeout_ms.into(),
+            req.sandbox_permissions,
             req.justification.clone(),
         )?;
         let env = attempt
-            .env_for(&spec)
+            .env_for(spec)
             .map_err(|err| ToolError::Codex(err.into()))?;
-        let out = execute_env(&env, attempt.policy, Self::stdout_stream(ctx))
+        let out = execute_env(env, attempt.policy, Self::stdout_stream(ctx))
             .await
             .map_err(ToolError::Codex)?;
         Ok(out)

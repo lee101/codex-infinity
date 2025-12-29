@@ -7,20 +7,23 @@ use additional_dirs::add_dir_warning_message;
 use app::App;
 pub use app::AppExitInfo;
 use codex_app_server_protocol::AuthMode;
+use codex_common::oss::ensure_oss_provider_ready;
+use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
-use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::find_codex_home;
+use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
-use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::error;
@@ -44,6 +47,7 @@ pub mod custom_terminal;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
+mod external_editor;
 mod file_search;
 mod frames;
 mod get_git_diff;
@@ -55,7 +59,9 @@ mod markdown;
 mod markdown_render;
 mod markdown_stream;
 mod model_migration;
+mod notifications;
 pub mod onboarding;
+mod oss_selection;
 mod pager_overlay;
 pub mod public_widgets;
 mod render;
@@ -70,6 +76,7 @@ mod streaming;
 mod style;
 mod terminal_palette;
 mod text_formatting;
+mod tooltips;
 mod tui;
 mod ui_consts;
 pub mod update_action;
@@ -82,7 +89,7 @@ mod wrapping;
 #[cfg(test)]
 pub mod test_backend;
 
-use crate::onboarding::WSL_INSTRUCTIONS;
+use crate::onboarding::TrustDirectorySelection;
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
@@ -136,51 +143,11 @@ pub async fn run_main(
 
     // When using `--oss`, let the bootstrapper pick the model (defaulting to
     // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
-    // `oss` model provider.
-    let model = if let Some(model) = &cli.model {
-        Some(model.clone())
-    } else if cli.oss {
-        Some(DEFAULT_OSS_MODEL.to_owned())
-    } else {
-        None // No model specified, will use the default.
-    };
-
-    let model_provider_override = if cli.oss {
-        Some(BUILT_IN_OSS_MODEL_PROVIDER_ID.to_owned())
-    } else {
-        None
-    };
-
-    // canonicalize the cwd
-    let cwd = cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p));
-    let additional_dirs = cli.add_dir.clone();
-
-    let overrides = ConfigOverrides {
-        model,
-        review_model: None,
-        approval_policy,
-        sandbox_mode,
-        cwd,
-        model_provider: model_provider_override,
-        config_profile: cli.config_profile.clone(),
-        codex_linux_sandbox_exe,
-        base_instructions: None,
-        developer_instructions: None,
-        compact_prompt: None,
-        include_apply_patch_tool: None,
-        show_raw_agent_reasoning: cli.oss.then_some(true),
-        tools_web_search_request: None,
-        experimental_sandbox_command_assessment: None,
-        disable_command_timeouts: dangerously_disable_timeouts.then_some(true),
-        passthrough_shell_environment: dangerously_disable_environment_wrapping.then_some(true),
-        passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
-        auto_next_steps: cli.auto_next_steps.then_some(true),
-        auto_next_idea: cli.auto_next_idea.then_some(true),
-        additional_writable_roots: additional_dirs,
-    };
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
+    // `oss` model provider.
     let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
     let cli_kv_overrides = match overrides_cli.parse_overrides() {
+        // Parse `-c` overrides from the CLI.
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
         Err(e) => {
@@ -189,9 +156,96 @@ pub async fn run_main(
         }
     };
 
+    // we load config.toml here to determine project state.
+    #[allow(clippy::print_stderr)]
+    let codex_home = match find_codex_home() {
+        Ok(codex_home) => codex_home.to_path_buf(),
+        Err(err) => {
+            eprintln!("Error finding codex home: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let cwd = cli.cwd.clone();
+    let config_cwd = match cwd.as_deref() {
+        Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
+        None => AbsolutePathBuf::current_dir()?,
+    };
+
+    #[allow(clippy::print_stderr)]
+    let config_toml = match load_config_as_toml_with_cli_overrides(
+        &codex_home,
+        &config_cwd,
+        cli_kv_overrides.clone(),
+    )
+    .await
+    {
+        Ok(config_toml) => config_toml,
+        Err(err) => {
+            eprintln!("Error loading config.toml: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let model_provider_override = if cli.oss {
+        let resolved = resolve_oss_provider(
+            cli.oss_provider.as_deref(),
+            &config_toml,
+            cli.config_profile.clone(),
+        );
+
+        if let Some(provider) = resolved {
+            Some(provider)
+        } else {
+            // No provider configured, prompt the user
+            let provider = oss_selection::select_oss_provider(&codex_home).await?;
+            if provider == "__CANCELLED__" {
+                return Err(std::io::Error::other(
+                    "OSS provider selection was cancelled by user",
+                ));
+            }
+            Some(provider)
+        }
+    } else {
+        None
+    };
+
+    // When using `--oss`, let the bootstrapper pick the model based on selected provider
+    let model = if let Some(model) = &cli.model {
+        Some(model.clone())
+    } else if cli.oss {
+        // Use the provider from model_provider_override
+        model_provider_override
+            .as_ref()
+            .and_then(|provider_id| get_default_model_for_oss_provider(provider_id))
+            .map(std::borrow::ToOwned::to_owned)
+    } else {
+        None // No model specified, will use the default.
+    };
+
+    let additional_dirs = cli.add_dir.clone();
+
+    let overrides = ConfigOverrides {
+        model,
+        approval_policy,
+        sandbox_mode,
+        cwd,
+        model_provider: model_provider_override.clone(),
+        config_profile: cli.config_profile.clone(),
+        codex_linux_sandbox_exe,
+        show_raw_agent_reasoning: cli.oss.then_some(true),
+        disable_command_timeouts: dangerously_disable_timeouts.then_some(true),
+        passthrough_shell_environment: dangerously_disable_environment_wrapping.then_some(true),
+        passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
+        auto_next_steps: cli.auto_next_steps.then_some(true),
+        auto_next_idea: cli.auto_next_idea.then_some(true),
+        additional_writable_roots: additional_dirs,
+        ..Default::default()
+    };
+
     let config = load_config_or_exit(cli_kv_overrides.clone(), overrides.clone()).await;
 
-    if let Some(warning) = add_dir_warning_message(&cli.add_dir, &config.sandbox_policy) {
+    if let Some(warning) = add_dir_warning_message(&cli.add_dir, config.sandbox_policy.get()) {
         #[allow(clippy::print_stderr)]
         {
             eprintln!("Error adding directories: {warning}");
@@ -236,8 +290,12 @@ pub async fn run_main(
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
-        .with_target(false)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        // `with_target(true)` is the default, but we previously disabled it for file output.
+        // Keep it enabled so we can selectively enable targets via `RUST_LOG=...` and then
+        // grep for a specific module/target while troubleshooting.
+        .with_target(true)
+        .with_ansi(false)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_filter(env_filter());
 
     let feedback = codex_feedback::CodexFeedback::new();
@@ -249,10 +307,19 @@ pub async fn run_main(
         .with_target(false)
         .with_filter(targets);
 
-    if cli.oss {
-        codex_ollama::ensure_oss_ready(&config)
-            .await
-            .map_err(|e| std::io::Error::other(format!("OSS setup failed: {e}")))?;
+    if cli.oss && model_provider_override.is_some() {
+        // We're in the oss section, so provider_id should be Some
+        // Let's handle None case gracefully though just in case
+        let provider_id = match model_provider_override.as_ref() {
+            Some(id) => id,
+            None => {
+                error!("OSS provider unexpectedly not set when oss flag is used");
+                return Err(std::io::Error::other(
+                    "OSS provider not set but oss flag was used",
+                ));
+            }
+        };
+        ensure_oss_provider_ready(provider_id, &config).await?;
     }
 
     let otel = codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"));
@@ -266,22 +333,16 @@ pub async fn run_main(
         }
     };
 
-    if let Some(provider) = otel.as_ref() {
-        let otel_layer = OpenTelemetryTracingBridge::new(&provider.logger).with_filter(
-            tracing_subscriber::filter::filter_fn(codex_core::otel_init::codex_export_filter),
-        );
+    let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
 
-        let _ = tracing_subscriber::registry()
-            .with(file_layer)
-            .with(feedback_layer)
-            .with(otel_layer)
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::registry()
-            .with(file_layer)
-            .with(feedback_layer)
-            .try_init();
-    };
+    let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
+
+    let _ = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(feedback_layer)
+        .with(otel_logger_layer)
+        .with(otel_tracing_layer)
+        .try_init();
 
     run_ratatui_app(
         cli,
@@ -349,20 +410,13 @@ async fn run_ratatui_app(
     );
     let login_status = get_login_status(&initial_config);
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
-    let should_show_windows_wsl_screen =
-        cfg!(target_os = "windows") && !initial_config.windows_wsl_setup_acknowledged;
-    let should_show_onboarding = should_show_onboarding(
-        login_status,
-        &initial_config,
-        should_show_trust_screen,
-        should_show_windows_wsl_screen,
-    );
+    let should_show_onboarding =
+        should_show_onboarding(login_status, &initial_config, should_show_trust_screen);
 
     let config = if should_show_onboarding {
         let onboarding_result = run_onboarding_app(
             OnboardingScreenArgs {
                 show_login_screen: should_show_login_screen(login_status, &initial_config),
-                show_windows_wsl_screen: should_show_windows_wsl_screen,
                 show_trust_screen: should_show_trust_screen,
                 login_status,
                 auth_manager: auth_manager.clone(),
@@ -381,21 +435,12 @@ async fn run_ratatui_app(
                 update_action: None,
             });
         }
-        if onboarding_result.windows_install_selected {
-            restore();
-            session_log::log_session_end();
-            let _ = tui.terminal.clear();
-            if let Err(err) = writeln!(std::io::stdout(), "{WSL_INSTRUCTIONS}") {
-                tracing::error!("Failed to write WSL instructions: {err}");
-            }
-            return Ok(AppExitInfo {
-                token_usage: codex_core::protocol::TokenUsage::default(),
-                conversation_id: None,
-                update_action: None,
-            });
-        }
-        // if the user acknowledged windows or made any trust decision, reload the config accordingly
-        if should_show_windows_wsl_screen || onboarding_result.directory_trust_decision.is_some() {
+        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
+        if onboarding_result
+            .directory_trust_decision
+            .map(|d| d == TrustDirectorySelection::Trust)
+            .unwrap_or(false)
+        {
             load_config_or_exit(cli_kv_overrides, overrides).await
         } else {
             initial_config
@@ -450,6 +495,7 @@ async fn run_ratatui_app(
             &mut tui,
             &config.codex_home,
             &config.model_provider_id,
+            cli.resume_show_all,
         )
         .await?
         {
@@ -487,6 +533,7 @@ async fn run_ratatui_app(
         feedback,
         auto_next_steps,
         auto_next_idea,
+        should_show_trust_screen, // Proxy to: is it a first run in this directory?
     )
     .await;
 
@@ -538,7 +585,7 @@ async fn load_config_or_exit(
     overrides: ConfigOverrides,
 ) -> Config {
     #[allow(clippy::print_stderr)]
-    match Config::load_with_cli_overrides(cli_kv_overrides, overrides).await {
+    match Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await {
         Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
@@ -552,7 +599,7 @@ async fn load_config_or_exit(
 /// show the trust screen.
 fn should_show_trust_screen(config: &Config) -> bool {
     if cfg!(target_os = "windows") && get_platform_sandbox().is_none() {
-        // If the experimental sandbox is not enabled, Native Windows cannot enforce sandboxed write access without WSL; skip the trust prompt entirely.
+        // If the experimental sandbox is not enabled, Native Windows cannot enforce sandboxed write access; skip the trust prompt entirely.
         return false;
     }
     if config.did_user_set_custom_approval_policy_or_sandbox_mode {
@@ -567,12 +614,7 @@ fn should_show_onboarding(
     login_status: LoginStatus,
     config: &Config,
     show_trust_screen: bool,
-    show_windows_wsl_screen: bool,
 ) -> bool {
-    if show_windows_wsl_screen {
-        return true;
-    }
-
     if show_trust_screen {
         return true;
     }
@@ -593,25 +635,26 @@ fn should_show_login_screen(login_status: LoginStatus, config: &Config) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_core::config::ConfigOverrides;
-    use codex_core::config::ConfigToml;
+    use codex_core::config::ConfigBuilder;
     use codex_core::config::ProjectConfig;
-    use codex_core::set_windows_sandbox_enabled;
     use serial_test::serial;
     use tempfile::TempDir;
 
-    #[test]
+    async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
+        ConfigBuilder::default()
+            .codex_home(temp_dir.path().to_path_buf())
+            .build()
+            .await
+    }
+
+    #[tokio::test]
     #[serial]
-    fn windows_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
+    async fn windows_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            temp_dir.path().to_path_buf(),
-        )?;
+        let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
         config.active_project = ProjectConfig { trust_level: None };
-        set_windows_sandbox_enabled(false);
+        config.set_windows_sandbox_globally(false);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {
@@ -627,18 +670,14 @@ mod tests {
         }
         Ok(())
     }
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
+    async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            temp_dir.path().to_path_buf(),
-        )?;
+        let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
         config.active_project = ProjectConfig { trust_level: None };
-        set_windows_sandbox_enabled(true);
+        config.set_windows_sandbox_globally(true);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {
@@ -654,15 +693,11 @@ mod tests {
         }
         Ok(())
     }
-    #[test]
-    fn untrusted_project_skips_trust_prompt() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn untrusted_project_skips_trust_prompt() -> std::io::Result<()> {
         use codex_protocol::config_types::TrustLevel;
         let temp_dir = TempDir::new()?;
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            temp_dir.path().to_path_buf(),
-        )?;
+        let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
         config.active_project = ProjectConfig {
             trust_level: Some(TrustLevel::Untrusted),

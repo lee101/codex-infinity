@@ -2,7 +2,7 @@ use codex_core::CodexAuth;
 use codex_core::ConversationManager;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
-use codex_core::protocol_config_types::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::load_default_config_for_test;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -19,11 +19,13 @@ async fn override_turn_context_does_not_persist_when_config_exists() {
         .await
         .expect("seed config.toml");
 
-    let mut config = load_default_config_for_test(&codex_home);
-    config.model = "gpt-4o".to_string();
+    let mut config = load_default_config_for_test(&codex_home).await;
+    config.model = Some("gpt-4o".to_string());
 
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
+    let conversation_manager = ConversationManager::with_models_provider(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+    );
     let codex = conversation_manager
         .new_conversation(config)
         .await
@@ -60,10 +62,12 @@ async fn override_turn_context_does_not_create_config_file() {
         "test setup should start without config"
     );
 
-    let config = load_default_config_for_test(&codex_home);
+    let config = load_default_config_for_test(&codex_home).await;
 
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
+    let conversation_manager = ConversationManager::with_models_provider(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+    );
     let codex = conversation_manager
         .new_conversation(config)
         .await

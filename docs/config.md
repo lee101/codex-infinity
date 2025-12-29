@@ -7,6 +7,7 @@ Codex configuration gives you fine-grained control over the model, execution env
 - [Feature flags](#feature-flags)
 - [Model selection](#model-selection)
 - [Execution environment](#execution-environment)
+- [Project root detection](#project-root-detection)
 - [MCP integration](#mcp-integration)
 - [Observability and telemetry](#observability-and-telemetry)
 - [Profiles and overrides](#profiles-and-overrides)
@@ -33,24 +34,21 @@ Optional and experimental capabilities are toggled via the `[features]` table in
 
 ```toml
 [features]
-streamable_shell = true          # enable the streamable exec tool
 web_search_request = true        # allow the model to request web searches
 # view_image_tool defaults to true; omit to keep defaults
 ```
 
 Supported features:
 
-| Key                                       | Default | Stage        | Description                                          |
-| ----------------------------------------- | :-----: | ------------ | ---------------------------------------------------- |
-| `unified_exec`                            |  false  | Experimental | Use the unified PTY-backed exec tool                 |
-| `streamable_shell`                        |  false  | Experimental | Use the streamable exec-command/write-stdin pair     |
-| `rmcp_client`                             |  false  | Experimental | Enable oauth support for streamable HTTP MCP servers |
-| `apply_patch_freeform`                    |  false  | Beta         | Include the freeform `apply_patch` tool              |
-| `view_image_tool`                         |  true   | Stable       | Include the `view_image` tool                        |
-| `web_search_request`                      |  false  | Stable       | Allow the model to issue web searches                |
-| `experimental_sandbox_command_assessment` |  false  | Experimental | Enable model-based sandbox risk assessment           |
-| `ghost_commit`                            |  false  | Experimental | Create a ghost commit each turn                      |
-| `enable_experimental_windows_sandbox`     |  false  | Experimental | Use the Windows restricted-token sandbox             |
+| Key                                   | Default | Stage        | Description                                           |
+| ------------------------------------- | :-----: | ------------ | ----------------------------------------------------- |
+| `unified_exec`                        |  false  | Experimental | Use the unified PTY-backed exec tool                  |
+| `apply_patch_freeform`                |  false  | Beta         | Include the freeform `apply_patch` tool               |
+| `view_image_tool`                     |  true   | Stable       | Include the `view_image` tool                         |
+| `web_search_request`                  |  false  | Stable       | Allow the model to issue web searches                 |
+| `enable_experimental_windows_sandbox` |  false  | Experimental | Use the Windows restricted-token sandbox              |
+| `tui2`                                |  false  | Experimental | Use the experimental TUI v2 (viewport) implementation |
+| `skills`                              |  false  | Experimental | Enable discovery and injection of skills              |
 
 Notes:
 
@@ -64,7 +62,7 @@ Notes:
 The model that Codex should use.
 
 ```toml
-model = "o4-mini"  # overrides the provider default (see table below)
+model = "gpt-5.1"  # overrides the default ("gpt-5.1-codex-max" across platforms)
 ```
 
 ### model_providers
@@ -73,52 +71,6 @@ This option lets you add to the default set of model providers bundled with Code
 
 > [!NOTE]
 > Built-in providers are not overwritten when you reuse their key. Entries you add only take effect when the key is **new**; for example `[model_providers.openai]` leaves the original OpenAI definition untouched. To customize the bundled OpenAI provider, prefer the dedicated knobs (for example the `OPENAI_BASE_URL` environment variable) or register a new provider key and point `model_provider` at it.
-
-Codex ships with the following providers ready to use:
-
-- `openai` (Responses API; use the ChatGPT login flow or set `OPENAI_API_KEY`)
-- `gemini` (Google Gemini’s OpenAI-compatible endpoint; set `GOOGLE_GENERATIVE_AI_API_KEY`)
-- `openrouter` (OpenRouter relay; set `OPENROUTER_API_KEY`)
-- `xai` (Grok via api.x.ai; set `XAI_API_KEY`)
-- `oss` (Ollama/OSS-compatible endpoint; defaults to `http://localhost:11434/v1`)
-
-Each provider carries two default models—an “agentic” default used for day-to-day turns and a “full context” default used for `/review` and other long-form tasks. Override them by setting `model` or `review_model`.
-
-| Provider     | Environment Variable Required        | Default Agentic Model            | Default Full Context Model  |
-| ------------ | ------------------------------------ | -------------------------------- | --------------------------- |
-| `openai`     | `OPENAI_API_KEY` (or ChatGPT login)  | `o4-mini`                        | `o3`                        |
-| `gemini`     | `GOOGLE_GENERATIVE_AI_API_KEY`       | `gemini-2.5-pro-preview-03-25`   | `gemini-2.0-flash`          |
-| `openrouter` | `OPENROUTER_API_KEY`                 | `openai/o4-mini`                 | `openai/o3`                 |
-| `ollama`     | _Not required_                       | _User must specify_              | _User must specify_         |
-| `xai`        | `XAI_API_KEY`                        | `grok-code-fast-1`               | `grok-4-fast-reasoning`     |
-
-> [!TIP]
-> OpenRouter exposes hundreds of community models. Two popular coding picks are `openrouter/polaris-alpha` and `moonshotai/kimi-linear-48b-a3b-instruct`. For xAI, refer to https://docs.x.ai/docs/models/grok-code-fast-1 and https://docs.x.ai/docs/models/grok-4-fast-reasoning for the latest Grok variants.
-
-To switch providers, either edit your config:
-
-```toml
-# ~/.codex/config.toml
-model_provider = "gemini"
-model = "gemini-2.5-pro-preview-03-25"
-review_model = "gemini-2.0-flash"
-```
-
-…or pass a one-off override when launching Codex:
-
-```bash
-codex --config model_provider="gemini"
-```
-
-Then export the matching API key(s):
-
-```bash
-export OPENAI_API_KEY="sk-your-openai-key"
-export GOOGLE_GENERATIVE_AI_API_KEY="your-gemini-key"
-export OPENROUTER_API_KEY="your-openrouter-key"
-export XAI_API_KEY="your-xai-key"
-# Ollama runs locally, so no key is required.
-```
 
 For example, if you wanted to add a provider that uses the OpenAI 4o model via the chat completions API, then you could add the following configuration:
 
@@ -237,12 +189,13 @@ model = "mistral"
 
 ### model_reasoning_effort
 
-If the selected model is known to support reasoning (for example: `o3`, `o4-mini`, `codex-*`, `gpt-5`, `gpt-5-codex`), reasoning is enabled by default when using the Responses API. As explained in the [OpenAI Platform documentation](https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning), this can be set to:
+If the selected model is known to support reasoning (for example: `o3`, `o4-mini`, `codex-*`, `gpt-5.1-codex-max`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.2`), reasoning is enabled by default when using the Responses API. As explained in the [OpenAI Platform documentation](https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning), this can be set to:
 
 - `"minimal"`
 - `"low"`
 - `"medium"` (default)
 - `"high"`
+- `"xhigh"` (available on `gpt-5.1-codex-max` and `gpt-5.2`)
 
 Note: to minimize reasoning, choose `"minimal"`.
 
@@ -273,7 +226,7 @@ When set, Codex includes a `text` object in the request payload with the configu
 Example:
 
 ```toml
-model = "gpt-5"
+model = "gpt-5.1"
 model_verbosity = "low"
 ```
 
@@ -293,11 +246,19 @@ The size of the context window for the model, in tokens.
 
 In general, Codex knows the context window for the most common OpenAI models, but if you are using a new model with an old version of the Codex CLI, then you can use `model_context_window` to tell Codex what value to use to determine how much context is left during a conversation.
 
-### model_max_output_tokens
+### oss_provider
 
-This is analogous to `model_context_window`, but for the maximum number of output tokens for the model.
+Specifies the default OSS provider to use when running Codex. This is used when the `--oss` flag is provided without a specific provider.
 
-> See also [`codex exec`](./exec.md) to see how these model settings influence non-interactive runs.
+Valid values are:
+
+- `"lmstudio"` - Use LM Studio as the local model provider
+- `"ollama"` - Use Ollama as the local model provider
+
+```toml
+# Example: Set default OSS provider to LM Studio
+oss_provider = "lmstudio"
+```
 
 ## Execution environment
 
@@ -354,7 +315,7 @@ disk, but attempts to write a file or access the network will be blocked.
 
 A more relaxed policy is `workspace-write`. When specified, the current working directory for the Codex task will be writable (as well as `$TMPDIR` on macOS). Note that the CLI defaults to using the directory where it was spawned as `cwd`, though this can be overridden using `--cwd/-C`.
 
-On macOS (and soon Linux), all writable roots (including `cwd`) that contain a `.git/` folder _as an immediate child_ will configure the `.git/` folder to be read-only while the rest of the Git repository will be writable. This means that commands like `git commit` will fail, by default (as it entails writing to `.git/`), and will require Codex to ask for permission.
+On macOS (and soon Linux), all writable roots (including `cwd`) that contain a `.git/` or `.codex/` folder _as an immediate child_ will configure those folders to be read-only while the rest of the root stays writable. This means that commands like `git commit` will fail, by default (as it entails writing to `.git/`), and will require Codex to ask for permission.
 
 ```toml
 # same as `--sandbox workspace-write`
@@ -389,6 +350,8 @@ Though using this option may also be necessary if you try to use Codex in enviro
 
 ### tools.\*
 
+These `[tools]` configuration options are deprecated. Use `[features]` instead (see [Feature flags](#feature-flags)).
+
 Use the optional `[tools]` table to toggle built-in tools that the agent may call. `web_search` stays off unless you opt in, while `view_image` is now enabled by default:
 
 ```toml
@@ -396,8 +359,6 @@ Use the optional `[tools]` table to toggle built-in tools that the agent may cal
 web_search = true   # allow Codex to issue first-party web searches without prompting you (deprecated)
 view_image = false  # disable image uploads (they're enabled by default)
 ```
-
-`web_search` is deprecated; use the `web_search_request` feature flag instead.
 
 The `view_image` toggle is useful when you want to include screenshots or diagrams from your repo without pasting them manually. Codex still respects sandboxing: it can only attach files inside the workspace roots you allow.
 
@@ -421,8 +382,8 @@ Codex spawns subprocesses (e.g. when executing a `local_shell` tool-call suggest
 [shell_environment_policy]
 # inherit can be "all" (default), "core", or "none"
 inherit = "core"
-# set to true to *skip* the filter for `"*KEY*"` and `"*TOKEN*"`
-ignore_default_excludes = false
+# set to true to *skip* the filter for `"*KEY*"`, `"*SECRET*"`, and `"*TOKEN*"`
+ignore_default_excludes = true
 # exclude patterns (case-insensitive globs)
 exclude = ["AWS_*", "AZURE_*"]
 # force-set / override values
@@ -434,7 +395,7 @@ include_only = ["PATH", "HOME"]
 | Field                     | Type                 | Default | Description                                                                                                                                     |
 | ------------------------- | -------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `inherit`                 | string               | `all`   | Starting template for the environment:<br>`all` (clone full parent env), `core` (`HOME`, `PATH`, `USER`, …), or `none` (start empty).           |
-| `ignore_default_excludes` | boolean              | `false` | When `false`, Codex removes any var whose **name** contains `KEY`, `SECRET`, or `TOKEN` (case-insensitive) before other rules run.              |
+| `ignore_default_excludes` | boolean              | `true`  | When `false`, Codex removes any var whose **name** contains `KEY`, `SECRET`, or `TOKEN` (case-insensitive) before other rules run.              |
 | `exclude`                 | array<string>        | `[]`    | Case-insensitive glob patterns to drop after the default filter.<br>Examples: `"AWS_*"`, `"AZURE_*"`.                                           |
 | `set`                     | table<string,string> | `{}`    | Explicit key/value overrides or additions – always win over inherited values.                                                                   |
 | `include_only`            | array<string>        | `[]`    | If non-empty, a whitelist of patterns; only variables that match _one_ pattern survive the final step. (Generally used with `inherit = "all"`.) |
@@ -455,6 +416,17 @@ set = { PATH = "/usr/bin", MY_FLAG = "1" }
 
 Currently, `CODEX_SANDBOX_NETWORK_DISABLED=1` is also added to the environment, assuming network is disabled. This is not configurable.
 
+## Project root detection
+
+Codex discovers `.codex/` project layers by walking up from the working directory until it hits a project marker. By default it looks for `.git`. You can override the marker list in user/system/MDM config:
+
+```toml
+# $CODEX_HOME/config.toml
+project_root_markers = [".git", ".hg", ".sl"]
+```
+
+Set `project_root_markers = []` to skip searching parent directories and treat the current working directory as the project root.
+
 ## MCP integration
 
 ### mcp_servers
@@ -474,7 +446,7 @@ You can configure Codex to use [MCP servers](https://modelcontextprotocol.io/abo
 command = "npx"
 # Optional
 args = ["-y", "mcp-server"]
-# Optional: propagate additional env vars to the MVP server.
+# Optional: propagate additional env vars to the MCP server.
 # A default whitelist of env vars will be propagated to the MCP server.
 # https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/utils.rs#L82
 env = { "API_KEY" = "value" }
@@ -503,13 +475,7 @@ http_headers = { "HEADER_NAME" = "HEADER_VALUE" }
 env_http_headers = { "HEADER_NAME" = "ENV_VAR" }
 ```
 
-Streamable HTTP connections always use the experimental Rust MCP client under the hood, so expect occasional rough edges. OAuth login flows are gated on the `experimental_use_rmcp_client = true` flag:
-
-```toml
-experimental_use_rmcp_client = true
-```
-
-After enabling it, run `codex mcp login <server-name>` when the server supports OAuth.
+Streamable HTTP connections always use the Rust MCP client under the hood. Run `codex mcp login <server-name>` to authenticate for servers supporting OAuth.
 
 #### Other configuration options
 
@@ -527,17 +493,6 @@ disabled_tools = ["search"]
 ```
 
 When both `enabled_tools` and `disabled_tools` are specified, Codex first restricts the server to the allow-list and then removes any tools that appear in the deny-list.
-
-#### Experimental RMCP client
-
-This flag enables OAuth support for streamable HTTP servers.
-
-```toml
-experimental_use_rmcp_client = true
-
-[mcp_servers.server_name]
-…
-```
 
 #### MCP CLI commands
 
@@ -642,7 +597,7 @@ metadata above):
 - `codex.tool_decision`
   - `tool_name`
   - `call_id`
-  - `decision` (`approved`, `approved_for_session`, `denied`, or `abort`)
+  - `decision` (`approved`, `approved_execpolicy_amendment`, `approved_for_session`, `denied`, or `abort`)
   - `source` (`config` or `user`)
 - `codex.tool_result`
   - `tool_name`
@@ -664,12 +619,12 @@ Set `otel.exporter` to control where events go:
   endpoint, protocol, and headers your collector expects:
 
   ```toml
-  [otel]
-  exporter = { otlp-http = {
-    endpoint = "https://otel.example.com/v1/logs",
-    protocol = "binary",
-    headers = { "x-otlp-api-key" = "${OTLP_TOKEN}" }
-  }}
+  [otel.exporter."otlp-http"]
+  endpoint = "https://otel.example.com/v1/logs"
+  protocol = "binary"
+
+  [otel.exporter."otlp-http".headers]
+  "x-otlp-api-key" = "${OTLP_TOKEN}"
   ```
 
 - `otlp-grpc` – streams OTLP log records over gRPC. Provide the endpoint and any
@@ -677,11 +632,25 @@ Set `otel.exporter` to control where events go:
 
   ```toml
   [otel]
-  exporter = { otlp-grpc = {
-    endpoint = "https://otel.example.com:4317",
-    headers = { "x-otlp-meta" = "abc123" }
-  }}
+  exporter = { otlp-grpc = {endpoint = "https://otel.example.com:4317",headers = { "x-otlp-meta" = "abc123" }}}
   ```
+
+Both OTLP exporters accept an optional `tls` block so you can trust a custom CA
+or enable mutual TLS. Relative paths are resolved against `~/.codex/`:
+
+```toml
+[otel.exporter."otlp-http"]
+endpoint = "https://otel.example.com/v1/logs"
+protocol = "binary"
+
+[otel.exporter."otlp-http".headers]
+"x-otlp-api-key" = "${OTLP_TOKEN}"
+
+[otel.exporter."otlp-http".tls]
+ca-certificate = "certs/otel-ca.pem"
+client-certificate = "/etc/codex/certs/client.pem"
+client-private-key = "/etc/codex/certs/client-key.pem"
+```
 
 If the exporter is `none` nothing is written anywhere; otherwise you must run or point to your
 own collector. All exporters run on a background batch worker that is flushed on
@@ -780,6 +749,8 @@ notify = ["python3", "/Users/mbolin/.codex/notify.py"]
 > [!NOTE]
 > Use `notify` for automation and integrations: Codex invokes your external program with a single JSON argument for each event, independent of the TUI. If you only want lightweight desktop notifications while using the TUI, prefer `tui.notifications`, which uses terminal escape codes and requires no external program. You can enable both; `tui.notifications` covers in‑TUI alerts (e.g., approval prompts), while `notify` is best for system‑level hooks or custom notifiers. Currently, `notify` emits only `agent-turn-complete`, whereas `tui.notifications` supports `agent-turn-complete` and `approval-requested` with optional filtering.
 
+When Codex detects WSL 2 inside Windows Terminal (the session exports `WT_SESSION`), `tui.notifications` automatically switches to a Windows toast backend by spawning `powershell.exe`. This ensures both approval prompts and completed turns trigger native toasts even though Windows Terminal ignores OSC 9 escape sequences. Terminals that advertise OSC 9 support (iTerm2, WezTerm, kitty, etc.) continue to use the existing escape-sequence backend, and the `notify` hook remains unchanged.
+
 ### hide_agent_reasoning
 
 Codex intermittently emits "reasoning" events that show the model's internal "thinking" before it produces a final answer. Some users may find these events distracting, especially in CI logs or minimal terminal output.
@@ -850,7 +821,7 @@ Users can specify config values at multiple levels. Order of precedence is as fo
 1. custom command-line argument, e.g., `--model o3`
 2. as part of a profile, where the `--profile` is specified via a CLI (or in the config file itself)
 3. as an entry in `config.toml`, e.g., `model = "o3"`
-4. the default value that comes with Codex CLI (for example, the bundled OpenAI provider defaults to `o4-mini`)
+4. the default value that comes with Codex CLI (i.e., Codex CLI defaults to `gpt-5.1-codex-max`)
 
 ### history
 
@@ -862,6 +833,11 @@ To disable this behavior, configure `[history]` as follows:
 [history]
 persistence = "none"  # "save-all" is the default value
 ```
+
+To cap the size of `history.jsonl`, set `history.max_bytes` to a positive byte
+count. When the file grows beyond the limit, Codex removes the oldest entries,
+compacting the file down to roughly 80% of the hard cap while keeping the newest
+record intact. Omitting the option—or setting it to `0`—disables pruning.
 
 ### file_opener
 
@@ -908,12 +884,81 @@ notifications = true
 # You can optionally filter to specific notification types.
 # Available types are "agent-turn-complete" and "approval-requested".
 notifications = [ "agent-turn-complete", "approval-requested" ]
+
+# Disable terminal animations (welcome screen, status shimmer, spinner).
+# Defaults to true.
+animations = false
+
+# TUI2 mouse scrolling (wheel + trackpad)
+#
+# Terminals emit different numbers of raw scroll events per physical wheel notch (commonly 1, 3,
+# or 9+). TUI2 normalizes raw event density into consistent wheel behavior (default: ~3 lines per
+# wheel notch) while keeping trackpad input higher fidelity via fractional accumulation.
+#
+# See `codex-rs/tui2/docs/scroll_input_model.md` for the model and probe data.
+
+# Override *wheel* event density (raw events per physical wheel notch). TUI2 only.
+#
+# Wheel-like per-event contribution is:
+# - `scroll_wheel_lines / scroll_events_per_tick`
+#
+# Trackpad-like streams use `min(scroll_events_per_tick, 3)` as the divisor so dense wheel ticks
+# (e.g. 9 events per notch) do not make trackpads feel artificially slow.
+scroll_events_per_tick = 3
+
+# Override wheel scroll lines per physical wheel notch (classic feel). TUI2 only.
+scroll_wheel_lines = 3
+
+# Override baseline trackpad sensitivity (lines per tick-equivalent). TUI2 only.
+#
+# Trackpad-like per-event contribution is:
+# - `scroll_trackpad_lines / min(scroll_events_per_tick, 3)`
+scroll_trackpad_lines = 1
+
+# Trackpad acceleration (optional). TUI2 only.
+# These keep small swipes precise while letting large/faster swipes cover more content.
+#
+# Concretely, TUI2 computes:
+# - `multiplier = clamp(1 + abs(events) / scroll_trackpad_accel_events, 1..scroll_trackpad_accel_max)`
+#
+# The multiplier is applied to the trackpad-like stream’s computed line delta (including any
+# carried fractional remainder).
+scroll_trackpad_accel_events = 30
+scroll_trackpad_accel_max = 3
+
+# Force scroll interpretation. TUI2 only.
+# Valid values: "auto" (default), "wheel", "trackpad"
+scroll_mode = "auto"
+
+# Auto-mode heuristic tuning. TUI2 only.
+scroll_wheel_tick_detect_max_ms = 12
+scroll_wheel_like_max_duration_ms = 200
+
+# Invert scroll direction for mouse wheel/trackpad. TUI2 only.
+scroll_invert = false
 ```
 
 > [!NOTE]
 > Codex emits desktop notifications using terminal escape codes. Not all terminals support these (notably, macOS Terminal.app and VS Code's terminal do not support custom notifications. iTerm2, Ghostty and WezTerm do support these notifications).
 
 > [!NOTE] > `tui.notifications` is built‑in and limited to the TUI session. For programmatic or cross‑environment notifications—or to integrate with OS‑specific notifiers—use the top‑level `notify` option to run an external program that receives event JSON. The two settings are independent and can be used together.
+
+Scroll settings (`tui.scroll_events_per_tick`, `tui.scroll_wheel_lines`, `tui.scroll_trackpad_lines`, `tui.scroll_trackpad_accel_*`, `tui.scroll_mode`, `tui.scroll_wheel_*`, `tui.scroll_invert`) currently apply to the TUI2 viewport scroll implementation.
+
+> [!NOTE] > `tui.scroll_events_per_tick` has terminal-specific defaults derived from mouse scroll probe logs
+> collected on macOS for a small set of terminals:
+>
+> - Terminal.app: 3
+> - Warp: 9
+> - WezTerm: 1
+> - Alacritty: 3
+> - Ghostty: 3 (stopgap; one probe measured ~9)
+> - iTerm2: 1
+> - VS Code terminal: 1
+> - Kitty: 3
+>
+> We should augment these defaults with data from more terminals and other platforms over time.
+> Unknown terminals fall back to 3 and can be overridden via `tui.scroll_events_per_tick`.
 
 ## Authentication and authorization
 
@@ -951,62 +996,76 @@ Valid values:
 
 ## Config reference
 
-| Key                                              | Type / Values                                                     | Notes                                                                                                                      |
-| ------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `model`                                          | string                                                            | Model to use (default follows the selected provider; e.g., `o4-mini` for the bundled OpenAI provider).                     |
-| `model_provider`                                 | string                                                            | Provider id from `model_providers` (default: `openai`).                                                                    |
-| `model_context_window`                           | number                                                            | Context window tokens.                                                                                                     |
-| `model_max_output_tokens`                        | number                                                            | Max output tokens.                                                                                                         |
-| `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                               |
-| `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                         |
-| `sandbox_workspace_write.writable_roots`         | array<string>                                                     | Extra writable roots in workspace‑write.                                                                                   |
-| `sandbox_workspace_write.network_access`         | boolean                                                           | Allow network in workspace‑write (default: false).                                                                         |
-| `sandbox_workspace_write.exclude_tmpdir_env_var` | boolean                                                           | Exclude `$TMPDIR` from writable roots (default: false).                                                                    |
-| `sandbox_workspace_write.exclude_slash_tmp`      | boolean                                                           | Exclude `/tmp` from writable roots (default: false).                                                                       |
-| `notify`                                         | array<string>                                                     | External program for notifications.                                                                                        |
-| `instructions`                                   | string                                                            | Currently ignored; use `experimental_instructions_file` or `AGENTS.md`.                                                    |
-| `features.<feature-flag>`                        | boolean                                                           | See [feature flags](#feature-flags) for details                                                                            |
-| `mcp_servers.<id>.command`                       | string                                                            | MCP server launcher command (stdio servers only).                                                                          |
-| `mcp_servers.<id>.args`                          | array<string>                                                     | MCP server args (stdio servers only).                                                                                      |
-| `mcp_servers.<id>.env`                           | map<string,string>                                                | MCP server env vars (stdio servers only).                                                                                  |
-| `mcp_servers.<id>.url`                           | string                                                            | MCP server url (streamable http servers only).                                                                             |
-| `mcp_servers.<id>.bearer_token_env_var`          | string                                                            | environment variable containing a bearer token to use for auth (streamable http servers only).                             |
-| `mcp_servers.<id>.enabled`                       | boolean                                                           | When false, Codex skips starting the server (default: true).                                                               |
-| `mcp_servers.<id>.startup_timeout_sec`           | number                                                            | Startup timeout in seconds (default: 10). Timeout is applied both for initializing MCP server and initially listing tools. |
-| `mcp_servers.<id>.tool_timeout_sec`              | number                                                            | Per-tool timeout in seconds (default: 60). Accepts fractional values; omit to use the default.                             |
-| `mcp_servers.<id>.enabled_tools`                 | array<string>                                                     | Restrict the server to the listed tool names.                                                                              |
-| `mcp_servers.<id>.disabled_tools`                | array<string>                                                     | Remove the listed tool names after applying `enabled_tools`, if any.                                                       |
-| `model_providers.<id>.name`                      | string                                                            | Display name.                                                                                                              |
-| `model_providers.<id>.base_url`                  | string                                                            | API base URL.                                                                                                              |
-| `model_providers.<id>.env_key`                   | string                                                            | Env var for API key.                                                                                                       |
-| `model_providers.<id>.wire_api`                  | `chat` \| `responses`                                             | Protocol used (default: `chat`).                                                                                           |
-| `model_providers.<id>.query_params`              | map<string,string>                                                | Extra query params (e.g., Azure `api-version`).                                                                            |
-| `model_providers.<id>.http_headers`              | map<string,string>                                                | Additional static headers.                                                                                                 |
-| `model_providers.<id>.env_http_headers`          | map<string,string>                                                | Headers sourced from env vars.                                                                                             |
-| `model_providers.<id>.request_max_retries`       | number                                                            | Per‑provider HTTP retry count (default: 4).                                                                                |
-| `model_providers.<id>.stream_max_retries`        | number                                                            | SSE stream retry count (default: 5).                                                                                       |
-| `model_providers.<id>.stream_idle_timeout_ms`    | number                                                            | SSE idle timeout (ms) (default: 300000).                                                                                   |
-| `project_doc_max_bytes`                          | number                                                            | Max bytes to read from `AGENTS.md`.                                                                                        |
-| `profile`                                        | string                                                            | Active profile name.                                                                                                       |
-| `profiles.<name>.*`                              | various                                                           | Profile‑scoped overrides of the same keys.                                                                                 |
-| `history.persistence`                            | `save-all` \| `none`                                              | History file persistence (default: `save-all`).                                                                            |
-| `history.max_bytes`                              | number                                                            | Currently ignored (not enforced).                                                                                          |
-| `file_opener`                                    | `vscode` \| `vscode-insiders` \| `windsurf` \| `cursor` \| `none` | URI scheme for clickable citations (default: `vscode`).                                                                    |
-| `tui`                                            | table                                                             | TUI‑specific options.                                                                                                      |
-| `tui.notifications`                              | boolean \| array<string>                                          | Enable desktop notifications in the tui (default: true).                                                                   |
-| `hide_agent_reasoning`                           | boolean                                                           | Hide model reasoning events.                                                                                               |
-| `show_raw_agent_reasoning`                       | boolean                                                           | Show raw reasoning (when available).                                                                                       |
-| `model_reasoning_effort`                         | `minimal` \| `low` \| `medium` \| `high`                          | Responses API reasoning effort.                                                                                            |
-| `model_reasoning_summary`                        | `auto` \| `concise` \| `detailed` \| `none`                       | Reasoning summaries.                                                                                                       |
-| `model_verbosity`                                | `low` \| `medium` \| `high`                                       | GPT‑5 text verbosity (Responses API).                                                                                      |
-| `model_supports_reasoning_summaries`             | boolean                                                           | Force‑enable reasoning summaries.                                                                                          |
-| `model_reasoning_summary_format`                 | `none` \| `experimental`                                          | Force reasoning summary format.                                                                                            |
-| `chatgpt_base_url`                               | string                                                            | Base URL for ChatGPT auth flow.                                                                                            |
-| `experimental_instructions_file`                 | string (path)                                                     | Replace built‑in instructions (experimental).                                                                              |
-| `experimental_use_exec_command_tool`             | boolean                                                           | Use experimental exec command tool.                                                                                        |
-| `projects.<path>.trust_level`                    | string                                                            | Mark project/worktree as trusted (only `"trusted"` is recognized).                                                         |
-| `tools.web_search`                               | boolean                                                           | Enable web search tool (deprecated) (default: false).                                                                      |
-| `tools.view_image`                               | boolean                                                           | Enable or disable the `view_image` tool so Codex can attach local image files from the workspace (default: true).          |
-| `forced_login_method`                            | `chatgpt` \| `api`                                                | Only allow Codex to be used with ChatGPT or API keys.                                                                      |
-| `forced_chatgpt_workspace_id`                    | string (uuid)                                                     | Only allow Codex to be used with the specified ChatGPT workspace.                                                          |
-| `cli_auth_credentials_store`                     | `file` \| `keyring` \| `auto`                                     | Where to store CLI login credentials (default: `file`).                                                                    |
+| Key                                              | Type / Values                                                     | Notes                                                                                                                           |
+| ------------------------------------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                                          | string                                                            | Model to use (e.g., `gpt-5.1-codex-max`).                                                                                       |
+| `model_provider`                                 | string                                                            | Provider id from `model_providers` (default: `openai`).                                                                         |
+| `model_context_window`                           | number                                                            | Context window tokens.                                                                                                          |
+| `tool_output_token_limit`                        | number                                                            | Token budget for stored function/tool outputs in history (default: 2,560 tokens).                                               |
+| `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                                    |
+| `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                              |
+| `sandbox_workspace_write.writable_roots`         | array<string>                                                     | Extra writable roots in workspace‑write.                                                                                        |
+| `sandbox_workspace_write.network_access`         | boolean                                                           | Allow network in workspace‑write (default: false).                                                                              |
+| `sandbox_workspace_write.exclude_tmpdir_env_var` | boolean                                                           | Exclude `$TMPDIR` from writable roots (default: false).                                                                         |
+| `sandbox_workspace_write.exclude_slash_tmp`      | boolean                                                           | Exclude `/tmp` from writable roots (default: false).                                                                            |
+| `notify`                                         | array<string>                                                     | External program for notifications.                                                                                             |
+| `tui.animations`                                 | boolean                                                           | Enable terminal animations (welcome screen, shimmer, spinner). Defaults to true; set to `false` to disable visual motion.       |
+| `instructions`                                   | string                                                            | Currently ignored; use `experimental_instructions_file` or `AGENTS.md`.                                                         |
+| `developer_instructions`                         | string                                                            | The additional developer instructions.                                                                                          |
+| `features.<feature-flag>`                        | boolean                                                           | See [feature flags](#feature-flags) for details                                                                                 |
+| `ghost_snapshot.disable_warnings`                | boolean                                                           | Disable every warnings around ghost snapshot (large files, directory, ...)                                                      |
+| `ghost_snapshot.ignore_large_untracked_files`    | number                                                            | Exclude untracked files larger than this many bytes from ghost snapshots (default: 10 MiB). Set to `0` to disable.              |
+| `ghost_snapshot.ignore_large_untracked_dirs`     | number                                                            | Ignore untracked directories with at least this many files (default: 200). Set to `0` to disable.                               |
+| `mcp_servers.<id>.command`                       | string                                                            | MCP server launcher command (stdio servers only).                                                                               |
+| `mcp_servers.<id>.args`                          | array<string>                                                     | MCP server args (stdio servers only).                                                                                           |
+| `mcp_servers.<id>.env`                           | map<string,string>                                                | MCP server env vars (stdio servers only).                                                                                       |
+| `mcp_servers.<id>.url`                           | string                                                            | MCP server url (streamable http servers only).                                                                                  |
+| `mcp_servers.<id>.bearer_token_env_var`          | string                                                            | environment variable containing a bearer token to use for auth (streamable http servers only).                                  |
+| `mcp_servers.<id>.enabled`                       | boolean                                                           | When false, Codex skips starting the server (default: true).                                                                    |
+| `mcp_servers.<id>.startup_timeout_sec`           | number                                                            | Startup timeout in seconds (default: 10). Timeout is applied both for initializing MCP server and initially listing tools.      |
+| `mcp_servers.<id>.tool_timeout_sec`              | number                                                            | Per-tool timeout in seconds (default: 60). Accepts fractional values; omit to use the default.                                  |
+| `mcp_servers.<id>.enabled_tools`                 | array<string>                                                     | Restrict the server to the listed tool names.                                                                                   |
+| `mcp_servers.<id>.disabled_tools`                | array<string>                                                     | Remove the listed tool names after applying `enabled_tools`, if any.                                                            |
+| `model_providers.<id>.name`                      | string                                                            | Display name.                                                                                                                   |
+| `model_providers.<id>.base_url`                  | string                                                            | API base URL.                                                                                                                   |
+| `model_providers.<id>.env_key`                   | string                                                            | Env var for API key.                                                                                                            |
+| `model_providers.<id>.wire_api`                  | `chat` \| `responses`                                             | Protocol used (default: `chat`).                                                                                                |
+| `model_providers.<id>.query_params`              | map<string,string>                                                | Extra query params (e.g., Azure `api-version`).                                                                                 |
+| `model_providers.<id>.http_headers`              | map<string,string>                                                | Additional static headers.                                                                                                      |
+| `model_providers.<id>.env_http_headers`          | map<string,string>                                                | Headers sourced from env vars.                                                                                                  |
+| `model_providers.<id>.request_max_retries`       | number                                                            | Per‑provider HTTP retry count (default: 4).                                                                                     |
+| `model_providers.<id>.stream_max_retries`        | number                                                            | SSE stream retry count (default: 5).                                                                                            |
+| `model_providers.<id>.stream_idle_timeout_ms`    | number                                                            | SSE idle timeout (ms) (default: 300000).                                                                                        |
+| `project_doc_max_bytes`                          | number                                                            | Max bytes to read from `AGENTS.md`.                                                                                             |
+| `profile`                                        | string                                                            | Active profile name.                                                                                                            |
+| `profiles.<name>.*`                              | various                                                           | Profile‑scoped overrides of the same keys.                                                                                      |
+| `history.persistence`                            | `save-all` \| `none`                                              | History file persistence (default: `save-all`).                                                                                 |
+| `history.max_bytes`                              | number                                                            | Maximum size of `history.jsonl` in bytes; when exceeded, history is compacted to ~80% of this limit by dropping oldest entries. |
+| `file_opener`                                    | `vscode` \| `vscode-insiders` \| `windsurf` \| `cursor` \| `none` | URI scheme for clickable citations (default: `vscode`).                                                                         |
+| `tui`                                            | table                                                             | TUI‑specific options.                                                                                                           |
+| `tui.notifications`                              | boolean \| array<string>                                          | Enable desktop notifications in the tui (default: true).                                                                        |
+| `tui.scroll_events_per_tick`                     | number                                                            | Raw events per wheel notch (normalization input; default: terminal-specific; fallback: 3).                                      |
+| `tui.scroll_wheel_lines`                         | number                                                            | Lines per physical wheel notch in wheel-like mode (default: 3).                                                                 |
+| `tui.scroll_trackpad_lines`                      | number                                                            | Baseline trackpad sensitivity in trackpad-like mode (default: 1).                                                               |
+| `tui.scroll_trackpad_accel_events`               | number                                                            | Trackpad acceleration: events per +1x speed in TUI2 (default: 30).                                                              |
+| `tui.scroll_trackpad_accel_max`                  | number                                                            | Trackpad acceleration: max multiplier in TUI2 (default: 3).                                                                     |
+| `tui.scroll_mode`                                | `auto` \| `wheel` \| `trackpad`                                   | How to interpret scroll input in TUI2 (default: `auto`).                                                                        |
+| `tui.scroll_wheel_tick_detect_max_ms`            | number                                                            | Auto-mode threshold (ms) for promoting a stream to wheel-like behavior (default: 12).                                           |
+| `tui.scroll_wheel_like_max_duration_ms`          | number                                                            | Auto-mode fallback duration (ms) used for 1-event-per-tick terminals (default: 200).                                            |
+| `tui.scroll_invert`                              | boolean                                                           | Invert mouse scroll direction in TUI2 (default: false).                                                                         |
+| `hide_agent_reasoning`                           | boolean                                                           | Hide model reasoning events.                                                                                                    |
+| `check_for_update_on_startup`                    | boolean                                                           | Check for Codex updates on startup (default: true). Set to `false` only if updates are centrally managed.                       |
+| `show_raw_agent_reasoning`                       | boolean                                                           | Show raw reasoning (when available).                                                                                            |
+| `model_reasoning_effort`                         | `minimal` \| `low` \| `medium` \| `high`\|`xhigh`                 | Responses API reasoning effort.                                                                                                 |
+| `model_reasoning_summary`                        | `auto` \| `concise` \| `detailed` \| `none`                       | Reasoning summaries.                                                                                                            |
+| `model_verbosity`                                | `low` \| `medium` \| `high`                                       | GPT‑5 text verbosity (Responses API).                                                                                           |
+| `model_supports_reasoning_summaries`             | boolean                                                           | Force‑enable reasoning summaries.                                                                                               |
+| `chatgpt_base_url`                               | string                                                            | Base URL for ChatGPT auth flow.                                                                                                 |
+| `experimental_instructions_file`                 | string (path)                                                     | Replace built‑in instructions (experimental).                                                                                   |
+| `experimental_use_exec_command_tool`             | boolean                                                           | Use experimental exec command tool.                                                                                             |
+| `projects.<path>.trust_level`                    | string                                                            | Mark project/worktree as trusted (only `"trusted"` is recognized).                                                              |
+| `tools.web_search`                               | boolean                                                           | Enable web search tool (deprecated) (default: false).                                                                           |
+| `tools.view_image`                               | boolean                                                           | Enable or disable the `view_image` tool so Codex can attach local image files from the workspace (default: true).               |
+| `forced_login_method`                            | `chatgpt` \| `api`                                                | Only allow Codex to be used with ChatGPT or API keys.                                                                           |
+| `forced_chatgpt_workspace_id`                    | string (uuid)                                                     | Only allow Codex to be used with the specified ChatGPT workspace.                                                               |
+| `cli_auth_credentials_store`                     | `file` \| `keyring` \| `auto`                                     | Where to store CLI login credentials (default: `file`).                                                                         |

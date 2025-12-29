@@ -21,6 +21,8 @@ Key flags: `--model/-m`, `--ask-for-approval/-a`.
 - Run `codex resume` to display the session picker UI
 - Resume most recent: `codex resume --last`
 - Resume by id: `codex resume <SESSION_ID>` (You can get session ids from /status or `~/.codex/sessions/`)
+- The picker shows the session's recorded Git branch when available.
+- To show the session's original working directory (CWD), run `codex resume --all` (this also disables cwd filtering and adds a `CWD` column).
 
 Examples:
 
@@ -112,3 +114,7 @@ Paste images directly into the composer (Ctrl+V / Cmd+V) to attach them to your 
 codex -i screenshot.png "Explain this error"
 codex --image img1.png,img2.jpg "Summarize these diagrams"
 ```
+
+#### Environment variables and executables
+
+Make sure your environment is already set up before launching Codex so it does not spend tokens probing what to activate. For example, source your Python virtualenv (or other language runtimes), start any required daemons, and export the env vars you expect to use ahead of time.

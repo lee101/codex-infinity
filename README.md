@@ -1,11 +1,3 @@
-Codex but with a --yolo3 command to avoid timeouts and sandboxing
-
-```
-cargo build --release -p codex-cli
-./codex-rs/target/release/codex --yolo3
-also the --auto-next-steps and --auto-next-idea args together make it fully autonomous
-```
-
 <p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
@@ -77,45 +69,9 @@ Codex can access MCP servers. To configure them, refer to the [config docs](./do
 
 Codex CLI supports a rich set of configuration options, with preferences stored in `~/.codex/config.toml`. For full configuration options, see [Configuration](./docs/config.md).
 
-### Built-in Providers
+### Execpolicy
 
-You can start with whichever API key you already have by selecting one of the bundled providers:
-
-| Provider   | Environment Variable Required        | Default Agentic Model          | Default Full Context Model |
-| ---------- | ------------------------------------ | ------------------------------ | -------------------------- |
-| openai     | `OPENAI_API_KEY` (or ChatGPT login)  | `o4-mini`                      | `o3`                       |
-| gemini     | `GOOGLE_GENERATIVE_AI_API_KEY`       | `gemini-2.5-pro-preview-03-25` | `gemini-2.0-flash`         |
-| openrouter | `OPENROUTER_API_KEY`                 | `openai/o4-mini`               | `openai/o3`                |
-| ollama     | _Not required_                       | _User must specify_            | _User must specify_        |
-| xai        | `XAI_API_KEY`                        | `grok-code-fast-1`             | `grok-4-fast-reasoning`    |
-
-> [!TIP]
-> OpenRouter slugs such as `openrouter/polaris-alpha` and `moonshotai/kimi-linear-48b-a3b-instruct` are great options for longer coding sessions. For xAI, the latest Grok models are documented at https://docs.x.ai/docs/models/grok-code-fast-1 and https://docs.x.ai/docs/models/grok-4-fast-reasoning.
-
-#### Switching providers
-
-Update `~/.codex/config.toml` (or your active profile) to pin the provider and model:
-
-```toml
-# ~/.codex/config.toml
-model_provider = "gemini"
-model = "gemini-2.5-pro-preview-03-25"
-review_model = "gemini-2.0-flash"
-```
-
-Prefer a one-off change? Pass `--config model_provider="gemini"` (and optionally `--model gemini-2.5-pro-preview-03-25`) when launching `codex` or `codex exec`.
-
-Make sure the corresponding API key is available before launching Codex:
-
-```bash
-export OPENAI_API_KEY="sk-your-openai-key"
-export GOOGLE_GENERATIVE_AI_API_KEY="your-gemini-key"
-export OPENROUTER_API_KEY="your-openrouter-key"
-export XAI_API_KEY="your-xai-key"
-# Ollama runs locally, so no API key is required.
-```
-
----
+See the [Execpolicy quickstart](./docs/execpolicy.md) to set up rules that govern what commands Codex can execute.
 
 ### Docs & FAQ
 
@@ -129,6 +85,7 @@ export XAI_API_KEY="your-xai-key"
 - [**Configuration**](./docs/config.md)
   - [Example config](./docs/example-config.md)
 - [**Sandbox & approvals**](./docs/sandbox.md)
+- [**Execpolicy quickstart**](./docs/execpolicy.md)
 - [**Authentication**](./docs/authentication.md)
   - [Auth methods](./docs/authentication.md#forcing-a-specific-auth-method-advanced)
   - [Login on a "Headless" machine](./docs/authentication.md#connecting-on-a-headless-machine)

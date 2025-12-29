@@ -2,8 +2,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use codex_rmcp_client::ElicitationAction;
+use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::RmcpClient;
-use escargot::CargoBuild;
+use codex_utils_cargo_bin::CargoBinError;
+use futures::FutureExt as _;
 use mcp_types::ClientCapabilities;
 use mcp_types::Implementation;
 use mcp_types::InitializeRequestParams;
@@ -17,12 +20,8 @@ use serde_json::json;
 
 const RESOURCE_URI: &str = "memo://codex/example-note";
 
-fn stdio_server_bin() -> anyhow::Result<PathBuf> {
-    let build = CargoBuild::new()
-        .package("codex-rmcp-client")
-        .bin("test_stdio_server")
-        .run()?;
-    Ok(build.path().to_path_buf())
+fn stdio_server_bin() -> Result<PathBuf, CargoBinError> {
+    codex_utils_cargo_bin::cargo_bin("test_stdio_server")
 }
 
 fn init_params() -> InitializeRequestParams {
@@ -55,7 +54,19 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
     .await?;
 
     client
-        .initialize(init_params(), Some(Duration::from_secs(5)))
+        .initialize(
+            init_params(),
+            Some(Duration::from_secs(5)),
+            Box::new(|_, _| {
+                async {
+                    Ok(ElicitationResponse {
+                        action: ElicitationAction::Accept,
+                        content: Some(json!({})),
+                    })
+                }
+                .boxed()
+            }),
+        )
         .await?;
 
     let list = client

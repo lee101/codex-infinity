@@ -8,6 +8,7 @@
 use crate::config::ConfigToml;
 use crate::config::profile::ConfigProfile;
 use serde::Deserialize;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -18,36 +19,83 @@ pub(crate) use legacy::LegacyFeatureToggles;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Experimental,
-    Beta,
+    Beta {
+        name: &'static str,
+        menu_description: &'static str,
+        announcement: &'static str,
+    },
     Stable,
     Deprecated,
     Removed,
 }
 
+impl Stage {
+    pub fn beta_menu_name(self) -> Option<&'static str> {
+        match self {
+            Stage::Beta { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn beta_menu_description(self) -> Option<&'static str> {
+        match self {
+            Stage::Beta {
+                menu_description, ..
+            } => Some(menu_description),
+            _ => None,
+        }
+    }
+
+    pub fn beta_announcement(self) -> Option<&'static str> {
+        match self {
+            Stage::Beta { announcement, .. } => Some(announcement),
+            _ => None,
+        }
+    }
+}
+
 /// Unique features toggled via configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
-    /// Use the single unified PTY-backed exec tool.
-    UnifiedExec,
-    /// Use the shell command tool that takes `command` as a single string of
-    /// shell instead of an array of args passed to `execvp(3)`.
-    ShellCommandTool,
-    /// Enable experimental RMCP features such as OAuth login.
-    RmcpClient,
-    /// Include the freeform apply_patch tool.
-    ApplyPatchFreeform,
-    /// Include the view_image tool.
-    ViewImageTool,
-    /// Allow the model to request web searches.
-    WebSearchRequest,
-    /// Enable the model-based risk assessments for sandboxed commands.
-    SandboxCommandAssessment,
-    /// Allow the agent to use the plan tool to communicate progress.
-    PlanTool,
+    // Stable.
     /// Create a ghost commit at each turn.
     GhostCommit,
+    /// Include the view_image tool.
+    ViewImageTool,
+    /// Send warnings to the model to correct it on the tool usage.
+    ModelWarnings,
+    /// Enable the default shell tool.
+    ShellTool,
+
+    // Experimental
+    /// Use the single unified PTY-backed exec tool.
+    UnifiedExec,
+    /// Include the freeform apply_patch tool.
+    ApplyPatchFreeform,
+    /// Allow the model to request web searches.
+    WebSearchRequest,
+    /// Gate the execpolicy enforcement for shell/unified exec.
+    ExecPolicy,
     /// Enable Windows sandbox (restricted token) on Windows.
     WindowsSandbox,
+    /// Use the elevated Windows sandbox pipeline (setup + runner).
+    WindowsSandboxElevated,
+    /// Remote compaction enabled (only for ChatGPT auth)
+    RemoteCompaction,
+    /// Refresh remote models and emit AppReady once the list is available.
+    RemoteModels,
+    /// Allow model to call multiple tools in parallel (only for models supporting it).
+    ParallelToolCalls,
+    /// Experimental shell snapshotting.
+    ShellSnapshot,
+    /// Experimental TUI v2 (viewport) implementation.
+    Tui2,
+    /// Enable discovery and injection of skills.
+    Skills,
+    /// Enforce UTF8 output in Powershell.
+    PowershellUtf8,
+    /// Allow the agent to use the plan tool to communicate progress.
+    PlanTool,
 }
 
 impl Feature {
@@ -88,7 +136,6 @@ pub struct Features {
 pub struct FeatureOverrides {
     pub include_apply_patch_tool: Option<bool>,
     pub web_search_request: Option<bool>,
-    pub experimental_sandbox_command_assessment: Option<bool>,
     pub plan_tool: Option<bool>,
 }
 
@@ -183,10 +230,8 @@ impl Features {
 
         let base_legacy = LegacyFeatureToggles {
             include_plan_tool: cfg.include_plan_tool,
-            experimental_sandbox_command_assessment: cfg.experimental_sandbox_command_assessment,
             experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-            experimental_use_rmcp_client: cfg.experimental_use_rmcp_client,
             tools_web_search: cfg.tools.as_ref().and_then(|t| t.web_search),
             tools_view_image: cfg.tools.as_ref().and_then(|t| t.view_image),
             ..Default::default()
@@ -200,13 +245,10 @@ impl Features {
         let profile_legacy = LegacyFeatureToggles {
             include_plan_tool: config_profile.include_plan_tool,
             include_apply_patch_tool: config_profile.include_apply_patch_tool,
-            experimental_sandbox_command_assessment: config_profile
-                .experimental_sandbox_command_assessment,
             experimental_use_freeform_apply_patch: config_profile
                 .experimental_use_freeform_apply_patch,
 
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
-            experimental_use_rmcp_client: config_profile.experimental_use_rmcp_client,
             tools_web_search: config_profile.tools_web_search,
             tools_view_image: config_profile.tools_view_image,
         };
@@ -237,7 +279,7 @@ pub fn is_known_feature_key(key: &str) -> bool {
 }
 
 /// Deserializable features table for TOML.
-#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct FeaturesToml {
     #[serde(flatten)]
     pub entries: BTreeMap<String, bool>,
@@ -253,34 +295,23 @@ pub struct FeatureSpec {
 }
 
 pub const FEATURES: &[FeatureSpec] = &[
+    // Stable features.
     FeatureSpec {
-        id: Feature::UnifiedExec,
-        key: "unified_exec",
-        stage: Stage::Experimental,
+        id: Feature::GhostCommit,
+        key: "undo",
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::ShellCommandTool,
-        key: "shell_command_tool",
-        stage: Stage::Experimental,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::RmcpClient,
-        key: "rmcp_client",
-        stage: Stage::Experimental,
-        default_enabled: false,
+        id: Feature::ParallelToolCalls,
+        key: "parallel",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::PlanTool,
         key: "plan_tool",
         stage: Stage::Stable,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ApplyPatchFreeform,
-        key: "apply_patch_freeform",
-        stage: Stage::Beta,
         default_enabled: false,
     },
     FeatureSpec {
@@ -290,26 +321,95 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::ShellTool,
+        key: "shell_tool",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ModelWarnings,
+        key: "warnings",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::WebSearchRequest,
         key: "web_search_request",
         stage: Stage::Stable,
         default_enabled: false,
     },
+    // Beta program. Rendered in the `/experimental` menu for users.
     FeatureSpec {
-        id: Feature::SandboxCommandAssessment,
-        key: "experimental_sandbox_command_assessment",
+        id: Feature::UnifiedExec,
+        key: "unified_exec",
+        stage: Stage::Beta {
+            name: "Background terminal",
+            menu_description: "Run long-running terminal commands in the background.",
+            announcement: "NEW! Try Background terminals for long running processes. Enable in /experimental!",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ShellSnapshot,
+        key: "shell_snapshot",
+        stage: Stage::Beta {
+            name: "Shell snapshot",
+            menu_description: "Snapshot your shell environment to avoid re-running login scripts for every command.",
+            announcement: "NEW! Try shell snapshotting to make your Codex faster. Enable in /experimental!",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ApplyPatchFreeform,
+        key: "apply_patch_freeform",
         stage: Stage::Experimental,
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::GhostCommit,
-        key: "ghost_commit",
+        id: Feature::ExecPolicy,
+        key: "exec_policy",
         stage: Stage::Experimental,
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::WindowsSandbox,
-        key: "enable_experimental_windows_sandbox",
+        key: "experimental_windows_sandbox",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WindowsSandboxElevated,
+        key: "elevated_windows_sandbox",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RemoteCompaction,
+        key: "remote_compaction",
+        stage: Stage::Experimental,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RemoteModels,
+        key: "remote_models",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Skills,
+        key: "skills",
+        stage: Stage::Experimental,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::PowershellUtf8,
+        key: "powershell_utf8",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Tui2,
+        key: "tui2",
         stage: Stage::Experimental,
         default_enabled: false,
     },

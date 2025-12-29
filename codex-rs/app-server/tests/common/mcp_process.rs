@@ -11,13 +11,15 @@ use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 
 use anyhow::Context;
-use assert_cmd::prelude::*;
 use codex_app_server_protocol::AddConversationListenerParams;
 use codex_app_server_protocol::ArchiveConversationParams;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginChatGptParams;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
+use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigReadParams;
+use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAuthStatusParams;
@@ -35,6 +37,7 @@ use codex_app_server_protocol::NewConversationParams;
 use codex_app_server_protocol::RemoveConversationListenerParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ResumeConversationParams;
+use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::SendUserMessageParams;
 use codex_app_server_protocol::SendUserTurnParams;
 use codex_app_server_protocol::ServerRequest;
@@ -45,7 +48,6 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
-use std::process::Command as StdCommand;
 use tokio::process::Command;
 
 pub struct McpProcess {
@@ -74,12 +76,8 @@ impl McpProcess {
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        // Use assert_cmd to locate the binary path and then switch to tokio::process::Command
-        let std_cmd = StdCommand::cargo_bin("codex-app-server")
-            .context("should find binary for codex-mcp-server")?;
-
-        let program = std_cmd.get_program().to_owned();
-
+        let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
+            .context("should find binary for codex-app-server")?;
         let mut cmd = Command::new(program);
 
         cmd.stdin(Stdio::piped());
@@ -377,6 +375,15 @@ impl McpProcess {
         self.send_request("turn/interrupt", params).await
     }
 
+    /// Send a `review/start` JSON-RPC request (v2).
+    pub async fn send_review_start_request(
+        &mut self,
+        params: ReviewStartParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("review/start", params).await
+    }
+
     /// Send a `cancelLoginChatGpt` JSON-RPC request.
     pub async fn send_cancel_login_chat_gpt_request(
         &mut self,
@@ -389,6 +396,30 @@ impl McpProcess {
     /// Send a `logoutChatGpt` JSON-RPC request.
     pub async fn send_logout_chat_gpt_request(&mut self) -> anyhow::Result<i64> {
         self.send_request("logoutChatGpt", None).await
+    }
+
+    pub async fn send_config_read_request(
+        &mut self,
+        params: ConfigReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("config/read", params).await
+    }
+
+    pub async fn send_config_value_write_request(
+        &mut self,
+        params: ConfigValueWriteParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("config/value/write", params).await
+    }
+
+    pub async fn send_config_batch_write_request(
+        &mut self,
+        params: ConfigBatchWriteParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("config/batchWrite", params).await
     }
 
     /// Send an `account/logout` JSON-RPC request.

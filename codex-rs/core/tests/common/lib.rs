@@ -4,14 +4,15 @@ use tempfile::TempDir;
 
 use codex_core::CodexConversation;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
-use codex_core::config::ConfigToml;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
+use std::path::PathBuf;
 
-#[cfg(target_os = "linux")]
-use assert_cmd::cargo::cargo_bin;
-
+pub mod process;
 pub mod responses;
+pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
 
@@ -25,22 +26,68 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
         .unwrap_or_else(|| panic!("regex {pattern:?} did not match {actual:?}"))
 }
 
+pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(windows) = windows_path {
+            PathBuf::from(windows)
+        } else {
+            let mut path = PathBuf::from(r"C:\");
+            path.extend(
+                unix_path
+                    .trim_start_matches('/')
+                    .split('/')
+                    .filter(|segment| !segment.is_empty()),
+            );
+            path
+        }
+    } else {
+        PathBuf::from(unix_path)
+    }
+}
+
+pub fn test_path_buf(unix_path: &str) -> PathBuf {
+    test_path_buf_with_windows(unix_path, None)
+}
+
+pub fn test_absolute_path_with_windows(
+    unix_path: &str,
+    windows_path: Option<&str>,
+) -> AbsolutePathBuf {
+    AbsolutePathBuf::from_absolute_path(test_path_buf_with_windows(unix_path, windows_path))
+        .expect("test path should be absolute")
+}
+
+pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
+    test_absolute_path_with_windows(unix_path, None)
+}
+
+pub fn test_tmp_path() -> AbsolutePathBuf {
+    test_absolute_path_with_windows("/tmp", Some(r"C:\Users\codex\AppData\Local\Temp"))
+}
+
+pub fn test_tmp_path_buf() -> PathBuf {
+    test_tmp_path().into_path_buf()
+}
+
 /// Returns a default `Config` whose on-disk state is confined to the provided
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
-pub fn load_default_config_for_test(codex_home: &TempDir) -> Config {
-    Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        default_test_overrides(),
-        codex_home.path().to_path_buf(),
-    )
-    .expect("defaults for test should always succeed")
+pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
+    ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(default_test_overrides())
+        .build()
+        .await
+        .expect("defaults for test should always succeed")
 }
 
 #[cfg(target_os = "linux")]
 fn default_test_overrides() -> ConfigOverrides {
     ConfigOverrides {
-        codex_linux_sandbox_exe: Some(cargo_bin("codex-linux-sandbox")),
+        codex_linux_sandbox_exe: Some(
+            codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
+                .expect("should find binary for codex-linux-sandbox"),
+        ),
         ..ConfigOverrides::default()
     }
 }
@@ -170,6 +217,25 @@ pub fn sandbox_env_var() -> &'static str {
 
 pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+}
+
+pub fn format_with_current_shell(command: &str) -> Vec<String> {
+    codex_core::shell::default_user_shell().derive_exec_args(command, true)
+}
+
+pub fn format_with_current_shell_display(command: &str) -> String {
+    let args = format_with_current_shell(command);
+    shlex::try_join(args.iter().map(String::as_str)).expect("serialize current shell command")
+}
+
+pub fn format_with_current_shell_non_login(command: &str) -> Vec<String> {
+    codex_core::shell::default_user_shell().derive_exec_args(command, false)
+}
+
+pub fn format_with_current_shell_display_non_login(command: &str) -> String {
+    let args = format_with_current_shell_non_login(command);
+    shlex::try_join(args.iter().map(String::as_str))
+        .expect("serialize current shell command without login")
 }
 
 pub mod fs_wait {
@@ -356,6 +422,16 @@ macro_rules! skip_if_no_network {
             println!(
                 "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
             );
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_windows {
+    ($return_value:expr $(,)?) => {{
+        if cfg!(target_os = "windows") {
+            println!("Skipping test because it cannot execute on Windows.");
             return $return_value;
         }
     }};

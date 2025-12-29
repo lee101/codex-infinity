@@ -8,9 +8,9 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::features::Feature;
-use codex_core::model_family::find_family_for_model;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
+use codex_core::sandboxing::SandboxPermissions;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -96,10 +96,7 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model = "gpt-5".to_string();
-        config.model_family = find_family_for_model("gpt-5").expect("gpt-5 is a valid model");
-    });
+    let mut builder = test_codex().with_model("gpt-5");
     let test = builder.build(&server).await?;
 
     let command = ["/bin/echo", "shell ok"];
@@ -109,7 +106,7 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
     let first_args = json!({
         "command": command,
         "timeout_ms": 1_000,
-        "with_escalated_permissions": true,
+        "sandbox_permissions": SandboxPermissions::RequireEscalated,
     });
     let second_args = json!({
         "command": command,
@@ -196,11 +193,7 @@ async fn sandbox_denied_shell_returns_original_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model = "gpt-5-codex".to_string();
-        config.model_family =
-            find_family_for_model("gpt-5-codex").expect("gpt-5-codex model family");
-    });
+    let mut builder = test_codex().with_model("gpt-5.1-codex");
     let fixture = builder.build(&server).await?;
 
     let call_id = "sandbox-denied-shell";
@@ -350,10 +343,7 @@ async fn shell_timeout_includes_timeout_prefix_and_metadata() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model = "gpt-5".to_string();
-        config.model_family = find_family_for_model("gpt-5").expect("gpt-5 is a valid model");
-    });
+    let mut builder = test_codex().with_model("gpt-5");
     let test = builder.build(&server).await?;
 
     let call_id = "shell-timeout";
@@ -424,10 +414,11 @@ async fn shell_timeout_handles_background_grandchild_stdout() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model = "gpt-5".to_string();
-        config.model_family = find_family_for_model("gpt-5").expect("gpt-5 is a valid model");
-        config.sandbox_policy = SandboxPolicy::DangerFullAccess;
+    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
+        config
+            .sandbox_policy
+            .set(SandboxPolicy::DangerFullAccess)
+            .expect("set sandbox policy");
     });
     let test = builder.build(&server).await?;
 
@@ -520,7 +511,9 @@ async fn shell_spawn_failure_truncates_exec_error() -> Result<()> {
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|cfg| {
-        cfg.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        cfg.sandbox_policy
+            .set(SandboxPolicy::DangerFullAccess)
+            .expect("set sandbox policy");
     });
     let test = builder.build(&server).await?;
 

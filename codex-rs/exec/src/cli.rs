@@ -18,8 +18,14 @@ pub struct Cli {
     #[arg(long, short = 'm')]
     pub model: Option<String>,
 
+    /// Use open-source provider.
     #[arg(long = "oss", default_value_t = false)]
     pub oss: bool,
+
+    /// Specify which local provider to use (lmstudio or ollama).
+    /// If not specified with --oss, will use config default or show selection.
+    #[arg(long = "local-provider")]
+    pub oss_provider: Option<String>,
 
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
@@ -132,6 +138,9 @@ pub struct Cli {
 pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
+
+    /// Run a code review against the current repository.
+    Review(ReviewArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -142,10 +151,45 @@ pub struct ResumeArgs {
     pub session_id: Option<String>,
 
     /// Resume the most recent recorded session (newest) without specifying an id.
-    #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
+    #[arg(long = "last", default_value_t = false)]
     pub last: bool,
 
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    pub prompt: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct ReviewArgs {
+    /// Review staged, unstaged, and untracked changes.
+    #[arg(
+        long = "uncommitted",
+        default_value_t = false,
+        conflicts_with_all = ["base", "commit", "prompt"]
+    )]
+    pub uncommitted: bool,
+
+    /// Review changes against the given base branch.
+    #[arg(
+        long = "base",
+        value_name = "BRANCH",
+        conflicts_with_all = ["uncommitted", "commit", "prompt"]
+    )]
+    pub base: Option<String>,
+
+    /// Review the changes introduced by a commit.
+    #[arg(
+        long = "commit",
+        value_name = "SHA",
+        conflicts_with_all = ["uncommitted", "base", "prompt"]
+    )]
+    pub commit: Option<String>,
+
+    /// Optional commit title to display in the review summary.
+    #[arg(long = "title", value_name = "TITLE", requires = "commit")]
+    pub commit_title: Option<String>,
+
+    /// Custom review instructions. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
 }
