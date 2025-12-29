@@ -164,6 +164,8 @@ pub(crate) struct ToolCtx<'a> {
 pub(crate) struct SandboxRetryData {
     pub command: Vec<String>,
     pub cwd: PathBuf,
+    pub with_escalated_permissions: Option<bool>,
+    pub justification: Option<String>,
 }
 
 pub(crate) trait ProvidesSandboxRetryData {

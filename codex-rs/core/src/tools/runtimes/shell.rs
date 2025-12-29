@@ -33,8 +33,6 @@ pub struct ShellRequest {
     pub env: std::collections::HashMap<String, String>,
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
-    pub disable_timeout: bool,
-    pub passthrough_stdio: bool,
 }
 
 impl ProvidesSandboxRetryData for ShellRequest {
@@ -42,6 +40,8 @@ impl ProvidesSandboxRetryData for ShellRequest {
         Some(SandboxRetryData {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+            with_escalated_permissions: self.with_escalated_permissions,
+            justification: self.justification.clone(),
         })
     }
 }
@@ -149,8 +149,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             req.timeout_ms,
             req.with_escalated_permissions,
             req.justification.clone(),
-            req.disable_timeout,
-            req.passthrough_stdio,
         )?;
         let env = attempt
             .env_for(&spec)

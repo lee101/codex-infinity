@@ -32,21 +32,14 @@ pub struct ShellCommandHandler;
 
 impl ShellHandler {
     fn to_exec_params(params: ShellToolCallParams, turn_context: &TurnContext) -> ExecParams {
-        let env = if turn_context.passthrough_shell_environment {
-            std::env::vars().collect()
-        } else {
-            create_env(&turn_context.shell_environment_policy)
-        };
         ExecParams {
             command: params.command,
             cwd: turn_context.resolve_path(params.workdir.clone()),
             timeout_ms: params.timeout_ms,
-            env,
+            env: create_env(&turn_context.shell_environment_policy),
             with_escalated_permissions: params.with_escalated_permissions,
             justification: params.justification,
             arg0: None,
-            disable_timeout: turn_context.disable_command_timeouts,
-            passthrough_stdio: turn_context.passthrough_shell_stdio,
         }
     }
 }
@@ -310,8 +303,6 @@ impl ShellHandler {
             env: exec_params.env.clone(),
             with_escalated_permissions: exec_params.with_escalated_permissions,
             justification: exec_params.justification.clone(),
-            disable_timeout: exec_params.disable_timeout,
-            passthrough_stdio: exec_params.passthrough_stdio,
         };
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = ShellRuntime::new();

@@ -1068,8 +1068,6 @@ impl CodexMessageProcessor {
             with_escalated_permissions: None,
             justification: None,
             arg0: None,
-            disable_timeout: false,
-            passthrough_stdio: false,
         };
 
         let effective_policy = params

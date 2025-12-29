@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-test-client"
-version = "0.0.0"
+version = "0.56.0"
 dependencies = [
  "anyhow",
  "clap",

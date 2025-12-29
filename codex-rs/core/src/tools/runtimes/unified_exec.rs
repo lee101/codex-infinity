@@ -31,6 +31,8 @@ pub struct UnifiedExecRequest {
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
+    pub with_escalated_permissions: Option<bool>,
+    pub justification: Option<String>,
 }
 
 impl ProvidesSandboxRetryData for UnifiedExecRequest {
@@ -38,6 +40,8 @@ impl ProvidesSandboxRetryData for UnifiedExecRequest {
         Some(SandboxRetryData {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+            with_escalated_permissions: self.with_escalated_permissions,
+            justification: self.justification.clone(),
         })
     }
 }
@@ -53,8 +57,20 @@ pub struct UnifiedExecRuntime<'a> {
 }
 
 impl UnifiedExecRequest {
-    pub fn new(command: Vec<String>, cwd: PathBuf, env: HashMap<String, String>) -> Self {
-        Self { command, cwd, env }
+    pub fn new(
+        command: Vec<String>,
+        cwd: PathBuf,
+        env: HashMap<String, String>,
+        with_escalated_permissions: Option<bool>,
+        justification: Option<String>,
+    ) -> Self {
+        Self {
+            command,
+            cwd,
+            env,
+            with_escalated_permissions,
+            justification,
+        }
     }
 }
 
@@ -120,10 +136,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecSession> for UnifiedExecRunt
             &req.cwd,
             &req.env,
             None,
-            None,
-            None,
-            false,
-            false,
+            req.with_escalated_permissions,
+            req.justification.clone(),
         )
         .map_err(|_| ToolError::Rejected("missing command line for PTY".to_string()))?;
         let exec_env = attempt

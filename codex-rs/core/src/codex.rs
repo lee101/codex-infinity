@@ -93,6 +93,7 @@ use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
+use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
@@ -131,9 +132,8 @@ use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
 use codex_utils_tokenizer::warm_model_cache;
 
-pub mod compact;
-use self::compact::build_compacted_history;
-use self::compact::collect_user_messages;
+use crate::compact::build_compacted_history;
+use crate::compact::collect_user_messages;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -346,7 +346,7 @@ impl TurnContext {
     pub(crate) fn compact_prompt(&self) -> &str {
         self.compact_prompt
             .as_deref()
-            .unwrap_or(compact::SUMMARIZATION_PROMPT)
+            .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
     }
 }
 
@@ -1086,7 +1086,7 @@ impl Session {
     }
 
     /// Append ResponseItems to the in-memory conversation history only.
-    async fn record_into_history(&self, items: &[ResponseItem]) {
+    pub(crate) async fn record_into_history(&self, items: &[ResponseItem]) {
         let mut state = self.state.lock().await;
         state.record_items(items.iter());
     }
@@ -1138,7 +1138,7 @@ impl Session {
         items
     }
 
-    async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
         let recorder = {
             let guard = self.services.rollout.lock().await;
             guard.clone()
@@ -1155,7 +1155,7 @@ impl Session {
         state.clone_history()
     }
 
-    async fn update_token_usage_info(
+    pub(crate) async fn update_token_usage_info(
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
@@ -1172,7 +1172,37 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
-    async fn update_rate_limits(
+    pub(crate) async fn override_last_token_usage_estimate(
+        &self,
+        turn_context: &TurnContext,
+        estimated_total_tokens: i64,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            let mut info = state.token_info().unwrap_or(TokenUsageInfo {
+                total_token_usage: TokenUsage::default(),
+                last_token_usage: TokenUsage::default(),
+                model_context_window: None,
+            });
+
+            info.last_token_usage = TokenUsage {
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: estimated_total_tokens.max(0),
+            };
+
+            if info.model_context_window.is_none() {
+                info.model_context_window = turn_context.client.get_model_context_window();
+            }
+
+            state.set_token_info(Some(info));
+        }
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn update_rate_limits(
         &self,
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
@@ -1193,7 +1223,7 @@ impl Session {
         self.send_event(turn_context, event).await;
     }
 
-    async fn set_total_tokens_full(&self, turn_context: &TurnContext) {
+    pub(crate) async fn set_total_tokens_full(&self, turn_context: &TurnContext) {
         let context_window = turn_context.client.get_model_context_window();
         if let Some(context_window) = context_window {
             {
@@ -1236,7 +1266,7 @@ impl Session {
         self.send_event(turn_context, event).await;
     }
 
-    async fn notify_stream_error(&self, turn_context: &TurnContext, message: impl Into<String>) {
+    pub(crate) async fn notify_stream_error(&self, turn_context: &TurnContext, message: impl Into<String>) {
         let event = EventMsg::StreamError(StreamErrorEvent {
             message: message.into(),
         });
@@ -1761,8 +1791,7 @@ async fn spawn_review_thread(
     let mut review_features = config.features.clone();
     review_features
         .disable(crate::features::Feature::WebSearchRequest)
-        .disable(crate::features::Feature::ViewImageTool)
-        .disable(crate::features::Feature::StreamableShell);
+        .disable(crate::features::Feature::ViewImageTool);
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_family: &review_model_family,
         features: &review_features,
@@ -1944,7 +1973,7 @@ pub(crate) async fn run_task(
                         break;
                     }
                     auto_compact_recently_attempted = true;
-                    compact::run_inline_auto_compact_task(sess.clone(), turn_context.clone()).await;
+                    crate::compact::run_inline_auto_compact_task(sess.clone(), turn_context.clone()).await;
                     continue;
                 }
 
@@ -2290,14 +2319,14 @@ async fn try_run_turn(
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryDelta(delta) => {
+            ResponseEvent::ReasoningSummaryDelta { delta, summary_index } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
                         delta: delta.clone(),
-                        summary_index: 0,
+                        summary_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
@@ -2305,22 +2334,22 @@ async fn try_run_turn(
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryPartAdded => {
+            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
                 let item_id = active_item.as_ref().map(|item| item.id()).unwrap_or_default();
                 let event = EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                     item_id,
-                    summary_index: 0,
+                    summary_index,
                 });
                 sess.send_event(&turn_context, event).await;
             }
-            ResponseEvent::ReasoningContentDelta(delta) => {
+            ResponseEvent::ReasoningContentDelta { delta, content_index } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
                         delta: delta.clone(),
-                        content_index: 0,
+                        content_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
