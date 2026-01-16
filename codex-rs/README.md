@@ -16,7 +16,12 @@ npm i -g @openai/codex
 codex
 ```
 
-You can also install via Homebrew (`brew install codex`) or download a platform-specific release directly from our [GitHub Releases](https://github.com/openai/codex/releases).
+You can also install via Homebrew (`brew install --cask codex`) or download a platform-specific release directly from our [GitHub Releases](https://github.com/openai/codex/releases).
+
+## Documentation quickstart
+
+- First run with Codex? Start with [`docs/getting-started.md`](../docs/getting-started.md) (links to the walkthrough for prompts, keyboard shortcuts, and session management).
+- Want deeper control? See [`docs/config.md`](../docs/config.md) and [`docs/install.md`](../docs/install.md).
 
 ## What's new in the Rust CLI
 
@@ -30,7 +35,7 @@ Codex supports a rich set of configuration options. Note that the Rust CLI uses 
 
 #### MCP client
 
-Codex CLI functions as an MCP client that allows the Codex CLI and IDE extension to connect to MCP servers on startup. See the [`configuration documentation`](../docs/config.md#mcp_servers) for details.
+Codex CLI functions as an MCP client that allows the Codex CLI and IDE extension to connect to MCP servers on startup. See the [`configuration documentation`](../docs/config.md#connecting-to-mcp-servers) for details.
 
 #### MCP server (experimental)
 

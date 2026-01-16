@@ -12,6 +12,7 @@ use codex_app_server_protocol::AuthMode;
 use http::HeaderMap;
 use http::header::HeaderName;
 use http::header::HeaderValue;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -36,11 +37,15 @@ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 /// *Responses* API. The two protocols use different request/response shapes
 /// and *cannot* be auto-detected at runtime, therefore each provider entry
 /// must declare which one it expects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     Responses,
+
+    /// Experimental: Responses API over WebSocket transport.
+    #[serde(rename = "responses_websocket")]
+    ResponsesWebsocket,
 
     /// Regular Chat Completions compatible with `/v1/chat/completions`.
     #[default]
@@ -48,7 +53,8 @@ pub enum WireApi {
 }
 
 /// Serializable representation of a provider definition.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ModelProviderInfo {
     /// Friendly display name.
     pub name: String,
@@ -156,6 +162,7 @@ impl ModelProviderInfo {
             query_params: self.query_params.clone(),
             wire: match self.wire_api {
                 WireApi::Responses => ApiWireApi::Responses,
+                WireApi::ResponsesWebsocket => ApiWireApi::Responses,
                 WireApi::Chat => ApiWireApi::Chat,
             },
             headers,
@@ -258,8 +265,10 @@ impl ModelProviderInfo {
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 
+pub const BUILT_IN_OSS_MODEL_PROVIDER_ID: &str = "oss";
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
+pub const OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
@@ -273,6 +282,10 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
         ("openai", P::create_openai_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
+            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
+        ),
+        (
+            OLLAMA_CHAT_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Chat),
         ),
         (
@@ -352,7 +365,10 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 requires_openai_auth: false,
             },
         ),
-        (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
+        (
+            BUILT_IN_OSS_MODEL_PROVIDER_ID,
+            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
+        ),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

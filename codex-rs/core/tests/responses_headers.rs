@@ -9,15 +9,18 @@ use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
+use codex_core::WEB_SEARCH_ELIGIBLE_HEADER;
 use codex_core::WireApi;
 use codex_core::models_manager::manager::ModelsManager;
-use codex_otel::otel_manager::OtelManager;
-use codex_protocol::ConversationId;
+use codex_otel::OtelManager;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
+use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use tempfile::TempDir;
 use wiremock::matchers::header;
@@ -65,14 +68,14 @@ async fn responses_stream_includes_subagent_header_on_review() {
     config.model = Some(model.clone());
     let config = Arc::new(config);
 
-    let conversation_id = ConversationId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode = AuthMode::ChatGPT;
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);
-    let model_family = ModelsManager::construct_model_family_offline(model.as_str(), &config);
+    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
     let otel_manager = OtelManager::new(
         conversation_id,
         model.as_str(),
-        model_family.slug.as_str(),
+        model_info.slug.as_str(),
         None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
@@ -81,17 +84,18 @@ async fn responses_stream_includes_subagent_header_on_review() {
         session_source.clone(),
     );
 
-    let client = ModelClient::new(
+    let mut client_session = ModelClient::new(
         Arc::clone(&config),
         None,
-        model_family,
+        model_info,
         otel_manager,
         provider,
         effort,
         summary,
         conversation_id,
         session_source,
-    );
+    )
+    .new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
@@ -102,7 +106,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         }],
     }];
 
-    let mut stream = client.stream(&prompt).await.expect("stream failed");
+    let mut stream = client_session.stream(&prompt).await.expect("stream failed");
     while let Some(event) = stream.next().await {
         if matches!(event, Ok(ResponseEvent::Completed { .. })) {
             break;
@@ -159,15 +163,15 @@ async fn responses_stream_includes_subagent_header_on_other() {
     config.model = Some(model.clone());
     let config = Arc::new(config);
 
-    let conversation_id = ConversationId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode = AuthMode::ChatGPT;
     let session_source = SessionSource::SubAgent(SubAgentSource::Other("my-task".to_string()));
-    let model_family = ModelsManager::construct_model_family_offline(model.as_str(), &config);
+    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
 
     let otel_manager = OtelManager::new(
         conversation_id,
         model.as_str(),
-        model_family.slug.as_str(),
+        model_info.slug.as_str(),
         None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
@@ -176,17 +180,18 @@ async fn responses_stream_includes_subagent_header_on_other() {
         session_source.clone(),
     );
 
-    let client = ModelClient::new(
+    let mut client_session = ModelClient::new(
         Arc::clone(&config),
         None,
-        model_family,
+        model_info,
         otel_manager,
         provider,
         effort,
         summary,
         conversation_id,
         session_source,
-    );
+    )
+    .new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
@@ -197,7 +202,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         }],
     }];
 
-    let mut stream = client.stream(&prompt).await.expect("stream failed");
+    let mut stream = client_session.stream(&prompt).await.expect("stream failed");
     while let Some(event) = stream.next().await {
         if matches!(event, Ok(ResponseEvent::Completed { .. })) {
             break;
@@ -212,7 +217,67 @@ async fn responses_stream_includes_subagent_header_on_other() {
 }
 
 #[tokio::test]
-async fn responses_respects_model_family_overrides_from_config() {
+async fn responses_stream_includes_web_search_eligible_header_true_by_default() {
+    core_test_support::skip_if_no_network!();
+
+    let server = responses::start_mock_server().await;
+    let response_body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]);
+
+    let request_recorder = responses::mount_sse_once_match(
+        &server,
+        header(WEB_SEARCH_ELIGIBLE_HEADER, "true"),
+        response_body,
+    )
+    .await;
+
+    let test = test_codex().build(&server).await.expect("build test codex");
+    test.submit_turn("hello").await.expect("submit test prompt");
+
+    let request = request_recorder.single_request();
+    assert_eq!(
+        request.header(WEB_SEARCH_ELIGIBLE_HEADER).as_deref(),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn responses_stream_includes_web_search_eligible_header_false_when_disabled() {
+    core_test_support::skip_if_no_network!();
+
+    let server = responses::start_mock_server().await;
+    let response_body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]);
+
+    let request_recorder = responses::mount_sse_once_match(
+        &server,
+        header(WEB_SEARCH_ELIGIBLE_HEADER, "false"),
+        response_body,
+    )
+    .await;
+
+    let test = test_codex()
+        .with_config(|config| {
+            config.web_search_mode = Some(WebSearchMode::Disabled);
+        })
+        .build(&server)
+        .await
+        .expect("build test codex");
+    test.submit_turn("hello").await.expect("submit test prompt");
+
+    let request = request_recorder.single_request();
+    assert_eq!(
+        request.header(WEB_SEARCH_ELIGIBLE_HEADER).as_deref(),
+        Some("false")
+    );
+}
+
+#[tokio::test]
+async fn responses_respects_model_info_overrides_from_config() {
     core_test_support::skip_if_no_network!();
 
     let server = responses::start_mock_server().await;
@@ -251,16 +316,16 @@ async fn responses_respects_model_family_overrides_from_config() {
     let model = config.model.clone().expect("model configured");
     let config = Arc::new(config);
 
-    let conversation_id = ConversationId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode =
         AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key")).get_auth_mode();
     let session_source =
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));
-    let model_family = ModelsManager::construct_model_family_offline(model.as_str(), &config);
+    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
     let otel_manager = OtelManager::new(
         conversation_id,
         model.as_str(),
-        model_family.slug.as_str(),
+        model_info.slug.as_str(),
         None,
         Some("test@test.com".to_string()),
         auth_mode,
@@ -269,17 +334,18 @@ async fn responses_respects_model_family_overrides_from_config() {
         session_source.clone(),
     );
 
-    let client = ModelClient::new(
+    let mut client = ModelClient::new(
         Arc::clone(&config),
         None,
-        model_family,
+        model_info,
         otel_manager,
         provider,
         effort,
         summary,
         conversation_id,
         session_source,
-    );
+    )
+    .new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {

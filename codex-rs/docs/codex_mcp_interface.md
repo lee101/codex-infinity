@@ -70,7 +70,9 @@ Response: `{ conversationId, model, reasoningEffort?, rolloutPath }`
 Send input to the active turn:
 
 - `sendUserMessage` → enqueue items to the conversation
-- `sendUserTurn` → structured turn with explicit `cwd`, `approvalPolicy`, `sandboxPolicy`, `model`, optional `effort`, and `summary`
+- `sendUserTurn` → structured turn with explicit `cwd`, `approvalPolicy`, `sandboxPolicy`, `model`, optional `effort`, `summary`, and optional `outputSchema` (JSON Schema for the final assistant message)
+
+For v2 threads, `turn/start` also accepts `outputSchema` to constrain the final assistant message for that turn.
 
 Interrupt a running turn: `interruptConversation`.
 
@@ -102,6 +104,24 @@ While a conversation runs, the server sends notifications:
 - Auth notifications via method names `loginChatGptComplete` and `authStatusChange`.
 
 Clients should render events and, when present, surface approval requests (see next section).
+
+## Tool responses
+
+The `codex` and `codex-reply` tools return standard MCP `CallToolResult` payloads. For
+compatibility with MCP clients that prefer `structuredContent`, Codex mirrors the
+content blocks inside `structuredContent` alongside the `threadId`.
+
+Example:
+
+```json
+{
+  "content": [{ "type": "text", "text": "Hello from Codex" }],
+  "structuredContent": {
+    "threadId": "019bbed6-1e9e-7f31-984c-a05b65045719",
+    "content": "Hello from Codex"
+  }
+}
+```
 
 ## Approvals (server → client)
 

@@ -2,13 +2,15 @@
 
 What Codex is allowed to do is governed by a combination of **sandbox modes** (what Codex is allowed to do without supervision) and **approval policies** (when you must confirm an action). This page explains the options, how they interact, and how the sandbox behaves on each platform.
 
+For more information, see [the official documentation](https://developers.openai.com/codex/security).
+
 ### Approval policies
 
 Codex starts conservatively. Until you explicitly tell it a working directory is trusted, the CLI defaults to **read-only**. Codex can inspect files and answer questions, but every edit or command requires approval.
 
-When you mark a working directory as trusted (for example via the onboarding prompt or `/approvals` → “Trust this directory”), Codex upgrades the default preset to **Agent**, which allows writes inside the workspace. Codex only interrupts you when it needs to leave the workspace or rerun something outside the sandbox. Note that the workspace includes the working directory plus temporary directories like `/tmp`. Use `/status` to confirm the exact writable roots.
+When you mark a working directory as trusted (for example via the onboarding prompt or `/approvals` -> "Trust this directory"), Codex upgrades the default preset to **Agent**, which allows writes inside the workspace. Codex only interrupts you when it needs to leave the workspace or rerun something outside the sandbox. Note that the workspace includes the working directory plus temporary directories like `/tmp`. Use `/status` to confirm the exact writable roots.
 
-If you want maximum guardrails for a trusted repo, switch back to Read Only from the `/approvals` picker. If you truly need hands-off automation, use `Full Access`—but be deliberate, because that skips both the sandbox and approvals.
+If you want maximum guardrails for a trusted repo, switch back to Read Only from the `/approvals` picker. If you truly need hands-off automation, use `Full Access`--but be deliberate, because that skips both the sandbox and approvals.
 
 ### Can I run without ANY approvals?
 
