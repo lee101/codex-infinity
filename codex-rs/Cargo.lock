@@ -1582,6 +1582,7 @@ dependencies = [
  "mcp_test_support",
  "os_info",
  "pretty_assertions",
+ "reqwest",
  "schemars 0.8.22",
  "serde",
  "serde_json",

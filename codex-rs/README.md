@@ -49,6 +49,19 @@ npx @modelcontextprotocol/inspector codex mcp-server
 
 Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.toml`, and `codex mcp-server` to run the MCP server directly.
 
+#### RA1 Art Generator Tool
+
+The MCP server includes an optional `ra1-art-generator` tool for generating AI images via [netwrck.com](https://netwrck.com). The tool is automatically enabled when the `NETWRCK_API_KEY` environment variable is set.
+
+```shell
+export NETWRCK_API_KEY="your-api-key"
+codex mcp-server
+```
+
+When enabled, the tool accepts:
+- `prompt` (required): Description of the image to generate
+- `size` (optional): Image dimensions (e.g. "1024x1024", "1360x768")
+
 ### Notifications
 
 You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS. When Codex detects that it is running under WSL 2 inside Windows Terminal (`WT_SESSION` is set), the TUI automatically falls back to native Windows toast notifications so approval prompts and completed turns surface even though Windows Terminal does not implement OSC 9.

@@ -7,6 +7,7 @@ use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::ra1_tool::{create_tool_for_ra1_art_generator, handle_ra1_art_generator, is_ra1_available};
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 
@@ -305,11 +306,15 @@ impl MessageProcessor {
         params: <mcp_types::ListToolsRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::trace!("tools/list -> {params:?}");
+        let mut tools = vec![
+            create_tool_for_codex_tool_call_param(),
+            create_tool_for_codex_tool_call_reply_param(),
+        ];
+        if is_ra1_available() {
+            tools.push(create_tool_for_ra1_art_generator());
+        }
         let result = ListToolsResult {
-            tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
-            ],
+            tools,
             next_cursor: None,
         };
 
@@ -330,6 +335,11 @@ impl MessageProcessor {
             "codex-reply" => {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
+            }
+            "ra1-art-generator" => {
+                let result = handle_ra1_art_generator(arguments).await;
+                self.send_response::<mcp_types::CallToolRequest>(id, result)
+                    .await;
             }
             _ => {
                 let result = CallToolResult {
