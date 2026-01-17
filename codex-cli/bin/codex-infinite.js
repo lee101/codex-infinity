@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unified entry point for the Codex CLI.
+// Unified entry point for Codex Infinite CLI.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "fs";
@@ -12,16 +12,16 @@ const __dirname = path.dirname(__filename);
 
 const { platform, arch } = process;
 
-let targetTriple = null;
+let targetTriples = [];
 switch (platform) {
   case "linux":
   case "android":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-unknown-linux-musl";
+        targetTriples = ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"];
         break;
       case "arm64":
-        targetTriple = "aarch64-unknown-linux-musl";
+        targetTriples = ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
         break;
       default:
         break;
@@ -30,10 +30,10 @@ switch (platform) {
   case "darwin":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-apple-darwin";
+        targetTriples = ["x86_64-apple-darwin"];
         break;
       case "arm64":
-        targetTriple = "aarch64-apple-darwin";
+        targetTriples = ["aarch64-apple-darwin"];
         break;
       default:
         break;
@@ -42,10 +42,10 @@ switch (platform) {
   case "win32":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-pc-windows-msvc";
+        targetTriples = ["x86_64-pc-windows-msvc"];
         break;
       case "arm64":
-        targetTriple = "aarch64-pc-windows-msvc";
+        targetTriples = ["aarch64-pc-windows-msvc"];
         break;
       default:
         break;
@@ -55,14 +55,28 @@ switch (platform) {
     break;
 }
 
-if (!targetTriple) {
+if (targetTriples.length === 0) {
   throw new Error(`Unsupported platform: ${platform} (${arch})`);
 }
 
 const vendorRoot = path.join(__dirname, "..", "vendor");
-const archRoot = path.join(vendorRoot, targetTriple);
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const binaryPath = path.join(archRoot, "codex", codexBinaryName);
+const binaryName = process.platform === "win32" ? "codex.exe" : "codex";
+
+// Find the first available binary
+let binaryPath = null;
+let archRoot = null;
+for (const triple of targetTriples) {
+  archRoot = path.join(vendorRoot, triple);
+  const candidatePath = path.join(archRoot, "codex", binaryName);
+  if (existsSync(candidatePath)) {
+    binaryPath = candidatePath;
+    break;
+  }
+}
+
+if (!binaryPath) {
+  throw new Error(`No binary found for platform: ${platform} (${arch}). Tried: ${targetTriples.join(", ")}`);
+}
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is

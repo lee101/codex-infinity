@@ -1,10 +1,10 @@
 {
-  "name": "milhouse",
-  "version": "0.0.1",
+  "name": "@lee101-3/codex-infinite",
+  "version": "0.0.2",
   "license": "Apache-2.0",
-  "description": "Milhouse - a smarter coding agent that can run forever",
+  "description": "Codex Infinite - a smarter coding agent that can run forever",
   "bin": {
-    "milhouse": "bin/milhouse.js"
+    "codex-infinite": "bin/codex-infinite.js"
   },
   "type": "module",
   "engines": {
@@ -24,7 +24,6 @@
     "coding",
     "agent",
     "cli",
-    "milhouse",
     "autonomous",
     "codex"
   ]

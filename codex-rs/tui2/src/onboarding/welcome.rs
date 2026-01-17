@@ -77,7 +77,7 @@ impl WidgetRef for &WelcomeWidget {
         lines.push(Line::from(vec![
             "  ".into(),
             "Welcome to ".into(),
-            "Milhouse".bold(),
+            "Codex Infinite".bold(),
             ", a smarter coding agent that runs forever".into(),
         ]));
 
