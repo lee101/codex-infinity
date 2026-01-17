@@ -1,9 +1,10 @@
 {
-  "name": "@openai/codex",
-  "version": "0.0.0-dev",
+  "name": "millhouse",
+  "version": "0.0.1",
   "license": "Apache-2.0",
+  "description": "Millhouse - a command-line coding agent",
   "bin": {
-    "codex": "bin/codex.js"
+    "millhouse": "bin/millhouse.js"
   },
   "type": "module",
   "engines": {
@@ -15,7 +16,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openai/codex.git",
+    "url": "git+https://github.com/lee101/codex.git",
     "directory": "codex-cli"
-  }
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "cli",
+    "millhouse"
+  ]
 }
