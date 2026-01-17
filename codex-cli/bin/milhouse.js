@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unified entry point for the Millhouse CLI.
+// Unified entry point for the Milhouse CLI.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "fs";

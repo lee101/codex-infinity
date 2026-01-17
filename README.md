@@ -1,28 +1,56 @@
-<p align="center"><code>npm i -g millhouse</code></p>
-<p align="center"><strong>Millhouse</strong> is a coding agent that runs locally on your computer.
 <p align="center">
-  <img src="./.github/codex-cli-splash.png" alt="Millhouse CLI splash" width="80%" />
+  <img src="./.github/milhouse.png" alt="Milhouse" width="200" />
 </p>
+
+<h1 align="center">Milhouse</h1>
+
+<p align="center"><code>npm i -g milhouse</code></p>
+
+<p align="center"><strong>Milhouse</strong> is a smarter coding agent that can run forever.</p>
 
 ---
 
-## Quickstart
+## What makes Milhouse different?
 
-### Installing and running Millhouse
+Milhouse is built on Codex but takes automation to the next level. With two simple arguments, Milhouse can continuously work on your codebase:
 
-Install globally with npm:
+- **`--auto-next-steps`** - Automatically continues working on the next logical steps after completing a task
+- **`--auto-next-idea`** - Generates and works on new ideas to improve your codebase
 
 ```shell
-npm install -g millhouse
+# Run milhouse with automatic continuation
+milhouse --auto-next-steps
+
+# Let milhouse dream up and implement new ideas
+milhouse --auto-next-idea
+
+# Combine both for fully autonomous coding
+milhouse --auto-next-steps --auto-next-idea
 ```
 
-Then simply run `millhouse` to get started.
+## Quickstart
 
-### Using Millhouse with your ChatGPT plan
+### Installation
 
-Run `millhouse` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Millhouse as part of your Plus, Pro, Team, Edu, or Enterprise plan.
+```shell
+npm install -g milhouse
+```
 
-You can also use Millhouse with an API key.
+Then simply run `milhouse` to get started.
+
+### Authentication
+
+Run `milhouse` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
+
+You can also use Milhouse with an API key.
+
+## Features
+
+- **Autonomous operation** - Set it and let it run
+- **Smart task continuation** - Knows what to do next
+- **Idea generation** - Can brainstorm and implement improvements
+- **Local execution** - Runs entirely on your machine
+- **Full Codex compatibility** - All Codex features work in Milhouse
 
 ## Docs
 

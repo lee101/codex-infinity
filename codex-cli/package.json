@@ -1,10 +1,10 @@
 {
-  "name": "millhouse",
+  "name": "milhouse",
   "version": "0.0.1",
   "license": "Apache-2.0",
-  "description": "Millhouse - a command-line coding agent",
+  "description": "Milhouse - a smarter coding agent that can run forever",
   "bin": {
-    "millhouse": "bin/millhouse.js"
+    "milhouse": "bin/milhouse.js"
   },
   "type": "module",
   "engines": {
@@ -24,6 +24,8 @@
     "coding",
     "agent",
     "cli",
-    "millhouse"
+    "milhouse",
+    "autonomous",
+    "codex"
   ]
 }
