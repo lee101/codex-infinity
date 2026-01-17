@@ -1,9 +1,10 @@
 {
-  "name": "@openai/codex",
-  "version": "0.0.0-dev",
+  "name": "milhouse",
+  "version": "0.0.1",
   "license": "Apache-2.0",
+  "description": "Milhouse - a smarter coding agent that can run forever",
   "bin": {
-    "codex": "bin/codex.js"
+    "milhouse": "bin/milhouse.js"
   },
   "type": "module",
   "engines": {
@@ -15,7 +16,16 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openai/codex.git",
+    "url": "git+https://github.com/lee101/codex.git",
     "directory": "codex-cli"
-  }
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "cli",
+    "milhouse",
+    "autonomous",
+    "codex"
+  ]
 }

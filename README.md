@@ -1,59 +1,60 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
-  <img src="./.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  <img src="./.github/milhouse.png" alt="Milhouse" width="200" />
 </p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+
+<h1 align="center">Milhouse</h1>
+
+<p align="center"><code>npm i -g milhouse</code></p>
+
+<p align="center"><strong>Milhouse</strong> is a smarter coding agent that can run forever.</p>
 
 ---
 
+## What makes Milhouse different?
+
+Milhouse is built on Codex but takes automation to the next level. With two simple arguments, Milhouse can continuously work on your codebase:
+
+- **`--auto-next-steps`** - Automatically continues working on the next logical steps after completing a task
+- **`--auto-next-idea`** - Generates and works on new ideas to improve your codebase
+
+```shell
+# Run milhouse with automatic continuation
+milhouse --auto-next-steps
+
+# Let milhouse dream up and implement new ideas
+milhouse --auto-next-idea
+
+# Combine both for fully autonomous coding
+milhouse --auto-next-steps --auto-next-idea
+```
+
 ## Quickstart
 
-### Installing and running Codex CLI
-
-Install globally with your preferred package manager:
+### Installation
 
 ```shell
-# Install using npm
-npm install -g @openai/codex
+npm install -g milhouse
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+Then simply run `milhouse` to get started.
 
-Then simply run `codex` to get started.
+### Authentication
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+Run `milhouse` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+You can also use Milhouse with an API key.
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+## Features
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Team, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+- **Autonomous operation** - Set it and let it run
+- **Smart task continuation** - Knows what to do next
+- **Idea generation** - Can brainstorm and implement improvements
+- **Local execution** - Runs entirely on your machine
+- **Full Codex compatibility** - All Codex features work in Milhouse
 
 ## Docs
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
