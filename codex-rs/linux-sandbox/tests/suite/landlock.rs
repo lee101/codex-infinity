@@ -62,8 +62,6 @@ async fn run_cmd_output(
         sandbox_permissions: SandboxPermissions::UseDefault,
         justification: None,
         arg0: None,
-        disable_timeout: false,
-        passthrough_stdio: false,
     };
 
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
@@ -181,8 +179,6 @@ async fn assert_network_blocked(cmd: &[&str]) {
         sandbox_permissions: SandboxPermissions::UseDefault,
         justification: None,
         arg0: None,
-        disable_timeout: false,
-        passthrough_stdio: false,
     };
 
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
