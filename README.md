@@ -21,10 +21,7 @@ Codex Infinite takes automation to the next level. With two simple arguments, it
 # Run codex-infinite with automatic continuation
 codex-infinite --auto-next-steps
 
-# Let codex-infinite dream up and implement new ideas
-codex-infinite --auto-next-idea
-
-# Combine both for fully autonomous coding
+# dream up and implement new ideas for fully autonomous coding
 codex-infinite --auto-next-steps --auto-next-idea
 ```
 
