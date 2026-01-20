@@ -60,6 +60,10 @@ cargo build --release -p codex-cli
 # Run the TUI
 cargo run --bin codex -- "your prompt here"
 ```
+### Support
+
+This project is supported from trading volume of the [codex memecoin on bags](
+https://bags.fm/HAK9cX1jfYmcNpr6keTkLvxehGPWKELXSu7GH2ofBAGS)
 
 ### Build TypeScript CLI
 
