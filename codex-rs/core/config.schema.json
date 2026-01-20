@@ -262,6 +262,14 @@
       "type": "integer",
       "format": "int64"
     },
+    "model_personality": {
+      "description": "EXPERIMENTAL Optionally specify a personality for the model",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Personality"
+        }
+      ]
+    },
     "model_provider": {
       "description": "Provider to use from the model_providers map.",
       "type": "string"
@@ -389,12 +397,12 @@
     },
     "shell_environment_policy": {
       "default": {
-        "inherit": null,
-        "ignore_default_excludes": null,
         "exclude": null,
-        "set": null,
+        "experimental_use_profile": null,
+        "ignore_default_excludes": null,
         "include_only": null,
-        "experimental_use_profile": null
+        "inherit": null,
+        "set": null
       },
       "allOf": [
         {
@@ -679,6 +687,9 @@
         },
         "model": {
           "type": "string"
+        },
+        "model_personality": {
+          "$ref": "#/definitions/Personality"
         },
         "model_provider": {
           "description": "The key in the `model_providers` map identifying the [`ModelProviderInfo`] to use.",
@@ -1104,6 +1115,13 @@
         }
       },
       "additionalProperties": false
+    },
+    "Personality": {
+      "type": "string",
+      "enum": [
+        "friendly",
+        "pragmatic"
+      ]
     },
     "ProjectConfig": {
       "type": "object",
