@@ -365,6 +365,26 @@ pub(crate) struct App {
 }
 
 impl App {
+    pub fn chatwidget_init_for_forked_or_resumed_thread(
+        &self,
+        tui: &mut tui::Tui,
+        cfg: codex_core::config::Config,
+    ) -> crate::chatwidget::ChatWidgetInit {
+        crate::chatwidget::ChatWidgetInit {
+            config: cfg,
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            // Fork/resume bootstraps here don't carry any prefilled message content.
+            initial_user_message: None,
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager: self.server.get_models_manager(),
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            model: Some(self.current_model.clone()),
+        }
+    }
+
     async fn shutdown_current_thread(&mut self) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
@@ -430,8 +450,12 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    initial_prompt: initial_prompt.clone(),
-                    initial_images: initial_images.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
                     enhanced_keys_supported,
                     auth_manager: auth_manager.clone(),
                     models_manager: thread_manager.get_models_manager(),
@@ -455,8 +479,12 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    initial_prompt: initial_prompt.clone(),
-                    initial_images: initial_images.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
                     enhanced_keys_supported,
                     auth_manager: auth_manager.clone(),
                     models_manager: thread_manager.get_models_manager(),
@@ -480,8 +508,12 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    initial_prompt: initial_prompt.clone(),
-                    initial_images: initial_images.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
                     enhanced_keys_supported,
                     auth_manager: auth_manager.clone(),
                     models_manager: thread_manager.get_models_manager(),
@@ -688,8 +720,8 @@ impl App {
                     config: self.config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: self.app_event_tx.clone(),
-                    initial_prompt: None,
-                    initial_images: Vec::new(),
+                    // New sessions start without prefilled message content.
+                    initial_user_message: None,
                     enhanced_keys_supported: self.enhanced_keys_supported,
                     auth_manager: self.auth_manager.clone(),
                     models_manager: self.server.get_models_manager(),
@@ -735,30 +767,17 @@ impl App {
                             .await
                         {
                             Ok(resumed) => {
-                                let (auto_next_steps, auto_next_idea) =
-                                    self.chat_widget.auto_prompt_flags();
                                 self.shutdown_current_thread().await;
-                                let init = crate::chatwidget::ChatWidgetInit {
-                                    config: self.config.clone(),
-                                    frame_requester: tui.frame_requester(),
-                                    app_event_tx: self.app_event_tx.clone(),
-                                    initial_prompt: None,
-                                    initial_images: Vec::new(),
-                                    enhanced_keys_supported: self.enhanced_keys_supported,
-                                    auth_manager: self.auth_manager.clone(),
-                                    models_manager: self.server.get_models_manager(),
-                                    feedback: self.feedback.clone(),
-                                    auto_next_steps,
-                                    auto_next_idea,
-                                    is_first_run: false,
-                                    model: Some(self.current_model.clone()),
-                                };
+                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                    tui,
+                                    self.config.clone(),
+                                );
                                 self.chat_widget = ChatWidget::new_from_existing(
                                     init,
                                     resumed.thread,
                                     resumed.session_configured,
                                 );
-                                self.current_model = model_info.slug.clone();
+                                self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
                                         vec![summary.usage_line.clone().into()];
@@ -869,30 +888,17 @@ impl App {
                         .await
                     {
                         Ok(forked) => {
-                            let (auto_next_steps, auto_next_idea) =
-                                self.chat_widget.auto_prompt_flags();
                             self.shutdown_current_thread().await;
-                            let init = crate::chatwidget::ChatWidgetInit {
-                                config: self.config.clone(),
-                                frame_requester: tui.frame_requester(),
-                                app_event_tx: self.app_event_tx.clone(),
-                                initial_prompt: None,
-                                initial_images: Vec::new(),
-                                enhanced_keys_supported: self.enhanced_keys_supported,
-                                auth_manager: self.auth_manager.clone(),
-                                models_manager: self.server.get_models_manager(),
-                                feedback: self.feedback.clone(),
-                                auto_next_steps,
-                                auto_next_idea,
-                                is_first_run: false,
-                                model: Some(self.current_model.clone()),
-                            };
+                            let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                tui,
+                                self.config.clone(),
+                            );
                             self.chat_widget = ChatWidget::new_from_existing(
                                 init,
                                 forked.thread,
                                 forked.session_configured,
                             );
-                            self.current_model = model_info.slug.clone();
+                            self.reset_thread_event_state();
                             if let Some(summary) = summary {
                                 let mut lines: Vec<Line<'static>> =
                                     vec![summary.usage_line.clone().into()];
@@ -2092,6 +2098,8 @@ mod tests {
         let user_cell = |text: &str| -> Arc<dyn HistoryCell> {
             Arc::new(UserHistoryCell {
                 message: text.to_string(),
+                text_elements: Vec::new(),
+                local_image_paths: Vec::new(),
             }) as Arc<dyn HistoryCell>
         };
         let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
