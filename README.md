@@ -46,7 +46,8 @@ You can also use Codex Infinite with an API key.
 - **Autonomous operation** - Set it and let it run
 - **Smart task continuation** - Knows what to do next
 - **Idea generation** - Can brainstorm and implement improvements
-- **Local execution** - Runs entirely on your machine
+- **Local execution** - Runs entirely on your machine or an [infinite cloud](https://codex-infinity.com/)
+- **AnyLLM** - bring any llm or your OpenAI codex max plan
 
 ## Development
 
