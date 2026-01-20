@@ -417,7 +417,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::RemoteModels,
         key: "remote_models",
         stage: Stage::Beta,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::PowershellUtf8,
