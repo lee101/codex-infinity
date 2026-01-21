@@ -2703,7 +2703,7 @@ mod handlers {
             .filter(|item| is_user_turn_boundary(item))
             .count();
         sess.services.otel_manager.counter(
-            "conversation.turn.count",
+            "codex.conversation.turn.count",
             i64::try_from(turn_count).unwrap_or(0),
             &[],
         );
