@@ -2340,6 +2340,9 @@ impl ChatWidget {
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
             }
+            SlashCommand::Permissions => {
+                self.open_permissions_popup();
+            }
             SlashCommand::ElevateSandbox => {
                 #[cfg(target_os = "windows")]
                 {
@@ -3613,6 +3616,16 @@ impl ChatWidget {
 
     /// Open a popup to choose the approvals mode (ask for approval policy + sandbox policy).
     pub(crate) fn open_approvals_popup(&mut self) {
+        self.open_approval_mode_popup(true);
+    }
+
+    /// Open a popup to choose the permissions mode (approval policy + sandbox policy).
+    pub(crate) fn open_permissions_popup(&mut self) {
+        let include_read_only = cfg!(target_os = "windows");
+        self.open_approval_mode_popup(include_read_only);
+    }
+
+    fn open_approval_mode_popup(&mut self, include_read_only: bool) {
         let current_approval = self.config.approval_policy.value();
         let current_sandbox = self.config.sandbox_policy.get();
         let mut items: Vec<SelectionItem> = Vec::new();
@@ -3629,10 +3642,13 @@ impl ChatWidget {
             && presets.iter().any(|preset| preset.id == "auto");
 
         for preset in presets.into_iter() {
+            if !include_read_only && preset.id == "read-only" {
+                continue;
+            }
             let is_current =
                 Self::preset_matches_current(current_approval, current_sandbox, &preset);
             let name = if preset.id == "auto" && windows_degraded_sandbox_enabled {
-                "Agent (non-elevated sandbox)".to_string()
+                "Default (non-elevated sandbox)".to_string()
             } else {
                 preset.label.to_string()
             };
@@ -3652,6 +3668,7 @@ impl ChatWidget {
                 vec![Box::new(move |tx| {
                     tx.send(AppEvent::OpenFullAccessConfirmation {
                         preset: preset_clone.clone(),
+                        return_to_permissions: !include_read_only,
                     });
                 })]
             } else if preset.id == "auto" {
@@ -3721,7 +3738,7 @@ impl ChatWidget {
         });
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Select Approval Mode".to_string()),
+            title: Some("Update Model Permissions".to_string()),
             footer_note,
             footer_hint: Some(standard_popup_hint_line()),
             items,
@@ -3821,7 +3838,11 @@ impl ChatWidget {
         None
     }
 
-    pub(crate) fn open_full_access_confirmation(&mut self, preset: ApprovalPreset) {
+    pub(crate) fn open_full_access_confirmation(
+        &mut self,
+        preset: ApprovalPreset,
+        return_to_permissions: bool,
+    ) {
         let approval = preset.approval;
         let sandbox = preset.sandbox;
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
@@ -3849,8 +3870,12 @@ impl ChatWidget {
             tx.send(AppEvent::PersistFullAccessWarningAcknowledged);
         }));
 
-        let deny_actions: Vec<SelectionAction> = vec![Box::new(|tx| {
-            tx.send(AppEvent::OpenApprovalsPopup);
+        let deny_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            if return_to_permissions {
+                tx.send(AppEvent::OpenPermissionsPopup);
+            } else {
+                tx.send(AppEvent::OpenApprovalsPopup);
+            }
         })];
 
         let items = vec![

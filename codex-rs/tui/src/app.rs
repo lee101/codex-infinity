@@ -1144,8 +1144,12 @@ impl App {
             AppEvent::OpenAllModelsPopup { models } => {
                 self.chat_widget.open_all_models_popup(models);
             }
-            AppEvent::OpenFullAccessConfirmation { preset } => {
-                self.chat_widget.open_full_access_confirmation(preset);
+            AppEvent::OpenFullAccessConfirmation {
+                preset,
+                return_to_permissions,
+            } => {
+                self.chat_widget
+                    .open_full_access_confirmation(preset, return_to_permissions);
             }
             AppEvent::OpenWorldWritableWarningConfirmation {
                 preset,
@@ -1586,6 +1590,9 @@ impl App {
                         ));
                     }
                 }
+            }
+            AppEvent::OpenPermissionsPopup => {
+                self.chat_widget.open_permissions_popup();
             }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
