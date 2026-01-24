@@ -247,6 +247,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
         auto_next_steps: auto_next_steps.then_some(true),
         auto_next_idea: auto_next_idea.then_some(true),
+        ephemeral: None,
         additional_writable_roots: add_dir,
     };
 
