@@ -1517,6 +1517,7 @@ pub enum SessionSource {
 pub enum SubAgentSource {
     Review,
     Compact,
+    ThreadSpawn { parent_thread_id: ThreadId },
     Other(String),
 }
 
@@ -1538,6 +1539,9 @@ impl fmt::Display for SubAgentSource {
         match self {
             SubAgentSource::Review => f.write_str("review"),
             SubAgentSource::Compact => f.write_str("compact"),
+            SubAgentSource::ThreadSpawn { parent_thread_id } => {
+                write!(f, "thread_spawn_{parent_thread_id}")
+            }
             SubAgentSource::Other(other) => f.write_str(other),
         }
     }
