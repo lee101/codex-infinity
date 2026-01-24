@@ -13,6 +13,8 @@ members = [
     "codex-backend-openapi-models",
     "cloud-tasks",
     "cloud-tasks-client",
+    "infinity-tasks",
+    "infinity-tasks-client",
     "cli",
     "common",
     "core",

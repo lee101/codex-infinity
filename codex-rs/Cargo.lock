@@ -1156,6 +1156,7 @@ dependencies = [
  "codex-core",
  "codex-exec",
  "codex-execpolicy",
+ "codex-infinity-tasks",
  "codex-login",
  "codex-mcp-server",
  "codex-protocol",
@@ -1505,6 +1506,37 @@ dependencies = [
  "thiserror 2.0.17",
  "ts-rs",
  "walkdir",
+]
+
+[[package]]
+name = "codex-infinity-tasks"
+version = "0.56.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "codex-common",
+ "codex-infinity-tasks-client",
+ "owo-colors",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "supports-color 3.0.2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "codex-infinity-tasks-client"
+version = "0.56.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

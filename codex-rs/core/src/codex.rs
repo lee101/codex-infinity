@@ -78,6 +78,7 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::ModelProviderInfo;
+use crate::refusal_fallback;
 use crate::WireApi;
 use crate::client::ModelClient;
 use crate::client::ModelClientSession;
@@ -2840,6 +2841,7 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
     let mut client_session = turn_context.client.new_session();
+    let mut tried_refusal_fallback = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -2892,6 +2894,43 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    // Check for model refusal and fallback to OpenRouter if available
+                    if !tried_refusal_fallback {
+                        if let Some(ref msg) = sampling_request_last_agent_message {
+                            if refusal_fallback::is_refusal(msg, false)
+                                && refusal_fallback::openrouter_fallback_available()
+                            {
+                                warn!(
+                                    "Model refusal detected, retrying with fallback model: {}",
+                                    refusal_fallback::OPENROUTER_FALLBACK_MODEL
+                                );
+                                tried_refusal_fallback = true;
+
+                                // Create fallback client with OpenRouter provider
+                                let fallback_provider =
+                                    refusal_fallback::create_openrouter_fallback_provider();
+                                let fallback_model_info = ModelInfo {
+                                    slug: refusal_fallback::OPENROUTER_FALLBACK_MODEL.to_string(),
+                                    display_name: "Grok Code Fast".to_string(),
+                                    ..turn_context.client.get_model_info()
+                                };
+                                let fb_client = crate::client::ModelClient::new(
+                                    turn_context.client.config(),
+                                    turn_context.client.get_auth_manager(),
+                                    fallback_model_info,
+                                    turn_context.client.get_otel_manager(),
+                                    fallback_provider,
+                                    turn_context.client.get_reasoning_effort(),
+                                    turn_context.client.get_reasoning_summary(),
+                                    sess.conversation_id,
+                                    turn_context.client.get_session_source(),
+                                );
+                                client_session = fb_client.new_session();
+                                continue;
+                            }
+                        }
+                    }
+
                     last_agent_message = sampling_request_last_agent_message;
                     sess.notifier()
                         .notify(&UserNotification::AgentTurnComplete {

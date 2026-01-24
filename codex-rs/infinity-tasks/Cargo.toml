@@ -1,0 +1,34 @@
+[package]
+name = "codex-infinity-tasks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_infinity_tasks"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+codex-infinity-tasks-client = { path = "../infinity-tasks-client", features = [
+    "mock",
+    "online",
+] }
+codex-common = { path = "../common", features = ["cli"] }
+owo-colors = { workspace = true, features = ["supports-colors"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+supports-color = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+tracing = { workspace = true, features = ["log"] }
+
+[dependencies.async-trait]
+workspace = true
+
+[dev-dependencies]
+async-trait = { workspace = true }
+pretty_assertions = { workspace = true }
