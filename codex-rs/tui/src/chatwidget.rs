@@ -948,7 +948,7 @@ impl ChatWidget {
         if !self.queued_user_messages.is_empty() {
             return;
         }
-        if !matches!(self.stored_collaboration_mode, CollaborationMode::Plan(_)) {
+        if self.stored_collaboration_mode.mode != ModeKind::Plan {
             return;
         }
         let has_message = last_agent_message.is_some_and(|message| !message.trim().is_empty());
@@ -1983,7 +1983,10 @@ impl ChatWidget {
                 config.experimental_mode,
             )
         } else {
-            CollaborationMode::Custom(fallback_custom)
+            CollaborationMode {
+                mode: ModeKind::Custom,
+                settings: fallback_custom,
+            }
         };
 
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
@@ -2103,7 +2106,10 @@ impl ChatWidget {
                 config.experimental_mode,
             )
         } else {
-            CollaborationMode::Custom(fallback_custom)
+            CollaborationMode {
+                mode: ModeKind::Custom,
+                settings: fallback_custom,
+            }
         };
 
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
@@ -2226,7 +2232,10 @@ impl ChatWidget {
                 config.experimental_mode,
             )
         } else {
-            CollaborationMode::Custom(fallback_custom)
+            CollaborationMode {
+                mode: ModeKind::Custom,
+                settings: fallback_custom,
+            }
         };
 
         let mut widget = Self {
@@ -3598,11 +3607,11 @@ impl ChatWidget {
         let items: Vec<SelectionItem> = presets
             .into_iter()
             .map(|preset| {
-                let name = match preset {
-                    CollaborationMode::Plan(_) => "Plan",
-                    CollaborationMode::PairProgramming(_) => "Pair Programming",
-                    CollaborationMode::Execute(_) => "Execute",
-                    CollaborationMode::Custom(_) => "Custom",
+                let name = match preset.mode {
+                    ModeKind::Plan => "Plan",
+                    ModeKind::PairProgramming => "Pair Programming",
+                    ModeKind::Execute => "Execute",
+                    ModeKind::Custom => "Custom",
                 };
                 let is_current =
                     collaboration_modes::same_variant(&self.stored_collaboration_mode, &preset);
@@ -4584,12 +4593,7 @@ impl ChatWidget {
         }
         if feature == Feature::CollaborationModes {
             self.bottom_pane.set_collaboration_modes_enabled(enabled);
-            let settings = match &self.stored_collaboration_mode {
-                CollaborationMode::Plan(settings)
-                | CollaborationMode::PairProgramming(settings)
-                | CollaborationMode::Execute(settings)
-                | CollaborationMode::Custom(settings) => settings.clone(),
-            };
+            let settings = self.stored_collaboration_mode.settings.clone();
             let fallback_custom = settings.clone();
             self.stored_collaboration_mode = if enabled {
                 initial_collaboration_mode(
@@ -4598,7 +4602,10 @@ impl ChatWidget {
                     self.config.experimental_mode,
                 )
             } else {
-                CollaborationMode::Custom(settings)
+                CollaborationMode {
+                    mode: ModeKind::Custom,
+                    settings,
+                }
             };
             self.update_collaboration_mode_indicator();
         }
@@ -4678,11 +4685,11 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return None;
         }
-        match &self.stored_collaboration_mode {
-            CollaborationMode::Plan(_) => Some("Plan"),
-            CollaborationMode::PairProgramming(_) => Some("Pair Programming"),
-            CollaborationMode::Execute(_) => Some("Execute"),
-            CollaborationMode::Custom(_) => None,
+        match self.stored_collaboration_mode.mode {
+            ModeKind::Plan => Some("Plan"),
+            ModeKind::PairProgramming => Some("Pair Programming"),
+            ModeKind::Execute => Some("Execute"),
+            ModeKind::Custom => None,
         }
     }
 
@@ -4690,13 +4697,11 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return None;
         }
-        match &self.stored_collaboration_mode {
-            CollaborationMode::Plan(_) => Some(CollaborationModeIndicator::Plan),
-            CollaborationMode::PairProgramming(_) => {
-                Some(CollaborationModeIndicator::PairProgramming)
-            }
-            CollaborationMode::Execute(_) => Some(CollaborationModeIndicator::Execute),
-            CollaborationMode::Custom(_) => None,
+        match self.stored_collaboration_mode.mode {
+            ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
+            ModeKind::PairProgramming => Some(CollaborationModeIndicator::PairProgramming),
+            ModeKind::Execute => Some(CollaborationModeIndicator::Execute),
+            ModeKind::Custom => None,
         }
     }
 
@@ -4727,7 +4732,8 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
-
+        let old_model = self.stored_collaboration_mode.model().to_string();
+        let mode = mode.with_updates(Some(old_model), None, None);
         self.stored_collaboration_mode = mode;
         self.update_collaboration_mode_indicator();
         self.request_redraw();
@@ -5354,15 +5360,20 @@ fn initial_collaboration_mode(
 ) -> CollaborationMode {
     if let Some(kind) = desired_mode {
         if kind == ModeKind::Custom {
-            return CollaborationMode::Custom(fallback_custom);
+            return CollaborationMode {
+                mode: ModeKind::Custom,
+                settings: fallback_custom,
+            };
         }
         if let Some(mode) = collaboration_modes::mode_for_kind(models_manager, kind) {
             return mode;
         }
     }
 
-    collaboration_modes::default_mode(models_manager)
-        .unwrap_or(CollaborationMode::Custom(fallback_custom))
+    collaboration_modes::default_mode(models_manager).unwrap_or(CollaborationMode {
+        mode: ModeKind::Custom,
+        settings: fallback_custom,
+    })
 }
 
 async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Option<RateLimitSnapshot> {
