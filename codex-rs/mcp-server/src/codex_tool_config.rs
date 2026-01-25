@@ -188,6 +188,8 @@ impl CodexToolCallParam {
             passthrough_shell_stdio: None,
             auto_next_steps: None,
             auto_next_idea: None,
+            ephemeral: None,
+            model_personality: None,
             additional_writable_roots: Vec::new(),
         };
 

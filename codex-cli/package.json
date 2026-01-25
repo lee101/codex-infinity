@@ -2,9 +2,9 @@
   "name": "@lee101-3/codex-infinite",
   "version": "0.0.2",
   "license": "Apache-2.0",
-  "description": "Codex Infinite - a smarter coding agent that can run forever",
+  "description": "Codex Infinity - a smarter coding agent that can run forever",
   "bin": {
-    "codex-infinite": "bin/codex-infinite.js"
+    "codex-infinity": "bin/codex-infinity.js"
   },
   "type": "module",
   "engines": {

@@ -1,28 +1,28 @@
 <p align="center">
-  <img src="./.github/codex-infinite-200h.webp" alt="Codex Infinite" height="200" />
+  <img src="./.github/codex-infinity-200h.webp" alt="Codex Infinity" height="200" />
 </p>
 
-<h1 align="center">Codex Infinite</h1>
+<h1 align="center">Codex Infinity</h1>
 
 <p align="center"><code>npm i -g @lee101-3/codex-infinite</code></p>
 
-<p align="center"><strong>Codex Infinite</strong> is a smarter coding agent that can run forever.</p>
+<p align="center"><strong>Codex Infinity</strong> is a smarter coding agent that can run forever.</p>
 
 ---
 
-## What makes Codex Infinite different?
+## What makes Codex Infinity different?
 
-Codex Infinite takes automation to the next level. With two simple arguments, it can continuously work on your codebase:
+Codex Infinity takes automation to the next level. With two simple arguments, it can continuously work on your codebase:
 
 - **`--auto-next-steps`** - Automatically continues working on the next logical steps after completing a task
 - **`--auto-next-idea`** - Generates and works on new ideas to improve your codebase
 
 ```shell
-# Run codex-infinite with automatic continuation
-codex-infinite --auto-next-steps
+# Run codex-infinity with automatic continuation
+codex-infinity --auto-next-steps
 
 # dream up and implement new ideas for fully autonomous coding
-codex-infinite --auto-next-steps --auto-next-idea
+codex-infinity --auto-next-steps --auto-next-idea
 ```
 
 ## Quickstart
@@ -33,13 +33,13 @@ codex-infinite --auto-next-steps --auto-next-idea
 npm install -g @lee101-3/codex-infinite
 ```
 
-Then simply run `codex-infinite` to get started.
+Then simply run `codex-infinity` to get started.
 
 ### Authentication
 
-Run `codex-infinite` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
+Run `codex-infinity` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
 
-You can also use Codex Infinite with an API key.
+You can also use Codex Infinity with an API key.
 
 ## Features
 

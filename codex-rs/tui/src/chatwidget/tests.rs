@@ -75,7 +75,6 @@ use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::user_input::UserInput;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::user_input::TextElement;
-use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
