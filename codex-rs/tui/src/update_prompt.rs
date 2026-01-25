@@ -191,7 +191,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push("");
         column.push(Line::from(vec![
             padded_emoji("  ✨").bold().cyan(),
-            "Update available!".bold(),
+            "Welcome to Codex Infinity!".bold(),
             " ".into(),
             format!(
                 "{current} -> {latest}",
@@ -203,9 +203,18 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push("");
         column.push(
             Line::from(vec![
-                "Release notes: ".dim(),
-                "https://github.com/lee101/codex/releases/latest"
-                    .dim()
+                "Website: ".dim(),
+                "https://codex-infinity.com"
+                    .cyan()
+                    .underlined(),
+            ])
+            .inset(Insets::tlbr(0, 2, 0, 0)),
+        );
+        column.push(
+            Line::from(vec![
+                "Token ICO: ".dim(),
+                "https://bags.fm/HAK9cX1jfYmcNpr6keTkLvxehGPWKELXSu7GH2ofBAGS"
+                    .yellow()
                     .underlined(),
             ])
             .inset(Insets::tlbr(0, 2, 0, 0)),

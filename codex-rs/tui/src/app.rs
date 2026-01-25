@@ -551,16 +551,18 @@ impl App {
         tui: &mut tui::Tui,
         cfg: codex_core::config::Config,
     ) -> crate::chatwidget::ChatWidgetInit {
+        let (auto_next_steps, auto_next_idea) = self.chat_widget.auto_prompt_flags();
         crate::chatwidget::ChatWidgetInit {
             config: cfg,
             frame_requester: tui.frame_requester(),
             app_event_tx: self.app_event_tx.clone(),
-            // Fork/resume bootstraps here don't carry any prefilled message content.
             initial_user_message: None,
             enhanced_keys_supported: self.enhanced_keys_supported,
             auth_manager: self.auth_manager.clone(),
             models_manager: self.server.get_models_manager(),
             feedback: self.feedback.clone(),
+            auto_next_steps,
+            auto_next_idea,
             is_first_run: false,
             model: Some(self.chat_widget.current_model().to_string()),
             otel_manager: self.otel_manager.clone(),
