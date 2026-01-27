@@ -493,6 +493,7 @@ checksum = "021e862c184ae977658b36c4500f7feac3221ca5da43e3f25bd04ab6c79a29b5"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -507,11 +508,15 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -531,6 +536,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -974,6 +980,7 @@ dependencies = [
  "codex-common",
  "codex-core",
  "codex-exec",
+ "codex-http-server",
  "codex-login",
  "codex-mcp-server",
  "codex-process-hardening",
@@ -988,6 +995,8 @@ dependencies = [
  "owo-colors",
  "predicates",
  "pretty_assertions",
+ "reqwest",
+ "serde",
  "serde_json",
  "supports-color",
  "tempfile",
@@ -1217,6 +1226,27 @@ dependencies = [
  "thiserror 2.0.17",
  "ts-rs",
  "walkdir",
+]
+
+[[package]]
+name = "codex-http-server"
+version = "0.50.0"
+dependencies = [
+ "axum",
+ "codex-app-server-protocol",
+ "codex-common",
+ "codex-core",
+ "codex-feedback",
+ "codex-protocol",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

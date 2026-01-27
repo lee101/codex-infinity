@@ -1,0 +1,27 @@
+[package]
+name = "codex-http-server"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+
+[dependencies]
+codex-core = { workspace = true }
+codex-common = { workspace = true, features = ["cli"] }
+codex-protocol = { workspace = true }
+codex-app-server-protocol = { workspace = true }
+codex-feedback = { workspace = true }
+
+axum = { version = "0.8", features = ["json", "http1", "tokio", "query"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+futures = { workspace = true }
+
+[lib]
+name = "codex_http_server"
+path = "src/lib.rs"

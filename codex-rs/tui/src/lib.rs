@@ -455,7 +455,13 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    let Cli { prompt, images, auto_next_steps, auto_next_idea, .. } = cli;
+    let Cli {
+        prompt,
+        images,
+        auto_next_steps,
+        auto_next_idea,
+        ..
+    } = cli;
 
     let app_result = App::run(
         &mut tui,

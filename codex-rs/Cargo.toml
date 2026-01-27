@@ -16,6 +16,7 @@ members = [
     "core",
     "exec",
     "execpolicy",
+    "http-server",
     "keyring-store",
     "file-search",
     "linux-sandbox",
@@ -76,6 +77,7 @@ codex-otel = { path = "otel" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
 codex-protocol-ts = { path = "protocol-ts" }
+codex-http-server = { path = "http-server" }
 codex-responses-api-proxy = { path = "responses-api-proxy" }
 codex-rmcp-client = { path = "rmcp-client" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }

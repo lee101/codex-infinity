@@ -25,8 +25,10 @@ use owo_colors::OwoColorize;
 use std::path::PathBuf;
 use supports_color::Stream;
 
+mod infinity_cmd;
 mod mcp_cmd;
 
+use crate::infinity_cmd::InfinityCli;
 use crate::mcp_cmd::McpCli;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -82,6 +84,9 @@ enum Subcommand {
     /// [experimental] Run the app server.
     AppServer,
 
+    /// [experimental] Run Codex as an HTTP server for remote control.
+    Server(ServerCommand),
+
     /// Generate shell completion scripts.
     Completion(CompletionCommand),
 
@@ -103,6 +108,10 @@ enum Subcommand {
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
 
+    /// Manage Codex Infinity machines.
+    #[clap(name = "infinity", alias = "codex-infinity")]
+    Infinity(InfinityCli),
+
     /// Internal: run the responses API proxy.
     #[clap(hide = true)]
     ResponsesApiProxy(ResponsesApiProxyArgs),
@@ -120,6 +129,16 @@ struct CompletionCommand {
     /// Shell to generate completions for
     #[clap(value_enum, default_value_t = Shell::Bash)]
     shell: Shell,
+}
+
+#[derive(Debug, Parser)]
+struct ServerCommand {
+    /// Port to listen on
+    #[arg(long, short = 'P', default_value = "8090")]
+    port: u16,
+
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
 }
 
 #[derive(Debug, Parser)]
@@ -390,6 +409,18 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::AppServer) => {
             codex_app_server::run_main(codex_linux_sandbox_exe, root_config_overrides).await?;
         }
+        Some(Subcommand::Server(mut server_cli)) => {
+            prepend_config_flags(
+                &mut server_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            codex_http_server::run_main(
+                server_cli.port,
+                codex_linux_sandbox_exe,
+                server_cli.config_overrides,
+            )
+            .await?;
+        }
         Some(Subcommand::Resume(ResumeCommand {
             session_id,
             last,
@@ -452,6 +483,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
             );
             codex_cloud_tasks::run_main(cloud_cli, codex_linux_sandbox_exe).await?;
+        }
+        Some(Subcommand::Infinity(infinity_cli)) => {
+            infinity_cli.run().await?;
         }
         Some(Subcommand::Sandbox(sandbox_args)) => match sandbox_args.cmd {
             SandboxCommand::Macos(mut seatbelt_cli) => {

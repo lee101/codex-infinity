@@ -455,7 +455,9 @@ impl ChatWidget {
         // Auto-prompt logic: if auto_next_steps or auto_next_idea is enabled and we're not in review mode,
         // automatically queue a follow-up prompt to continue working.
         if !self.is_review_mode {
-            let summary = last_agent_message.as_deref().unwrap_or("(no summary provided)");
+            let summary = last_agent_message
+                .as_deref()
+                .unwrap_or("(no summary provided)");
 
             if self.auto_next_steps {
                 // Queue a prompt to continue with natural next steps
@@ -467,7 +469,7 @@ impl ChatWidget {
                 );
                 self.add_to_history(history_cell::new_info_event(
                     "Auto-next-steps: queuing detailed follow-up tasks.".to_string(),
-                    None
+                    None,
                 ));
                 self.request_redraw();
                 self.submit_text_message(auto_prompt);
@@ -481,7 +483,7 @@ impl ChatWidget {
                 );
                 self.add_to_history(history_cell::new_info_event(
                     "Auto-next-idea: queuing autonomous ideation and implementation.".to_string(),
-                    None
+                    None,
                 ));
                 self.request_redraw();
                 self.submit_text_message(auto_prompt);
