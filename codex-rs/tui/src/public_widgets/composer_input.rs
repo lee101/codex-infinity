@@ -7,13 +7,13 @@
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::WidgetRef;
 use std::time::Duration;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::InputResult;
+use crate::render::renderable::Renderable;
 
 /// Action returned from feeding a key event into the ComposerInput.
 pub enum ComposerAction {
@@ -48,13 +48,14 @@ impl ComposerInput {
 
     /// Clear the input text.
     pub fn clear(&mut self) {
-        self.inner.set_text_content(String::new());
+        self.inner
+            .set_text_content(String::new(), Vec::new(), Vec::new());
     }
 
     /// Feed a key event into the composer and return a high-level action.
     pub fn input(&mut self, key: KeyEvent) -> ComposerAction {
         let action = match self.inner.handle_key_event(key).0 {
-            InputResult::Submitted(text) => ComposerAction::Submitted(text),
+            InputResult::Submitted { text, .. } => ComposerAction::Submitted(text),
             _ => ComposerAction::None,
         };
         self.drain_app_events();
@@ -94,7 +95,7 @@ impl ComposerInput {
 
     /// Render the input into the provided buffer at `area`.
     pub fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        WidgetRef::render_ref(&self.inner, area, buf);
+        self.inner.render(area, buf);
     }
 
     /// Return true if a paste-burst detection is currently active.

@@ -1,7 +1,12 @@
+use std::path::PathBuf;
+
 use tree_sitter::Node;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 use tree_sitter_bash::LANGUAGE as BASH;
+
+use crate::shell::ShellType;
+use crate::shell::detect_shell_type;
 
 /// Parse the provided bash source using tree-sitter-bash, returning a Tree on
 /// success or None if parsing failed.
@@ -41,6 +46,7 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
         "string_content",
         "raw_string",
         "number",
+        "concatenation",
     ];
     // Allow only safe punctuation / operator tokens; anything else causes reject.
     const ALLOWED_PUNCT_TOKENS: &[&str] = &["&&", "||", ";", "|", "\"", "'"];
@@ -88,17 +94,26 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
     Some(commands)
 }
 
+pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
+    let [shell, flag, script] = command else {
+        return None;
+    };
+    if !matches!(flag.as_str(), "-lc" | "-c")
+        || !matches!(
+            detect_shell_type(&PathBuf::from(shell)),
+            Some(ShellType::Zsh) | Some(ShellType::Bash) | Some(ShellType::Sh)
+        )
+    {
+        return None;
+    }
+    Some((shell, script))
+}
+
 /// Returns the sequence of plain commands within a `bash -lc "..."` or
 /// `zsh -lc "..."` invocation when the script only contains word-only commands
 /// joined by safe operators.
 pub fn parse_shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>> {
-    let [shell, flag, script] = command else {
-        return None;
-    };
-
-    if flag != "-lc" || !(shell == "bash" || shell == "zsh") {
-        return None;
-    }
+    let (_, script) = extract_bash_command(command)?;
 
     let tree = try_parse_shell(script)?;
     try_parse_word_only_commands_sequence(&tree, script)
@@ -123,26 +138,38 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
                 words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
             }
             "string" => {
-                if child.child_count() == 3
-                    && child.child(0)?.kind() == "\""
-                    && child.child(1)?.kind() == "string_content"
-                    && child.child(2)?.kind() == "\""
-                {
-                    words.push(child.child(1)?.utf8_text(src.as_bytes()).ok()?.to_owned());
-                } else {
-                    return None;
-                }
+                let parsed = parse_double_quoted_string(child, src)?;
+                words.push(parsed);
             }
             "raw_string" => {
-                let raw_string = child.utf8_text(src.as_bytes()).ok()?;
-                let stripped = raw_string
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''));
-                if let Some(s) = stripped {
-                    words.push(s.to_owned());
-                } else {
+                let parsed = parse_raw_string(child, src)?;
+                words.push(parsed);
+            }
+            "concatenation" => {
+                // Handle concatenated arguments like -g"*.py"
+                let mut concatenated = String::new();
+                let mut concat_cursor = child.walk();
+                for part in child.named_children(&mut concat_cursor) {
+                    match part.kind() {
+                        "word" | "number" => {
+                            concatenated
+                                .push_str(part.utf8_text(src.as_bytes()).ok()?.to_owned().as_str());
+                        }
+                        "string" => {
+                            let parsed = parse_double_quoted_string(part, src)?;
+                            concatenated.push_str(&parsed);
+                        }
+                        "raw_string" => {
+                            let parsed = parse_raw_string(part, src)?;
+                            concatenated.push_str(&parsed);
+                        }
+                        _ => return None,
+                    }
+                }
+                if concatenated.is_empty() {
                     return None;
                 }
+                words.push(concatenated);
             }
             _ => return None,
         }
@@ -150,9 +177,40 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
     Some(words)
 }
 
+fn parse_double_quoted_string(node: Node, src: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        if part.kind() != "string_content" {
+            return None;
+        }
+    }
+    let raw = node.utf8_text(src.as_bytes()).ok()?;
+    let stripped = raw
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))?;
+    Some(stripped.to_string())
+}
+
+fn parse_raw_string(node: Node, src: &str) -> Option<String> {
+    if node.kind() != "raw_string" {
+        return None;
+    }
+
+    let raw_string = node.utf8_text(src.as_bytes()).ok()?;
+    let stripped = raw_string
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''));
+    stripped.map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     fn parse_seq(src: &str) -> Option<Vec<Vec<String>>> {
         let tree = try_parse_shell(src)?;
@@ -191,6 +249,38 @@ mod tests {
             cmds2,
             vec![vec!["echo".to_string(), "hi there".to_string()]]
         );
+    }
+
+    #[test]
+    fn accepts_double_quoted_strings_with_newlines() {
+        let cmds = parse_seq("git commit -m \"line1\nline2\"").unwrap();
+        assert_eq!(
+            cmds,
+            vec![vec![
+                "git".to_string(),
+                "commit".to_string(),
+                "-m".to_string(),
+                "line1\nline2".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn accepts_mixed_quote_concatenation() {
+        assert_eq!(
+            parse_seq(r#"echo "/usr"'/'"local"/bin"#).unwrap(),
+            vec![vec!["echo".to_string(), "/usr/local/bin".to_string()]]
+        );
+        assert_eq!(
+            parse_seq(r#"echo '/usr'"/"'local'/bin"#).unwrap(),
+            vec![vec!["echo".to_string(), "/usr/local/bin".to_string()]]
+        );
+    }
+
+    #[test]
+    fn rejects_double_quoted_strings_with_expansions() {
+        assert!(parse_seq(r#"echo "hi ${USER}""#).is_none());
+        assert!(parse_seq(r#"echo "$HOME""#).is_none());
     }
 
     #[test]
@@ -241,5 +331,48 @@ mod tests {
         let command = vec!["zsh".to_string(), "-lc".to_string(), "ls".to_string()];
         let parsed = parse_shell_lc_plain_commands(&command).unwrap();
         assert_eq!(parsed, vec![vec!["ls".to_string()]]);
+    }
+
+    #[test]
+    fn accepts_concatenated_flag_and_value() {
+        // Test case: -g"*.py" (flag directly concatenated with quoted value)
+        let cmds = parse_seq("rg -n \"foo\" -g\"*.py\"").unwrap();
+        assert_eq!(
+            cmds,
+            vec![vec![
+                "rg".to_string(),
+                "-n".to_string(),
+                "foo".to_string(),
+                "-g*.py".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn accepts_concatenated_flag_with_single_quotes() {
+        let cmds = parse_seq("grep -n 'pattern' -g'*.txt'").unwrap();
+        assert_eq!(
+            cmds,
+            vec![vec![
+                "grep".to_string(),
+                "-n".to_string(),
+                "pattern".to_string(),
+                "-g*.txt".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn rejects_concatenation_with_variable_substitution() {
+        // Environment variables in concatenated strings should be rejected
+        assert!(parse_seq("rg -g\"$VAR\" pattern").is_none());
+        assert!(parse_seq("rg -g\"${VAR}\" pattern").is_none());
+    }
+
+    #[test]
+    fn rejects_concatenation_with_command_substitution() {
+        // Command substitution in concatenated strings should be rejected
+        assert!(parse_seq("rg -g\"$(pwd)\" pattern").is_none());
+        assert!(parse_seq("rg -g\"$(echo '*.py')\" pattern").is_none());
     }
 }

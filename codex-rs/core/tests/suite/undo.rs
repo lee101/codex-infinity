@@ -8,10 +8,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use codex_core::CodexConversation;
-use codex_core::config::Config;
+use codex_core::CodexThread;
 use codex_core::features::Feature;
-use codex_core::model_family::find_family_for_model;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::UndoCompletedEvent;
@@ -23,18 +21,17 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexHarness;
+use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 
 #[allow(clippy::expect_used)]
 async fn undo_harness() -> Result<TestCodexHarness> {
-    TestCodexHarness::with_config(|config: &mut Config| {
+    let builder = test_codex().with_model("gpt-5.1").with_config(|config| {
         config.include_apply_patch_tool = true;
-        config.model = "gpt-5".to_string();
-        config.model_family = find_family_for_model("gpt-5").expect("gpt-5 is valid");
         config.features.enable(Feature::GhostCommit);
-    })
-    .await
+    });
+    TestCodexHarness::with_builder(builder).await
 }
 
 fn git(path: &Path, args: &[&str]) -> Result<()> {
@@ -111,7 +108,7 @@ async fn run_apply_patch_turn(
     harness.submit(prompt).await
 }
 
-async fn invoke_undo(codex: &Arc<CodexConversation>) -> Result<UndoCompletedEvent> {
+async fn invoke_undo(codex: &Arc<CodexThread>) -> Result<UndoCompletedEvent> {
     codex.submit(Op::Undo).await?;
     let event = wait_for_event_match(codex, |msg| match msg {
         EventMsg::UndoCompleted(done) => Some(done.clone()),
@@ -121,7 +118,7 @@ async fn invoke_undo(codex: &Arc<CodexConversation>) -> Result<UndoCompletedEven
     Ok(event)
 }
 
-async fn expect_successful_undo(codex: &Arc<CodexConversation>) -> Result<UndoCompletedEvent> {
+async fn expect_successful_undo(codex: &Arc<CodexThread>) -> Result<UndoCompletedEvent> {
     let event = invoke_undo(codex).await?;
     assert!(
         event.success,
@@ -131,7 +128,7 @@ async fn expect_successful_undo(codex: &Arc<CodexConversation>) -> Result<UndoCo
     Ok(event)
 }
 
-async fn expect_failed_undo(codex: &Arc<CodexConversation>) -> Result<UndoCompletedEvent> {
+async fn expect_failed_undo(codex: &Arc<CodexThread>) -> Result<UndoCompletedEvent> {
     let event = invoke_undo(codex).await?;
     assert!(
         !event.success,
@@ -486,6 +483,68 @@ async fn undo_overwrites_manual_edits_after_turn() -> Result<()> {
     expect_successful_undo(&codex).await?;
 
     assert_eq!(fs::read_to_string(&tracked)?, "baseline\n");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_preserves_unrelated_staged_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = undo_harness().await?;
+    init_git_repo(harness.cwd())?;
+
+    // create a file for user to mess with
+    let user_file = harness.path("user_file.txt");
+    fs::write(&user_file, "user content v1\n")?;
+    git(harness.cwd(), &["add", "user_file.txt"])?;
+    git(harness.cwd(), &["commit", "-m", "add user file"])?;
+
+    // AI turn: modifies a DIFFERENT file (creating ghost commit of baseline)
+    let ai_file = harness.path("ai_file.txt");
+    fs::write(&ai_file, "ai content v1\n")?;
+    git(harness.cwd(), &["add", "ai_file.txt"])?;
+    git(harness.cwd(), &["commit", "-m", "add ai file"])?; // baseline
+
+    let patch = "*** Begin Patch\n*** Update File: ai_file.txt\n@@\n-ai content v1\n+ai content v2\n*** End Patch";
+    run_apply_patch_turn(&harness, "modify ai file", "undo-staging-test", patch, "ok").await?;
+    assert_eq!(fs::read_to_string(&ai_file)?, "ai content v2\n");
+
+    // NOW: User modifies user_file AND stages it
+    fs::write(&user_file, "user content v2 (staged)\n")?;
+    git(harness.cwd(), &["add", "user_file.txt"])?;
+
+    // Verify status before undo
+    let status_before = git_output(harness.cwd(), &["status", "--porcelain"])?;
+    assert!(status_before.contains("M  user_file.txt")); // M in index
+
+    // UNDO
+    let codex = Arc::clone(&harness.test().codex);
+    // checks that undo succeeded
+    expect_successful_undo(&codex).await?;
+
+    // AI file should be reverted
+    assert_eq!(fs::read_to_string(&ai_file)?, "ai content v1\n");
+
+    // User file should STILL be staged with v2
+    let status_after = git_output(harness.cwd(), &["status", "--porcelain"])?;
+
+    // We expect 'M' in the first column (index modified).
+    // The second column will likely be 'M' because the worktree was reverted to v1 while index has v2.
+    // So "MM user_file.txt" is expected.
+    if !status_after.contains("MM user_file.txt") && !status_after.contains("M  user_file.txt") {
+        bail!("Status should contain staged change (M in first col), but was: '{status_after}'");
+    }
+
+    // Disk content is reverted to v1 (snapshot state)
+    assert_eq!(fs::read_to_string(&user_file)?, "user content v1\n");
+
+    // But we can get v2 back from index
+    git(harness.cwd(), &["checkout", "user_file.txt"])?;
+    assert_eq!(
+        fs::read_to_string(&user_file)?,
+        "user content v2 (staged)\n"
+    );
 
     Ok(())
 }

@@ -1,7 +1,8 @@
 [package]
-edition = "2024"
 name = "codex-stdio-to-uds"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "codex-stdio-to-uds"
@@ -22,5 +23,6 @@ uds_windows = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

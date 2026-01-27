@@ -31,12 +31,12 @@ const SCHEMA: &str = r#"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_returns_json_result_for_gpt5() -> anyhow::Result<()> {
-    codex_returns_json_result("gpt-5".to_string()).await
+    codex_returns_json_result("gpt-5.1".to_string()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_returns_json_result_for_gpt5_codex() -> anyhow::Result<()> {
-    codex_returns_json_result("gpt-5-codex".to_string()).await
+    codex_returns_json_result("gpt-5.1-codex".to_string()).await
 }
 
 async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
@@ -76,6 +76,7 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
         .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "hello world".into(),
+                text_elements: Vec::new(),
             }],
             final_output_json_schema: Some(serde_json::from_str(SCHEMA)?),
             cwd: cwd.path().to_path_buf(),
@@ -84,6 +85,8 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
             model,
             effort: None,
             summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await?;
 

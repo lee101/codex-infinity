@@ -6,6 +6,8 @@ use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;
 use codex_core::protocol::Op;
 use codex_protocol::items::TurnItem;
+use codex_protocol::user_input::ByteRange;
+use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -18,7 +20,7 @@ use core_test_support::responses::ev_reasoning_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_web_search_call_added;
 use core_test_support::responses::ev_web_search_call_done;
-use core_test_support::responses::mount_sse_once_match;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -26,7 +28,6 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
-use wiremock::matchers::any;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_message_item_is_emitted() -> anyhow::Result<()> {
@@ -37,13 +38,21 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     let TestCodex { codex, .. } = test_codex().build(&server).await?;
 
     let first_response = sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]);
-    mount_sse_once_match(&server, any(), first_response).await;
+    mount_sse_once(&server, first_response).await;
+
+    let text_elements = vec![TextElement::new(
+        ByteRange { start: 0, end: 6 },
+        Some("<file>".into()),
+    )];
+    let expected_input = UserInput::Text {
+        text: "please inspect sample.txt".into(),
+        text_elements: text_elements.clone(),
+    };
 
     codex
         .submit(Op::UserInput {
-            items: (vec![UserInput::Text {
-                text: "please inspect sample.txt".into(),
-            }]),
+            items: vec![expected_input.clone()],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -65,18 +74,16 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     .await;
 
     assert_eq!(started_item.id, completed_item.id);
-    assert_eq!(
-        started_item.content,
-        vec![UserInput::Text {
-            text: "please inspect sample.txt".into(),
-        }]
-    );
-    assert_eq!(
-        completed_item.content,
-        vec![UserInput::Text {
-            text: "please inspect sample.txt".into(),
-        }]
-    );
+    assert_eq!(started_item.content, vec![expected_input.clone()]);
+    assert_eq!(completed_item.content, vec![expected_input]);
+
+    let legacy_message = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::UserMessage(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(legacy_message.message, "please inspect sample.txt");
+    assert_eq!(legacy_message.text_elements, text_elements);
     Ok(())
 }
 
@@ -93,13 +100,15 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
         ev_assistant_message("msg-1", "all done"),
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), first_response).await;
+    mount_sse_once(&server, first_response).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "please summarize results".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -149,13 +158,15 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
         reasoning_item,
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), first_response).await;
+    mount_sse_once(&server, first_response).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "explain your reasoning".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -207,13 +218,15 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
         web_search_done,
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), first_response).await;
+    mount_sse_once(&server, first_response).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "find the weather".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -259,13 +272,15 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
         ev_assistant_message("msg-1", "streamed response"),
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), stream).await;
+    mount_sse_once(&server, stream).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "please stream text".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -324,13 +339,15 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
         ev_reasoning_item("reasoning-1", &["step one"], &[]),
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), stream).await;
+    mount_sse_once(&server, stream).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "reason through it".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -381,13 +398,15 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
         ev_reasoning_item("reasoning-raw", &["complete"], &["raw detail"]),
         ev_completed("resp-1"),
     ]);
-    mount_sse_once_match(&server, any(), stream).await;
+    mount_sse_once(&server, stream).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "show raw reasoning".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 

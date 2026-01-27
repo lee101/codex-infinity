@@ -1,10 +1,10 @@
 use codex_core::CodexAuth;
-use codex_core::CodexConversation;
+use codex_core::CodexThread;
 use codex_core::ContentItem;
-use codex_core::ConversationManager;
 use codex_core::ModelProviderInfo;
 use codex_core::REVIEW_PROMPT;
 use codex_core::ResponseItem;
+use codex_core::ThreadManager;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
@@ -16,28 +16,27 @@ use codex_core::protocol::ReviewFinding;
 use codex_core::protocol::ReviewLineRange;
 use codex_core::protocol::ReviewOutputEvent;
 use codex_core::protocol::ReviewRequest;
+use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
+use codex_core::review_format::render_review_output_text;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
 use core_test_support::load_sse_fixture_with_id_from_str;
+use core_test_support::responses::ResponseMock;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::skip_if_no_network;
 use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
-use wiremock::Mock;
 use wiremock::MockServer;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
 /// Verify that submitting `Op::Review` spawns a child task and emits
-/// EnteredReviewMode -> ExitedReviewMode(None) -> TaskComplete
+/// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
 /// in that order when the model returns a structured review JSON payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_op_emits_lifecycle_and_review_output() {
@@ -73,7 +72,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
         ]"#;
     let review_json_escaped = serde_json::to_string(&review_json).unwrap();
     let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
-    let server = start_responses_server_with_sse(&sse_raw, 1).await;
+    let (server, _request_log) = start_responses_server_with_sse(&sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
     let codex = new_conversation_for_server(&server, &codex_home, |_| {}).await;
 
@@ -81,14 +80,16 @@ async fn review_op_emits_lifecycle_and_review_output() {
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Please review my changes".to_string(),
-                user_facing_hint: "my changes".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Please review my changes".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
         .unwrap();
 
-    // Verify lifecycle: Entered -> Exited(Some(review)) -> TaskComplete.
+    // Verify lifecycle: Entered -> Exited(Some(review)) -> TurnComplete.
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {
@@ -115,31 +116,45 @@ async fn review_op_emits_lifecycle_and_review_output() {
         overall_confidence_score: 0.8,
     };
     assert_eq!(expected, review);
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Also verify that a user message with the header and a formatted finding
     // was recorded back in the parent session's rollout.
-    let path = codex.rollout_path();
+    let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");
 
     let mut saw_header = false;
     let mut saw_finding_line = false;
+    let expected_assistant_text = render_review_output_text(&expected);
+    let mut saw_assistant_plain = false;
+    let mut saw_assistant_xml = false;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
         let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item
-            && role == "user"
-        {
-            for c in content {
-                if let ContentItem::InputText { text } = c {
-                    if text.contains("full review output from reviewer model") {
-                        saw_header = true;
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item {
+            if role == "user" {
+                for c in content {
+                    if let ContentItem::InputText { text } = c {
+                        if text.contains("full review output from reviewer model") {
+                            saw_header = true;
+                        }
+                        if text.contains("- Prefer Stylize helpers — /tmp/file.rs:10-20") {
+                            saw_finding_line = true;
+                        }
                     }
-                    if text.contains("- Prefer Stylize helpers — /tmp/file.rs:10-20") {
-                        saw_finding_line = true;
+                }
+            } else if role == "assistant" {
+                for c in content {
+                    if let ContentItem::OutputText { text } = c {
+                        if text.contains("<user_action>") {
+                            saw_assistant_xml = true;
+                        }
+                        if text == expected_assistant_text {
+                            saw_assistant_plain = true;
+                        }
                     }
                 }
             }
@@ -149,6 +164,14 @@ async fn review_op_emits_lifecycle_and_review_output() {
     assert!(
         saw_finding_line,
         "formatted finding line missing from rollout"
+    );
+    assert!(
+        saw_assistant_plain,
+        "assistant review output missing from rollout"
+    );
+    assert!(
+        !saw_assistant_xml,
+        "assistant review output contains user_action markup"
     );
 
     server.verify().await;
@@ -170,15 +193,17 @@ async fn review_op_with_plain_text_emits_review_fallback() {
         }},
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
-    let server = start_responses_server_with_sse(sse_raw, 1).await;
+    let (server, _request_log) = start_responses_server_with_sse(sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
     let codex = new_conversation_for_server(&server, &codex_home, |_| {}).await;
 
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Plain text review".to_string(),
-                user_facing_hint: "plain text review".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Plain text review".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -199,7 +224,7 @@ async fn review_op_with_plain_text_emits_review_fallback() {
         ..Default::default()
     };
     assert_eq!(expected, review);
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     server.verify().await;
 }
@@ -228,15 +253,17 @@ async fn review_filters_agent_message_related_events() {
         }},
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
-    let server = start_responses_server_with_sse(sse_raw, 1).await;
+    let (server, _request_log) = start_responses_server_with_sse(sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
     let codex = new_conversation_for_server(&server, &codex_home, |_| {}).await;
 
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Filter streaming events".to_string(),
-                user_facing_hint: "Filter streaming events".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Filter streaming events".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -245,46 +272,35 @@ async fn review_filters_agent_message_related_events() {
     let mut saw_entered = false;
     let mut saw_exited = false;
 
-    // Drain until TaskComplete; assert filtered events never surface.
-    wait_for_event_with_timeout(
-        &codex,
-        |event| match event {
-            EventMsg::TaskComplete(_) => true,
-            EventMsg::EnteredReviewMode(_) => {
-                saw_entered = true;
-                false
-            }
-            EventMsg::ExitedReviewMode(_) => {
-                saw_exited = true;
-                false
-            }
-            // The following must be filtered by review flow
-            EventMsg::AgentMessageContentDelta(_) => {
-                panic!("unexpected AgentMessageContentDelta surfaced during review")
-            }
-            EventMsg::AgentMessageDelta(_) => {
-                panic!("unexpected AgentMessageDelta surfaced during review")
-            }
-            EventMsg::ItemCompleted(ev) => match &ev.item {
-                codex_protocol::items::TurnItem::AgentMessage(_) => {
-                    panic!(
-                        "unexpected ItemCompleted for TurnItem::AgentMessage surfaced during review"
-                    )
-                }
-                _ => false,
-            },
-            _ => false,
-        },
-        tokio::time::Duration::from_secs(5),
-    )
+    // Drain until TurnComplete; assert streaming-related events never surface.
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnComplete(_) => true,
+        EventMsg::EnteredReviewMode(_) => {
+            saw_entered = true;
+            false
+        }
+        EventMsg::ExitedReviewMode(_) => {
+            saw_exited = true;
+            false
+        }
+        // The following must be filtered by review flow
+        EventMsg::AgentMessageContentDelta(_) => {
+            panic!("unexpected AgentMessageContentDelta surfaced during review")
+        }
+        EventMsg::AgentMessageDelta(_) => {
+            panic!("unexpected AgentMessageDelta surfaced during review")
+        }
+        _ => false,
+    })
     .await;
     assert!(saw_entered && saw_exited, "missing review lifecycle events");
 
     server.verify().await;
 }
 
-/// When the model returns structured JSON in a review, ensure no AgentMessage
-/// is emitted; the UI consumes the structured result via ExitedReviewMode.
+/// When the model returns structured JSON in a review, ensure only a single
+/// non-streaming AgentMessage is emitted; the UI consumes the structured
+/// result via ExitedReviewMode plus a final assistant message.
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -318,43 +334,45 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
         ]"#;
     let review_json_escaped = serde_json::to_string(&review_json).unwrap();
     let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
-    let server = start_responses_server_with_sse(&sse_raw, 1).await;
+    let (server, _request_log) = start_responses_server_with_sse(&sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
     let codex = new_conversation_for_server(&server, &codex_home, |_| {}).await;
 
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "check structured".to_string(),
-                user_facing_hint: "check structured".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "check structured".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
         .unwrap();
 
-    // Drain events until TaskComplete; ensure none are AgentMessage.
+    // Drain events until TurnComplete; ensure we only see a final
+    // AgentMessage (no streaming assistant messages).
     let mut saw_entered = false;
     let mut saw_exited = false;
-    wait_for_event_with_timeout(
-        &codex,
-        |event| match event {
-            EventMsg::TaskComplete(_) => true,
-            EventMsg::AgentMessage(_) => {
-                panic!("unexpected AgentMessage during review with structured output")
-            }
-            EventMsg::EnteredReviewMode(_) => {
-                saw_entered = true;
-                false
-            }
-            EventMsg::ExitedReviewMode(_) => {
-                saw_exited = true;
-                false
-            }
-            _ => false,
-        },
-        tokio::time::Duration::from_secs(5),
-    )
+    let mut agent_messages = 0;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnComplete(_) => true,
+        EventMsg::AgentMessage(_) => {
+            agent_messages += 1;
+            false
+        }
+        EventMsg::EnteredReviewMode(_) => {
+            saw_entered = true;
+            false
+        }
+        EventMsg::ExitedReviewMode(_) => {
+            saw_exited = true;
+            false
+        }
+        _ => false,
+    })
     .await;
+    assert_eq!(1, agent_messages, "expected exactly one AgentMessage event");
     assert!(saw_entered && saw_exited, "missing review lifecycle events");
 
     server.verify().await;
@@ -370,20 +388,22 @@ async fn review_uses_custom_review_model_from_config() {
     let sse_raw = r#"[
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
-    let server = start_responses_server_with_sse(sse_raw, 1).await;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
     // Choose a review model different from the main model; ensure it is used.
     let codex = new_conversation_for_server(&server, &codex_home, |cfg| {
-        cfg.model = "gpt-4.1".to_string();
-        cfg.review_model = "gpt-5".to_string();
+        cfg.model = Some("gpt-4.1".to_string());
+        cfg.review_model = Some("gpt-5.1".to_string());
     })
     .await;
 
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "use custom model".to_string(),
-                user_facing_hint: "use custom model".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "use custom model".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -400,12 +420,63 @@ async fn review_uses_custom_review_model_from_config() {
         )
     })
     .await;
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Assert the request body model equals the configured review model
-    let request = &server.received_requests().await.unwrap()[0];
-    let body = request.body_json::<serde_json::Value>().unwrap();
-    assert_eq!(body["model"].as_str().unwrap(), "gpt-5");
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(body["model"].as_str().unwrap(), "gpt-5.1");
+
+    server.verify().await;
+}
+
+/// Ensure that when `review_model` is not set in the config, the review request
+/// uses the session model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_uses_session_model_when_review_model_unset() {
+    skip_if_no_network!();
+
+    // Minimal stream: just a completed event
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex_home = TempDir::new().unwrap();
+    let codex = new_conversation_for_server(&server, &codex_home, |cfg| {
+        cfg.model = Some("gpt-4.1".to_string());
+        cfg.review_model = None;
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "use session model".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: None
+            })
+        )
+    })
+    .await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(body["model"].as_str().unwrap(), "gpt-4.1");
 
     server.verify().await;
 }
@@ -423,11 +494,11 @@ async fn review_input_isolated_from_parent_history() {
     let sse_raw = r#"[
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
-    let server = start_responses_server_with_sse(sse_raw, 1).await;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
 
     // Seed a parent session history via resume file with both user + assistant items.
     let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
+    let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider = ModelProviderInfo {
         base_url: Some(format!("{}/v1", server.uri())),
         ..built_in_model_providers()["openai"].clone()
@@ -444,7 +515,6 @@ async fn review_input_isolated_from_parent_history() {
             "payload": {
                 "id": convo_id,
                 "timestamp": "2024-01-01T00:00:00Z",
-                "instructions": null,
                 "cwd": ".",
                 "originator": "test_originator",
                 "cli_version": "test_version",
@@ -462,6 +532,7 @@ async fn review_input_isolated_from_parent_history() {
             content: vec![codex_protocol::models::ContentItem::InputText {
                 text: "parent: earlier user message".to_string(),
             }],
+            end_turn: None,
         };
         let user_json = serde_json::to_value(&user).unwrap();
         let user_line = serde_json::json!({
@@ -480,6 +551,7 @@ async fn review_input_isolated_from_parent_history() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "parent: assistant reply".to_string(),
             }],
+            end_turn: None,
         };
         let assistant_json = serde_json::to_value(&assistant).unwrap();
         let assistant_line = serde_json::json!({
@@ -499,8 +571,10 @@ async fn review_input_isolated_from_parent_history() {
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: review_prompt.clone(),
-                user_facing_hint: review_prompt.clone(),
+                target: ReviewTarget::Custom {
+                    instructions: review_prompt.clone(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -516,37 +590,35 @@ async fn review_input_isolated_from_parent_history() {
         )
     })
     .await;
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Assert the request `input` contains the environment context followed by the user review prompt.
-    let request = &server.received_requests().await.unwrap()[0];
-    let body = request.body_json::<serde_json::Value>().unwrap();
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
     let input = body["input"].as_array().expect("input array");
-    assert_eq!(
-        input.len(),
-        2,
-        "expected environment context and review prompt"
+    assert!(
+        input.len() >= 2,
+        "expected at least environment context and review prompt"
     );
 
-    let env_msg = &input[0];
-    assert_eq!(env_msg["type"].as_str().unwrap(), "message");
-    assert_eq!(env_msg["role"].as_str().unwrap(), "user");
-    let env_text = env_msg["content"][0]["text"].as_str().expect("env text");
-    assert!(
-        env_text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
-        "environment context must be the first item"
-    );
+    let env_text = input
+        .iter()
+        .filter_map(|msg| msg["content"][0]["text"].as_str())
+        .find(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
+        .expect("env text");
     assert!(
         env_text.contains("<cwd>"),
         "environment context should include cwd"
     );
 
-    let review_msg = &input[1];
-    assert_eq!(review_msg["type"].as_str().unwrap(), "message");
-    assert_eq!(review_msg["role"].as_str().unwrap(), "user");
+    let review_text = input
+        .iter()
+        .filter_map(|msg| msg["content"][0]["text"].as_str())
+        .find(|text| *text == review_prompt)
+        .expect("review prompt text");
     assert_eq!(
-        review_msg["content"][0]["text"].as_str().unwrap(),
-        review_prompt,
+        review_text, review_prompt,
         "user message should only contain the raw review prompt"
     );
 
@@ -555,7 +627,7 @@ async fn review_input_isolated_from_parent_history() {
     assert_eq!(instructions, REVIEW_PROMPT);
 
     // Also verify that a user interruption note was recorded in the rollout.
-    let path = codex.rollout_path();
+    let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");
     let mut saw_interruption_message = false;
     for line in text.lines() {
@@ -588,11 +660,10 @@ async fn review_input_isolated_from_parent_history() {
     server.verify().await;
 }
 
-/// After a review thread finishes, its conversation should not leak into the
-/// parent session. A subsequent parent turn must not include any review
-/// messages in its request `input`.
+/// After a review thread finishes, its conversation should be visible in the
+/// parent session so later turns can reference the results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_history_does_not_leak_into_parent_session() {
+async fn review_history_surfaces_in_parent_session() {
     skip_if_no_network!();
 
     // Respond to both the review request and the subsequent parent request.
@@ -603,7 +674,7 @@ async fn review_history_does_not_leak_into_parent_session() {
         }},
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
-    let server = start_responses_server_with_sse(sse_raw, 2).await;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 2).await;
     let codex_home = TempDir::new().unwrap();
     let codex = new_conversation_for_server(&server, &codex_home, |_| {}).await;
 
@@ -611,8 +682,10 @@ async fn review_history_does_not_leak_into_parent_session() {
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Start a review".to_string(),
-                user_facing_hint: "Start a review".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Start a review".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -627,7 +700,7 @@ async fn review_history_does_not_leak_into_parent_session() {
         )
     })
     .await;
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // 2) Continue in the parent session; request input must not include any review items.
     let followup = "back to parent".to_string();
@@ -635,18 +708,23 @@ async fn review_history_does_not_leak_into_parent_session() {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: followup.clone(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await
         .unwrap();
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Inspect the second request (parent turn) input contents.
     // Parent turns include session initial messages (user_instructions, environment_context).
     // Critically, no messages from the review thread should appear.
-    let requests = server.received_requests().await.unwrap();
+    let requests = request_log.requests();
     assert_eq!(requests.len(), 2);
-    let body = requests[1].body_json::<serde_json::Value>().unwrap();
+    for request in &requests {
+        assert_eq!(request.path(), "/v1/responses");
+    }
+    let body = requests[1].body_json();
     let input = body["input"].as_array().expect("input array");
 
     // Must include the followup as the last item for this turn
@@ -655,40 +733,145 @@ async fn review_history_does_not_leak_into_parent_session() {
     let last_text = last["content"][0]["text"].as_str().unwrap();
     assert_eq!(last_text, followup);
 
-    // Ensure no review-thread content leaked into the parent request
-    let contains_review_prompt = input
-        .iter()
-        .any(|msg| msg["content"][0]["text"].as_str().unwrap_or_default() == "Start a review");
+    // Ensure review-thread content is present for downstream turns.
+    let contains_review_rollout_user = input.iter().any(|msg| {
+        msg["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("User initiated a review task.")
+    });
     let contains_review_assistant = input.iter().any(|msg| {
-        msg["content"][0]["text"].as_str().unwrap_or_default() == "review assistant output"
+        msg["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("review assistant output")
     });
     assert!(
-        !contains_review_prompt,
-        "review prompt leaked into parent turn input"
+        contains_review_rollout_user,
+        "review rollout user message missing from parent turn input"
     );
     assert!(
-        !contains_review_assistant,
-        "review assistant output leaked into parent turn input"
+        contains_review_assistant,
+        "review assistant output missing from parent turn input"
+    );
+
+    server.verify().await;
+}
+
+/// `/review` should use the session's current cwd (including runtime overrides)
+/// when resolving base-branch review prompts (merge-base computation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
+    skip_if_no_network!();
+
+    let sse_raw = r#"[{"type":"response.completed", "response": {"id": "__ID__"}}]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+
+    let initial_cwd = TempDir::new().unwrap();
+
+    let repo_dir = TempDir::new().unwrap();
+    let repo_path = repo_dir.path();
+
+    fn run_git(repo_path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: stdout={:?} stderr={:?}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    run_git(repo_path, &["init", "-b", "main"]);
+    run_git(repo_path, &["config", "user.email", "test@example.com"]);
+    run_git(repo_path, &["config", "user.name", "Test User"]);
+    std::fs::write(repo_path.join("file.txt"), "hello\n").unwrap();
+    run_git(repo_path, &["add", "."]);
+    run_git(repo_path, &["commit", "-m", "initial"]);
+
+    let head_sha = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(head_sha.status.success());
+    let head_sha = String::from_utf8(head_sha.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string();
+
+    let codex_home = TempDir::new().unwrap();
+    let codex = new_conversation_for_server(&server, &codex_home, |config| {
+        config.cwd = initial_cwd.path().to_path_buf();
+    })
+    .await;
+
+    codex
+        .submit(Op::OverrideTurnContext {
+            cwd: Some(repo_path.to_path_buf()),
+            approval_policy: None,
+            sandbox_policy: None,
+            model: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await
+        .unwrap();
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::BaseBranch {
+                    branch: "main".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 1);
+    for request in &requests {
+        assert_eq!(request.path(), "/v1/responses");
+    }
+    let body = requests[0].body_json();
+    let input = body["input"].as_array().expect("input array");
+
+    let saw_merge_base_sha = input
+        .iter()
+        .filter_map(|msg| msg["content"][0]["text"].as_str())
+        .any(|text| text.contains(&head_sha));
+    assert!(
+        saw_merge_base_sha,
+        "expected review prompt to include merge-base sha {head_sha}"
     );
 
     server.verify().await;
 }
 
 /// Start a mock Responses API server and mount the given SSE stream body.
-async fn start_responses_server_with_sse(sse_raw: &str, expected_requests: usize) -> MockServer {
+async fn start_responses_server_with_sse(
+    sse_raw: &str,
+    expected_requests: usize,
+) -> (MockServer, ResponseMock) {
     let server = MockServer::start().await;
     let sse = load_sse_fixture_with_id_from_str(sse_raw, &Uuid::new_v4().to_string());
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(sse.clone(), "text/event-stream"),
-        )
-        .expect(expected_requests as u64)
-        .mount(&server)
-        .await;
-    server
+    let responses = vec![sse; expected_requests];
+    let request_log = mount_sse_sequence(&server, responses).await;
+    (server, request_log)
 }
 
 /// Create a conversation configured to talk to the provided mock server.
@@ -697,7 +880,7 @@ async fn new_conversation_for_server<F>(
     server: &MockServer,
     codex_home: &TempDir,
     mutator: F,
-) -> Arc<CodexConversation>
+) -> Arc<CodexThread>
 where
     F: FnOnce(&mut Config),
 {
@@ -705,16 +888,18 @@ where
         base_url: Some(format!("{}/v1", server.uri())),
         ..built_in_model_providers()["openai"].clone()
     };
-    let mut config = load_default_config_for_test(codex_home);
+    let mut config = load_default_config_for_test(codex_home).await;
     config.model_provider = model_provider;
     mutator(&mut config);
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
-    conversation_manager
-        .new_conversation(config)
+    let thread_manager = ThreadManager::with_models_provider(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+    );
+    thread_manager
+        .start_thread(config)
         .await
         .expect("create conversation")
-        .conversation
+        .thread
 }
 
 /// Create a conversation resuming from a rollout file, configured to talk to the provided mock server.
@@ -724,7 +909,7 @@ async fn resume_conversation_for_server<F>(
     codex_home: &TempDir,
     resume_path: std::path::PathBuf,
     mutator: F,
-) -> Arc<CodexConversation>
+) -> Arc<CodexThread>
 where
     F: FnOnce(&mut Config),
 {
@@ -732,16 +917,18 @@ where
         base_url: Some(format!("{}/v1", server.uri())),
         ..built_in_model_providers()["openai"].clone()
     };
-    let mut config = load_default_config_for_test(codex_home);
+    let mut config = load_default_config_for_test(codex_home).await;
     config.model_provider = model_provider;
     mutator(&mut config);
-    let conversation_manager =
-        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
+    let thread_manager = ThreadManager::with_models_provider(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+    );
     let auth_manager =
         codex_core::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    conversation_manager
-        .resume_conversation_from_rollout(config, resume_path, auth_manager)
+    thread_manager
+        .resume_thread_from_rollout(config, resume_path, auth_manager)
         .await
         .expect("resume conversation")
-        .conversation
+        .thread
 }

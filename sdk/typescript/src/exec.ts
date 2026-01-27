@@ -3,7 +3,12 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-import { SandboxMode } from "./threadOptions";
+import {
+  SandboxMode,
+  ModelReasoningEffort,
+  ApprovalMode,
+  WebSearchMode,
+} from "./threadOptions";
 
 export type CodexExecArgs = {
   input: string;
@@ -18,10 +23,24 @@ export type CodexExecArgs = {
   sandboxMode?: SandboxMode;
   // --cd
   workingDirectory?: string;
+  // --add-dir
+  additionalDirectories?: string[];
   // --skip-git-repo-check
   skipGitRepoCheck?: boolean;
   // --output-schema
   outputSchemaFile?: string;
+  // --config model_reasoning_effort
+  modelReasoningEffort?: ModelReasoningEffort;
+  // AbortSignal to cancel the execution
+  signal?: AbortSignal;
+  // --config sandbox_workspace_write.network_access
+  networkAccessEnabled?: boolean;
+  // --config web_search
+  webSearchMode?: WebSearchMode;
+  // legacy --config features.web_search_request
+  webSearchEnabled?: boolean;
+  // --config approval_policy
+  approvalPolicy?: ApprovalMode;
 };
 
 const INTERNAL_ORIGINATOR_ENV = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
@@ -29,8 +48,11 @@ const TYPESCRIPT_SDK_ORIGINATOR = "codex_sdk_ts";
 
 export class CodexExec {
   private executablePath: string;
-  constructor(executablePath: string | null = null) {
+  private envOverride?: Record<string, string>;
+
+  constructor(executablePath: string | null = null, env?: Record<string, string>) {
     this.executablePath = executablePath || findCodexPath();
+    this.envOverride = env;
   }
 
   async *run(args: CodexExecArgs): AsyncGenerator<string> {
@@ -48,12 +70,41 @@ export class CodexExec {
       commandArgs.push("--cd", args.workingDirectory);
     }
 
+    if (args.additionalDirectories?.length) {
+      for (const dir of args.additionalDirectories) {
+        commandArgs.push("--add-dir", dir);
+      }
+    }
+
     if (args.skipGitRepoCheck) {
       commandArgs.push("--skip-git-repo-check");
     }
 
     if (args.outputSchemaFile) {
       commandArgs.push("--output-schema", args.outputSchemaFile);
+    }
+
+    if (args.modelReasoningEffort) {
+      commandArgs.push("--config", `model_reasoning_effort="${args.modelReasoningEffort}"`);
+    }
+
+    if (args.networkAccessEnabled !== undefined) {
+      commandArgs.push(
+        "--config",
+        `sandbox_workspace_write.network_access=${args.networkAccessEnabled}`,
+      );
+    }
+
+    if (args.webSearchMode) {
+      commandArgs.push("--config", `web_search="${args.webSearchMode}"`);
+    } else if (args.webSearchEnabled === true) {
+      commandArgs.push("--config", `web_search="live"`);
+    } else if (args.webSearchEnabled === false) {
+      commandArgs.push("--config", `web_search="disabled"`);
+    }
+
+    if (args.approvalPolicy) {
+      commandArgs.push("--config", `approval_policy="${args.approvalPolicy}"`);
     }
 
     if (args.images?.length) {
@@ -66,9 +117,16 @@ export class CodexExec {
       commandArgs.push("resume", args.threadId);
     }
 
-    const env = {
-      ...process.env,
-    };
+    const env: Record<string, string> = {};
+    if (this.envOverride) {
+      Object.assign(env, this.envOverride);
+    } else {
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) {
+          env[key] = value;
+        }
+      }
+    }
     if (!env[INTERNAL_ORIGINATOR_ENV]) {
       env[INTERNAL_ORIGINATOR_ENV] = TYPESCRIPT_SDK_ORIGINATOR;
     }
@@ -81,6 +139,7 @@ export class CodexExec {
 
     const child = spawn(this.executablePath, commandArgs, {
       env,
+      signal: args.signal,
     });
 
     let spawnError: unknown | null = null;
@@ -105,6 +164,14 @@ export class CodexExec {
       });
     }
 
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once("exit", (code, signal) => {
+          resolve({ code, signal });
+        });
+      },
+    );
+
     const rl = readline.createInterface({
       input: child.stdout,
       crlfDelay: Infinity,
@@ -116,21 +183,13 @@ export class CodexExec {
         yield line as string;
       }
 
-      const exitCode = new Promise((resolve, reject) => {
-        child.once("exit", (code) => {
-          if (code === 0) {
-            resolve(code);
-          } else {
-            const stderrBuffer = Buffer.concat(stderrChunks);
-            reject(
-              new Error(`Codex Exec exited with code ${code}: ${stderrBuffer.toString("utf8")}`),
-            );
-          }
-        });
-      });
-
       if (spawnError) throw spawnError;
-      await exitCode;
+      const { code, signal } = await exitPromise;
+      if (code !== 0 || signal) {
+        const stderrBuffer = Buffer.concat(stderrChunks);
+        const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
+        throw new Error(`Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}`);
+      }
     } finally {
       rl.close();
       child.removeAllListeners();

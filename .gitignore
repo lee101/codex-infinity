@@ -9,6 +9,7 @@ node_modules
 
 # build
 dist/
+bazel-*
 build/
 out/
 storybook-static/
@@ -64,6 +65,9 @@ apply_patch/
 # coverage
 coverage/
 
+# personal files
+personal/
+
 # os
 .DS_Store
 Thumbs.db
@@ -82,3 +86,8 @@ CHANGELOG.ignore.md
 # nix related
 .direnv
 .envrc
+
+# Python bytecode files
+__pycache__/
+*.pyc
+

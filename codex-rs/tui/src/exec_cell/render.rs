@@ -14,19 +14,19 @@ use crate::wrapping::word_wrap_line;
 use crate::wrapping::word_wrap_lines;
 use codex_ansi_escape::ansi_escape_line;
 use codex_common::elapsed::format_duration;
+use codex_core::bash::extract_bash_command;
+use codex_core::protocol::ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 use itertools::Itertools;
 use ratatui::prelude::*;
 use ratatui::style::Modifier;
 use ratatui::style::Stylize;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::WidgetRef;
-use ratatui::widgets::Wrap;
 use textwrap::WordSplitter;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
+const MAX_INTERACTION_PREVIEW_CHARS: usize = 80;
 
 pub(crate) struct OutputLinesParams {
     pub(crate) line_limit: usize,
@@ -39,17 +39,53 @@ pub(crate) fn new_active_exec_command(
     call_id: String,
     command: Vec<String>,
     parsed: Vec<ParsedCommand>,
-    is_user_shell_command: bool,
+    source: ExecCommandSource,
+    interaction_input: Option<String>,
+    animations_enabled: bool,
 ) -> ExecCell {
-    ExecCell::new(ExecCall {
-        call_id,
-        command,
-        parsed,
-        output: None,
-        is_user_shell_command,
-        start_time: Some(Instant::now()),
-        duration: None,
-    })
+    ExecCell::new(
+        ExecCall {
+            call_id,
+            command,
+            parsed,
+            output: None,
+            source,
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input,
+        },
+        animations_enabled,
+    )
+}
+
+fn format_unified_exec_interaction(command: &[String], input: Option<&str>) -> String {
+    let command_display = if let Some((_, script)) = extract_bash_command(command) {
+        script.to_string()
+    } else {
+        command.join(" ")
+    };
+    match input {
+        Some(data) if !data.is_empty() => {
+            let preview = summarize_interaction_input(data);
+            format!("Interacted with `{command_display}`, sent `{preview}`")
+        }
+        _ => format!("Waited for `{command_display}`"),
+    }
+}
+
+fn summarize_interaction_input(input: &str) -> String {
+    let single_line = input.replace('\n', "\\n");
+    let sanitized = single_line.replace('`', "\\`");
+    if sanitized.chars().count() <= MAX_INTERACTION_PREVIEW_CHARS {
+        return sanitized;
+    }
+
+    let mut preview = String::new();
+    for ch in sanitized.chars().take(MAX_INTERACTION_PREVIEW_CHARS) {
+        preview.push(ch);
+    }
+    preview.push_str("...");
+    preview
 }
 
 #[derive(Clone)]
@@ -141,7 +177,10 @@ pub(crate) fn output_lines(
     }
 }
 
-pub(crate) fn spinner(start_time: Option<Instant>) -> Span<'static> {
+pub(crate) fn spinner(start_time: Option<Instant>, animations_enabled: bool) -> Span<'static> {
+    if !animations_enabled {
+        return "•".dim();
+    }
     let elapsed = start_time.map(|st| st.elapsed()).unwrap_or_default();
     if supports_color::on_cached(supports_color::Stream::Stdout)
         .map(|level| level.has_16m)
@@ -184,7 +223,14 @@ impl HistoryCell for ExecCell {
             lines.extend(cmd_display);
 
             if let Some(output) = call.output.as_ref() {
-                lines.extend(output.formatted_output.lines().map(ansi_escape_line));
+                if !call.is_unified_exec_interaction() {
+                    let wrap_width = width.max(1) as usize;
+                    let wrap_opts = RtOptions::new(wrap_width);
+                    for unwrapped in output.formatted_output.lines().map(ansi_escape_line) {
+                        let wrapped = word_wrap_line(&unwrapped, wrap_opts.clone());
+                        push_owned_lines(&wrapped, &mut lines);
+                    }
+                }
                 let duration = call
                     .duration
                     .map(format_duration)
@@ -205,37 +251,12 @@ impl HistoryCell for ExecCell {
     }
 }
 
-impl WidgetRef for &ExecCell {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
-            return;
-        }
-        let content_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: area.height,
-        };
-        let lines = self.display_lines(area.width);
-        let max_rows = area.height as usize;
-        let rendered = if lines.len() > max_rows {
-            lines[lines.len() - max_rows..].to_vec()
-        } else {
-            lines
-        };
-
-        Paragraph::new(Text::from(rendered))
-            .wrap(Wrap { trim: false })
-            .render(content_area, buf);
-    }
-}
-
 impl ExecCell {
     fn exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::from(vec![
             if self.is_active() {
-                spinner(self.active_start_time())
+                spinner(self.active_start_time(), self.animations_enabled())
             } else {
                 "•".dim()
             },
@@ -343,15 +364,31 @@ impl ExecCell {
         let bullet = match success {
             Some(true) => "•".green().bold(),
             Some(false) => "•".red().bold(),
-            None => spinner(call.start_time),
+            None => spinner(call.start_time, self.animations_enabled()),
         };
-        let title = if self.is_active() { "Running" } else { "Ran" };
+        let is_interaction = call.is_unified_exec_interaction();
+        let title = if is_interaction {
+            ""
+        } else if self.is_active() {
+            "Running"
+        } else if call.is_user_shell_command() {
+            "You ran"
+        } else {
+            "Ran"
+        };
 
-        let mut header_line =
-            Line::from(vec![bullet.clone(), " ".into(), title.bold(), " ".into()]);
+        let mut header_line = if is_interaction {
+            Line::from(vec![bullet.clone(), " ".into()])
+        } else {
+            Line::from(vec![bullet.clone(), " ".into(), title.bold(), " ".into()])
+        };
         let header_prefix_width = header_line.width();
 
-        let cmd_display = strip_bash_lc_and_escape(&call.command);
+        let cmd_display = if call.is_unified_exec_interaction() {
+            format_unified_exec_interaction(&call.command, call.interaction_input.as_deref())
+        } else {
+            strip_bash_lc_and_escape(&call.command)
+        };
         let highlighted_lines = highlight_bash_to_lines(&cmd_display);
 
         let continuation_wrap_width = layout.command_continuation.wrap_width(width);
@@ -395,7 +432,7 @@ impl ExecCell {
         }
 
         if let Some(output) = call.output.as_ref() {
-            let line_limit = if call.is_user_shell_command {
+            let line_limit = if call.is_user_shell_command() {
                 USER_SHELL_TOOL_CALL_MAX_LINES
             } else {
                 TOOL_CALL_MAX_LINES
@@ -409,39 +446,41 @@ impl ExecCell {
                     include_prefix: false,
                 },
             );
-            let display_limit = if call.is_user_shell_command {
+            let display_limit = if call.is_user_shell_command() {
                 USER_SHELL_TOOL_CALL_MAX_LINES
             } else {
                 layout.output_max_lines
             };
 
             if raw_output.lines.is_empty() {
-                lines.extend(prefix_lines(
-                    vec![Line::from("(no output)".dim())],
-                    Span::from(layout.output_block.initial_prefix).dim(),
-                    Span::from(layout.output_block.subsequent_prefix),
-                ));
+                if !call.is_unified_exec_interaction() {
+                    lines.extend(prefix_lines(
+                        vec![Line::from("(no output)".dim())],
+                        Span::from(layout.output_block.initial_prefix).dim(),
+                        Span::from(layout.output_block.subsequent_prefix),
+                    ));
+                }
             } else {
-                let trimmed_output = Self::truncate_lines_middle(
-                    &raw_output.lines,
-                    display_limit,
-                    raw_output.omitted,
-                );
-
+                // Wrap first so that truncation is applied to on-screen lines
+                // rather than logical lines. This ensures that a small number
+                // of very long lines cannot flood the viewport.
                 let mut wrapped_output: Vec<Line<'static>> = Vec::new();
                 let output_wrap_width = layout.output_block.wrap_width(width);
                 let output_opts =
                     RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
-                for line in trimmed_output {
+                for line in &raw_output.lines {
                     push_owned_lines(
-                        &word_wrap_line(&line, output_opts.clone()),
+                        &word_wrap_line(line, output_opts.clone()),
                         &mut wrapped_output,
                     );
                 }
 
-                if !wrapped_output.is_empty() {
+                let trimmed_output =
+                    Self::truncate_lines_middle(&wrapped_output, display_limit, raw_output.omitted);
+
+                if !trimmed_output.is_empty() {
                     lines.extend(prefix_lines(
-                        wrapped_output,
+                        trimmed_output,
                         Span::from(layout.output_block.initial_prefix).dim(),
                         Span::from(layout.output_block.subsequent_prefix),
                     ));
@@ -568,3 +607,99 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
     PrefixedBlock::new("  └ ", "    "),
     5,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::protocol::ExecCommandSource;
+
+    #[test]
+    fn user_shell_output_is_limited_by_screen_lines() {
+        // Construct a user shell exec cell whose aggregated output consists of a
+        // small number of very long logical lines. These will wrap into many
+        // on-screen lines at narrow widths.
+        //
+        // Use a short marker so it survives wrapping intact inside each
+        // rendered screen line; the previous test used a marker longer than
+        // the wrap width, so it was split across lines and the assertion
+        // never actually saw it.
+        let marker = "Z";
+        let long_chunk = marker.repeat(800);
+        let aggregated_output = format!("{long_chunk}\n{long_chunk}\n");
+
+        // Baseline: how many screen lines would we get if we simply wrapped
+        // all logical lines without any truncation?
+        let output = CommandOutput {
+            exit_code: 0,
+            aggregated_output,
+            formatted_output: String::new(),
+        };
+        let width = 20;
+        let layout = EXEC_DISPLAY_LAYOUT;
+        let raw_output = output_lines(
+            Some(&output),
+            OutputLinesParams {
+                // Large enough to include all logical lines without
+                // triggering the ellipsis in `output_lines`.
+                line_limit: 100,
+                only_err: false,
+                include_angle_pipe: false,
+                include_prefix: false,
+            },
+        );
+        let output_wrap_width = layout.output_block.wrap_width(width);
+        let output_opts =
+            RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
+        let mut full_wrapped_output: Vec<Line<'static>> = Vec::new();
+        for line in &raw_output.lines {
+            push_owned_lines(
+                &word_wrap_line(line, output_opts.clone()),
+                &mut full_wrapped_output,
+            );
+        }
+        let full_screen_lines = full_wrapped_output
+            .iter()
+            .filter(|line| line.spans.iter().any(|span| span.content.contains(marker)))
+            .count();
+
+        // Sanity check: this scenario should produce more screen lines than
+        // the user shell per-call limit when no truncation is applied. If
+        // this ever fails, the test no longer exercises the regression.
+        assert!(
+            full_screen_lines > USER_SHELL_TOOL_CALL_MAX_LINES,
+            "expected unbounded wrapping to produce more than {USER_SHELL_TOOL_CALL_MAX_LINES} screen lines, got {full_screen_lines}",
+        );
+
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec!["bash".into(), "-lc".into(), "echo long".into()],
+            parsed: Vec::new(),
+            output: Some(output),
+            source: ExecCommandSource::UserShell,
+            start_time: None,
+            duration: None,
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, false);
+
+        // Use a narrow width so each logical line wraps into many on-screen lines.
+        let lines = cell.command_display_lines(width);
+
+        // Count how many rendered lines contain our marker text. This approximates
+        // the number of visible output "screen lines" for this command.
+        let output_screen_lines = lines
+            .iter()
+            .filter(|line| line.spans.iter().any(|span| span.content.contains(marker)))
+            .count();
+
+        // Regression guard: previously this scenario could render hundreds of
+        // wrapped lines because truncation happened before wrapping. Now the
+        // truncation is applied after wrapping, so the number of visible
+        // screen lines is bounded by USER_SHELL_TOOL_CALL_MAX_LINES.
+        assert!(
+            output_screen_lines <= USER_SHELL_TOOL_CALL_MAX_LINES,
+            "expected at most {USER_SHELL_TOOL_CALL_MAX_LINES} screen lines of user shell output, got {output_screen_lines}",
+        );
+    }
+}

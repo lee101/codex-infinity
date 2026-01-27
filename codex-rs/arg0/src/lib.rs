@@ -11,32 +11,7 @@ const LINUX_SANDBOX_ARG0: &str = "codex-linux-sandbox";
 const APPLY_PATCH_ARG0: &str = "apply_patch";
 const MISSPELLED_APPLY_PATCH_ARG0: &str = "applypatch";
 
-/// While we want to deploy the Codex CLI as a single executable for simplicity,
-/// we also want to expose some of its functionality as distinct CLIs, so we use
-/// the "arg0 trick" to determine which CLI to dispatch. This effectively allows
-/// us to simulate deploying multiple executables as a single binary on Mac and
-/// Linux (but not Windows).
-///
-/// When the current executable is invoked through the hard-link or alias named
-/// `codex-linux-sandbox` we *directly* execute
-/// [`codex_linux_sandbox::run_main`] (which never returns). Otherwise we:
-///
-/// 1.  Load `.env` values from `~/.codex/.env` before creating any threads.
-/// 2.  Construct a Tokio multi-thread runtime.
-/// 3.  Derive the path to the current executable (so children can re-invoke the
-///     sandbox) when running on Linux.
-/// 4.  Execute the provided async `main_fn` inside that runtime, forwarding any
-///     error. Note that `main_fn` receives `codex_linux_sandbox_exe:
-///     Option<PathBuf>`, as an argument, which is generally needed as part of
-///     constructing [`codex_core::config::Config`].
-///
-/// This function should be used to wrap any `main()` function in binary crates
-/// in this workspace that depends on these helper CLIs.
-pub fn arg0_dispatch_or_else<F, Fut>(main_fn: F) -> anyhow::Result<()>
-where
-    F: FnOnce(Option<PathBuf>) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
-{
+pub fn arg0_dispatch() -> Option<TempDir> {
     // Determine if we were invoked via the special alias.
     let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
@@ -76,10 +51,7 @@ where
     // before creating any threads/the Tokio runtime.
     load_dotenv();
 
-    // Retain the TempDir so it exists for the lifetime of the invocation of
-    // this executable. Admittedly, we could invoke `keep()` on it, but it
-    // would be nice to avoid leaving temporary directories behind, if possible.
-    let _path_entry = match prepend_path_entry_for_apply_patch() {
+    match prepend_path_entry_for_codex_aliases() {
         Ok(path_entry) => Some(path_entry),
         Err(err) => {
             // It is possible that Codex will proceed successfully even if
@@ -87,7 +59,39 @@ where
             eprintln!("WARNING: proceeding, even though we could not update PATH: {err}");
             None
         }
-    };
+    }
+}
+
+/// While we want to deploy the Codex CLI as a single executable for simplicity,
+/// we also want to expose some of its functionality as distinct CLIs, so we use
+/// the "arg0 trick" to determine which CLI to dispatch. This effectively allows
+/// us to simulate deploying multiple executables as a single binary on Mac and
+/// Linux (but not Windows).
+///
+/// When the current executable is invoked through the hard-link or alias named
+/// `codex-linux-sandbox` we *directly* execute
+/// [`codex_linux_sandbox::run_main`] (which never returns). Otherwise we:
+///
+/// 1.  Load `.env` values from `~/.codex/.env` before creating any threads.
+/// 2.  Construct a Tokio multi-thread runtime.
+/// 3.  Derive the path to the current executable (so children can re-invoke the
+///     sandbox) when running on Linux.
+/// 4.  Execute the provided async `main_fn` inside that runtime, forwarding any
+///     error. Note that `main_fn` receives `codex_linux_sandbox_exe:
+///     Option<PathBuf>`, as an argument, which is generally needed as part of
+///     constructing [`codex_core::config::Config`].
+///
+/// This function should be used to wrap any `main()` function in binary crates
+/// in this workspace that depends on these helper CLIs.
+pub fn arg0_dispatch_or_else<F, Fut>(main_fn: F) -> anyhow::Result<()>
+where
+    F: FnOnce(Option<PathBuf>) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    // Retain the TempDir so it exists for the lifetime of the invocation of
+    // this executable. Admittedly, we could invoke `keep()` on it, but it
+    // would be nice to avoid leaving temporary directories behind, if possible.
+    let _path_entry = arg0_dispatch();
 
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
@@ -141,14 +145,49 @@ where
 /// that `apply_patch` can be on the PATH without requiring the user to
 /// install a separate `apply_patch` executable, simplifying the deployment of
 /// Codex CLI.
+/// Note: In debug builds the temp-dir guard is disabled to ease local testing.
 ///
 /// IMPORTANT: This function modifies the PATH environment variable, so it MUST
 /// be called before multiple threads are spawned.
-fn prepend_path_entry_for_apply_patch() -> std::io::Result<TempDir> {
-    let temp_dir = TempDir::new()?;
+pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<TempDir> {
+    let codex_home = codex_core::config::find_codex_home()?;
+    #[cfg(not(debug_assertions))]
+    {
+        // Guard against placing helpers in system temp directories outside debug builds.
+        let temp_root = std::env::temp_dir();
+        if codex_home.starts_with(&temp_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_home: {codex_home:?})"
+                ),
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(&codex_home)?;
+    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+    let temp_root = codex_home.join("tmp").join("path");
+    std::fs::create_dir_all(&temp_root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Ensure only the current user can access the temp directory.
+        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("codex-arg0")
+        .tempdir_in(&temp_root)?;
     let path = temp_dir.path();
 
-    for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
+    for filename in &[
+        APPLY_PATCH_ARG0,
+        MISSPELLED_APPLY_PATCH_ARG0,
+        #[cfg(target_os = "linux")]
+        LINUX_SANDBOX_ARG0,
+    ] {
         let exe = std::env::current_exe()?;
 
         #[cfg(unix)]

@@ -287,6 +287,8 @@ async fn handle_list_resources(
             let resources = session
                 .services
                 .mcp_connection_manager
+                .read()
+                .await
                 .list_all_resources()
                 .await;
             Ok(ListResourcesPayload::from_all_servers(resources))
@@ -396,6 +398,8 @@ async fn handle_list_resource_templates(
             let templates = session
                 .services
                 .mcp_connection_manager
+                .read()
+                .await
                 .list_all_resource_templates()
                 .await;
             Ok(ListResourceTemplatesPayload::from_all_servers(templates))
@@ -636,9 +640,14 @@ fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError> {
     if raw_args.trim().is_empty() {
         Ok(None)
     } else {
-        serde_json::from_str(raw_args).map(Some).map_err(|err| {
+        let value: Value = serde_json::from_str(raw_args).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
-        })
+        })?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 }
 
@@ -763,6 +772,11 @@ mod tests {
         assert!(
             parse_arguments(" \n\t").unwrap().is_none(),
             "expected None for empty arguments"
+        );
+
+        assert!(
+            parse_arguments("null").unwrap().is_none(),
+            "expected None for null arguments"
         );
 
         let value = parse_arguments(r#"{"server":"figma"}"#)

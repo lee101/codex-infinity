@@ -1,7 +1,8 @@
 [package]
-edition = "2024"
 name = "codex-cli"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "codex"
@@ -23,21 +24,22 @@ codex-app-server-protocol = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
+codex-infinity-tasks = { path = "../infinity-tasks" }
 codex-common = { workspace = true, features = ["cli"] }
 codex-core = { workspace = true }
 codex-exec = { workspace = true }
+codex-execpolicy = { workspace = true }
 codex-http-server = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp-server = { workspace = true }
-codex-process-hardening = { workspace = true }
 codex-protocol = { workspace = true }
-codex-protocol-ts = { workspace = true }
 codex-responses-api-proxy = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-tui = { workspace = true }
-ctor = { workspace = true }
+libc = { workspace = true }
 owo-colors = { workspace = true }
+regex-lite = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -49,6 +51,8 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "signal",
 ] }
+toml = { workspace = true }
+tracing = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
@@ -56,6 +60,7 @@ codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

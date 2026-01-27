@@ -12,13 +12,14 @@ use std::time::Instant;
 use async_channel::Sender;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::SandboxErr;
+use crate::get_platform_sandbox;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
@@ -27,10 +28,13 @@ use crate::protocol::SandboxPolicy;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::ExecEnv;
 use crate::sandboxing::SandboxManager;
+use crate::sandboxing::SandboxPermissions;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use crate::text_encoding::bytes_to_string_smart;
+use codex_utils_pty::process_group::kill_child_process_group;
 
-const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.
@@ -43,31 +47,68 @@ const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
 const READ_CHUNK_SIZE: usize = 8192; // bytes per read
 const AGGREGATE_BUFFER_INITIAL_CAPACITY: usize = 8 * 1024; // 8 KiB
 
+/// Hard cap on bytes retained from exec stdout/stderr/aggregated output.
+///
+/// This mirrors unified exec's output cap so a single runaway command cannot
+/// OOM the process by dumping huge amounts of data to stdout/stderr.
+const EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Limit the number of ExecCommandOutputDelta events emitted per exec call.
 /// Aggregation still collects full output; only the live event stream is capped.
 pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExecParams {
     pub command: Vec<String>,
     pub cwd: PathBuf,
-    pub timeout_ms: Option<u64>,
+    pub expiration: ExecExpiration,
     pub env: HashMap<String, String>,
-    pub with_escalated_permissions: Option<bool>,
+    pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
     pub arg0: Option<String>,
-    pub disable_timeout: bool,
-    pub passthrough_stdio: bool,
 }
 
-impl ExecParams {
-    pub fn timeout_duration(&self) -> Option<Duration> {
-        if self.disable_timeout {
-            None
-        } else {
-            Some(Duration::from_millis(
-                self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            ))
+/// Mechanism to terminate an exec invocation before it finishes naturally.
+#[derive(Debug)]
+pub enum ExecExpiration {
+    Timeout(Duration),
+    DefaultTimeout,
+    Cancellation(CancellationToken),
+}
+
+impl From<Option<u64>> for ExecExpiration {
+    fn from(timeout_ms: Option<u64>) -> Self {
+        timeout_ms.map_or(ExecExpiration::DefaultTimeout, |timeout_ms| {
+            ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
+        })
+    }
+}
+
+impl From<u64> for ExecExpiration {
+    fn from(timeout_ms: u64) -> Self {
+        ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
+    }
+}
+
+impl ExecExpiration {
+    async fn wait(self) {
+        match self {
+            ExecExpiration::Timeout(duration) => tokio::time::sleep(duration).await,
+            ExecExpiration::DefaultTimeout => {
+                tokio::time::sleep(Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)).await
+            }
+            ExecExpiration::Cancellation(cancel) => {
+                cancel.cancelled().await;
+            }
+        }
+    }
+
+    /// If ExecExpiration is a timeout, returns the timeout in milliseconds.
+    pub(crate) fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
+            ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
+            ExecExpiration::Cancellation(_) => None,
         }
     }
 }
@@ -95,22 +136,27 @@ pub struct StdoutStream {
 
 pub async fn process_exec_tool_call(
     params: ExecParams,
-    sandbox_type: SandboxType,
     sandbox_policy: &SandboxPolicy,
     sandbox_cwd: &Path,
     codex_linux_sandbox_exe: &Option<PathBuf>,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
+    let sandbox_type = match &sandbox_policy {
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+            SandboxType::None
+        }
+        _ => get_platform_sandbox().unwrap_or(SandboxType::None),
+    };
+    tracing::debug!("Sandbox type: {sandbox_type:?}");
+
     let ExecParams {
         command,
         cwd,
-        timeout_ms,
+        expiration,
         env,
-        with_escalated_permissions,
+        sandbox_permissions,
         justification,
         arg0: _,
-        disable_timeout,
-        passthrough_stdio,
     } = params;
 
     let (program, args) = command.split_first().ok_or_else(|| {
@@ -125,17 +171,15 @@ pub async fn process_exec_tool_call(
         args: args.to_vec(),
         cwd,
         env,
-        timeout_ms,
-        with_escalated_permissions,
+        expiration,
+        sandbox_permissions,
         justification,
-        disable_timeout,
-        passthrough_stdio,
     };
 
     let manager = SandboxManager::new();
     let exec_env = manager
         .transform(
-            &spec,
+            spec,
             sandbox_policy,
             sandbox_type,
             sandbox_cwd,
@@ -144,7 +188,7 @@ pub async fn process_exec_tool_call(
         .map_err(CodexErr::from)?;
 
     // Route through the sandboxing module for a single, unified execution path.
-    crate::sandboxing::execute_env(&exec_env, sandbox_policy, stdout_stream).await
+    crate::sandboxing::execute_env(exec_env, sandbox_policy, stdout_stream).await
 }
 
 pub(crate) async fn execute_exec_env(
@@ -156,25 +200,21 @@ pub(crate) async fn execute_exec_env(
         command,
         cwd,
         env,
-        timeout_ms,
+        expiration,
         sandbox,
-        with_escalated_permissions,
+        sandbox_permissions,
         justification,
         arg0,
-        disable_timeout,
-        passthrough_stdio,
     } = env;
 
     let params = ExecParams {
         command,
         cwd,
-        timeout_ms,
+        expiration,
         env,
-        with_escalated_permissions,
+        sandbox_permissions,
         justification,
         arg0,
-        disable_timeout,
-        passthrough_stdio,
     };
 
     let start = Instant::now();
@@ -189,34 +229,55 @@ async fn exec_windows_sandbox(
     sandbox_policy: &SandboxPolicy,
 ) -> Result<RawExecToolCallOutput> {
     use crate::config::find_codex_home;
+    use crate::safety::is_windows_elevated_sandbox_enabled;
     use codex_windows_sandbox::run_windows_sandbox_capture;
+    use codex_windows_sandbox::run_windows_sandbox_capture_elevated;
 
     let ExecParams {
         command,
         cwd,
         env,
-        timeout_ms,
+        expiration,
         ..
     } = params;
+    // TODO(iceweasel-oai): run_windows_sandbox_capture should support all
+    // variants of ExecExpiration, not just timeout.
+    let timeout_ms = expiration.timeout_ms();
 
-    let policy_str = match sandbox_policy {
-        SandboxPolicy::DangerFullAccess => "workspace-write",
-        SandboxPolicy::ReadOnly => "read-only",
-        SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
-    };
-
+    let policy_str = serde_json::to_string(sandbox_policy).map_err(|err| {
+        CodexErr::Io(io::Error::other(format!(
+            "failed to serialize Windows sandbox policy: {err}"
+        )))
+    })?;
     let sandbox_cwd = cwd.clone();
-    let logs_base_dir = find_codex_home().ok();
+    let codex_home = find_codex_home().map_err(|err| {
+        CodexErr::Io(io::Error::other(format!(
+            "windows sandbox: failed to resolve codex_home: {err}"
+        )))
+    })?;
+    let use_elevated = is_windows_elevated_sandbox_enabled();
     let spawn_res = tokio::task::spawn_blocking(move || {
-        run_windows_sandbox_capture(
-            policy_str,
-            &sandbox_cwd,
-            command,
-            &cwd,
-            env,
-            timeout_ms,
-            logs_base_dir.as_deref(),
-        )
+        if use_elevated {
+            run_windows_sandbox_capture_elevated(
+                policy_str.as_str(),
+                &sandbox_cwd,
+                codex_home.as_ref(),
+                command,
+                &cwd,
+                env,
+                timeout_ms,
+            )
+        } else {
+            run_windows_sandbox_capture(
+                policy_str.as_str(),
+                &sandbox_cwd,
+                codex_home.as_ref(),
+                command,
+                &cwd,
+                env,
+                timeout_ms,
+            )
+        }
     })
     .await;
 
@@ -235,18 +296,32 @@ async fn exec_windows_sandbox(
     };
 
     let exit_status = synthetic_exit_status(capture.exit_code);
+    let mut stdout_text = capture.stdout;
+    if stdout_text.len() > EXEC_OUTPUT_MAX_BYTES {
+        stdout_text.truncate(EXEC_OUTPUT_MAX_BYTES);
+    }
+    let mut stderr_text = capture.stderr;
+    if stderr_text.len() > EXEC_OUTPUT_MAX_BYTES {
+        stderr_text.truncate(EXEC_OUTPUT_MAX_BYTES);
+    }
     let stdout = StreamOutput {
-        text: capture.stdout,
+        text: stdout_text,
         truncated_after_lines: None,
     };
     let stderr = StreamOutput {
-        text: capture.stderr,
+        text: stderr_text,
         truncated_after_lines: None,
     };
-    // Best-effort aggregate: stdout then stderr
-    let mut aggregated = Vec::with_capacity(stdout.text.len() + stderr.text.len());
-    append_all(&mut aggregated, &stdout.text);
-    append_all(&mut aggregated, &stderr.text);
+    // Best-effort aggregate: stdout then stderr (capped).
+    let mut aggregated = Vec::with_capacity(
+        stdout
+            .text
+            .len()
+            .saturating_add(stderr.text.len())
+            .min(EXEC_OUTPUT_MAX_BYTES),
+    );
+    append_capped(&mut aggregated, &stdout.text, EXEC_OUTPUT_MAX_BYTES);
+    append_capped(&mut aggregated, &stderr.text, EXEC_OUTPUT_MAX_BYTES);
     let aggregated_output = StreamOutput {
         text: aggregated,
         truncated_after_lines: None,
@@ -330,6 +405,10 @@ pub(crate) mod errors {
                 SandboxTransformError::MissingLinuxSandboxExecutable => {
                     CodexErr::LandlockSandboxExecutableNotProvided
                 }
+                #[cfg(not(target_os = "macos"))]
+                SandboxTransformError::SeatbeltUnavailable => CodexErr::UnsupportedOperation(
+                    "seatbelt sandbox is only available on macOS".to_string(),
+                ),
             }
         }
     }
@@ -424,15 +503,20 @@ impl StreamOutput<String> {
 impl StreamOutput<Vec<u8>> {
     pub fn from_utf8_lossy(&self) -> StreamOutput<String> {
         StreamOutput {
-            text: String::from_utf8_lossy(&self.text).to_string(),
+            text: bytes_to_string_smart(&self.text),
             truncated_after_lines: self.truncated_after_lines,
         }
     }
 }
 
 #[inline]
-fn append_all(dst: &mut Vec<u8>, src: &[u8]) {
-    dst.extend_from_slice(src);
+fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize) {
+    if dst.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes.saturating_sub(dst.len());
+    let take = remaining.min(src.len());
+    dst.extend_from_slice(&src[..take]);
 }
 
 #[derive(Clone, Debug)]
@@ -445,6 +529,19 @@ pub struct ExecToolCallOutput {
     pub timed_out: bool,
 }
 
+impl Default for ExecToolCallOutput {
+    fn default() -> Self {
+        Self {
+            exit_code: 0,
+            stdout: StreamOutput::new(String::new()),
+            stderr: StreamOutput::new(String::new()),
+            aggregated_output: StreamOutput::new(String::new()),
+            duration: Duration::ZERO,
+            timed_out: false,
+        }
+    }
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
 async fn exec(
     params: ExecParams,
@@ -453,16 +550,20 @@ async fn exec(
     stdout_stream: Option<StdoutStream>,
 ) -> Result<RawExecToolCallOutput> {
     #[cfg(target_os = "windows")]
-    if sandbox == SandboxType::WindowsRestrictedToken {
+    if sandbox == SandboxType::WindowsRestrictedToken
+        && !matches!(
+            sandbox_policy,
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+        )
+    {
         return exec_windows_sandbox(params, sandbox_policy).await;
     }
-    let timeout = params.timeout_duration();
-    let passthrough_stdio = params.passthrough_stdio;
     let ExecParams {
         command,
         cwd,
         env,
         arg0,
+        expiration,
         ..
     } = params;
 
@@ -473,35 +574,25 @@ async fn exec(
         ))
     })?;
     let arg0_ref = arg0.as_deref();
-    let stdio_policy = if passthrough_stdio {
-        StdioPolicy::Inherit
-    } else {
-        StdioPolicy::RedirectForShellTool
-    };
     let child = spawn_child_async(
         PathBuf::from(program),
         args.into(),
         arg0_ref,
         cwd,
         sandbox_policy,
-        stdio_policy,
+        StdioPolicy::RedirectForShellTool,
         env,
     )
     .await?;
-    if passthrough_stdio {
-        consume_passthrough_output(child, timeout).await
-    } else {
-        consume_truncated_output(child, timeout, stdout_stream, false).await
-    }
+    consume_truncated_output(child, expiration, stdout_stream).await
 }
 
 /// Consumes the output of a child process, truncating it so it is suitable for
 /// use as the output of a `shell` tool call. Also enforces specified timeout.
 async fn consume_truncated_output(
     mut child: Child,
-    timeout: Option<Duration>,
+    expiration: ExecExpiration,
     stdout_stream: Option<StdoutStream>,
-    passthrough_stdio: bool,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -518,72 +609,92 @@ async fn consume_truncated_output(
         ))
     })?;
 
-    let (agg_tx, agg_rx) = async_channel::unbounded::<Vec<u8>>();
-
     let stdout_handle = tokio::spawn(read_capped(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         false,
-        passthrough_stdio,
-        Some(agg_tx.clone()),
     ));
     let stderr_handle = tokio::spawn(read_capped(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         true,
-        passthrough_stdio,
-        Some(agg_tx.clone()),
     ));
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    let (exit_status, timed_out) = match timeout {
-        Some(timeout) => {
-            tokio::select! {
-                result = tokio::time::timeout(timeout, child.wait()) => {
-                    match result {
-                        Ok(status_result) => {
-                            let exit_status = status_result?;
-                            (exit_status, false)
-                        }
-                        Err(_) => {
-                            child.start_kill()?;
-                            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
-                        }
-                    }
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
+    let (exit_status, timed_out) = tokio::select! {
+        status_result = child.wait() => {
+            let exit_status = status_result?;
+            (exit_status, false)
         }
-        None => {
-            tokio::select! {
-                result = child.wait() => {
-                    let exit_status = result?;
-                    (exit_status, false)
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
+        _ = expiration.wait() => {
+            kill_child_process_group(&mut child)?;
+            child.start_kill()?;
+            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
+        }
+        _ = tokio::signal::ctrl_c() => {
+            kill_child_process_group(&mut child)?;
+            child.start_kill()?;
+            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
         }
     };
 
-    let stdout = stdout_handle.await??;
-    let stderr = stderr_handle.await??;
+    // Wait for the stdout/stderr collection tasks but guard against them
+    // hanging forever. In the normal case, both pipes are closed once the child
+    // terminates so the tasks exit quickly. However, if the child process
+    // spawned grandchildren that inherited its stdout/stderr file descriptors
+    // those pipes may stay open after we `kill` the direct child on timeout.
+    // That would cause the `read_capped` tasks to block on `read()`
+    // indefinitely, effectively hanging the whole agent.
 
-    drop(agg_tx);
+    const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pipes
 
-    let mut combined_buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
-    while let Ok(chunk) = agg_rx.recv().await {
-        append_all(&mut combined_buf, &chunk);
+    // We need mutable bindings so we can `abort()` them on timeout.
+    use tokio::task::JoinHandle;
+
+    async fn await_with_timeout(
+        handle: &mut JoinHandle<std::io::Result<StreamOutput<Vec<u8>>>>,
+        timeout: Duration,
+    ) -> std::io::Result<StreamOutput<Vec<u8>>> {
+        match tokio::time::timeout(timeout, &mut *handle).await {
+            Ok(join_res) => match join_res {
+                Ok(io_res) => io_res,
+                Err(join_err) => Err(std::io::Error::other(join_err)),
+            },
+            Err(_elapsed) => {
+                // Timeout: abort the task to avoid hanging on open pipes.
+                handle.abort();
+                Ok(StreamOutput {
+                    text: Vec::new(),
+                    truncated_after_lines: None,
+                })
+            }
+        }
     }
+
+    let mut stdout_handle = stdout_handle;
+    let mut stderr_handle = stderr_handle;
+
+    let stdout = await_with_timeout(
+        &mut stdout_handle,
+        Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+    )
+    .await?;
+    let stderr = await_with_timeout(
+        &mut stderr_handle,
+        Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+    )
+    .await?;
+    // Best-effort aggregate: stdout then stderr (capped).
+    let mut aggregated = Vec::with_capacity(
+        stdout
+            .text
+            .len()
+            .saturating_add(stderr.text.len())
+            .min(EXEC_OUTPUT_MAX_BYTES),
+    );
+    append_capped(&mut aggregated, &stdout.text, EXEC_OUTPUT_MAX_BYTES);
+    append_capped(&mut aggregated, &stderr.text, EXEC_OUTPUT_MAX_BYTES * 2);
     let aggregated_output = StreamOutput {
-        text: combined_buf,
+        text: aggregated,
         truncated_after_lines: None,
     };
 
@@ -596,78 +707,14 @@ async fn consume_truncated_output(
     })
 }
 
-async fn consume_passthrough_output(
-    mut child: Child,
-    timeout: Option<Duration>,
-) -> Result<RawExecToolCallOutput> {
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    let (exit_status, timed_out) = match timeout {
-        Some(timeout) => {
-            tokio::select! {
-                result = tokio::time::timeout(timeout, child.wait()) => {
-                    match result {
-                        Ok(status_result) => {
-                            let exit_status = status_result?;
-                            (exit_status, false)
-                        }
-                        Err(_) => {
-                            child.start_kill()?;
-                            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
-                        }
-                    }
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
-        }
-        None => {
-            tokio::select! {
-                result = child.wait() => {
-                    let exit_status = result?;
-                    (exit_status, false)
-                }
-                _ = &mut ctrl_c => {
-                    child.start_kill()?;
-                    (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-                }
-            }
-        }
-    };
-
-    Ok(RawExecToolCallOutput {
-        exit_status,
-        stdout: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        stderr: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        aggregated_output: StreamOutput {
-            text: Vec::new(),
-            truncated_after_lines: None,
-        },
-        timed_out,
-    })
-}
-
 async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
-    passthrough_stdio: bool,
-    aggregate_tx: Option<Sender<Vec<u8>>>,
 ) -> io::Result<StreamOutput<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
+    let mut buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY.min(EXEC_OUTPUT_MAX_BYTES));
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
-
-    // No caps: append all bytes
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -676,7 +723,7 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
         }
 
         if let Some(stream) = &stream
-            && (passthrough_stdio || emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL)
+            && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
             let chunk = tmp[..n].to_vec();
             let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
@@ -694,27 +741,10 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
             };
             #[allow(clippy::let_unit_value)]
             let _ = stream.tx_event.send(event).await;
-            if !passthrough_stdio {
-                emitted_deltas += 1;
-            }
+            emitted_deltas += 1;
         }
 
-        if let Some(tx) = &aggregate_tx {
-            let _ = tx.send(tmp[..n].to_vec()).await;
-        }
-
-        append_all(&mut buf, &tmp[..n]);
-        if passthrough_stdio {
-            if is_stderr {
-                let mut stderr = tokio::io::stderr();
-                stderr.write_all(&tmp[..n]).await?;
-                stderr.flush().await?;
-            } else {
-                let mut stdout = tokio::io::stdout();
-                stdout.write_all(&tmp[..n]).await?;
-                stdout.flush().await?;
-            }
-        }
+        append_capped(&mut buf, &tmp[..n], EXEC_OUTPUT_MAX_BYTES);
         // Continue reading to EOF to avoid back-pressure
     }
 
@@ -742,6 +772,7 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     fn make_exec_output(
         exit_code: i32,
@@ -803,11 +834,136 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn read_capped_limits_retained_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let bytes = vec![b'a'; EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024)];
+        tokio::spawn(async move {
+            writer.write_all(&bytes).await.expect("write");
+        });
+
+        let out = read_capped(reader, None, false).await.expect("read");
+        assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
+    }
+
     #[cfg(unix)]
     #[test]
     fn sandbox_detection_flags_sigsys_exit_code() {
         let exit_code = EXIT_CODE_SIGNAL_BASE + libc::SIGSYS;
         let output = make_exec_output(exit_code, "", "", "");
         assert!(is_likely_sandbox_denied(SandboxType::LinuxSeccomp, &output));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()> {
+        // On Linux/macOS, /bin/bash is typically present; on FreeBSD/OpenBSD,
+        // prefer /bin/sh to avoid NotFound errors.
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 60 & echo $!; sleep 60".to_string(),
+        ];
+        #[cfg(all(unix, not(any(target_os = "freebsd", target_os = "openbsd"))))]
+        let command = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            "sleep 60 & echo $!; sleep 60".to_string(),
+        ];
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let params = ExecParams {
+            command,
+            cwd: std::env::current_dir()?,
+            expiration: 500.into(),
+            env,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            justification: None,
+            arg0: None,
+        };
+
+        let output = exec(params, SandboxType::None, &SandboxPolicy::ReadOnly, None).await?;
+        assert!(output.timed_out);
+
+        let stdout = output.stdout.from_utf8_lossy().text;
+        let pid_line = stdout.lines().next().unwrap_or("").trim();
+        let pid: i32 = pid_line.parse().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse pid from stdout '{pid_line}': {error}"),
+            )
+        })?;
+
+        let mut killed = false;
+        for _ in 0..20 {
+            // Use kill(pid, 0) to check if the process is alive.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
+            {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(killed, "grandchild process with pid {pid} is still alive");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
+        let command = long_running_command();
+        let cwd = std::env::current_dir()?;
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let cancel_token = CancellationToken::new();
+        let cancel_tx = cancel_token.clone();
+        let params = ExecParams {
+            command,
+            cwd: cwd.clone(),
+            expiration: ExecExpiration::Cancellation(cancel_token),
+            env,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            justification: None,
+            arg0: None,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
+            cancel_tx.cancel();
+        });
+        let result = process_exec_tool_call(
+            params,
+            &SandboxPolicy::DangerFullAccess,
+            cwd.as_path(),
+            &None,
+            None,
+        )
+        .await;
+        let output = match result {
+            Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) => output,
+            other => panic!("expected timeout error, got {other:?}"),
+        };
+        assert!(output.timed_out);
+        assert_eq!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            "powershell.exe".to_string(),
+            "-NonInteractive".to_string(),
+            "-NoLogo".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 30".to_string(),
+        ]
     }
 }

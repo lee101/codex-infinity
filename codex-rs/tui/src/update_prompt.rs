@@ -10,8 +10,8 @@ use crate::selection_list::selection_option_row;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
+use crate::update_action::UpdateAction;
 use crate::updates;
-use crate::updates::UpdateAction;
 use codex_core::config::Config;
 use color_eyre::Result;
 use crossterm::event::KeyCode;
@@ -39,7 +39,7 @@ pub(crate) async fn run_update_prompt_if_needed(
     let Some(latest_version) = updates::get_upgrade_version_for_popup(config) else {
         return Ok(UpdatePromptOutcome::Continue);
     };
-    let Some(update_action) = crate::updates::get_update_action() else {
+    let Some(update_action) = crate::update_action::get_update_action() else {
         return Ok(UpdatePromptOutcome::Continue);
     };
 
@@ -191,7 +191,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push("");
         column.push(Line::from(vec![
             padded_emoji("  ✨").bold().cyan(),
-            "Update available!".bold(),
+            "Welcome to Codex Infinity!".bold(),
             " ".into(),
             format!(
                 "{current} -> {latest}",
@@ -203,9 +203,18 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push("");
         column.push(
             Line::from(vec![
-                "Release notes: ".dim(),
-                "https://github.com/openai/codex/releases/latest"
-                    .dim()
+                "Website: ".dim(),
+                "https://codex-infinity.com"
+                    .cyan()
+                    .underlined(),
+            ])
+            .inset(Insets::tlbr(0, 2, 0, 0)),
+        );
+        column.push(
+            Line::from(vec![
+                "Token ICO: ".dim(),
+                "https://bags.fm/HAK9cX1jfYmcNpr6keTkLvxehGPWKELXSu7GH2ofBAGS"
+                    .yellow()
                     .underlined(),
             ])
             .inset(Insets::tlbr(0, 2, 0, 0)),

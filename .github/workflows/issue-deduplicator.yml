@@ -9,14 +9,15 @@ on:
 jobs:
   gather-duplicates:
     name: Identify potential duplicates
-    if: ${{ github.event.action == 'opened' || (github.event.action == 'labeled' && github.event.label.name == 'codex-deduplicate') }}
+    # Prevent runs on forks (requires OpenAI API key, wastes Actions minutes)
+    if: github.repository == 'openai/codex' && (github.event.action == 'opened' || (github.event.action == 'labeled' && github.event.label.name == 'codex-deduplicate'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       codex_output: ${{ steps.codex.outputs.final-message }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Prepare Codex inputs
         env:
@@ -46,7 +47,6 @@ jobs:
         with:
           openai-api-key: ${{ secrets.CODEX_OPENAI_API_KEY }}
           allow-users: "*"
-          model: gpt-5
           prompt: |
             You are an assistant that triages new GitHub issues by identifying potential duplicates.
 

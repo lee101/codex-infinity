@@ -1,6 +1,5 @@
 use std::num::NonZero;
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -19,6 +18,10 @@ pub(crate) async fn run_fuzzy_file_search(
     roots: Vec<String>,
     cancellation_flag: Arc<AtomicBool>,
 ) -> Vec<FuzzyFileSearchResult> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
     #[expect(clippy::expect_used)]
     let limit_per_root =
         NonZero::new(LIMIT_PER_ROOT).expect("LIMIT_PER_ROOT should be a valid non-zero usize");
@@ -59,11 +62,7 @@ pub(crate) async fn run_fuzzy_file_search(
             Ok(Ok((root, res))) => {
                 for m in res.matches {
                     let path = m.path;
-                    //TODO(shijie): Move file name generation to file_search lib.
-                    let file_name = Path::new(&path)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.clone());
+                    let file_name = file_search::file_name_from_path(&path);
                     let result = FuzzyFileSearchResult {
                         root: root.clone(),
                         path,

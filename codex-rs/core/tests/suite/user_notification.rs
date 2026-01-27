@@ -15,7 +15,6 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::any;
 
 use responses::ev_assistant_message;
 use responses::ev_completed;
@@ -24,6 +23,10 @@ use responses::start_mock_server;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "flaky on ubuntu-24.04-arm - aarch64-unknown-linux-gnu"]
+// The notify script gets far enough to create (and therefore surface) the file,
+// but hasn’t flushed the JSON yet. Reading an empty file produces EOF while parsing
+// a value at line 1 column 0. May be caused by a slow runner.
 async fn summarize_context_three_requests_and_instructions() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -31,7 +34,7 @@ async fn summarize_context_three_requests_and_instructions() -> anyhow::Result<(
 
     let sse1 = sse(vec![ev_assistant_message("m1", "Done"), ev_completed("r1")]);
 
-    responses::mount_sse_once_match(&server, any(), sse1).await;
+    responses::mount_sse_once(&server, sse1).await;
 
     let notify_dir = TempDir::new()?;
     // write a script to the notify that touches a file next to it
@@ -57,10 +60,12 @@ echo -n "${@: -1}" > $(dirname "${0}")/notify.txt"#,
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hello world".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // We fork the notify script, so we need to wait for it to write to the file.
     fs_wait::wait_for_path_exists(&notify_file, Duration::from_secs(5)).await?;

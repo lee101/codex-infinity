@@ -1,16 +1,19 @@
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningEvent;
+use codex_core::protocol::AskForApproval;
 use codex_core::protocol::ErrorEvent;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
+use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchEndEvent;
@@ -44,6 +47,9 @@ use codex_exec::exec_events::WebSearchItem;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecOutputStream;
 use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
 use mcp_types::TextContent;
@@ -63,19 +69,23 @@ fn event(id: &str, msg: EventMsg) -> Event {
 fn session_configured_produces_thread_started_event() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
     let session_id =
-        codex_protocol::ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
-            .unwrap();
+        codex_protocol::ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
     let rollout_path = PathBuf::from("/tmp/rollout.json");
     let ev = event(
         "e1",
         EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id,
+            forked_from_id: None,
             model: "codex-mini-latest".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            cwd: PathBuf::from("/home/user/project"),
             reasoning_effort: None,
             history_log_id: 0,
             history_entry_count: 0,
             initial_messages: None,
-            rollout_path,
+            rollout_path: Some(rollout_path),
         }),
     );
     let out = ep.collect_thread_events(&ev);
@@ -92,7 +102,7 @@ fn task_started_produces_turn_started_event() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
     let out = ep.collect_thread_events(&event(
         "t1",
-        EventMsg::TaskStarted(codex_core::protocol::TaskStartedEvent {
+        EventMsg::TurnStarted(codex_core::protocol::TurnStartedEvent {
             model_context_window: Some(32_000),
         }),
     ));
@@ -208,7 +218,7 @@ fn plan_update_emits_todo_list_started_updated_and_completed() {
     // Task completes => item.completed (same id, latest state)
     let complete = event(
         "p3",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
             last_agent_message: None,
         }),
     );
@@ -452,7 +462,7 @@ fn plan_update_after_complete_starts_new_todo_list_with_new_id() {
     let _ = ep.collect_thread_events(&start);
     let complete = event(
         "t2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
             last_agent_message: None,
         }),
     );
@@ -532,6 +542,7 @@ fn error_event_produces_error() {
         "e1",
         EventMsg::Error(codex_core::protocol::ErrorEvent {
             message: "boom".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
         }),
     ));
     assert_eq!(
@@ -548,7 +559,7 @@ fn warning_event_produces_error_item() {
     let out = ep.collect_thread_events(&event(
         "e1",
         EventMsg::Warning(WarningEvent {
-            message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start new a new conversation when possible to keep conversations small and targeted.".to_string(),
+            message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start a new conversation when possible to keep conversations small and targeted.".to_string(),
         }),
     ));
     assert_eq!(
@@ -557,7 +568,7 @@ fn warning_event_produces_error_item() {
             item: ThreadItem {
                 id: "item_0".to_string(),
                 details: ThreadItemDetails::Error(ErrorItem {
-                    message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start new a new conversation when possible to keep conversations small and targeted.".to_string(),
+                    message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start a new conversation when possible to keep conversations small and targeted.".to_string(),
                 }),
             },
         })]
@@ -571,6 +582,8 @@ fn stream_error_event_produces_error() {
         "e1",
         EventMsg::StreamError(codex_core::protocol::StreamErrorEvent {
             message: "retrying".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            additional_details: None,
         }),
     ));
     assert_eq!(
@@ -589,6 +602,7 @@ fn error_followed_by_task_complete_produces_turn_failed() {
         "e1",
         EventMsg::Error(ErrorEvent {
             message: "boom".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
         }),
     );
     assert_eq!(
@@ -600,7 +614,7 @@ fn error_followed_by_task_complete_produces_turn_failed() {
 
     let complete_event = event(
         "e2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
             last_agent_message: None,
         }),
     );
@@ -617,16 +631,22 @@ fn error_followed_by_task_complete_produces_turn_failed() {
 #[test]
 fn exec_command_end_success_produces_completed_command_item() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec!["bash".to_string(), "-lc".to_string(), "echo hi".to_string()];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
 
     // Begin -> no output
     let begin = event(
         "c1",
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
             call_id: "1".to_string(),
-            command: vec!["bash".to_string(), "-lc".to_string(), "echo hi".to_string()],
-            cwd: std::env::current_dir().unwrap(),
-            parsed_cmd: Vec::new(),
-            is_user_shell_command: false,
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
         }),
     );
     let out_begin = ep.collect_thread_events(&begin);
@@ -650,6 +670,13 @@ fn exec_command_end_success_produces_completed_command_item() {
         "c2",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "1".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: "hi\n".to_string(),
@@ -676,18 +703,111 @@ fn exec_command_end_success_produces_completed_command_item() {
 }
 
 #[test]
+fn command_execution_output_delta_updates_item_progress() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "echo delta".to_string(),
+    ];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
+
+    let begin = event(
+        "d1",
+        EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: "delta-1".to_string(),
+            process_id: Some("42".to_string()),
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+        }),
+    );
+    let out_begin = ep.collect_thread_events(&begin);
+    assert_eq!(
+        out_begin,
+        vec![ThreadEvent::ItemStarted(ItemStartedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                    command: "bash -lc 'echo delta'".to_string(),
+                    aggregated_output: String::new(),
+                    exit_code: None,
+                    status: CommandExecutionStatus::InProgress,
+                }),
+            },
+        })]
+    );
+
+    let delta = event(
+        "d2",
+        EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: "delta-1".to_string(),
+            stream: ExecOutputStream::Stdout,
+            chunk: b"partial output\n".to_vec(),
+        }),
+    );
+    let out_delta = ep.collect_thread_events(&delta);
+    assert_eq!(out_delta, Vec::<ThreadEvent>::new());
+
+    let end = event(
+        "d3",
+        EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: "delta-1".to_string(),
+            process_id: Some("42".to_string()),
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            aggregated_output: String::new(),
+            exit_code: 0,
+            duration: Duration::from_millis(3),
+            formatted_output: String::new(),
+        }),
+    );
+    let out_end = ep.collect_thread_events(&end);
+    assert_eq!(
+        out_end,
+        vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                    command: "bash -lc 'echo delta'".to_string(),
+                    aggregated_output: String::new(),
+                    exit_code: Some(0),
+                    status: CommandExecutionStatus::Completed,
+                }),
+            },
+        })]
+    );
+}
+
+#[test]
 fn exec_command_end_failure_produces_failed_command_item() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
 
     // Begin -> no output
     let begin = event(
         "c1",
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
             call_id: "2".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
-            cwd: std::env::current_dir().unwrap(),
-            parsed_cmd: Vec::new(),
-            is_user_shell_command: false,
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
         }),
     );
     assert_eq!(
@@ -710,6 +830,13 @@ fn exec_command_end_failure_produces_failed_command_item() {
         "c2",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "2".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: String::new(),
@@ -744,6 +871,13 @@ fn exec_command_end_without_begin_is_ignored() {
         "c1",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "no-begin".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: Vec::new(),
+            cwd: PathBuf::from("."),
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: String::new(),
@@ -787,6 +921,7 @@ fn patch_apply_success_produces_item_completed_patchapply() {
         "p1",
         EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
             call_id: "call-1".to_string(),
+            turn_id: "turn-1".to_string(),
             auto_approved: true,
             changes: changes.clone(),
         }),
@@ -799,9 +934,11 @@ fn patch_apply_success_produces_item_completed_patchapply() {
         "p2",
         EventMsg::PatchApplyEnd(PatchApplyEndEvent {
             call_id: "call-1".to_string(),
+            turn_id: "turn-1".to_string(),
             stdout: "applied 3 changes".to_string(),
             stderr: String::new(),
             success: true,
+            changes: changes.clone(),
         }),
     );
     let out_end = ep.collect_thread_events(&end);
@@ -856,6 +993,7 @@ fn patch_apply_failure_produces_item_completed_patchapply_failed() {
         "p1",
         EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
             call_id: "call-2".to_string(),
+            turn_id: "turn-2".to_string(),
             auto_approved: false,
             changes: changes.clone(),
         }),
@@ -867,9 +1005,11 @@ fn patch_apply_failure_produces_item_completed_patchapply_failed() {
         "p2",
         EventMsg::PatchApplyEnd(PatchApplyEndEvent {
             call_id: "call-2".to_string(),
+            turn_id: "turn-2".to_string(),
             stdout: String::new(),
             stderr: "failed to apply".to_string(),
             success: false,
+            changes: changes.clone(),
         }),
     );
     let out_end = ep.collect_thread_events(&end);
@@ -918,10 +1058,10 @@ fn task_complete_produces_turn_completed_with_usage() {
     );
     assert!(ep.collect_thread_events(&token_count_event).is_empty());
 
-    // Then TaskComplete should produce turn.completed with the captured usage.
+    // Then TurnComplete should produce turn.completed with the captured usage.
     let complete_event = event(
         "e2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
             last_agent_message: Some("done".to_string()),
         }),
     );

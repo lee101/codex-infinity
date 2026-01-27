@@ -14,10 +14,16 @@
 //! 3.  We do **not** walk past the Git root.
 
 use crate::config::Config;
+use crate::features::Feature;
+use crate::skills::SkillMetadata;
+use crate::skills::render_skills_section;
 use dunce::canonicalize as normalize_path;
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
+
+pub(crate) const HIERARCHICAL_AGENTS_MESSAGE: &str =
+    include_str!("../hierarchical_agents_message.md");
 
 /// Default filename scanned for project-level docs.
 pub const DEFAULT_PROJECT_DOC_FILENAME: &str = "AGENTS.md";
@@ -30,19 +36,50 @@ const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
 /// Combines `Config::instructions` and `AGENTS.md` (if present) into a single
 /// string of instructions.
-pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
-    match read_project_docs(config).await {
-        Ok(Some(project_doc)) => match &config.user_instructions {
-            Some(original_instructions) => Some(format!(
-                "{original_instructions}{PROJECT_DOC_SEPARATOR}{project_doc}"
-            )),
-            None => Some(project_doc),
-        },
-        Ok(None) => config.user_instructions.clone(),
+pub(crate) async fn get_user_instructions(
+    config: &Config,
+    skills: Option<&[SkillMetadata]>,
+) -> Option<String> {
+    let project_docs = read_project_docs(config).await;
+
+    let mut output = String::new();
+
+    if let Some(instructions) = config.user_instructions.clone() {
+        output.push_str(&instructions);
+    }
+
+    match project_docs {
+        Ok(Some(docs)) => {
+            if !output.is_empty() {
+                output.push_str(PROJECT_DOC_SEPARATOR);
+            }
+            output.push_str(&docs);
+        }
+        Ok(None) => {}
         Err(e) => {
             error!("error trying to find project doc: {e:#}");
-            config.user_instructions.clone()
         }
+    };
+
+    let skills_section = skills.and_then(render_skills_section);
+    if let Some(skills_section) = skills_section {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&skills_section);
+    }
+
+    if config.features.enabled(Feature::ChildAgentsMd) {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(HIERARCHICAL_AGENTS_MESSAGE);
+    }
+
+    if !output.is_empty() {
+        Some(output)
+    } else {
+        None
     }
 }
 
@@ -198,9 +235,10 @@ fn candidate_filenames<'a>(config: &'a Config) -> Vec<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConfigOverrides;
-    use crate::config::ConfigToml;
+    use crate::config::ConfigBuilder;
+    use crate::skills::load_skills;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper that returns a `Config` pointing at `root` and using `limit` as
@@ -208,14 +246,13 @@ mod tests {
     /// optionally specify a custom `instructions` string – when `None` the
     /// value is cleared to mimic a scenario where no system instructions have
     /// been configured.
-    fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -> Config {
+    async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -> Config {
         let codex_home = TempDir::new().unwrap();
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            codex_home.path().to_path_buf(),
-        )
-        .expect("defaults for test should always succeed");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("defaults for test should always succeed");
 
         config.cwd = root.path().to_path_buf();
         config.project_doc_max_bytes = limit;
@@ -224,13 +261,13 @@ mod tests {
         config
     }
 
-    fn make_config_with_fallback(
+    async fn make_config_with_fallback(
         root: &TempDir,
         limit: usize,
         instructions: Option<&str>,
         fallbacks: &[&str],
     ) -> Config {
-        let mut config = make_config(root, limit, instructions);
+        let mut config = make_config(root, limit, instructions).await;
         config.project_doc_fallback_filenames = fallbacks
             .iter()
             .map(std::string::ToString::to_string)
@@ -243,7 +280,7 @@ mod tests {
     async fn no_doc_file_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
-        let res = get_user_instructions(&make_config(&tmp, 4096, None)).await;
+        let res = get_user_instructions(&make_config(&tmp, 4096, None).await, None).await;
         assert!(
             res.is_none(),
             "Expected None when AGENTS.md is absent and no system instructions provided"
@@ -257,7 +294,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::write(tmp.path().join("AGENTS.md"), "hello world").unwrap();
 
-        let res = get_user_instructions(&make_config(&tmp, 4096, None))
+        let res = get_user_instructions(&make_config(&tmp, 4096, None).await, None)
             .await
             .expect("doc expected");
 
@@ -276,7 +313,7 @@ mod tests {
         let huge = "A".repeat(LIMIT * 2); // 2 KiB
         fs::write(tmp.path().join("AGENTS.md"), &huge).unwrap();
 
-        let res = get_user_instructions(&make_config(&tmp, LIMIT, None))
+        let res = get_user_instructions(&make_config(&tmp, LIMIT, None).await, None)
             .await
             .expect("doc expected");
 
@@ -305,10 +342,12 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         // Build config pointing at the nested dir.
-        let mut cfg = make_config(&repo, 4096, None);
+        let mut cfg = make_config(&repo, 4096, None).await;
         cfg.cwd = nested;
 
-        let res = get_user_instructions(&cfg).await.expect("doc expected");
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("doc expected");
         assert_eq!(res, "root level doc");
     }
 
@@ -318,7 +357,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::write(tmp.path().join("AGENTS.md"), "something").unwrap();
 
-        let res = get_user_instructions(&make_config(&tmp, 0, None)).await;
+        let res = get_user_instructions(&make_config(&tmp, 0, None).await, None).await;
         assert!(
             res.is_none(),
             "With limit 0 the function should return None"
@@ -334,7 +373,7 @@ mod tests {
 
         const INSTRUCTIONS: &str = "base instructions";
 
-        let res = get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)))
+        let res = get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)).await, None)
             .await
             .expect("should produce a combined instruction string");
 
@@ -351,7 +390,8 @@ mod tests {
 
         const INSTRUCTIONS: &str = "some instructions";
 
-        let res = get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS))).await;
+        let res =
+            get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)).await, None).await;
 
         assert_eq!(res, Some(INSTRUCTIONS.to_string()));
     }
@@ -377,10 +417,12 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("AGENTS.md"), "crate doc").unwrap();
 
-        let mut cfg = make_config(&repo, 4096, None);
+        let mut cfg = make_config(&repo, 4096, None).await;
         cfg.cwd = nested;
 
-        let res = get_user_instructions(&cfg).await.expect("doc expected");
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("doc expected");
         assert_eq!(res, "root doc\n\ncrate doc");
     }
 
@@ -391,9 +433,9 @@ mod tests {
         fs::write(tmp.path().join(DEFAULT_PROJECT_DOC_FILENAME), "versioned").unwrap();
         fs::write(tmp.path().join(LOCAL_PROJECT_DOC_FILENAME), "local").unwrap();
 
-        let cfg = make_config(&tmp, 4096, None);
+        let cfg = make_config(&tmp, 4096, None).await;
 
-        let res = get_user_instructions(&cfg)
+        let res = get_user_instructions(&cfg, None)
             .await
             .expect("local doc expected");
 
@@ -413,9 +455,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::write(tmp.path().join("EXAMPLE.md"), "example instructions").unwrap();
 
-        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md"]);
+        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md"]).await;
 
-        let res = get_user_instructions(&cfg)
+        let res = get_user_instructions(&cfg, None)
             .await
             .expect("fallback doc expected");
 
@@ -429,9 +471,9 @@ mod tests {
         fs::write(tmp.path().join("AGENTS.md"), "primary").unwrap();
         fs::write(tmp.path().join("EXAMPLE.md"), "secondary").unwrap();
 
-        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md", ".example.md"]);
+        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md", ".example.md"]).await;
 
-        let res = get_user_instructions(&cfg)
+        let res = get_user_instructions(&cfg, None)
             .await
             .expect("AGENTS.md should win");
 
@@ -446,5 +488,69 @@ mod tests {
                 .to_string_lossy()
                 .eq(DEFAULT_PROJECT_DOC_FILENAME)
         );
+    }
+
+    #[tokio::test]
+    async fn skills_are_appended_to_project_doc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join("AGENTS.md"), "base doc").unwrap();
+
+        let cfg = make_config(&tmp, 4096, None).await;
+        create_skill(
+            cfg.codex_home.clone(),
+            "pdf-processing",
+            "extract from pdfs",
+        );
+
+        let skills = load_skills(&cfg);
+        let res = get_user_instructions(
+            &cfg,
+            skills.errors.is_empty().then_some(skills.skills.as_slice()),
+        )
+        .await
+        .expect("instructions expected");
+        let expected_path = dunce::canonicalize(
+            cfg.codex_home
+                .join("skills/pdf-processing/SKILL.md")
+                .as_path(),
+        )
+        .unwrap_or_else(|_| cfg.codex_home.join("skills/pdf-processing/SKILL.md"));
+        let expected_path_str = expected_path.to_string_lossy().replace('\\', "/");
+        let usage_rules = "- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1) After deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow.\n  2) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n  3) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n  4) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n- Coordination and sequencing:\n  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.\n  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.\n- Context hygiene:\n  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.\n  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.";
+        let expected = format!(
+            "base doc\n\n## Skills\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.\n### Available skills\n- pdf-processing: extract from pdfs (file: {expected_path_str})\n### How to use skills\n{usage_rules}"
+        );
+        assert_eq!(res, expected);
+    }
+
+    #[tokio::test]
+    async fn skills_render_without_project_doc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = make_config(&tmp, 4096, None).await;
+        create_skill(cfg.codex_home.clone(), "linting", "run clippy");
+
+        let skills = load_skills(&cfg);
+        let res = get_user_instructions(
+            &cfg,
+            skills.errors.is_empty().then_some(skills.skills.as_slice()),
+        )
+        .await
+        .expect("instructions expected");
+        let expected_path =
+            dunce::canonicalize(cfg.codex_home.join("skills/linting/SKILL.md").as_path())
+                .unwrap_or_else(|_| cfg.codex_home.join("skills/linting/SKILL.md"));
+        let expected_path_str = expected_path.to_string_lossy().replace('\\', "/");
+        let usage_rules = "- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1) After deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow.\n  2) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n  3) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n  4) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n- Coordination and sequencing:\n  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.\n  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.\n- Context hygiene:\n  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.\n  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.";
+        let expected = format!(
+            "## Skills\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.\n### Available skills\n- linting: run clippy (file: {expected_path_str})\n### How to use skills\n{usage_rules}"
+        );
+        assert_eq!(res, expected);
+    }
+
+    fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
+        let skill_dir = codex_home.join(format!("skills/{name}"));
+        fs::create_dir_all(&skill_dir).unwrap();
+        let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
+        fs::write(skill_dir.join("SKILL.md"), content).unwrap();
     }
 }

@@ -3,10 +3,14 @@ source: tui/src/chatwidget/tests.rs
 expression: popup
 ---
   Select Model and Effort
-  Switch the model for this and future Codex CLI sessions
+  Access legacy models by running codex -m <model_name> or in your config.toml
 
-› 1. gpt-5-codex (current)  Optimized for coding tasks with many tools.
-  2. gpt-5                  Broad world knowledge with strong general
-                            reasoning.
+› 1. gpt-5.2-codex (default)  Latest frontier agentic coding model.
+  2. gpt-5.2                  Latest frontier model with improvements across
+                              knowledge, reasoning and coding
+  3. gpt-5.1-codex-max        Codex-optimized flagship for deep and fast
+                              reasoning.
+  4. gpt-5.1-codex-mini       Optimized for codex. Cheaper, faster, but less
+                              capable.
 
   Press enter to select reasoning effort, or esc to dismiss.

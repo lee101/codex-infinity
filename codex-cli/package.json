@@ -1,9 +1,10 @@
 {
-  "name": "@openai/codex",
-  "version": "0.0.0-dev",
+  "name": "@lee101-3/codex-infinite",
+  "version": "0.0.2",
   "license": "Apache-2.0",
+  "description": "Codex Infinity - a smarter coding agent that can run forever",
   "bin": {
-    "codex": "bin/codex.js"
+    "codex-infinity": "bin/codex-infinity.js"
   },
   "type": "module",
   "engines": {
@@ -15,7 +16,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openai/codex.git",
+    "url": "git+https://github.com/lee101/codex.git",
     "directory": "codex-cli"
-  }
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "cli",
+    "autonomous",
+    "codex"
+  ]
 }

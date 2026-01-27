@@ -1,36 +1,57 @@
 use anyhow::Result;
-use serde::Deserialize;
-use serde::Serialize;
+pub use codex_protocol::protocol::SandboxPolicy;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PolicyJson {
-    pub mode: String,
-    #[serde(default)]
-    pub workspace_roots: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub enum SandboxMode {
-    ReadOnly,
-    WorkspaceWrite,
-}
-
-#[derive(Clone, Debug)]
-pub struct SandboxPolicy(pub SandboxMode);
-
-impl SandboxPolicy {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "read-only" => Ok(SandboxPolicy(SandboxMode::ReadOnly)),
-            "workspace-write" => Ok(SandboxPolicy(SandboxMode::WorkspaceWrite)),
-            other => {
-                let pj: PolicyJson = serde_json::from_str(other)?;
-                Ok(match pj.mode.as_str() {
-                    "read-only" => SandboxPolicy(SandboxMode::ReadOnly),
-                    "workspace-write" => SandboxPolicy(SandboxMode::WorkspaceWrite),
-                    _ => SandboxPolicy(SandboxMode::ReadOnly),
-                })
+pub fn parse_policy(value: &str) -> Result<SandboxPolicy> {
+    match value {
+        "read-only" => Ok(SandboxPolicy::ReadOnly),
+        "workspace-write" => Ok(SandboxPolicy::new_workspace_write_policy()),
+        "danger-full-access" | "external-sandbox" => anyhow::bail!(
+            "DangerFullAccess and ExternalSandbox are not supported for sandboxing"
+        ),
+        other => {
+            let parsed: SandboxPolicy = serde_json::from_str(other)?;
+            if matches!(
+                parsed,
+                SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+            ) {
+                anyhow::bail!(
+                    "DangerFullAccess and ExternalSandbox are not supported for sandboxing"
+                );
             }
+            Ok(parsed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rejects_external_sandbox_preset() {
+        let err = parse_policy("external-sandbox").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("DangerFullAccess and ExternalSandbox are not supported"));
+    }
+
+    #[test]
+    fn rejects_external_sandbox_json() {
+        let payload = serde_json::to_string(
+            &codex_protocol::protocol::SandboxPolicy::ExternalSandbox {
+                network_access: codex_protocol::protocol::NetworkAccess::Enabled,
+            },
+        )
+        .unwrap();
+        let err = parse_policy(&payload).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("DangerFullAccess and ExternalSandbox are not supported"));
+    }
+
+    #[test]
+    fn parses_read_only_policy() {
+        assert_eq!(parse_policy("read-only").unwrap(), SandboxPolicy::ReadOnly);
     }
 }

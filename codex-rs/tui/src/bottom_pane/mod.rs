@@ -1,47 +1,102 @@
-//! Bottom pane: shows the ChatComposer or a BottomPaneView, if one is active.
+//! The bottom pane is the interactive footer of the chat UI.
+//!
+//! The pane owns the [`ChatComposer`] (editable prompt input) and a stack of transient
+//! [`BottomPaneView`]s (popups/modals) that temporarily replace the composer for focused
+//! interactions like selection lists.
+//!
+//! Input routing is layered: `BottomPane` decides which local surface receives a key (view vs
+//! composer), while higher-level intent such as "interrupt" or "quit" is decided by the parent
+//! widget (`ChatWidget`). This split matters for Ctrl+C/Ctrl+D: the bottom pane gives the active
+//! view the first chance to consume Ctrl+C (typically to dismiss itself), and `ChatWidget` may
+//! treat an unhandled Ctrl+C as an interrupt or as the first press of a double-press quit
+//! shortcut.
+//!
+//! Some UI is time-based rather than input-based, such as the transient "press again to quit"
+//! hint. The pane schedules redraws so those hints can expire even when the UI is otherwise idle.
 use std::path::PathBuf;
 
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::queued_user_messages::QueuedUserMessages;
-use crate::render::Insets;
-use crate::render::RectExt;
-use crate::render::renderable::Renderable as _;
+use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
+use crate::key_hint;
+use crate::key_hint::KeyBinding;
+use crate::render::renderable::FlexRenderable;
+use crate::render::renderable::Renderable;
+use crate::render::renderable::RenderableItem;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
+use codex_core::features::Features;
+use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
+use codex_protocol::request_user_input::RequestUserInputEvent;
+use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Constraint;
-use ratatui::layout::Layout;
 use ratatui::layout::Rect;
-use ratatui::widgets::WidgetRef;
 use std::time::Duration;
 
 mod approval_overlay;
+mod request_user_input;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use request_user_input::RequestUserInputOverlay;
 mod bottom_pane_view;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalImageAttachment {
+    pub(crate) placeholder: String,
+    pub(crate) path: PathBuf,
+}
 mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
 pub mod custom_prompt_view;
+mod experimental_features_view;
 mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod prompt_args;
+mod skill_popup;
+mod skills_toggle_view;
+pub(crate) use footer::CollaborationModeIndicator;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod feedback_view;
+pub(crate) use feedback_view::feedback_disabled_params;
 pub(crate) use feedback_view::feedback_selection_params;
 pub(crate) use feedback_view::feedback_upload_consent_params;
+pub(crate) use skills_toggle_view::SkillsToggleItem;
+pub(crate) use skills_toggle_view::SkillsToggleView;
 mod paste_burst;
 pub mod popup_consts;
 mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
 mod textarea;
+mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 
+/// How long the "press again to quit" hint stays visible.
+///
+/// This is shared between:
+/// - `ChatWidget`: arming the double-press quit shortcut.
+/// - `BottomPane`/`ChatComposer`: rendering and expiring the footer hint.
+///
+/// Keeping a single value ensures Ctrl+C and Ctrl+D behave identically.
+pub(crate) const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether Ctrl+C/Ctrl+D require a second press to quit.
+///
+/// This UX experiment was enabled by default, but requiring a double press to quit feels janky in
+/// practice (especially for users accustomed to shells and other TUIs). Disable it for now while we
+/// rethink a better quit/interrupt design.
+pub(crate) const DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED: bool = false;
+
+/// The result of offering a cancellation key to a bottom-pane surface.
+///
+/// This is primarily used for Ctrl+C routing: active views can consume the key to dismiss
+/// themselves, and the caller can decide what higher-level action (if any) to take when the key is
+/// not handled locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
     Handled,
@@ -53,10 +108,16 @@ pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
 
 use crate::status_indicator_widget::StatusIndicatorWidget;
+pub(crate) use experimental_features_view::BetaFeatureItem;
+pub(crate) use experimental_features_view::ExperimentalFeaturesView;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
 
 /// Pane displayed in the lower half of the chat UI.
+///
+/// This is the owning container for the prompt input (`ChatComposer`) and the view stack
+/// (`BottomPaneView`). It performs local input routing and renders time-based hints, while leaving
+/// process-level decisions (quit, interrupt, shutdown) to `ChatWidget`.
 pub(crate) struct BottomPane {
     /// Composer is retained even when a BottomPaneView is displayed so the
     /// input state is retained when the view is closed.
@@ -70,14 +131,17 @@ pub(crate) struct BottomPane {
 
     has_input_focus: bool,
     is_task_running: bool,
-    ctrl_c_quit_hint: bool,
     esc_backtrack_hint: bool,
+    animations_enabled: bool,
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    /// Unified exec session summary shown above the composer.
+    unified_exec_footer: UnifiedExecFooter,
     /// Queued user messages to show above the composer while a turn is running.
     queued_user_messages: QueuedUserMessages,
     context_window_percent: Option<i64>,
+    context_window_used_tokens: Option<i64>,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -87,34 +151,86 @@ pub(crate) struct BottomPaneParams {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) placeholder_text: String,
     pub(crate) disable_paste_burst: bool,
+    pub(crate) animations_enabled: bool,
+    pub(crate) skills: Option<Vec<SkillMetadata>>,
 }
 
 impl BottomPane {
     pub fn new(params: BottomPaneParams) -> Self {
-        let enhanced_keys_supported = params.enhanced_keys_supported;
+        let BottomPaneParams {
+            app_event_tx,
+            frame_requester,
+            has_input_focus,
+            enhanced_keys_supported,
+            placeholder_text,
+            disable_paste_burst,
+            animations_enabled,
+            skills,
+        } = params;
+        let mut composer = ChatComposer::new(
+            has_input_focus,
+            app_event_tx.clone(),
+            enhanced_keys_supported,
+            placeholder_text,
+            disable_paste_burst,
+        );
+        composer.set_skill_mentions(skills);
+
         Self {
-            composer: ChatComposer::new(
-                params.has_input_focus,
-                params.app_event_tx.clone(),
-                enhanced_keys_supported,
-                params.placeholder_text,
-                params.disable_paste_burst,
-            ),
+            composer,
             view_stack: Vec::new(),
-            app_event_tx: params.app_event_tx,
-            frame_requester: params.frame_requester,
-            has_input_focus: params.has_input_focus,
+            app_event_tx,
+            frame_requester,
+            has_input_focus,
             is_task_running: false,
-            ctrl_c_quit_hint: false,
             status: None,
+            unified_exec_footer: UnifiedExecFooter::new(),
             queued_user_messages: QueuedUserMessages::new(),
             esc_backtrack_hint: false,
+            animations_enabled,
             context_window_percent: None,
+            context_window_used_tokens: None,
         }
+    }
+
+    pub fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
+        self.composer.set_skill_mentions(skills);
+        self.request_redraw();
+    }
+
+    pub fn set_steer_enabled(&mut self, enabled: bool) {
+        self.composer.set_steer_enabled(enabled);
+    }
+
+    pub fn set_collaboration_modes_enabled(&mut self, enabled: bool) {
+        self.composer.set_collaboration_modes_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_collaboration_mode_indicator(
+        &mut self,
+        indicator: Option<CollaborationModeIndicator>,
+    ) {
+        self.composer.set_collaboration_mode_indicator(indicator);
+        self.request_redraw();
     }
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
+    }
+
+    pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
+        self.composer.skills()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_window_percent(&self) -> Option<i64> {
+        self.context_window_percent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_window_used_tokens(&self) -> Option<i64> {
+        self.context_window_used_tokens
     }
 
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
@@ -124,77 +240,6 @@ impl BottomPane {
     fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.view_stack.push(view);
         self.request_redraw();
-    }
-
-    pub fn desired_height(&self, width: u16) -> u16 {
-        let top_margin = 1;
-
-        // Base height depends on whether a modal/overlay is active.
-        let base = match self.active_view().as_ref() {
-            Some(view) => view.desired_height(width),
-            None => {
-                let status_height = self
-                    .status
-                    .as_ref()
-                    .map_or(0, |status| status.desired_height(width));
-                let queue_height = self.queued_user_messages.desired_height(width);
-                let spacing_height = if status_height == 0 && queue_height == 0 {
-                    0
-                } else {
-                    1
-                };
-                self.composer
-                    .desired_height(width)
-                    .saturating_add(spacing_height)
-                    .saturating_add(status_height)
-                    .saturating_add(queue_height)
-            }
-        };
-        // Account for bottom padding rows. Top spacing is handled in layout().
-        base.saturating_add(top_margin)
-    }
-
-    fn layout(&self, area: Rect) -> [Rect; 2] {
-        // At small heights, bottom pane takes the entire height.
-        let top_margin = if area.height <= 1 { 0 } else { 1 };
-
-        let area = area.inset(Insets::tlbr(top_margin, 0, 0, 0));
-        if self.active_view().is_some() {
-            return [Rect::ZERO, area];
-        }
-        let has_queue = !self.queued_user_messages.messages.is_empty();
-        let mut status_height = self
-            .status
-            .as_ref()
-            .map_or(0, |status| status.desired_height(area.width))
-            .min(area.height.saturating_sub(1));
-        if has_queue && status_height > 1 {
-            status_height = status_height.saturating_sub(1);
-        }
-        let combined_height = status_height
-            .saturating_add(self.queued_user_messages.desired_height(area.width))
-            .min(area.height.saturating_sub(1));
-
-        let [status_area, _, content_area] = Layout::vertical([
-            Constraint::Length(combined_height),
-            Constraint::Length(if combined_height == 0 { 0 } else { 1 }),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-        [status_area, content_area]
-    }
-
-    pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        // Hide the cursor whenever an overlay view is active (e.g. the
-        // status indicator shown while a task is running, or approval modal).
-        // In these states the textarea is not interactable, so we should not
-        // show its caret.
-        let [_, content] = self.layout(area);
-        if let Some(view) = self.active_view() {
-            view.cursor_pos(content)
-        } else {
-            self.composer.cursor_pos(content)
-        }
     }
 
     /// Forward a key event to the active view or the composer.
@@ -219,8 +264,10 @@ impl BottomPane {
         } else {
             // If a task is running and a status line is visible, allow Esc to
             // send an interrupt even while the composer has focus.
-            if matches!(key_event.code, crossterm::event::KeyCode::Esc)
+            // When a popup is active, prefer dismissing it over interrupting the task.
+            if key_event.code == KeyCode::Esc
                 && self.is_task_running
+                && !self.composer.popup_active()
                 && let Some(status) = &self.status
             {
                 // Send Op::Interrupt
@@ -239,8 +286,14 @@ impl BottomPane {
         }
     }
 
-    /// Handle Ctrl-C in the bottom pane. If a modal view is active it gets a
-    /// chance to consume the event (e.g. to dismiss itself).
+    /// Handles a Ctrl+C press within the bottom pane.
+    ///
+    /// An active modal view is given the first chance to consume the key (typically to dismiss
+    /// itself). If no view is active, Ctrl+C clears draft composer input.
+    ///
+    /// This method may show the quit shortcut hint as a user-visible acknowledgement that Ctrl+C
+    /// was received, but it does not decide whether the process should exit; `ChatWidget` owns the
+    /// quit/interrupt state machine and uses the result to decide what happens next.
     pub(crate) fn on_ctrl_c(&mut self) -> CancellationEvent {
         if let Some(view) = self.view_stack.last_mut() {
             let event = view.on_ctrl_c();
@@ -249,7 +302,7 @@ impl BottomPane {
                     self.view_stack.pop();
                     self.on_active_view_complete();
                 }
-                self.show_ctrl_c_quit_hint();
+                self.show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')));
             }
             event
         } else if self.composer_is_empty() {
@@ -257,7 +310,7 @@ impl BottomPane {
         } else {
             self.view_stack.pop();
             self.clear_composer_for_ctrl_c();
-            self.show_ctrl_c_quit_hint();
+            self.show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')));
             CancellationEvent::Handled
         }
     }
@@ -285,8 +338,24 @@ impl BottomPane {
     }
 
     /// Replace the composer text with `text`.
-    pub(crate) fn set_composer_text(&mut self, text: String) {
-        self.composer.set_text_content(text);
+    pub(crate) fn set_composer_text(
+        &mut self,
+        text: String,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+    ) {
+        self.composer
+            .set_text_content(text, text_elements, local_image_paths);
+        self.request_redraw();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_composer_input_enabled(
+        &mut self,
+        enabled: bool,
+        placeholder: Option<String>,
+    ) {
+        self.composer.set_input_enabled(enabled, placeholder);
         self.request_redraw();
     }
 
@@ -300,35 +369,83 @@ impl BottomPane {
         self.composer.current_text()
     }
 
-    /// Update the animated header shown to the left of the brackets in the
-    /// status indicator (defaults to "Working"). No-ops if the status
-    /// indicator is not active.
-    pub(crate) fn update_status_header(&mut self, header: String) {
-        if let Some(status) = self.status.as_mut() {
-            status.update_header(header);
-            self.request_redraw();
-        }
+    pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {
+        self.composer.text_elements()
     }
 
-    pub(crate) fn show_ctrl_c_quit_hint(&mut self) {
-        self.ctrl_c_quit_hint = true;
-        self.composer
-            .set_ctrl_c_quit_hint(true, self.has_input_focus);
-        self.request_redraw();
-    }
-
-    pub(crate) fn clear_ctrl_c_quit_hint(&mut self) {
-        if self.ctrl_c_quit_hint {
-            self.ctrl_c_quit_hint = false;
-            self.composer
-                .set_ctrl_c_quit_hint(false, self.has_input_focus);
-            self.request_redraw();
-        }
+    pub(crate) fn composer_local_images(&self) -> Vec<LocalImageAttachment> {
+        self.composer.local_images()
     }
 
     #[cfg(test)]
-    pub(crate) fn ctrl_c_quit_hint_visible(&self) -> bool {
-        self.ctrl_c_quit_hint
+    pub(crate) fn composer_local_image_paths(&self) -> Vec<PathBuf> {
+        self.composer.local_image_paths()
+    }
+
+    pub(crate) fn composer_text_with_pending(&self) -> String {
+        self.composer.current_text_with_pending()
+    }
+
+    pub(crate) fn apply_external_edit(&mut self, text: String) {
+        self.composer.apply_external_edit(text);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
+        self.composer.set_footer_hint_override(items);
+        self.request_redraw();
+    }
+
+    /// Update the status indicator header (defaults to "Working") and details below it.
+    ///
+    /// Passing `None` clears any existing details. No-ops if the status indicator is not active.
+    pub(crate) fn update_status(&mut self, header: String, details: Option<String>) {
+        if let Some(status) = self.status.as_mut() {
+            status.update_header(header);
+            status.update_details(details);
+            self.request_redraw();
+        }
+    }
+
+    /// Show the transient "press again to quit" hint for `key`.
+    ///
+    /// `ChatWidget` owns the quit shortcut state machine (it decides when quit is
+    /// allowed), while the bottom pane owns rendering. We also schedule a redraw
+    /// after [`QUIT_SHORTCUT_TIMEOUT`] so the hint disappears even if the user
+    /// stops typing and no other events trigger a draw.
+    pub(crate) fn show_quit_shortcut_hint(&mut self, key: KeyBinding) {
+        if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
+            return;
+        }
+
+        self.composer
+            .show_quit_shortcut_hint(key, self.has_input_focus);
+        let frame_requester = self.frame_requester.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(QUIT_SHORTCUT_TIMEOUT).await;
+                frame_requester.schedule_frame();
+            });
+        } else {
+            // In tests (and other non-Tokio contexts), fall back to a thread so
+            // the hint can still expire without requiring an explicit draw.
+            std::thread::spawn(move || {
+                std::thread::sleep(QUIT_SHORTCUT_TIMEOUT);
+                frame_requester.schedule_frame();
+            });
+        }
+        self.request_redraw();
+    }
+
+    /// Clear the "press again to quit" hint immediately.
+    pub(crate) fn clear_quit_shortcut_hint(&mut self) {
+        self.composer.clear_quit_shortcut_hint(self.has_input_focus);
+        self.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quit_shortcut_hint_visible(&self) -> bool {
+        self.composer.quit_shortcut_hint_visible()
     }
 
     #[cfg(test)]
@@ -353,20 +470,24 @@ impl BottomPane {
     // esc_backtrack_hint_visible removed; hints are controlled internally.
 
     pub fn set_task_running(&mut self, running: bool) {
+        let was_running = self.is_task_running;
         self.is_task_running = running;
         self.composer.set_task_running(running);
 
         if running {
-            if self.status.is_none() {
-                self.status = Some(StatusIndicatorWidget::new(
-                    self.app_event_tx.clone(),
-                    self.frame_requester.clone(),
-                ));
+            if !was_running {
+                if self.status.is_none() {
+                    self.status = Some(StatusIndicatorWidget::new(
+                        self.app_event_tx.clone(),
+                        self.frame_requester.clone(),
+                        self.animations_enabled,
+                    ));
+                }
+                if let Some(status) = self.status.as_mut() {
+                    status.set_interrupt_hint_visible(true);
+                }
+                self.request_redraw();
             }
-            if let Some(status) = self.status.as_mut() {
-                status.set_interrupt_hint_visible(true);
-            }
-            self.request_redraw();
         } else {
             // Hide the status indicator when a task completes, but keep other modal views.
             self.hide_status_indicator();
@@ -385,6 +506,7 @@ impl BottomPane {
             self.status = Some(StatusIndicatorWidget::new(
                 self.app_event_tx.clone(),
                 self.frame_requester.clone(),
+                self.animations_enabled,
             ));
             self.request_redraw();
         }
@@ -397,13 +519,16 @@ impl BottomPane {
         }
     }
 
-    pub(crate) fn set_context_window_percent(&mut self, percent: Option<i64>) {
-        if self.context_window_percent == percent {
+    pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
+        if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
+        {
             return;
         }
 
         self.context_window_percent = percent;
-        self.composer.set_context_window_percent(percent);
+        self.context_window_used_tokens = used_tokens;
+        self.composer
+            .set_context_window(percent, self.context_window_used_tokens);
         self.request_redraw();
     }
 
@@ -417,6 +542,12 @@ impl BottomPane {
     pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
         self.queued_user_messages.messages = queued;
         self.request_redraw();
+    }
+
+    pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<String>) {
+        if self.unified_exec_footer.set_processes(processes) {
+            self.request_redraw();
+        }
     }
 
     /// Update custom prompts available for the slash popup.
@@ -440,12 +571,26 @@ impl BottomPane {
         !self.is_task_running && self.view_stack.is_empty() && !self.composer.popup_active()
     }
 
+    /// Return true when no popups or modal views are active, regardless of task state.
+    pub(crate) fn can_launch_external_editor(&self) -> bool {
+        self.view_stack.is_empty() && !self.composer.popup_active()
+    }
+
+    /// Returns true when the bottom pane has no active modal view and no active composer popup.
+    ///
+    /// This is the UI-level definition of "no modal/popup is active" for key routing decisions.
+    /// It intentionally does not include task state, since some actions are safe while a task is
+    /// running and some are not.
+    pub(crate) fn no_modal_or_popup_active(&self) -> bool {
+        self.can_launch_external_editor()
+    }
+
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
     }
 
     /// Called when the agent requests user approval.
-    pub fn push_approval_request(&mut self, request: ApprovalRequest) {
+    pub fn push_approval_request(&mut self, request: ApprovalRequest, features: &Features) {
         let request = if let Some(view) = self.view_stack.last_mut() {
             match view.try_consume_approval_request(request) {
                 Some(request) => request,
@@ -459,13 +604,37 @@ impl BottomPane {
         };
 
         // Otherwise create a new approval modal overlay.
-        let modal = ApprovalOverlay::new(request, self.app_event_tx.clone());
+        let modal = ApprovalOverlay::new(request, self.app_event_tx.clone(), features.clone());
         self.pause_status_timer_for_modal();
+        self.push_view(Box::new(modal));
+    }
+
+    /// Called when the agent requests user input.
+    pub fn push_user_input_request(&mut self, request: RequestUserInputEvent) {
+        let request = if let Some(view) = self.view_stack.last_mut() {
+            match view.try_consume_user_input_request(request) {
+                Some(request) => request,
+                None => {
+                    self.request_redraw();
+                    return;
+                }
+            }
+        } else {
+            request
+        };
+
+        let modal = RequestUserInputOverlay::new(request, self.app_event_tx.clone());
+        self.pause_status_timer_for_modal();
+        self.set_composer_input_enabled(
+            false,
+            Some("Answer the questions to continue.".to_string()),
+        );
         self.push_view(Box::new(modal));
     }
 
     fn on_active_view_complete(&mut self) {
         self.resume_status_timer_after_modal();
+        self.set_composer_input_enabled(true, None);
     }
 
     fn pause_status_timer_for_modal(&mut self) {
@@ -523,56 +692,63 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn attach_image(
-        &mut self,
-        path: PathBuf,
-        width: u32,
-        height: u32,
-        format_label: &str,
-    ) {
+    pub(crate) fn attach_image(&mut self, path: PathBuf) {
         if self.view_stack.is_empty() {
-            self.composer
-                .attach_image(path, width, height, format_label);
+            self.composer.attach_image(path);
             self.request_redraw();
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn take_recent_submission_images(&mut self) -> Vec<PathBuf> {
         self.composer.take_recent_submission_images()
     }
+
+    pub(crate) fn take_recent_submission_images_with_placeholders(
+        &mut self,
+    ) -> Vec<LocalImageAttachment> {
+        self.composer
+            .take_recent_submission_images_with_placeholders()
+    }
+
+    fn as_renderable(&'_ self) -> RenderableItem<'_> {
+        if let Some(view) = self.active_view() {
+            RenderableItem::Borrowed(view)
+        } else {
+            let mut flex = FlexRenderable::new();
+            if let Some(status) = &self.status {
+                flex.push(0, RenderableItem::Borrowed(status));
+            }
+            if !self.unified_exec_footer.is_empty() {
+                flex.push(0, RenderableItem::Borrowed(&self.unified_exec_footer));
+            }
+            let has_queued_messages = !self.queued_user_messages.messages.is_empty();
+            let has_status_or_footer =
+                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            if has_queued_messages && has_status_or_footer {
+                flex.push(0, RenderableItem::Owned("".into()));
+            }
+            flex.push(1, RenderableItem::Borrowed(&self.queued_user_messages));
+            if !has_queued_messages && has_status_or_footer {
+                flex.push(0, RenderableItem::Owned("".into()));
+            }
+            let mut flex2 = FlexRenderable::new();
+            flex2.push(1, RenderableItem::Owned(flex.into()));
+            flex2.push(0, RenderableItem::Borrowed(&self.composer));
+            RenderableItem::Owned(Box::new(flex2))
+        }
+    }
 }
 
-impl WidgetRef for &BottomPane {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let [top_area, content_area] = self.layout(area);
-
-        // When a modal view is active, it owns the whole content area.
-        if let Some(view) = self.active_view() {
-            view.render(content_area, buf);
-        } else {
-            let status_height = self
-                .status
-                .as_ref()
-                .map(|status| status.desired_height(top_area.width).min(top_area.height))
-                .unwrap_or(0);
-            if let Some(status) = &self.status
-                && status_height > 0
-            {
-                status.render_ref(top_area, buf);
-            }
-
-            let queue_area = Rect {
-                x: top_area.x,
-                y: top_area.y.saturating_add(status_height),
-                width: top_area.width,
-                height: top_area.height.saturating_sub(status_height),
-            };
-            if queue_area.height > 0 {
-                self.queued_user_messages.render(queue_area, buf);
-            }
-
-            self.composer.render_ref(content_area, buf);
-        }
+impl Renderable for BottomPane {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.as_renderable().render(area, buf);
+    }
+    fn desired_height(&self, width: u16) -> u16 {
+        self.as_renderable().desired_height(width)
+    }
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.as_renderable().cursor_pos(area)
     }
 }
 
@@ -580,9 +756,13 @@ impl WidgetRef for &BottomPane {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
+    use codex_core::protocol::Op;
+    use codex_protocol::protocol::SkillScope;
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use std::path::PathBuf;
     use tokio::sync::mpsc::unbounded_channel;
 
     fn snapshot_buffer(buf: &Buffer) -> String {
@@ -599,7 +779,7 @@ mod tests {
 
     fn render_snapshot(pane: &BottomPane, area: Rect) -> String {
         let mut buf = Buffer::empty(area);
-        (&pane).render_ref(area, &mut buf);
+        pane.render(area, &mut buf);
         snapshot_buffer(&buf)
     }
 
@@ -608,14 +788,15 @@ mod tests {
             id: "1".to_string(),
             command: vec!["echo".into(), "ok".into()],
             reason: None,
-            risk: None,
+            proposed_execpolicy_amendment: None,
         }
     }
 
     #[test]
-    fn ctrl_c_on_modal_consumes_and_shows_quit_hint() {
+    fn ctrl_c_on_modal_consumes_without_showing_quit_hint() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
+        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -623,10 +804,12 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
-        pane.push_approval_request(exec_request());
+        pane.push_approval_request(exec_request(), &features);
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
-        assert!(pane.ctrl_c_quit_hint_visible());
+        assert!(!pane.quit_shortcut_hint_visible());
         assert_eq!(CancellationEvent::NotHandled, pane.on_ctrl_c());
     }
 
@@ -636,6 +819,7 @@ mod tests {
     fn overlay_not_shown_above_approval_modal() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
+        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -643,15 +827,17 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         // Create an approval modal (active view).
-        pane.push_approval_request(exec_request());
+        pane.push_approval_request(exec_request(), &features);
 
         // Render and verify the top row does not include an overlay.
         let area = Rect::new(0, 0, 60, 6);
         let mut buf = Buffer::empty(area);
-        (&pane).render_ref(area, &mut buf);
+        pane.render(area, &mut buf);
 
         let mut r0 = String::new();
         for x in 0..area.width {
@@ -665,8 +851,9 @@ mod tests {
 
     #[test]
     fn composer_shown_after_denied_while_task_running() {
-        let (tx_raw, rx) = unbounded_channel::<AppEvent>();
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
+        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -674,13 +861,15 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         // Start a running task so the status indicator is active above the composer.
         pane.set_task_running(true);
 
         // Push an approval modal (e.g., command approval) which should hide the status view.
-        pane.push_approval_request(exec_request());
+        pane.push_approval_request(exec_request(), &features);
 
         // Simulate pressing 'n' (No) on the modal.
         use crossterm::event::KeyCode;
@@ -700,14 +889,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         let area = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(area);
-        (&pane).render_ref(area, &mut buf);
-        let mut row1 = String::new();
+        pane.render(area, &mut buf);
+        let mut row0 = String::new();
         for x in 0..area.width {
-            row1.push(buf[(x, 1)].symbol().chars().next().unwrap_or(' '));
+            row0.push(buf[(x, 0)].symbol().chars().next().unwrap_or(' '));
         }
         assert!(
-            row1.contains("Working"),
-            "expected Working header after denial on row 1: {row1:?}"
+            row0.contains("Working"),
+            "expected Working header after denial on row 0: {row0:?}"
         );
 
         // Composer placeholder should be visible somewhere below.
@@ -726,9 +915,6 @@ mod tests {
             found_composer,
             "expected composer visible under status line"
         );
-
-        // Drain the channel to avoid unused warnings.
-        drop(rx);
     }
 
     #[test]
@@ -742,6 +928,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         // Begin a task: show initial status.
@@ -750,16 +938,10 @@ mod tests {
         // Use a height that allows the status line to be visible above the composer.
         let area = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(area);
-        (&pane).render_ref(area, &mut buf);
+        pane.render(area, &mut buf);
 
-        let mut row0 = String::new();
-        for x in 0..area.width {
-            row0.push(buf[(x, 1)].symbol().chars().next().unwrap_or(' '));
-        }
-        assert!(
-            row0.contains("Working"),
-            "expected Working header: {row0:?}"
-        );
+        let bufs = snapshot_buffer(&buf);
+        assert!(bufs.contains("• Working"), "expected Working header");
     }
 
     #[test]
@@ -773,6 +955,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         // Activate spinner (status view replaces composer) with no live ring.
@@ -792,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn status_hidden_when_height_too_small() {
+    fn status_only_snapshot() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -802,22 +986,46 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         pane.set_task_running(true);
 
-        // Height=2 → composer takes the full space; status collapses when there is no room.
-        let area2 = Rect::new(0, 0, 20, 2);
-        assert_snapshot!(
-            "status_hidden_when_height_too_small_height_2",
-            render_snapshot(&pane, area2)
-        );
+        let width = 48;
+        let height = pane.desired_height(width);
+        let area = Rect::new(0, 0, width, height);
+        assert_snapshot!("status_only_snapshot", render_snapshot(&pane, area));
+    }
 
-        // Height=1 → no padding; single row is the composer (status hidden).
-        let area1 = Rect::new(0, 0, 20, 1);
+    #[test]
+    fn status_with_details_and_queued_messages_snapshot() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        pane.update_status(
+            "Working".to_string(),
+            Some("First detail line\nSecond detail line".to_string()),
+        );
+        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+
+        let width = 48;
+        let height = pane.desired_height(width);
+        let area = Rect::new(0, 0, width, height);
         assert_snapshot!(
-            "status_hidden_when_height_too_small_height_1",
-            render_snapshot(&pane, area1)
+            "status_with_details_and_queued_messages_snapshot",
+            render_snapshot(&pane, area)
         );
     }
 
@@ -832,6 +1040,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         pane.set_task_running(true);
@@ -858,6 +1068,8 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
         });
 
         pane.set_task_running(true);
@@ -869,6 +1081,111 @@ mod tests {
         assert_snapshot!(
             "status_and_queued_messages_snapshot",
             render_snapshot(&pane, area)
+        );
+    }
+
+    #[test]
+    fn esc_with_skill_popup_does_not_interrupt_task() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(vec![SkillMetadata {
+                name: "test-skill".to_string(),
+                description: "test skill".to_string(),
+                short_description: None,
+                interface: None,
+                path: PathBuf::from("test-skill"),
+                scope: SkillScope::User,
+            }]),
+        });
+
+        pane.set_task_running(true);
+
+        // Repro: a running task + skill popup + Esc should dismiss the popup, not interrupt.
+        pane.insert_str("$");
+        assert!(
+            pane.composer.popup_active(),
+            "expected skill popup after typing `$`"
+        );
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
+                "expected Esc to not send Op::Interrupt when dismissing skill popup"
+            );
+        }
+        assert!(
+            !pane.composer.popup_active(),
+            "expected Esc to dismiss skill popup"
+        );
+    }
+
+    #[test]
+    fn esc_with_slash_command_popup_does_not_interrupt_task() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+
+        // Repro: a running task + slash-command popup + Esc should not interrupt the task.
+        pane.insert_str("/");
+        assert!(
+            pane.composer.popup_active(),
+            "expected command popup after typing `/`"
+        );
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
+                "expected Esc to not send Op::Interrupt while command popup is active"
+            );
+        }
+        assert_eq!(pane.composer_text(), "/");
+    }
+
+    #[test]
+    fn esc_interrupts_running_task_when_no_popup() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
+            "expected Esc to send Op::Interrupt while a task is running"
         );
     }
 }

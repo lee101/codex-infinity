@@ -1,16 +1,17 @@
 ---
 source: tui/src/status/tests.rs
+assertion_line: 277
 expression: sanitized
 ---
 /status
 
 ╭────────────────────────────────────────────────────────────────────────────╮
-│  >_ OpenAI Codex (v0.50.0)                                                 │
+│  >_ OpenAI Codex (v0.56.0)                                                 │
 │                                                                            │
 │ Visit https://chatgpt.com/codex/settings/usage for up-to-date              │
 │ information on rate limits and credits                                     │
 │                                                                            │
-│  Model:            gpt-5-codex (reasoning none, summaries auto)            │
+│  Model:            gpt-5.1-codex-max (reasoning none, summaries auto)      │
 │  Directory: [[workspace]]                                                  │
 │  Approval:         on-request                                              │
 │  Sandbox:          read-only                                               │
@@ -18,5 +19,5 @@ expression: sanitized
 │                                                                            │
 │  Token usage:      1.2K total  (800 input + 400 output)                    │
 │  Context window:   100% left (1.2K used / 272K)                            │
-│  Monthly limit:    [██░░░░░░░░░░░░░░░░░░] 12% used (resets 07:08 on 7 May) │
+│  Monthly limit:    [██████████████████░░] 88% left (resets 07:08 on 7 May) │
 ╰────────────────────────────────────────────────────────────────────────────╯

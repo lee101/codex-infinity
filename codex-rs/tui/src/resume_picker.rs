@@ -5,11 +5,13 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
-use codex_core::ConversationItem;
-use codex_core::ConversationsPage;
 use codex_core::Cursor;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
+use codex_core::ThreadItem;
+use codex_core::ThreadSortKey;
+use codex_core::ThreadsPage;
+use codex_core::path_utils;
 use codex_protocol::items::TurnItem;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -26,21 +28,53 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use unicode_width::UnicodeWidthStr;
 
+use crate::diff_render::display_path_for;
 use crate::key_hint;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::SessionMetaLine;
 
 const PAGE_SIZE: usize = 25;
 const LOAD_NEAR_THRESHOLD: usize = 5;
 
 #[derive(Debug, Clone)]
-pub enum ResumeSelection {
+pub enum SessionSelection {
     StartFresh,
     Resume(PathBuf),
+    Fork(PathBuf),
     Exit,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SessionPickerAction {
+    Resume,
+    Fork,
+}
+
+impl SessionPickerAction {
+    fn title(self) -> &'static str {
+        match self {
+            SessionPickerAction::Resume => "Resume a previous session",
+            SessionPickerAction::Fork => "Fork a previous session",
+        }
+    }
+
+    fn action_label(self) -> &'static str {
+        match self {
+            SessionPickerAction::Resume => "resume",
+            SessionPickerAction::Fork => "fork",
+        }
+    }
+
+    fn selection(self, path: PathBuf) -> SessionSelection {
+        match self {
+            SessionPickerAction::Resume => SessionSelection::Resume(path),
+            SessionPickerAction::Fork => SessionSelection::Fork(path),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -58,7 +92,7 @@ enum BackgroundEvent {
     PageLoaded {
         request_token: usize,
         search_token: Option<usize>,
-        page: std::io::Result<ConversationsPage>,
+        page: std::io::Result<ThreadsPage>,
     },
 }
 
@@ -69,21 +103,61 @@ pub async fn run_resume_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
-) -> Result<ResumeSelection> {
+    show_all: bool,
+) -> Result<SessionSelection> {
+    run_session_picker(
+        tui,
+        codex_home,
+        default_provider,
+        show_all,
+        SessionPickerAction::Resume,
+    )
+    .await
+}
+
+pub async fn run_fork_picker(
+    tui: &mut Tui,
+    codex_home: &Path,
+    default_provider: &str,
+    show_all: bool,
+) -> Result<SessionSelection> {
+    run_session_picker(
+        tui,
+        codex_home,
+        default_provider,
+        show_all,
+        SessionPickerAction::Fork,
+    )
+    .await
+}
+
+async fn run_session_picker(
+    tui: &mut Tui,
+    codex_home: &Path,
+    default_provider: &str,
+    show_all: bool,
+    action: SessionPickerAction,
+) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
     let default_provider = default_provider.to_string();
+    let filter_cwd = if show_all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
 
     let loader_tx = bg_tx.clone();
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
         tokio::spawn(async move {
             let provider_filter = vec![request.default_provider.clone()];
-            let page = RolloutRecorder::list_conversations(
+            let page = RolloutRecorder::list_threads(
                 &request.codex_home,
                 PAGE_SIZE,
                 request.cursor.as_ref(),
+                ThreadSortKey::CreatedAt,
                 INTERACTIVE_SESSION_SOURCES,
                 Some(provider_filter.as_slice()),
                 request.default_provider.as_str(),
@@ -102,8 +176,11 @@ pub async fn run_resume_picker(
         alt.tui.frame_requester(),
         page_loader,
         default_provider.clone(),
+        show_all,
+        filter_cwd,
+        action,
     );
-    state.load_initial_page().await?;
+    state.start_initial_load();
     state.request_frame();
 
     let mut tui_events = alt.tui.event_stream().fuse();
@@ -140,7 +217,7 @@ pub async fn run_resume_picker(
     }
 
     // Fallback – treat as cancel/new
-    Ok(ResumeSelection::StartFresh)
+    Ok(SessionSelection::StartFresh)
 }
 
 /// RAII guard that ensures we leave the alt-screen on scope exit.
@@ -177,6 +254,9 @@ struct PickerState {
     page_loader: PageLoader,
     view_rows: Option<usize>,
     default_provider: String,
+    show_all: bool,
+    filter_cwd: Option<PathBuf>,
+    action: SessionPickerAction,
 }
 
 struct PaginationState {
@@ -234,6 +314,8 @@ struct Row {
     preview: String,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    cwd: Option<PathBuf>,
+    git_branch: Option<String>,
 }
 
 impl PickerState {
@@ -242,6 +324,9 @@ impl PickerState {
         requester: FrameRequester,
         page_loader: PageLoader,
         default_provider: String,
+        show_all: bool,
+        filter_cwd: Option<PathBuf>,
+        action: SessionPickerAction,
     ) -> Self {
         Self {
             codex_home,
@@ -264,6 +349,9 @@ impl PickerState {
             page_loader,
             view_rows: None,
             default_provider,
+            show_all,
+            filter_cwd,
+            action,
         }
     }
 
@@ -271,19 +359,19 @@ impl PickerState {
         self.requester.schedule_frame();
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<ResumeSelection>> {
+    async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
         match key.code {
-            KeyCode::Esc => return Ok(Some(ResumeSelection::StartFresh)),
+            KeyCode::Esc => return Ok(Some(SessionSelection::StartFresh)),
             KeyCode::Char('c')
                 if key
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
-                return Ok(Some(ResumeSelection::Exit));
+                return Ok(Some(SessionSelection::Exit));
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    return Ok(Some(ResumeSelection::Resume(row.path.clone())));
+                    return Ok(Some(self.action.selection(row.path.clone())));
                 }
             }
             KeyCode::Up => {
@@ -341,25 +429,28 @@ impl PickerState {
         Ok(None)
     }
 
-    async fn load_initial_page(&mut self) -> Result<()> {
-        let provider_filter = vec![self.default_provider.clone()];
-        let page = RolloutRecorder::list_conversations(
-            &self.codex_home,
-            PAGE_SIZE,
-            None,
-            INTERACTIVE_SESSION_SOURCES,
-            Some(provider_filter.as_slice()),
-            self.default_provider.as_str(),
-        )
-        .await?;
+    fn start_initial_load(&mut self) {
         self.reset_pagination();
         self.all_rows.clear();
         self.filtered_rows.clear();
         self.seen_paths.clear();
         self.search_state = SearchState::Idle;
         self.selected = 0;
-        self.ingest_page(page);
-        Ok(())
+
+        let request_token = self.allocate_request_token();
+        self.pagination.loading = LoadingState::Pending(PendingLoad {
+            request_token,
+            search_token: None,
+        });
+        self.request_frame();
+
+        (self.page_loader)(PageLoadRequest {
+            codex_home: self.codex_home.clone(),
+            cursor: None,
+            request_token,
+            search_token: None,
+            default_provider: self.default_provider.clone(),
+        });
     }
 
     fn handle_background_event(&mut self, event: BackgroundEvent) -> Result<()> {
@@ -393,7 +484,7 @@ impl PickerState {
         self.pagination.loading = LoadingState::Idle;
     }
 
-    fn ingest_page(&mut self, page: ConversationsPage) {
+    fn ingest_page(&mut self, page: ThreadsPage) {
         if let Some(cursor) = page.next_cursor.clone() {
             self.pagination.next_cursor = Some(cursor);
         } else {
@@ -418,13 +509,15 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        let base_iter = self
+            .all_rows
+            .iter()
+            .filter(|row| self.row_matches_filter(row));
         if self.query.is_empty() {
-            self.filtered_rows = self.all_rows.clone();
+            self.filtered_rows = base_iter.cloned().collect();
         } else {
             let q = self.query.to_lowercase();
-            self.filtered_rows = self
-                .all_rows
-                .iter()
+            self.filtered_rows = base_iter
                 .filter(|r| r.preview.to_lowercase().contains(&q))
                 .cloned()
                 .collect();
@@ -437,6 +530,19 @@ impl PickerState {
         }
         self.ensure_selected_visible();
         self.request_frame();
+    }
+
+    fn row_matches_filter(&self, row: &Row) -> bool {
+        if self.show_all {
+            return true;
+        }
+        let Some(filter_cwd) = self.filter_cwd.as_ref() else {
+            return true;
+        };
+        let Some(row_cwd) = row.cwd.as_ref() else {
+            return false;
+        };
+        paths_match(row_cwd, filter_cwd)
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -590,11 +696,11 @@ impl PickerState {
     }
 }
 
-fn rows_from_items(items: Vec<ConversationItem>) -> Vec<Row> {
+fn rows_from_items(items: Vec<ThreadItem>) -> Vec<Row> {
     items.into_iter().map(|item| head_to_row(&item)).collect()
 }
 
-fn head_to_row(item: &ConversationItem) -> Row {
+fn head_to_row(item: &ThreadItem) -> Row {
     let created_at = item
         .created_at
         .as_deref()
@@ -606,6 +712,7 @@ fn head_to_row(item: &ConversationItem) -> Row {
         .and_then(parse_timestamp_str)
         .or(created_at);
 
+    let (cwd, git_branch) = extract_session_meta_from_head(&item.head);
     let preview = preview_from_head(&item.head)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -616,7 +723,30 @@ fn head_to_row(item: &ConversationItem) -> Row {
         preview,
         created_at,
         updated_at,
+        cwd,
+        git_branch,
     }
+}
+
+fn extract_session_meta_from_head(head: &[serde_json::Value]) -> (Option<PathBuf>, Option<String>) {
+    for value in head {
+        if let Ok(meta_line) = serde_json::from_value::<SessionMetaLine>(value.clone()) {
+            let cwd = Some(meta_line.meta.cwd);
+            let git_branch = meta_line.git.and_then(|git| git.branch);
+            return (cwd, git_branch);
+        }
+    }
+    (None, None)
+}
+
+fn paths_match(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (
+        path_utils::normalize_for_path_comparison(a),
+        path_utils::normalize_for_path_comparison(b),
+    ) {
+        return ca == cb;
+    }
+    a == b
 }
 
 fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
@@ -657,10 +787,7 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         .areas(area);
 
         // Header
-        frame.render_widget_ref(
-            Line::from(vec!["Resume a previous session".bold().cyan()]),
-            header,
-        );
+        frame.render_widget_ref(Line::from(vec![state.action.title().bold().cyan()]), header);
 
         // Search line
         let q = if state.query.is_empty() {
@@ -670,16 +797,17 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         };
         frame.render_widget_ref(Line::from(q), search);
 
-        let metrics = calculate_column_metrics(&state.filtered_rows);
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
 
         // Column headers and list
         render_column_headers(frame, columns, &metrics);
         render_list(frame, list, state, &metrics);
 
         // Hint line
+        let action_label = state.action.action_label();
         let hint_line: Line = vec![
             key_hint::plain(KeyCode::Enter).into(),
-            " to resume ".dim(),
+            format!(" to {action_label} ").dim(),
             "    ".dim(),
             key_hint::plain(KeyCode::Esc).into(),
             " to start new ".dim(),
@@ -720,10 +848,11 @@ fn render_list(
     let labels = &metrics.labels;
     let mut y = area.y;
 
-    let max_created_width = metrics.max_created_width;
     let max_updated_width = metrics.max_updated_width;
+    let max_branch_width = metrics.max_branch_width;
+    let max_cwd_width = metrics.max_cwd_width;
 
-    for (idx, (row, (created_label, updated_label))) in rows[start..end]
+    for (idx, (row, (updated_label, branch_label, cwd_label))) in rows[start..end]
         .iter()
         .zip(labels[start..end].iter())
         .enumerate()
@@ -731,36 +860,67 @@ fn render_list(
         let is_sel = start + idx == state.selected;
         let marker = if is_sel { "> ".bold() } else { "  ".into() };
         let marker_width = 2usize;
-        let created_span = if max_created_width == 0 {
-            None
-        } else {
-            Some(Span::from(format!("{created_label:<max_created_width$}")).dim())
-        };
         let updated_span = if max_updated_width == 0 {
             None
         } else {
             Some(Span::from(format!("{updated_label:<max_updated_width$}")).dim())
         };
+        let branch_span = if max_branch_width == 0 {
+            None
+        } else if branch_label.is_empty() {
+            Some(
+                Span::from(format!(
+                    "{empty:<width$}",
+                    empty = "-",
+                    width = max_branch_width
+                ))
+                .dim(),
+            )
+        } else {
+            Some(Span::from(format!("{branch_label:<max_branch_width$}")).cyan())
+        };
+        let cwd_span = if max_cwd_width == 0 {
+            None
+        } else if cwd_label.is_empty() {
+            Some(
+                Span::from(format!(
+                    "{empty:<width$}",
+                    empty = "-",
+                    width = max_cwd_width
+                ))
+                .dim(),
+            )
+        } else {
+            Some(Span::from(format!("{cwd_label:<max_cwd_width$}")).dim())
+        };
+
         let mut preview_width = area.width as usize;
         preview_width = preview_width.saturating_sub(marker_width);
-        if max_created_width > 0 {
-            preview_width = preview_width.saturating_sub(max_created_width + 2);
-        }
         if max_updated_width > 0 {
             preview_width = preview_width.saturating_sub(max_updated_width + 2);
         }
-        let add_leading_gap = max_created_width == 0 && max_updated_width == 0;
+        if max_branch_width > 0 {
+            preview_width = preview_width.saturating_sub(max_branch_width + 2);
+        }
+        if max_cwd_width > 0 {
+            preview_width = preview_width.saturating_sub(max_cwd_width + 2);
+        }
+        let add_leading_gap = max_updated_width == 0 && max_branch_width == 0 && max_cwd_width == 0;
         if add_leading_gap {
             preview_width = preview_width.saturating_sub(2);
         }
         let preview = truncate_text(&row.preview, preview_width);
         let mut spans: Vec<Span> = vec![marker];
-        if let Some(created) = created_span {
-            spans.push(created);
-            spans.push("  ".into());
-        }
         if let Some(updated) = updated_span {
             spans.push(updated);
+            spans.push("  ".into());
+        }
+        if let Some(branch) = branch_span {
+            spans.push(branch);
+            spans.push("  ".into());
+        }
+        if let Some(cwd) = cwd_span {
+            spans.push(cwd);
             spans.push("  ".into());
         }
         if add_leading_gap {
@@ -844,12 +1004,6 @@ fn human_time_ago(ts: DateTime<Utc>) -> String {
     }
 }
 
-fn format_created_label(row: &Row) -> String {
-    row.created_at
-        .map(human_time_ago)
-        .unwrap_or_else(|| "-".to_string())
-}
-
 fn format_updated_label(row: &Row) -> String {
     match (row.updated_at, row.created_at) {
         (Some(updated), _) => human_time_ago(updated),
@@ -868,15 +1022,6 @@ fn render_column_headers(
     }
 
     let mut spans: Vec<Span> = vec!["  ".into()];
-    if metrics.max_created_width > 0 {
-        let label = format!(
-            "{text:<width$}",
-            text = "Created",
-            width = metrics.max_created_width
-        );
-        spans.push(Span::from(label).bold());
-        spans.push("  ".into());
-    }
     if metrics.max_updated_width > 0 {
         let label = format!(
             "{text:<width$}",
@@ -886,32 +1031,88 @@ fn render_column_headers(
         spans.push(Span::from(label).bold());
         spans.push("  ".into());
     }
+    if metrics.max_branch_width > 0 {
+        let label = format!(
+            "{text:<width$}",
+            text = "Branch",
+            width = metrics.max_branch_width
+        );
+        spans.push(Span::from(label).bold());
+        spans.push("  ".into());
+    }
+    if metrics.max_cwd_width > 0 {
+        let label = format!(
+            "{text:<width$}",
+            text = "CWD",
+            width = metrics.max_cwd_width
+        );
+        spans.push(Span::from(label).bold());
+        spans.push("  ".into());
+    }
     spans.push("Conversation".bold());
     frame.render_widget_ref(Line::from(spans), area);
 }
 
 struct ColumnMetrics {
-    max_created_width: usize,
     max_updated_width: usize,
-    labels: Vec<(String, String)>,
+    max_branch_width: usize,
+    max_cwd_width: usize,
+    labels: Vec<(String, String, String)>,
 }
 
-fn calculate_column_metrics(rows: &[Row]) -> ColumnMetrics {
-    let mut labels: Vec<(String, String)> = Vec::with_capacity(rows.len());
-    let mut max_created_width = UnicodeWidthStr::width("Created");
+fn calculate_column_metrics(rows: &[Row], include_cwd: bool) -> ColumnMetrics {
+    fn right_elide(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            return s.to_string();
+        }
+        if max <= 1 {
+            return "…".to_string();
+        }
+        let tail_len = max - 1;
+        let tail: String = s
+            .chars()
+            .rev()
+            .take(tail_len)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("…{tail}")
+    }
+
+    let mut labels: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
     let mut max_updated_width = UnicodeWidthStr::width("Updated");
+    let mut max_branch_width = UnicodeWidthStr::width("Branch");
+    let mut max_cwd_width = if include_cwd {
+        UnicodeWidthStr::width("CWD")
+    } else {
+        0
+    };
 
     for row in rows {
-        let created = format_created_label(row);
         let updated = format_updated_label(row);
-        max_created_width = max_created_width.max(UnicodeWidthStr::width(created.as_str()));
+        let branch_raw = row.git_branch.clone().unwrap_or_default();
+        let branch = right_elide(&branch_raw, 24);
+        let cwd = if include_cwd {
+            let cwd_raw = row
+                .cwd
+                .as_ref()
+                .map(|p| display_path_for(p, std::path::Path::new("/")))
+                .unwrap_or_default();
+            right_elide(&cwd_raw, 24)
+        } else {
+            String::new()
+        };
         max_updated_width = max_updated_width.max(UnicodeWidthStr::width(updated.as_str()));
-        labels.push((created, updated));
+        max_branch_width = max_branch_width.max(UnicodeWidthStr::width(branch.as_str()));
+        max_cwd_width = max_cwd_width.max(UnicodeWidthStr::width(cwd.as_str()));
+        labels.push((updated, branch, cwd));
     }
 
     ColumnMetrics {
-        max_created_width,
         max_updated_width,
+        max_branch_width,
+        max_cwd_width,
         labels,
     }
 }
@@ -925,7 +1126,6 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use serde_json::json;
-    use std::future::Future;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -944,11 +1144,10 @@ mod tests {
         ]
     }
 
-    fn make_item(path: &str, ts: &str, preview: &str) -> ConversationItem {
-        ConversationItem {
+    fn make_item(path: &str, ts: &str, preview: &str) -> ThreadItem {
+        ThreadItem {
             path: PathBuf::from(path),
             head: head_with_ts_and_user_text(ts, &[preview]),
-            tail: Vec::new(),
             created_at: Some(ts.to_string()),
             updated_at: Some(ts.to_string()),
         }
@@ -960,25 +1159,17 @@ mod tests {
     }
 
     fn page(
-        items: Vec<ConversationItem>,
+        items: Vec<ThreadItem>,
         next_cursor: Option<Cursor>,
         num_scanned_files: usize,
         reached_scan_cap: bool,
-    ) -> ConversationsPage {
-        ConversationsPage {
+    ) -> ThreadsPage {
+        ThreadsPage {
             items,
             next_cursor,
             num_scanned_files,
             reached_scan_cap,
         }
-    }
-
-    fn block_on_future<F: Future<Output = T>, T>(future: F) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(future)
     }
 
     #[test]
@@ -1020,17 +1211,15 @@ mod tests {
     #[test]
     fn rows_from_items_preserves_backend_order() {
         // Construct two items with different timestamps and real user text.
-        let a = ConversationItem {
+        let a = ThreadItem {
             path: PathBuf::from("/tmp/a.jsonl"),
             head: head_with_ts_and_user_text("2025-01-01T00:00:00Z", &["A"]),
-            tail: Vec::new(),
             created_at: Some("2025-01-01T00:00:00Z".into()),
             updated_at: Some("2025-01-01T00:00:00Z".into()),
         };
-        let b = ConversationItem {
+        let b = ThreadItem {
             path: PathBuf::from("/tmp/b.jsonl"),
             head: head_with_ts_and_user_text("2025-01-02T00:00:00Z", &["B"]),
-            tail: Vec::new(),
             created_at: Some("2025-01-02T00:00:00Z".into()),
             updated_at: Some("2025-01-02T00:00:00Z".into()),
         };
@@ -1044,21 +1233,9 @@ mod tests {
     #[test]
     fn row_uses_tail_timestamp_for_updated_at() {
         let head = head_with_ts_and_user_text("2025-01-01T00:00:00Z", &["Hello"]);
-        let tail = vec![json!({
-            "timestamp": "2025-01-01T01:00:00Z",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": "hi",
-                }
-            ],
-        })];
-        let item = ConversationItem {
+        let item = ThreadItem {
             path: PathBuf::from("/tmp/a.jsonl"),
             head,
-            tail,
             created_at: Some("2025-01-01T00:00:00Z".into()),
             updated_at: Some("2025-01-01T01:00:00Z".into()),
         };
@@ -1088,6 +1265,9 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
 
         let now = Utc::now();
@@ -1097,18 +1277,24 @@ mod tests {
                 preview: String::from("Fix resume picker timestamps"),
                 created_at: Some(now - Duration::minutes(16)),
                 updated_at: Some(now - Duration::seconds(42)),
+                cwd: None,
+                git_branch: None,
             },
             Row {
                 path: PathBuf::from("/tmp/b.jsonl"),
                 preview: String::from("Investigate lazy pagination cap"),
                 created_at: Some(now - Duration::hours(1)),
                 updated_at: Some(now - Duration::minutes(35)),
+                cwd: None,
+                git_branch: None,
             },
             Row {
                 path: PathBuf::from("/tmp/c.jsonl"),
                 preview: String::from("Explain the codebase"),
                 created_at: Some(now - Duration::hours(2)),
                 updated_at: Some(now - Duration::hours(2)),
+                cwd: None,
+                git_branch: None,
             },
         ];
         state.all_rows = rows.clone();
@@ -1118,7 +1304,7 @@ mod tests {
         state.scroll_top = 0;
         state.update_view_rows(3);
 
-        let metrics = calculate_column_metrics(&state.filtered_rows);
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
 
         let width: u16 = 80;
         let height: u16 = 6;
@@ -1140,6 +1326,168 @@ mod tests {
         assert_snapshot!("resume_picker_table", snapshot);
     }
 
+    #[tokio::test]
+    async fn resume_picker_screen_snapshot() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+        use uuid::Uuid;
+
+        // Create real rollout files so the snapshot uses the actual listing pipeline.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tempdir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
+
+        let now = Utc::now();
+
+        // Helper to write a rollout file with minimal meta + one user message.
+        let write_rollout = |ts: DateTime<Utc>, cwd: &str, branch: &str, preview: &str| {
+            let dir = sessions_root
+                .join(ts.format("%Y").to_string())
+                .join(ts.format("%m").to_string())
+                .join(ts.format("%d").to_string());
+            std::fs::create_dir_all(&dir).expect("mkdir date dirs");
+            let filename = format!(
+                "rollout-{}-{}.jsonl",
+                ts.format("%Y-%m-%dT%H-%M-%S"),
+                Uuid::new_v4()
+            );
+            let path = dir.join(filename);
+            let meta = serde_json::json!({
+                "timestamp": ts.to_rfc3339(),
+                "item": {
+                    "SessionMeta": {
+                        "meta": {
+                            "id": Uuid::new_v4(),
+                            "timestamp": ts.to_rfc3339(),
+                            "cwd": cwd,
+                            "originator": "user",
+                            "cli_version": "0.0.0",
+                            "source": "Cli",
+                            "model_provider": "openai",
+                        }
+                    }
+                }
+            });
+            let user = serde_json::json!({
+                "timestamp": ts.to_rfc3339(),
+                "item": {
+                    "EventMsg": {
+                        "UserMessage": {
+                            "message": preview,
+                            "images": null
+                        }
+                    }
+                }
+            });
+            let branch_meta = serde_json::json!({
+                "timestamp": ts.to_rfc3339(),
+                "item": {
+                    "EventMsg": {
+                        "SessionMeta": {
+                            "meta": {
+                                "git_branch": branch
+                            }
+                        }
+                    }
+                }
+            });
+            std::fs::write(&path, format!("{meta}\n{user}\n{branch_meta}\n"))
+                .expect("write rollout");
+        };
+
+        write_rollout(
+            now - Duration::seconds(42),
+            "/tmp/project",
+            "feature/resume",
+            "Fix resume picker timestamps",
+        );
+        write_rollout(
+            now - Duration::minutes(35),
+            "/tmp/other",
+            "main",
+            "Investigate lazy pagination cap",
+        );
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+
+        let page = RolloutRecorder::list_threads(
+            &state.codex_home,
+            PAGE_SIZE,
+            None,
+            ThreadSortKey::CreatedAt,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(&[String::from("openai")]),
+            "openai",
+        )
+        .await
+        .expect("list conversations");
+
+        let rows = rows_from_items(page.items);
+        state.all_rows = rows.clone();
+        state.filtered_rows = rows;
+        state.view_rows = Some(4);
+        state.selected = 0;
+        state.scroll_top = 0;
+        state.update_view_rows(4);
+
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
+
+        let width: u16 = 80;
+        let height: u16 = 9;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let [header, search, columns, list, hint] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(area.height.saturating_sub(4)),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+
+            frame.render_widget_ref(
+                Line::from(vec!["Resume a previous session".bold().cyan()]),
+                header,
+            );
+
+            frame.render_widget_ref(Line::from("Type to search".dim()), search);
+
+            render_column_headers(&mut frame, columns, &metrics);
+            render_list(&mut frame, list, &state, &metrics);
+
+            let hint_line: Line = vec![
+                key_hint::plain(KeyCode::Enter).into(),
+                " to resume ".dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Esc).into(),
+                " to start new ".dim(),
+                "    ".dim(),
+                key_hint::ctrl(KeyCode::Char('c')).into(),
+                " to quit ".dim(),
+            ]
+            .into();
+            frame.render_widget_ref(hint_line, hint);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_screen", snapshot);
+    }
+
     #[test]
     fn pageless_scrolling_deduplicates_and_keeps_order() {
         let loader: PageLoader = Arc::new(|_| {});
@@ -1148,6 +1496,9 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
 
         state.reset_pagination();
@@ -1214,6 +1565,9 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
         state.reset_pagination();
         state.ingest_page(page(
@@ -1235,14 +1589,17 @@ mod tests {
         assert!(guard[0].search_token.is_none());
     }
 
-    #[test]
-    fn page_navigation_uses_view_rows() {
+    #[tokio::test]
+    async fn page_navigation_uses_view_rows() {
         let loader: PageLoader = Arc::new(|_| {});
         let mut state = PickerState::new(
             PathBuf::from("/tmp"),
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
 
         let mut items = Vec::new();
@@ -1258,39 +1615,36 @@ mod tests {
         state.update_view_rows(5);
 
         assert_eq!(state.selected, 0);
-        block_on_future(async {
-            state
-                .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
-                .await
-                .unwrap();
-        });
+        state
+            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert_eq!(state.selected, 5);
 
-        block_on_future(async {
-            state
-                .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
-                .await
-                .unwrap();
-        });
+        state
+            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert_eq!(state.selected, 10);
 
-        block_on_future(async {
-            state
-                .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
-                .await
-                .unwrap();
-        });
+        state
+            .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert_eq!(state.selected, 5);
     }
 
-    #[test]
-    fn up_at_bottom_does_not_scroll_when_visible() {
+    #[tokio::test]
+    async fn up_at_bottom_does_not_scroll_when_visible() {
         let loader: PageLoader = Arc::new(|_| {});
         let mut state = PickerState::new(
             PathBuf::from("/tmp"),
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
 
         let mut items = Vec::new();
@@ -1311,12 +1665,10 @@ mod tests {
         let initial_top = state.scroll_top;
         assert_eq!(initial_top, state.filtered_rows.len().saturating_sub(5));
 
-        block_on_future(async {
-            state
-                .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-                .await
-                .unwrap();
-        });
+        state
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
 
         assert_eq!(state.scroll_top, initial_top);
         assert_eq!(state.selected, state.filtered_rows.len().saturating_sub(2));
@@ -1335,6 +1687,9 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
         );
         state.reset_pagination();
         state.ingest_page(page(

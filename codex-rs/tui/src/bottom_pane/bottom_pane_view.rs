@@ -1,7 +1,7 @@
 use crate::bottom_pane::ApprovalRequest;
 use crate::render::renderable::Renderable;
+use codex_protocol::request_user_input::RequestUserInputEvent;
 use crossterm::event::KeyEvent;
-use ratatui::layout::Rect;
 
 use super::CancellationEvent;
 
@@ -27,17 +27,21 @@ pub(crate) trait BottomPaneView: Renderable {
         false
     }
 
-    /// Cursor position when this view is active.
-    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
-        None
-    }
-
     /// Try to handle approval request; return the original value if not
     /// consumed.
     fn try_consume_approval_request(
         &mut self,
         request: ApprovalRequest,
     ) -> Option<ApprovalRequest> {
+        Some(request)
+    }
+
+    /// Try to handle request_user_input; return the original value if not
+    /// consumed.
+    fn try_consume_user_input_request(
+        &mut self,
+        request: RequestUserInputEvent,
+    ) -> Option<RequestUserInputEvent> {
         Some(request)
     }
 }

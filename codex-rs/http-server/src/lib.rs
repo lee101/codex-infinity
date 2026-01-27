@@ -1,7 +1,7 @@
 //! HTTP Server for Codex - enables remote control of Codex agent
 //!
 //! This server exposes the Codex agent functionality over HTTP, allowing:
-//! - Creating conversations
+//! - Creating threads (conversations)
 //! - Sending messages (follow-ups)
 //! - Interrupting in-progress work
 //! - Streaming events via SSE
@@ -17,12 +17,12 @@ use axum::routing::get;
 use axum::routing::post;
 use codex_common::CliConfigOverrides;
 use codex_core::AuthManager;
-use codex_core::ConversationManager;
+use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use serde::Deserialize;
@@ -45,17 +45,17 @@ use tracing::info;
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
-    conversation_manager: Arc<ConversationManager>,
+    thread_manager: Arc<ThreadManager>,
     config: Arc<Config>,
     codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
-    /// Active event streams per conversation
-    event_streams: Arc<RwLock<HashMap<ConversationId, Vec<tokio::sync::mpsc::Sender<String>>>>>,
+    /// Active event streams per thread
+    event_streams: Arc<RwLock<HashMap<ThreadId, Vec<tokio::sync::mpsc::Sender<String>>>>>,
 }
 
-/// Request to create a new conversation
+/// Request to create a new thread
 #[derive(Debug, Deserialize)]
-pub struct NewConversationRequest {
+pub struct NewThreadRequest {
     pub cwd: Option<String>,
     #[allow(dead_code)]
     pub model: Option<String>,
@@ -65,14 +65,14 @@ pub struct NewConversationRequest {
     pub sandbox_mode: Option<String>,
 }
 
-/// Response after creating a conversation
+/// Response after creating a thread
 #[derive(Debug, Serialize)]
-pub struct NewConversationResponse {
-    pub conversation_id: String,
+pub struct NewThreadResponse {
+    pub thread_id: String,
     pub model: Option<String>,
 }
 
-/// Request to send a message to a conversation
+/// Request to send a message to a thread
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
     pub text: String,
@@ -86,7 +86,7 @@ pub struct SendMessageResponse {
     pub queued: bool,
 }
 
-/// Response after interrupting a conversation
+/// Response after interrupting a thread
 #[derive(Debug, Serialize)]
 pub struct InterruptResponse {
     pub interrupted: bool,
@@ -133,7 +133,7 @@ pub async fn run_main(
         codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
         ..ConfigOverrides::default()
     };
-    let config = Config::load_with_cli_overrides(cli_kv_overrides, overrides)
+    let config = Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides)
         .await
         .map_err(|e| IoError::new(ErrorKind::InvalidData, format!("error loading config: {e}")))?;
 
@@ -146,15 +146,16 @@ pub async fn run_main(
         config.cli_auth_credentials_store_mode,
     );
 
-    // Create conversation manager
-    let conversation_manager = Arc::new(ConversationManager::new(
+    // Create thread manager
+    let thread_manager = Arc::new(ThreadManager::new(
+        config.codex_home.clone(),
         auth_manager.clone(),
         SessionSource::Exec, // Use Exec source for remote/automated connections
     ));
 
     // Create app state
     let state = AppState {
-        conversation_manager,
+        thread_manager,
         config,
         codex_linux_sandbox_exe,
         cli_config_overrides,
@@ -164,9 +165,14 @@ pub async fn run_main(
     // Build router
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/conversations", post(create_conversation))
+        .route("/threads", post(create_thread))
+        .route("/threads/:id/messages", post(send_message))
+        .route("/threads/:id/interrupt", post(interrupt_thread))
+        .route("/threads/:id/events", get(stream_events))
+        // Legacy conversation routes for backwards compatibility
+        .route("/conversations", post(create_thread))
         .route("/conversations/:id/messages", post(send_message))
-        .route("/conversations/:id/interrupt", post(interrupt_conversation))
+        .route("/conversations/:id/interrupt", post(interrupt_thread))
         .route("/conversations/:id/events", get(stream_events))
         .layer(
             CorsLayer::new()
@@ -196,11 +202,11 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
-/// Create a new conversation
-async fn create_conversation(
+/// Create a new thread
+async fn create_thread(
     State(state): State<AppState>,
-    Json(req): Json<NewConversationRequest>,
-) -> Result<Json<NewConversationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Json(req): Json<NewThreadRequest>,
+) -> Result<Json<NewThreadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let config = if let Some(cwd) = req.cwd {
         let cli_kv_overrides = state.cli_config_overrides.parse_overrides().map_err(|e| {
             (
@@ -215,7 +221,7 @@ async fn create_conversation(
             codex_linux_sandbox_exe: state.codex_linux_sandbox_exe.clone(),
             ..ConfigOverrides::default()
         };
-        Config::load_with_cli_overrides(cli_kv_overrides, overrides)
+        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides)
             .await
             .map_err(|e| {
                 (
@@ -229,114 +235,109 @@ async fn create_conversation(
         (*state.config).clone()
     };
 
-    match state.conversation_manager.new_conversation(config).await {
-        Ok(new_conv) => {
-            let conversation_id = new_conv.conversation_id;
-            info!("Created conversation: {}", conversation_id);
+    match state.thread_manager.start_thread(config).await {
+        Ok(new_thread) => {
+            let thread_id = new_thread.thread_id;
+            info!("Created thread: {}", thread_id);
 
-            // Start event listener for this conversation
+            // Start event listener for this thread
             let state_clone = state.clone();
-            let conv_id_clone = conversation_id;
+            let thread_id_clone = thread_id;
+            let thread = new_thread.thread.clone();
             tokio::spawn(async move {
-                if let Ok(conversation) = state_clone
-                    .conversation_manager
-                    .get_conversation(conv_id_clone)
-                    .await
-                {
-                    loop {
-                        match conversation.next_event().await {
-                            Ok(event) => {
-                                let event_json = match serde_json::to_string(&event) {
-                                    Ok(j) => j,
-                                    Err(_) => continue,
-                                };
+                loop {
+                    match thread.next_event().await {
+                        Ok(event) => {
+                            let event_json = match serde_json::to_string(&event) {
+                                Ok(j) => j,
+                                Err(_) => continue,
+                            };
 
-                                // Broadcast to all listeners
-                                let mut prune_after_send = false;
-                                let senders = {
-                                    let mut streams = state_clone.event_streams.write().await;
-                                    match streams.get_mut(&conv_id_clone) {
-                                        Some(senders) => {
-                                            senders.retain(|sender| !sender.is_closed());
-                                            if senders.is_empty() {
-                                                streams.remove(&conv_id_clone);
-                                                Vec::new()
-                                            } else {
-                                                senders.clone()
-                                            }
-                                        }
-                                        None => Vec::new(),
-                                    }
-                                };
-                                for sender in senders {
-                                    if sender.send(event_json.clone()).await.is_err() {
-                                        prune_after_send = true;
-                                    }
-                                }
-                                if prune_after_send {
-                                    let mut streams = state_clone.event_streams.write().await;
-                                    if let Some(senders) = streams.get_mut(&conv_id_clone) {
+                            // Broadcast to all listeners
+                            let mut prune_after_send = false;
+                            let senders = {
+                                let mut streams = state_clone.event_streams.write().await;
+                                match streams.get_mut(&thread_id_clone) {
+                                    Some(senders) => {
                                         senders.retain(|sender| !sender.is_closed());
                                         if senders.is_empty() {
-                                            streams.remove(&conv_id_clone);
+                                            streams.remove(&thread_id_clone);
+                                            Vec::new()
+                                        } else {
+                                            senders.clone()
                                         }
                                     }
+                                    None => Vec::new(),
                                 }
-
-                                // Check for shutdown
-                                if matches!(event.msg, EventMsg::ShutdownComplete) {
-                                    break;
+                            };
+                            for sender in senders {
+                                if sender.send(event_json.clone()).await.is_err() {
+                                    prune_after_send = true;
                                 }
                             }
-                            Err(_) => break,
+                            if prune_after_send {
+                                let mut streams = state_clone.event_streams.write().await;
+                                if let Some(senders) = streams.get_mut(&thread_id_clone) {
+                                    senders.retain(|sender| !sender.is_closed());
+                                    if senders.is_empty() {
+                                        streams.remove(&thread_id_clone);
+                                    }
+                                }
+                            }
+
+                            // Check for shutdown
+                            if matches!(event.msg, EventMsg::ShutdownComplete) {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    let mut streams = state_clone.event_streams.write().await;
-                    streams.remove(&conv_id_clone);
                 }
+                let mut streams = state_clone.event_streams.write().await;
+                streams.remove(&thread_id_clone);
             });
 
-            Ok(Json(NewConversationResponse {
-                conversation_id: conversation_id.to_string(),
-                model: Some(new_conv.session_configured.model),
+            Ok(Json(NewThreadResponse {
+                thread_id: thread_id.to_string(),
+                model: Some(new_thread.session_configured.model),
             }))
         }
         Err(e) => {
-            error!("Failed to create conversation: {}", e);
+            error!("Failed to create thread: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("Failed to create conversation: {}", e),
+                    error: format!("Failed to create thread: {}", e),
                 }),
             ))
         }
     }
 }
 
-/// Send a message to an existing conversation
+/// Send a message to an existing thread
 async fn send_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let conversation_id = ConversationId::from_string(&id).map_err(|e| {
+    let thread_id = ThreadId::from_string(&id).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: format!("Invalid conversation ID: {}", e),
+                error: format!("Invalid thread ID: {}", e),
             }),
         )
     })?;
 
-    let conversation = state
-        .conversation_manager
-        .get_conversation(conversation_id)
+    let thread = state
+        .thread_manager
+        .get_thread(thread_id)
         .await
         .map_err(|_| {
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "Conversation not found".to_string(),
+                    error: "Thread not found".to_string(),
                 }),
             )
         })?;
@@ -344,6 +345,7 @@ async fn send_message(
     // Build input items
     let mut items = vec![CoreInputItem::Text {
         text: req.text.clone(),
+        text_elements: vec![],
     }];
 
     for image_url in req.images {
@@ -351,8 +353,11 @@ async fn send_message(
     }
 
     // Submit user input
-    conversation
-        .submit(Op::UserInput { items })
+    thread
+        .submit(Op::UserInput {
+            items,
+            final_output_json_schema: None,
+        })
         .await
         .map_err(|e| {
             (
@@ -363,39 +368,39 @@ async fn send_message(
             )
         })?;
 
-    info!("Sent message to conversation {}: {}", id, req.text);
+    info!("Sent message to thread {}: {}", id, req.text);
 
     Ok(Json(SendMessageResponse { queued: true }))
 }
 
-/// Interrupt an in-progress conversation
-async fn interrupt_conversation(
+/// Interrupt an in-progress thread
+async fn interrupt_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<InterruptResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let conversation_id = ConversationId::from_string(&id).map_err(|e| {
+    let thread_id = ThreadId::from_string(&id).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: format!("Invalid conversation ID: {}", e),
+                error: format!("Invalid thread ID: {}", e),
             }),
         )
     })?;
 
-    let conversation = state
-        .conversation_manager
-        .get_conversation(conversation_id)
+    let thread = state
+        .thread_manager
+        .get_thread(thread_id)
         .await
         .map_err(|_| {
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "Conversation not found".to_string(),
+                    error: "Thread not found".to_string(),
                 }),
             )
         })?;
 
-    conversation.submit(Op::Interrupt).await.map_err(|e| {
+    thread.submit(Op::Interrupt).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -404,12 +409,12 @@ async fn interrupt_conversation(
         )
     })?;
 
-    info!("Interrupted conversation {}", id);
+    info!("Interrupted thread {}", id);
 
     Ok(Json(InterruptResponse { interrupted: true }))
 }
 
-/// Stream events from a conversation via SSE
+/// Stream events from a thread via SSE
 async fn stream_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -417,25 +422,25 @@ async fn stream_events(
     Sse<impl futures::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let conversation_id = ConversationId::from_string(&id).map_err(|e| {
+    let thread_id = ThreadId::from_string(&id).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: format!("Invalid conversation ID: {}", e),
+                error: format!("Invalid thread ID: {}", e),
             }),
         )
     })?;
 
-    // Verify conversation exists
+    // Verify thread exists
     state
-        .conversation_manager
-        .get_conversation(conversation_id)
+        .thread_manager
+        .get_thread(thread_id)
         .await
         .map_err(|_| {
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "Conversation not found".to_string(),
+                    error: "Thread not found".to_string(),
                 }),
             )
         })?;
@@ -446,10 +451,10 @@ async fn stream_events(
     // Register subscriber
     {
         let mut streams = state.event_streams.write().await;
-        streams.entry(conversation_id).or_default().push(tx);
+        streams.entry(thread_id).or_default().push(tx);
     }
 
-    info!("Started event stream for conversation {}", id);
+    info!("Started event stream for thread {}", id);
 
     // Convert to SSE stream
     let stream = ReceiverStream::new(rx).map(|msg| Ok(Event::default().data(msg)));

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use codex_core::ModelProviderInfo;
 use codex_core::WireApi;
 use codex_core::protocol::EventMsg;
@@ -9,7 +7,7 @@ use core_test_support::load_sse_fixture_with_id;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event_with_timeout;
+use core_test_support::wait_for_event;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -18,7 +16,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("tests/fixtures/completed_template.json", id)
+    load_sse_fixture_with_id("../fixtures/completed_template.json", id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -90,25 +88,17 @@ async fn continue_after_stream_error() {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "first message".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await
         .unwrap();
 
-    // Expect an Error followed by TaskComplete so the session is released.
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::Error(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    // Expect an Error followed by TurnComplete so the session is released.
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // 2) Second turn: now send another prompt that should succeed using the
     // mock server SSE stream. If the agent failed to clear the running task on
@@ -117,15 +107,12 @@ async fn continue_after_stream_error() {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "follow up".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await
         .unwrap();
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }

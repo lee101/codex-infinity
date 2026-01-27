@@ -1,28 +1,75 @@
+//! Application-level events used to coordinate UI actions.
+//!
+//! `AppEvent` is the internal message bus between UI components and the top-level `App` loop.
+//! Widgets emit events to request actions that must be handled at the app layer (like opening
+//! pickers, persisting configuration, or shutting down the agent), without needing direct access to
+//! `App` internals.
+//!
+//! Exit is modelled explicitly via `AppEvent::Exit(ExitMode)` so callers can request shutdown-first
+//! quits without reaching into the app loop or coupling to shutdown/exit sequencing.
+
 use std::path::PathBuf;
 
 use codex_common::approval_presets::ApprovalPreset;
-use codex_common::model_presets::ModelPreset;
-use codex_core::protocol::ConversationPathResponseEvent;
 use codex_core::protocol::Event;
+use codex_core::protocol::RateLimitSnapshot;
 use codex_file_search::FileMatch;
+use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::history_cell::HistoryCell;
 
+use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol_config_types::ReasoningEffort;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::openai_models::ReasoningEffort;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum WindowsSandboxEnableMode {
+    Elevated,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum WindowsSandboxFallbackReason {
+    ElevationFailed,
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
+    /// Open the agent picker for switching active threads.
+    OpenAgentPicker,
+    /// Switch the active thread to the selected agent.
+    SelectAgentThread(ThreadId),
 
     /// Start a new session.
     NewSession,
 
-    /// Request to exit the application gracefully.
-    ExitRequest,
+    /// Open the resume picker inside the running TUI session.
+    OpenResumePicker,
+
+    /// Fork the current session into a new thread.
+    ForkCurrentSession,
+
+    /// Open the fork picker to select a session to fork from.
+    OpenForkPicker,
+
+    /// Request to exit the application.
+    ///
+    /// Use `ShutdownFirst` for user-initiated quits so core cleanup runs and the
+    /// UI exits only after `ShutdownComplete`. `Immediate` is a last-resort
+    /// escape hatch that skips shutdown and may drop in-flight work (e.g.,
+    /// background tasks, rollout flush, or child process cleanup).
+    Exit(ExitMode),
+
+    /// Request to exit the application due to a fatal error.
+    FatalExitRequest(String),
 
     /// Forward an `Op` to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
@@ -41,6 +88,9 @@ pub(crate) enum AppEvent {
         matches: Vec<FileMatch>,
     },
 
+    /// Result of refreshing rate limits
+    RateLimitSnapshotFetched(RateLimitSnapshot),
+
     /// Result of computing a `/diff` command.
     DiffResult(String),
 
@@ -56,6 +106,9 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Update the current collaboration mode in the running app and widget.
+    UpdateCollaborationMode(CollaborationMode),
+
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
         model: String,
@@ -67,13 +120,57 @@ pub(crate) enum AppEvent {
         model: ModelPreset,
     },
 
+    /// Open the full model picker (non-auto models).
+    OpenAllModelsPopup {
+        models: Vec<ModelPreset>,
+    },
+
     /// Open the confirmation prompt before enabling full access mode.
     OpenFullAccessConfirmation {
         preset: ApprovalPreset,
+        return_to_permissions: bool,
     },
 
-    /// Show Windows Subsystem for Linux setup instructions for auto mode.
-    ShowWindowsAutoModeInstructions,
+    /// Open the Windows world-writable directories warning.
+    /// If `preset` is `Some`, the confirmation will apply the provided
+    /// approval/sandbox configuration on Continue; if `None`, it performs no
+    /// policy change and only acknowledges/dismisses the warning.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    OpenWorldWritableWarningConfirmation {
+        preset: Option<ApprovalPreset>,
+        /// Up to 3 sample world-writable directories to display in the warning.
+        sample_paths: Vec<String>,
+        /// If there are more than `sample_paths`, this carries the remaining count.
+        extra_count: usize,
+        /// True when the scan failed (e.g. ACL query error) and protections could not be verified.
+        failed_scan: bool,
+    },
+
+    /// Prompt to enable the Windows sandbox feature before using Agent mode.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    OpenWindowsSandboxEnablePrompt {
+        preset: ApprovalPreset,
+    },
+
+    /// Open the Windows sandbox fallback prompt after declining or failing elevation.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    OpenWindowsSandboxFallbackPrompt {
+        preset: ApprovalPreset,
+        reason: WindowsSandboxFallbackReason,
+    },
+
+    /// Begin the elevated Windows sandbox setup flow.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    BeginWindowsSandboxElevatedSetup {
+        preset: ApprovalPreset,
+    },
+
+    /// Enable the Windows sandbox feature and switch to Agent mode.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    EnableWindowsSandboxForAgentMode {
+        preset: ApprovalPreset,
+        mode: WindowsSandboxEnableMode,
+    },
 
     /// Update the current approval policy in the running app and widget.
     UpdateAskForApprovalPolicy(AskForApproval),
@@ -81,17 +178,61 @@ pub(crate) enum AppEvent {
     /// Update the current sandbox policy in the running app and widget.
     UpdateSandboxPolicy(SandboxPolicy),
 
+    /// Update feature flags and persist them to the top-level config.
+    UpdateFeatureFlags {
+        updates: Vec<(Feature, bool)>,
+    },
+
     /// Update whether the full access warning prompt has been acknowledged.
     UpdateFullAccessWarningAcknowledged(bool),
+
+    /// Update whether the world-writable directories warning has been acknowledged.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    UpdateWorldWritableWarningAcknowledged(bool),
+
+    /// Update whether the rate limit switch prompt has been acknowledged for the session.
+    UpdateRateLimitSwitchPromptHidden(bool),
 
     /// Persist the acknowledgement flag for the full access warning prompt.
     PersistFullAccessWarningAcknowledged,
 
+    /// Persist the acknowledgement flag for the world-writable directories warning.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    PersistWorldWritableWarningAcknowledged,
+
+    /// Persist the acknowledgement flag for the rate limit switch prompt.
+    PersistRateLimitSwitchPromptHidden,
+
+    /// Persist the acknowledgement flag for the model migration prompt.
+    PersistModelMigrationPromptAcknowledged {
+        from_model: String,
+        to_model: String,
+    },
+
+    /// Skip the next world-writable scan (one-shot) after a user-confirmed continue.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    SkipNextWorldWritableScan,
+
     /// Re-open the approval presets popup.
     OpenApprovalsPopup,
 
-    /// Forwarded conversation history snapshot from the current conversation.
-    ConversationHistory(ConversationPathResponseEvent),
+    /// Open the skills list popup.
+    OpenSkillsList,
+
+    /// Open the skills enable/disable picker.
+    OpenManageSkillsPopup,
+
+    /// Enable or disable a skill by path.
+    SetSkillEnabled {
+        path: PathBuf,
+        enabled: bool,
+    },
+
+    /// Notify that the manage skills popup was closed.
+    ManageSkillsClosed,
+
+    /// Re-open the permissions presets popup.
+    OpenPermissionsPopup,
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
@@ -101,6 +242,12 @@ pub(crate) enum AppEvent {
 
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
+
+    /// Submit a user message with an explicit collaboration mode.
+    SubmitUserMessageWithMode {
+        text: String,
+        collaboration_mode: CollaborationMode,
+    },
 
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
@@ -115,6 +262,25 @@ pub(crate) enum AppEvent {
     OpenFeedbackConsent {
         category: FeedbackCategory,
     },
+
+    /// Launch the external editor after a normal draw has completed.
+    LaunchExternalEditor,
+}
+
+/// The exit strategy requested by the UI layer.
+///
+/// Most user-initiated exits should use `ShutdownFirst` so core cleanup runs and the UI exits only
+/// after core acknowledges completion. `Immediate` is an escape hatch for cases where shutdown has
+/// already completed (or is being bypassed) and the UI loop should terminate right away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMode {
+    /// Shutdown core and exit after completion.
+    ShutdownFirst,
+    /// Exit the UI loop immediately without waiting for shutdown.
+    ///
+    /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
+    /// cleanup that normally runs before `ShutdownComplete` can be missed.
+    Immediate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -40,6 +40,14 @@ pub struct FileMatch {
     pub indices: Option<Vec<u32>>, // Sorted & deduplicated when present
 }
 
+/// Returns the final path component for a matched path, falling back to the full path.
+pub fn file_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 #[derive(Debug)]
 pub struct FileSearchResults {
     pub matches: Vec<FileMatch>,
@@ -159,6 +167,8 @@ pub fn run(
         .threads(num_walk_builder_threads)
         // Allow hidden entries.
         .hidden(false)
+        // Follow symlinks to search their contents.
+        .follow_links(true)
         // Don't require git to be present to apply to apply git-related ignore rules.
         .require_git(false);
     if !respect_gitignore {
@@ -401,6 +411,7 @@ fn create_pattern(pattern: &str) -> Pattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn verify_score_is_none_for_non_match() {
@@ -431,5 +442,15 @@ mod tests {
         ];
 
         assert_eq!(matches, expected);
+    }
+
+    #[test]
+    fn file_name_from_path_uses_basename() {
+        assert_eq!(file_name_from_path("foo/bar.txt"), "bar.txt");
+    }
+
+    #[test]
+    fn file_name_from_path_falls_back_to_full_path() {
+        assert_eq!(file_name_from_path(""), "");
     }
 }

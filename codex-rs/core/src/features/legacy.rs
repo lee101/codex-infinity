@@ -10,20 +10,12 @@ struct Alias {
 
 const ALIASES: &[Alias] = &[
     Alias {
-        legacy_key: "experimental_sandbox_command_assessment",
-        feature: Feature::SandboxCommandAssessment,
+        legacy_key: "enable_experimental_windows_sandbox",
+        feature: Feature::WindowsSandbox,
     },
     Alias {
         legacy_key: "experimental_use_unified_exec_tool",
         feature: Feature::UnifiedExec,
-    },
-    Alias {
-        legacy_key: "experimental_use_exec_command_tool",
-        feature: Feature::StreamableShell,
-    },
-    Alias {
-        legacy_key: "experimental_use_rmcp_client",
-        feature: Feature::RmcpClient,
     },
     Alias {
         legacy_key: "experimental_use_freeform_apply_patch",
@@ -38,14 +30,14 @@ const ALIASES: &[Alias] = &[
         feature: Feature::PlanTool,
     },
     Alias {
-        legacy_key: "include_view_image_tool",
-        feature: Feature::ViewImageTool,
-    },
-    Alias {
         legacy_key: "web_search",
         feature: Feature::WebSearchRequest,
     },
 ];
+
+pub(crate) fn legacy_feature_keys() -> impl Iterator<Item = &'static str> {
+    ALIASES.iter().map(|alias| alias.legacy_key)
+}
 
 pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
     ALIASES
@@ -61,13 +53,9 @@ pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
 pub struct LegacyFeatureToggles {
     pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
-    pub experimental_sandbox_command_assessment: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
-    pub experimental_use_exec_command_tool: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
-    pub experimental_use_rmcp_client: Option<bool>,
     pub tools_web_search: Option<bool>,
-    pub tools_view_image: Option<bool>,
 }
 
 impl LegacyFeatureToggles {
@@ -86,21 +74,9 @@ impl LegacyFeatureToggles {
         );
         set_if_some(
             features,
-            Feature::SandboxCommandAssessment,
-            self.experimental_sandbox_command_assessment,
-            "experimental_sandbox_command_assessment",
-        );
-        set_if_some(
-            features,
             Feature::ApplyPatchFreeform,
             self.experimental_use_freeform_apply_patch,
             "experimental_use_freeform_apply_patch",
-        );
-        set_if_some(
-            features,
-            Feature::StreamableShell,
-            self.experimental_use_exec_command_tool,
-            "experimental_use_exec_command_tool",
         );
         set_if_some(
             features,
@@ -110,21 +86,9 @@ impl LegacyFeatureToggles {
         );
         set_if_some(
             features,
-            Feature::RmcpClient,
-            self.experimental_use_rmcp_client,
-            "experimental_use_rmcp_client",
-        );
-        set_if_some(
-            features,
             Feature::WebSearchRequest,
             self.tools_web_search,
             "tools.web_search",
-        );
-        set_if_some(
-            features,
-            Feature::ViewImageTool,
-            self.tools_view_image,
-            "tools.view_image",
         );
     }
 }

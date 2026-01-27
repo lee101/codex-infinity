@@ -1,6 +1,7 @@
 mod storage;
 
 use chrono::Utc;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
@@ -11,7 +12,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -21,11 +21,17 @@ pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
 use crate::config::Config;
-use crate::default_client::CodexHttpClient;
-use crate::token_data::PlanType;
+use crate::error::RefreshTokenFailedError;
+use crate::error::RefreshTokenFailedReason;
+use crate::token_data::KnownPlan as InternalKnownPlan;
+use crate::token_data::PlanType as InternalPlanType;
 use crate::token_data::TokenData;
 use crate::token_data::parse_id_token;
 use crate::util::try_parse_error_message;
+use codex_client::CodexHttpClient;
+use codex_protocol::account::PlanType as AccountPlanType;
+use serde_json::Value;
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct CodexAuth {
@@ -46,42 +52,41 @@ impl PartialEq for CodexAuth {
 // TODO(pakrym): use token exp field to check for expiration instead
 const TOKEN_REFRESH_INTERVAL: i64 = 8;
 
-impl CodexAuth {
-    pub async fn refresh_token(&self) -> Result<String, std::io::Error> {
-        tracing::info!("Refreshing token");
+const REFRESH_TOKEN_EXPIRED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
+const REFRESH_TOKEN_REUSED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+const REFRESH_TOKEN_INVALIDATED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.";
+const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
+    "Your access token could not be refreshed. Please log out and sign in again.";
+const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 
-        let token_data = self
-            .get_current_token_data()
-            .ok_or(std::io::Error::other("Token data is not available."))?;
-        let token = token_data.refresh_token;
+#[derive(Debug, Error)]
+pub enum RefreshTokenError {
+    #[error("{0}")]
+    Permanent(#[from] RefreshTokenFailedError),
+    #[error(transparent)]
+    Transient(#[from] std::io::Error),
+}
 
-        let refresh_response = try_refresh_token(token, &self.client)
-            .await
-            .map_err(std::io::Error::other)?;
-
-        let updated = update_tokens(
-            &self.storage,
-            refresh_response.id_token,
-            refresh_response.access_token,
-            refresh_response.refresh_token,
-        )
-        .await?;
-
-        if let Ok(mut auth_lock) = self.auth_dot_json.lock() {
-            *auth_lock = Some(updated.clone());
+impl RefreshTokenError {
+    pub fn failed_reason(&self) -> Option<RefreshTokenFailedReason> {
+        match self {
+            Self::Permanent(error) => Some(error.reason),
+            Self::Transient(_) => None,
         }
-
-        let access = match updated.tokens {
-            Some(t) => t.access_token,
-            None => {
-                return Err(std::io::Error::other(
-                    "Token data is not available after refresh.",
-                ));
-            }
-        };
-        Ok(access)
     }
+}
 
+impl From<RefreshTokenError> for std::io::Error {
+    fn from(err: RefreshTokenError) -> Self {
+        match err {
+            RefreshTokenError::Permanent(failed) => std::io::Error::other(failed),
+            RefreshTokenError::Transient(inner) => inner,
+        }
+    }
+}
+
+impl CodexAuth {
     /// Loads the available auth information from auth storage.
     pub fn from_auth_storage(
         codex_home: &Path,
@@ -90,56 +95,23 @@ impl CodexAuth {
         load_auth(codex_home, false, auth_credentials_store_mode)
     }
 
-    pub async fn get_token_data(&self) -> Result<TokenData, std::io::Error> {
+    pub fn get_token_data(&self) -> Result<TokenData, std::io::Error> {
         let auth_dot_json: Option<AuthDotJson> = self.get_current_auth_json();
         match auth_dot_json {
             Some(AuthDotJson {
-                tokens: Some(mut tokens),
-                last_refresh: Some(last_refresh),
+                tokens: Some(tokens),
+                last_refresh: Some(_),
                 ..
-            }) => {
-                if last_refresh < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL) {
-                    let refresh_response = tokio::time::timeout(
-                        Duration::from_secs(60),
-                        try_refresh_token(tokens.refresh_token.clone(), &self.client),
-                    )
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::other("timed out while refreshing OpenAI API key")
-                    })?
-                    .map_err(std::io::Error::other)?;
-
-                    let updated_auth_dot_json = update_tokens(
-                        &self.storage,
-                        refresh_response.id_token,
-                        refresh_response.access_token,
-                        refresh_response.refresh_token,
-                    )
-                    .await?;
-
-                    tokens = updated_auth_dot_json
-                        .tokens
-                        .clone()
-                        .ok_or(std::io::Error::other(
-                            "Token data is not available after refresh.",
-                        ))?;
-
-                    #[expect(clippy::unwrap_used)]
-                    let mut auth_lock = self.auth_dot_json.lock().unwrap();
-                    *auth_lock = Some(updated_auth_dot_json);
-                }
-
-                Ok(tokens)
-            }
+            }) => Ok(tokens),
             _ => Err(std::io::Error::other("Token data is not available.")),
         }
     }
 
-    pub async fn get_token(&self) -> Result<String, std::io::Error> {
+    pub fn get_token(&self) -> Result<String, std::io::Error> {
         match self.mode {
             AuthMode::ApiKey => Ok(self.api_key.clone().unwrap_or_default()),
             AuthMode::ChatGPT => {
-                let id_token = self.get_token_data().await?.access_token;
+                let id_token = self.get_token_data()?.access_token;
                 Ok(id_token)
             }
         }
@@ -153,9 +125,27 @@ impl CodexAuth {
         self.get_current_token_data().and_then(|t| t.id_token.email)
     }
 
-    pub(crate) fn get_plan_type(&self) -> Option<PlanType> {
+    /// Account-facing plan classification derived from the current token.
+    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/…)
+    /// mapped from the ID token's internal plan value. Prefer this when you
+    /// need to make UI or product decisions based on the user's subscription.
+    pub fn account_plan_type(&self) -> Option<AccountPlanType> {
+        let map_known = |kp: &InternalKnownPlan| match kp {
+            InternalKnownPlan::Free => AccountPlanType::Free,
+            InternalKnownPlan::Plus => AccountPlanType::Plus,
+            InternalKnownPlan::Pro => AccountPlanType::Pro,
+            InternalKnownPlan::Team => AccountPlanType::Team,
+            InternalKnownPlan::Business => AccountPlanType::Business,
+            InternalKnownPlan::Enterprise => AccountPlanType::Enterprise,
+            InternalKnownPlan::Edu => AccountPlanType::Edu,
+        };
+
         self.get_current_token_data()
             .and_then(|t| t.id_token.chatgpt_plan_type)
+            .map(|pt| match pt {
+                InternalPlanType::Known(k) => map_known(&k),
+                InternalPlanType::Unknown(_) => AccountPlanType::Unknown,
+            })
     }
 
     fn get_current_auth_json(&self) -> Option<AuthDotJson> {
@@ -257,7 +247,10 @@ pub fn save_auth(
 }
 
 /// Load CLI auth data using the configured credential store backend.
-/// Returns `None` when no credentials are stored.
+/// Returns `None` when no credentials are stored. This function is
+/// provided only for tests. Production code should not directly load
+/// from the auth.json storage. It should use the AuthManager abstraction
+/// instead.
 pub fn load_auth_dot_json(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -266,7 +259,7 @@ pub fn load_auth_dot_json(
     storage.load()
 }
 
-pub async fn enforce_login_restrictions(config: &Config) -> std::io::Result<()> {
+pub fn enforce_login_restrictions(config: &Config) -> std::io::Result<()> {
     let Some(auth) = load_auth(
         &config.codex_home,
         true,
@@ -304,7 +297,7 @@ pub async fn enforce_login_restrictions(config: &Config) -> std::io::Result<()> 
             return Ok(());
         }
 
-        let token_data = match auth.get_token_data().await {
+        let token_data = match auth.get_token_data() {
             Ok(data) => data,
             Err(err) => {
                 return logout_with_message(
@@ -425,7 +418,7 @@ async fn update_tokens(
 async fn try_refresh_token(
     refresh_token: String,
     client: &CodexHttpClient,
-) -> std::io::Result<RefreshResponse> {
+) -> Result<RefreshResponse, RefreshTokenError> {
     let refresh_request = RefreshRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
@@ -433,28 +426,92 @@ async fn try_refresh_token(
         scope: "openid profile email",
     };
 
+    let endpoint = refresh_token_endpoint();
+
     // Use shared client factory to include standard headers
     let response = client
-        .post("https://auth.openai.com/oauth/token")
+        .post(endpoint.as_str())
         .header("Content-Type", "application/json")
         .json(&refresh_request)
         .send()
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
 
-    if response.status().is_success() {
+    let status = response.status();
+    if status.is_success() {
         let refresh_response = response
             .json::<RefreshResponse>()
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
         Ok(refresh_response)
     } else {
-        Err(std::io::Error::other(format!(
-            "Failed to refresh token: {}: {}",
-            response.status(),
-            try_parse_error_message(&response.text().await.unwrap_or_default()),
-        )))
+        let body = response.text().await.unwrap_or_default();
+        tracing::error!("Failed to refresh token: {status}: {body}");
+        if status == StatusCode::UNAUTHORIZED {
+            let failed = classify_refresh_token_failure(&body);
+            Err(RefreshTokenError::Permanent(failed))
+        } else {
+            let message = try_parse_error_message(&body);
+            Err(RefreshTokenError::Transient(std::io::Error::other(
+                format!("Failed to refresh token: {status}: {message}"),
+            )))
+        }
     }
+}
+
+fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
+    let code = extract_refresh_token_error_code(body);
+
+    let normalized_code = code.as_deref().map(str::to_ascii_lowercase);
+    let reason = match normalized_code.as_deref() {
+        Some("refresh_token_expired") => RefreshTokenFailedReason::Expired,
+        Some("refresh_token_reused") => RefreshTokenFailedReason::Exhausted,
+        Some("refresh_token_invalidated") => RefreshTokenFailedReason::Revoked,
+        _ => RefreshTokenFailedReason::Other,
+    };
+
+    if reason == RefreshTokenFailedReason::Other {
+        tracing::warn!(
+            backend_code = normalized_code.as_deref(),
+            backend_body = body,
+            "Encountered unknown 401 response while refreshing token"
+        );
+    }
+
+    let message = match reason {
+        RefreshTokenFailedReason::Expired => REFRESH_TOKEN_EXPIRED_MESSAGE.to_string(),
+        RefreshTokenFailedReason::Exhausted => REFRESH_TOKEN_REUSED_MESSAGE.to_string(),
+        RefreshTokenFailedReason::Revoked => REFRESH_TOKEN_INVALIDATED_MESSAGE.to_string(),
+        RefreshTokenFailedReason::Other => REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+    };
+
+    RefreshTokenFailedError::new(reason, message)
+}
+
+fn extract_refresh_token_error_code(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+
+    let Value::Object(map) = serde_json::from_str::<Value>(body).ok()? else {
+        return None;
+    };
+
+    if let Some(error_value) = map.get("error") {
+        match error_value {
+            Value::Object(obj) => {
+                if let Some(code) = obj.get("code").and_then(Value::as_str) {
+                    return Some(code.to_string());
+                }
+            }
+            Value::String(code) => {
+                return Some(code.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    map.get("code").and_then(Value::as_str).map(str::to_string)
 }
 
 #[derive(Serialize)]
@@ -475,6 +532,11 @@ struct RefreshResponse {
 // Shared constant for token refresh (client id used for oauth token refresh flow)
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
+fn refresh_token_endpoint() -> String {
+    std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
+        .unwrap_or_else(|_| REFRESH_TOKEN_URL.to_string())
+}
+
 use std::sync::RwLock;
 
 /// Internal cached auth state.
@@ -483,17 +545,340 @@ struct CachedAuth {
     auth: Option<CodexAuth>,
 }
 
+enum UnauthorizedRecoveryStep {
+    Reload,
+    RefreshToken,
+    Done,
+}
+
+enum ReloadOutcome {
+    Reloaded,
+    Skipped,
+}
+
+// UnauthorizedRecovery is a state machine that handles an attempt to refresh the authentication when requests
+// to API fail with 401 status code.
+// The client calls next() every time it encounters a 401 error, one time per retry.
+// For API key based authentication, we don't do anything and let the error bubble to the user.
+// For ChatGPT based authentication, we:
+// 1. Attempt to reload the auth data from disk. We only reload if the account id matches the one the current process is running as.
+// 2. Attempt to refresh the token using OAuth token refresh flow.
+// If after both steps the server still responds with 401 we let the error bubble to the user.
+pub struct UnauthorizedRecovery {
+    manager: Arc<AuthManager>,
+    step: UnauthorizedRecoveryStep,
+    expected_account_id: Option<String>,
+}
+
+impl UnauthorizedRecovery {
+    fn new(manager: Arc<AuthManager>) -> Self {
+        let expected_account_id = manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id);
+        Self {
+            manager,
+            step: UnauthorizedRecoveryStep::Reload,
+            expected_account_id,
+        }
+    }
+
+    pub fn has_next(&self) -> bool {
+        if !self
+            .manager
+            .auth_cached()
+            .is_some_and(|auth| auth.mode == AuthMode::ChatGPT)
+        {
+            return false;
+        }
+
+        !matches!(self.step, UnauthorizedRecoveryStep::Done)
+    }
+
+    pub async fn next(&mut self) -> Result<(), RefreshTokenError> {
+        if !self.has_next() {
+            return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                "No more recovery steps available.",
+            )));
+        }
+
+        match self.step {
+            UnauthorizedRecoveryStep::Reload => {
+                match self
+                    .manager
+                    .reload_if_account_id_matches(self.expected_account_id.as_deref())
+                {
+                    ReloadOutcome::Reloaded => {
+                        self.step = UnauthorizedRecoveryStep::RefreshToken;
+                    }
+                    ReloadOutcome::Skipped => {
+                        self.manager.refresh_token().await?;
+                        self.step = UnauthorizedRecoveryStep::Done;
+                    }
+                }
+            }
+            UnauthorizedRecoveryStep::RefreshToken => {
+                self.manager.refresh_token().await?;
+                self.step = UnauthorizedRecoveryStep::Done;
+            }
+            UnauthorizedRecoveryStep::Done => {}
+        }
+        Ok(())
+    }
+}
+
+/// Central manager providing a single source of truth for auth.json derived
+/// authentication data. It loads once (or on preference change) and then
+/// hands out cloned `CodexAuth` values so the rest of the program has a
+/// consistent snapshot.
+///
+/// External modifications to `auth.json` will NOT be observed until
+/// `reload()` is called explicitly. This matches the design goal of avoiding
+/// different parts of the program seeing inconsistent auth data mid‑run.
+#[derive(Debug)]
+pub struct AuthManager {
+    codex_home: PathBuf,
+    inner: RwLock<CachedAuth>,
+    enable_codex_api_key_env: bool,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+}
+
+impl AuthManager {
+    /// Create a new manager loading the initial auth using the provided
+    /// preferred auth method. Errors loading auth are swallowed; `auth()` will
+    /// simply return `None` in that case so callers can treat it as an
+    /// unauthenticated state.
+    pub fn new(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Self {
+        let auth = load_auth(
+            &codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        )
+        .ok()
+        .flatten();
+        Self {
+            codex_home,
+            inner: RwLock::new(CachedAuth { auth }),
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Create an AuthManager with a specific CodexAuth, for testing only.
+    pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
+        let cached = CachedAuth { auth: Some(auth) };
+
+        Arc::new(Self {
+            codex_home: PathBuf::from("non-existent"),
+            inner: RwLock::new(cached),
+            enable_codex_api_key_env: false,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
+    pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
+        let cached = CachedAuth { auth: Some(auth) };
+        Arc::new(Self {
+            codex_home,
+            inner: RwLock::new(cached),
+            enable_codex_api_key_env: false,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        })
+    }
+
+    /// Current cached auth (clone) without attempting a refresh.
+    pub fn auth_cached(&self) -> Option<CodexAuth> {
+        self.inner.read().ok().and_then(|c| c.auth.clone())
+    }
+
+    /// Current cached auth (clone). May be `None` if not logged in or load failed.
+    /// Refreshes cached ChatGPT tokens if they are stale before returning.
+    pub async fn auth(&self) -> Option<CodexAuth> {
+        let auth = self.auth_cached()?;
+        if let Err(err) = self.refresh_if_stale(&auth).await {
+            tracing::error!("Failed to refresh token: {}", err);
+            return Some(auth);
+        }
+        self.auth_cached()
+    }
+
+    /// Force a reload of the auth information from auth.json. Returns
+    /// whether the auth value changed.
+    pub fn reload(&self) -> bool {
+        tracing::info!("Reloading auth");
+        let new_auth = self.load_auth_from_storage();
+        self.set_auth(new_auth)
+    }
+
+    fn reload_if_account_id_matches(&self, expected_account_id: Option<&str>) -> ReloadOutcome {
+        let expected_account_id = match expected_account_id {
+            Some(account_id) => account_id,
+            None => {
+                tracing::info!("Skipping auth reload because no account id is available.");
+                return ReloadOutcome::Skipped;
+            }
+        };
+
+        let new_auth = self.load_auth_from_storage();
+        let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
+
+        if new_account_id.as_deref() != Some(expected_account_id) {
+            let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
+            tracing::info!(
+                "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
+            );
+            return ReloadOutcome::Skipped;
+        }
+
+        tracing::info!("Reloading auth for account {expected_account_id}");
+        self.set_auth(new_auth);
+        ReloadOutcome::Reloaded
+    }
+
+    fn auths_equal(a: &Option<CodexAuth>, b: &Option<CodexAuth>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn load_auth_from_storage(&self) -> Option<CodexAuth> {
+        load_auth(
+            &self.codex_home,
+            self.enable_codex_api_key_env,
+            self.auth_credentials_store_mode,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn set_auth(&self, new_auth: Option<CodexAuth>) -> bool {
+        if let Ok(mut guard) = self.inner.write() {
+            let changed = !AuthManager::auths_equal(&guard.auth, &new_auth);
+            tracing::info!("Reloaded auth, changed: {changed}");
+            guard.auth = new_auth;
+            changed
+        } else {
+            false
+        }
+    }
+
+    /// Convenience constructor returning an `Arc` wrapper.
+    pub fn shared(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        ))
+    }
+
+    pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
+        UnauthorizedRecovery::new(Arc::clone(self))
+    }
+
+    /// Attempt to refresh the current auth token (if any). On success, reload
+    /// the auth state from disk so other components observe refreshed token.
+    /// If the token refresh fails, returns the error to the caller.
+    pub async fn refresh_token(&self) -> Result<(), RefreshTokenError> {
+        tracing::info!("Refreshing token");
+
+        let auth = match self.auth_cached() {
+            Some(auth) => auth,
+            None => return Ok(()),
+        };
+        let token_data = auth.get_current_token_data().ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
+        })?;
+        self.refresh_tokens(&auth, token_data.refresh_token).await?;
+        // Reload to pick up persisted changes.
+        self.reload();
+        Ok(())
+    }
+
+    /// Log out by deleting the on‑disk auth.json (if present). Returns Ok(true)
+    /// if a file was removed, Ok(false) if no auth file existed. On success,
+    /// reloads the in‑memory auth cache so callers immediately observe the
+    /// unauthenticated state.
+    pub fn logout(&self) -> std::io::Result<bool> {
+        let removed = super::auth::logout(&self.codex_home, self.auth_credentials_store_mode)?;
+        // Always reload to clear any cached auth (even if file absent).
+        self.reload();
+        Ok(removed)
+    }
+
+    pub fn get_auth_mode(&self) -> Option<AuthMode> {
+        self.auth_cached().map(|a| a.mode)
+    }
+
+    async fn refresh_if_stale(&self, auth: &CodexAuth) -> Result<bool, RefreshTokenError> {
+        if auth.mode != AuthMode::ChatGPT {
+            return Ok(false);
+        }
+
+        let auth_dot_json = match auth.get_current_auth_json() {
+            Some(auth_dot_json) => auth_dot_json,
+            None => return Ok(false),
+        };
+        let tokens = match auth_dot_json.tokens {
+            Some(tokens) => tokens,
+            None => return Ok(false),
+        };
+        let last_refresh = match auth_dot_json.last_refresh {
+            Some(last_refresh) => last_refresh,
+            None => return Ok(false),
+        };
+        if last_refresh >= Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL) {
+            return Ok(false);
+        }
+        self.refresh_tokens(auth, tokens.refresh_token).await?;
+        self.reload();
+        Ok(true)
+    }
+
+    async fn refresh_tokens(
+        &self,
+        auth: &CodexAuth,
+        refresh_token: String,
+    ) -> Result<(), RefreshTokenError> {
+        let refresh_response = try_refresh_token(refresh_token, &auth.client).await?;
+
+        update_tokens(
+            &auth.storage,
+            refresh_response.id_token,
+            refresh_response.access_token,
+            refresh_response.refresh_token,
+        )
+        .await
+        .map_err(RefreshTokenError::from)?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::storage::FileAuthStorage;
     use crate::auth::storage::get_auth_file;
     use crate::config::Config;
-    use crate::config::ConfigOverrides;
-    use crate::config::ConfigToml;
+    use crate::config::ConfigBuilder;
     use crate::token_data::IdTokenInfo;
-    use crate::token_data::KnownPlan;
-    use crate::token_data::PlanType;
+    use crate::token_data::KnownPlan as InternalKnownPlan;
+    use crate::token_data::PlanType as InternalPlanType;
+    use codex_protocol::account::PlanType as AccountPlanType;
 
     use base64::Engine;
     use codex_protocol::config_types::ForcedLoginMethod;
@@ -610,7 +995,8 @@ mod tests {
                 tokens: Some(TokenData {
                     id_token: IdTokenInfo {
                         email: Some("user@example.com".to_string()),
-                        chatgpt_plan_type: Some(PlanType::Known(KnownPlan::Pro)),
+                        chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Pro)),
+                        chatgpt_user_id: Some("user-12345".to_string()),
                         chatgpt_account_id: None,
                         raw_jwt: fake_jwt,
                     },
@@ -641,7 +1027,7 @@ mod tests {
         assert_eq!(auth.mode, AuthMode::ApiKey);
         assert_eq!(auth.api_key, Some("sk-test-key".to_string()));
 
-        assert!(auth.get_token_data().await.is_err());
+        assert!(auth.get_token_data().is_err());
     }
 
     #[test]
@@ -714,17 +1100,16 @@ mod tests {
         Ok(fake_jwt)
     }
 
-    fn build_config(
+    async fn build_config(
         codex_home: &Path,
         forced_login_method: Option<ForcedLoginMethod>,
         forced_chatgpt_workspace_id: Option<String>,
     ) -> Config {
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            codex_home.to_path_buf(),
-        )
-        .expect("config should load");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .build()
+            .await
+            .expect("config should load");
         config.forced_login_method = forced_login_method;
         config.forced_chatgpt_workspace_id = forced_chatgpt_workspace_id;
         config
@@ -767,10 +1152,9 @@ mod tests {
         login_with_api_key(codex_home.path(), "sk-test", AuthCredentialsStoreMode::File)
             .expect("seed api key");
 
-        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None);
+        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None).await;
 
         let err = super::enforce_login_restrictions(&config)
-            .await
             .expect_err("expected method mismatch to error");
         assert!(err.to_string().contains("ChatGPT login is required"));
         assert!(
@@ -793,10 +1177,9 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
         let err = super::enforce_login_restrictions(&config)
-            .await
             .expect_err("expected workspace mismatch to error");
         assert!(err.to_string().contains("workspace org_mine"));
         assert!(
@@ -819,11 +1202,9 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
-        super::enforce_login_restrictions(&config)
-            .await
-            .expect("matching workspace should succeed");
+        super::enforce_login_restrictions(&config).expect("matching workspace should succeed");
         assert!(
             codex_home.path().join("auth.json").exists(),
             "auth.json should remain when restrictions pass"
@@ -837,11 +1218,9 @@ mod tests {
         login_with_api_key(codex_home.path(), "sk-test", AuthCredentialsStoreMode::File)
             .expect("seed api key");
 
-        let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
+        let config = build_config(codex_home.path(), None, Some("org_mine".to_string())).await;
 
-        super::enforce_login_restrictions(&config)
-            .await
-            .expect("matching workspace should succeed");
+        super::enforce_login_restrictions(&config).expect("matching workspace should succeed");
         assert!(
             codex_home.path().join("auth.json").exists(),
             "auth.json should remain when restrictions pass"
@@ -854,143 +1233,53 @@ mod tests {
         let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
         let codex_home = tempdir().unwrap();
 
-        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None);
+        let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None).await;
 
         let err = super::enforce_login_restrictions(&config)
-            .await
             .expect_err("environment API key should not satisfy forced ChatGPT login");
         assert!(
             err.to_string()
                 .contains("ChatGPT login is required, but an API key is currently being used.")
         );
     }
-}
 
-/// Central manager providing a single source of truth for auth.json derived
-/// authentication data. It loads once (or on preference change) and then
-/// hands out cloned `CodexAuth` values so the rest of the program has a
-/// consistent snapshot.
-///
-/// External modifications to `auth.json` will NOT be observed until
-/// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data mid‑run.
-#[derive(Debug)]
-pub struct AuthManager {
-    codex_home: PathBuf,
-    inner: RwLock<CachedAuth>,
-    enable_codex_api_key_env: bool,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-}
-
-impl AuthManager {
-    /// Create a new manager loading the initial auth using the provided
-    /// preferred auth method. Errors loading auth are swallowed; `auth()` will
-    /// simply return `None` in that case so callers can treat it as an
-    /// unauthenticated state.
-    pub fn new(
-        codex_home: PathBuf,
-        enable_codex_api_key_env: bool,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
-        let auth = load_auth(
-            &codex_home,
-            enable_codex_api_key_env,
-            auth_credentials_store_mode,
+    #[test]
+    fn plan_type_maps_known_plan() {
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
         )
-        .ok()
-        .flatten();
-        Self {
-            codex_home,
-            inner: RwLock::new(CachedAuth { auth }),
-            enable_codex_api_key_env,
-            auth_credentials_store_mode,
-        }
+        .expect("failed to write auth file");
+
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .expect("load auth")
+            .expect("auth available");
+
+        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
     }
 
-    /// Create an AuthManager with a specific CodexAuth, for testing only.
-    pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
-        let cached = CachedAuth { auth: Some(auth) };
-        Arc::new(Self {
-            codex_home: PathBuf::new(),
-            inner: RwLock::new(cached),
-            enable_codex_api_key_env: false,
-            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        })
-    }
-
-    /// Current cached auth (clone). May be `None` if not logged in or load failed.
-    pub fn auth(&self) -> Option<CodexAuth> {
-        self.inner.read().ok().and_then(|c| c.auth.clone())
-    }
-
-    /// Force a reload of the auth information from auth.json. Returns
-    /// whether the auth value changed.
-    pub fn reload(&self) -> bool {
-        let new_auth = load_auth(
-            &self.codex_home,
-            self.enable_codex_api_key_env,
-            self.auth_credentials_store_mode,
+    #[test]
+    fn plan_type_maps_unknown_to_unknown() {
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: "mystery-tier".to_string(),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
         )
-        .ok()
-        .flatten();
-        if let Ok(mut guard) = self.inner.write() {
-            let changed = !AuthManager::auths_equal(&guard.auth, &new_auth);
-            guard.auth = new_auth;
-            changed
-        } else {
-            false
-        }
-    }
+        .expect("failed to write auth file");
 
-    fn auths_equal(a: &Option<CodexAuth>, b: &Option<CodexAuth>) -> bool {
-        match (a, b) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
-    }
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .expect("load auth")
+            .expect("auth available");
 
-    /// Convenience constructor returning an `Arc` wrapper.
-    pub fn shared(
-        codex_home: PathBuf,
-        enable_codex_api_key_env: bool,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Arc<Self> {
-        Arc::new(Self::new(
-            codex_home,
-            enable_codex_api_key_env,
-            auth_credentials_store_mode,
-        ))
-    }
-
-    /// Attempt to refresh the current auth token (if any). On success, reload
-    /// the auth state from disk so other components observe refreshed token.
-    pub async fn refresh_token(&self) -> std::io::Result<Option<String>> {
-        let auth = match self.auth() {
-            Some(a) => a,
-            None => return Ok(None),
-        };
-        match auth.refresh_token().await {
-            Ok(token) => {
-                // Reload to pick up persisted changes.
-                self.reload();
-                Ok(Some(token))
-            }
-            Err(e) => {
-                tracing::error!("Failed to refresh token: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Log out by deleting the on‑disk auth.json (if present). Returns Ok(true)
-    /// if a file was removed, Ok(false) if no auth file existed. On success,
-    /// reloads the in‑memory auth cache so callers immediately observe the
-    /// unauthenticated state.
-    pub fn logout(&self) -> std::io::Result<bool> {
-        let removed = super::auth::logout(&self.codex_home, self.auth_credentials_store_mode)?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.reload();
-        Ok(removed)
+        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
     }
 }

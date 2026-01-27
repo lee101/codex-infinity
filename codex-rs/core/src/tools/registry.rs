@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use codex_protocol::models::ResponseInputItem;
-use tracing::warn;
-
 use crate::client_common::tools::ToolSpec;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use async_trait::async_trait;
+use codex_protocol::models::ResponseInputItem;
+use codex_utils_readiness::Readiness;
+use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolKind {
@@ -30,6 +30,16 @@ pub trait ToolHandler: Send + Sync {
         )
     }
 
+    /// Returns `true` if the [ToolInvocation] *might* mutate the environment of the
+    /// user (through file system, OS operations, ...).
+    /// This function must remains defensive and return `true` if a doubt exist on the
+    /// exact effect of a ToolInvocation.
+    async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
+    /// Perform the actual [ToolInvocation] and returns a [ToolOutput] containing
+    /// the final output to return to the model.
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError>;
 }
 
@@ -60,7 +70,7 @@ impl ToolRegistry {
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.turn.client.get_otel_event_manager();
+        let otel = invocation.turn.client.get_otel_manager();
         let payload_for_response = invocation.payload.clone();
         let log_payload = payload_for_response.log_payload();
 
@@ -106,6 +116,11 @@ impl ToolRegistry {
                     let output_cell = &output_cell;
                     let invocation = invocation;
                     async move {
+                        if handler.is_mutating(&invocation).await {
+                            tracing::trace!("waiting for tool gate");
+                            invocation.turn.tool_call_gate.wait_ready().await;
+                            tracing::trace!("tool gate released");
+                        }
                         match handler.handle(invocation).await {
                             Ok(output) => {
                                 let preview = output.log_preview();
