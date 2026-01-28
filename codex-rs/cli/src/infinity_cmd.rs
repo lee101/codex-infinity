@@ -123,9 +123,16 @@ struct InfinityClient {
     http: reqwest::Client,
 }
 
+const MAX_RETRIES: u32 = 3;
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+
 impl InfinityClient {
     fn new(base_url: String, api_key: String) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder().build()?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .connect_timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()?;
         Ok(Self {
             base_url,
             api_key,
@@ -137,9 +144,40 @@ impl InfinityClient {
         let trimmed = path.trim_start_matches('/');
         let base_url = &self.base_url;
         let url = format!("{base_url}/{trimmed}");
+
+        let mut last_error = None;
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << (attempt - 1)); // Exponential backoff
+                eprintln!(
+                    "Retry {}/{} for {} (waiting {}ms)...",
+                    attempt, MAX_RETRIES - 1, url, delay_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            match self.try_get_json::<T>(&url).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Only retry on timeout/connection errors
+                    let is_retryable = e.to_string().contains("timeout")
+                        || e.to_string().contains("connect")
+                        || e.to_string().contains("connection");
+                    if !is_retryable {
+                        return Err(e);
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
+    }
+
+    async fn try_get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> anyhow::Result<T> {
         let res = self
             .http
-            .get(&url)
+            .get(url)
             .header("X-API-Key", &self.api_key)
             .send()
             .await
