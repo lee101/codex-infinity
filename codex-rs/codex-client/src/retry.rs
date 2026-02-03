@@ -36,12 +36,13 @@ impl RetryOn {
 }
 
 pub fn backoff(base: Duration, attempt: u64) -> Duration {
+    const MAX_BACKOFF_MS: u64 = 60_000; // 60 seconds
     if attempt == 0 {
         return base;
     }
     let exp = 2u64.saturating_pow(attempt as u32 - 1);
     let millis = base.as_millis() as u64;
-    let raw = millis.saturating_mul(exp);
+    let raw = millis.saturating_mul(exp).min(MAX_BACKOFF_MS);
     let jitter: f64 = rand::rng().random_range(0.9..1.1);
     Duration::from_millis((raw as f64 * jitter) as u64)
 }

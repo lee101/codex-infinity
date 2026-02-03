@@ -3719,8 +3719,8 @@ name = "OpenAI using Chat Completions"
 base_url = "https://api.openai.com/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "chat"
-request_max_retries = 4            # retry failed HTTP requests
-stream_max_retries = 10            # retry dropped SSE streams
+request_max_retries = 60           # retry failed HTTP requests (~1hr with backoff)
+stream_max_retries = 60            # retry dropped SSE streams (~1hr with backoff)
 stream_idle_timeout_ms = 300000    # 5m idle timeout
 
 [profiles.o3]

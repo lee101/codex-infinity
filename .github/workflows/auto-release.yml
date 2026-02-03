@@ -1,0 +1,76 @@
+name: auto-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get current version
+        id: current
+        run: |
+          version=$(grep -m1 '^version' codex-rs/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate new version
+        id: new
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_version="${major}.${minor}.${patch}"
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT -> $new_version"
+
+      - name: Update version in Cargo.toml files
+        env:
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+          NEW_VERSION: ${{ steps.new.outputs.version }}
+        run: |
+          find codex-rs -name Cargo.toml -exec sed -i "s/version = \"$OLD_VERSION\"/version = \"$NEW_VERSION\"/g" {} \;
+          cargo generate-lockfile --manifest-path codex-rs/Cargo.toml || true
+
+      - name: Commit version bump
+        env:
+          NEW_VERSION: ${{ steps.new.outputs.version }}
+        run: |
+          git add -A
+          git commit -m "Release $NEW_VERSION"
+          git push
+
+      - name: Create and push tag
+        env:
+          NEW_VERSION: ${{ steps.new.outputs.version }}
+        run: |
+          git tag -a "rust-v$NEW_VERSION" -m "Release $NEW_VERSION"
+          git push origin "rust-v$NEW_VERSION"

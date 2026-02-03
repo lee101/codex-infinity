@@ -419,8 +419,11 @@ impl Tui {
             return Ok(());
         }
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
-        // Enable "alternate scroll" so terminals may translate wheel to arrows
-        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        // Enable "alternate scroll" so terminals may translate wheel to arrows.
+        // Skip for kitty - it handles scrolling natively and this mode interferes with selection.
+        if std::env::var("KITTY_WINDOW_ID").is_err() {
+            let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        }
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);
             self.terminal.set_viewport_area(ratatui::layout::Rect::new(
@@ -440,8 +443,10 @@ impl Tui {
         if !self.alt_screen_enabled {
             return Ok(());
         }
-        // Disable alternate scroll when leaving alt-screen
-        let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
+        // Disable alternate scroll when leaving alt-screen (skip for kitty)
+        if std::env::var("KITTY_WINDOW_ID").is_err() {
+            let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
+        }
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);

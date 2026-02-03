@@ -903,9 +903,13 @@ impl ChatWidget {
 
             if self.auto_next_steps {
                 let auto_prompt = format!(
-                    "Continue working autonomously on the natural next steps for this project. \
-                    Consider testing, documentation, edge cases, and any remaining work.\n\n\
-                    Initial summary of work: {}",
+                    "You are in AUTONOMOUS MODE. Do not ask for permission or confirmation. \
+                    Pick the highest-impact next step and implement it now.\n\n\
+                    At the end of your response, output a section titled 'NEXT:' containing \
+                    a natural follow-up request a user would make, phrased as a direct instruction \
+                    (e.g., 'Add e2e tests for the new feature' or 'Refactor the error handling to use Result types'). \
+                    This will be automatically sent as the next prompt.\n\n\
+                    Previous work: {}",
                     summary
                 );
                 self.add_to_history(history_cell::new_info_event(
@@ -916,9 +920,13 @@ impl ChatWidget {
                 self.submit_user_message(auto_prompt.into());
             } else if self.auto_next_idea {
                 let auto_prompt = format!(
-                    "Brainstorm and autonomously implement new follow-on improvement ideas for this project. \
-                    Consider enhancements, optimizations, new features, or technical debt that could be addressed.\n\n\
-                    Previous work summary: {}",
+                    "You are in AUTONOMOUS IDEATION MODE. Do not ask for permission or offer choices. \
+                    Pick the single best improvement idea and implement it immediately.\n\n\
+                    At the end of your response, output a section titled 'NEXT:' containing \
+                    a natural follow-up request a user would make to continue improving the project, \
+                    phrased as a direct instruction (e.g., 'Add caching to reduce API calls' or \
+                    'Improve accessibility with ARIA labels'). This will be automatically sent as the next prompt.\n\n\
+                    Previous work: {}",
                     summary
                 );
                 self.add_to_history(history_cell::new_info_event(
