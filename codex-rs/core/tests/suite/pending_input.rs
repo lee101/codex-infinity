@@ -13,6 +13,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration};
 
 fn ev_message_item_done(id: &str, text: &str) -> Value {
     serde_json::json!({
@@ -42,6 +43,27 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
         .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
         .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
         .collect()
+}
+
+async fn wait_for_request_count(
+    server: &core_test_support::streaming_sse::StreamingSseServer,
+    expected: usize,
+) -> Vec<Vec<u8>> {
+    let mut attempts = 0;
+    loop {
+        let requests = server.requests().await;
+        if requests.len() >= expected {
+            return requests;
+        }
+        attempts += 1;
+        if attempts > 50 {
+            panic!(
+                "expected at least {expected} requests, got {}",
+                requests.len()
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -127,7 +149,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let requests = server.requests().await;
+    let requests = wait_for_request_count(&server, 2).await;
     assert_eq!(requests.len(), 2);
 
     let first_body: Value = serde_json::from_slice(&requests[0]).expect("parse first request");

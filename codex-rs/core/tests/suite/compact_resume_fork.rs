@@ -740,7 +740,7 @@ async fn compact_resume_after_second_compaction_preserves_history() {
     // Build expected final request input: initial context + forked user message +
     // compacted summary + post-compact user message + resumed user message.
     let summary_after_second_compact =
-        extract_summary_message(&requests[requests.len() - 3], SUMMARY_TEXT);
+        extract_summary_message(&requests[requests.len() - 2], SUMMARY_TEXT);
 
     let mut expected = json!([
       {
@@ -895,8 +895,9 @@ async fn mount_second_compact_flow(server: &MockServer) -> Vec<ResponseMock> {
         ev_completed("r6"),
     ]);
     let sse7 = sse(vec![ev_completed("r7")]);
+    let sse8 = sse(vec![ev_completed("r8")]);
 
-    let request_log = mount_sse_sequence_any_post(server, vec![sse6, sse7]).await;
+    let request_log = mount_sse_sequence_any_post(server, vec![sse6, sse7, sse8]).await;
     vec![request_log]
 }
 
@@ -907,6 +908,7 @@ async fn start_test_conversation(
     let model_provider = ModelProviderInfo {
         name: "Non-OpenAI Model provider".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        requires_openai_auth: false,
         ..built_in_model_providers()["openai"].clone()
     };
     let home = TempDir::new().expect("create temp dir");

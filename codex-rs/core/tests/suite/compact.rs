@@ -109,6 +109,7 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     let mut provider = built_in_model_providers()["openai"].clone();
     provider.name = "OpenAI (test)".into();
     provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.requires_openai_auth = false;
     provider
 }
 
@@ -471,6 +472,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let codex = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
+            config.model_provider.requires_openai_auth = false;
         })
         .build(&server)
         .await
