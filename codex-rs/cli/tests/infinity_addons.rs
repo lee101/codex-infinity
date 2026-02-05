@@ -197,3 +197,141 @@ fn addons_restore_requires_yes() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn addons_events_outputs_json_with_filters() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_runtime(async {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "addons": [
+                    {
+                        "id": "addon-pg",
+                        "type": "postgres",
+                        "status": "active",
+                        "plan": "starter",
+                        "region": "nbg1"
+                    }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons/addon-pg/events"))
+            .and(query_param("limit", "50"))
+            .and(query_param("event_type", "restore"))
+            .and(query_param("cursor", "cursor-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "events": [
+                    {
+                        "id": "evt-1",
+                        "addon_id": "addon-pg",
+                        "event_type": "restore",
+                        "payload": {
+                            "object_key": "addon-backups/addon-pg/backup.dump"
+                        },
+                        "created_at": "2026-02-05T00:00:00Z"
+                    }
+                ],
+                "total": 1,
+                "next_cursor": "next-token"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+            .env("CODEX_INFINITY_BASE_URL", server.uri())
+            .env("CODEX_INFINITY_API_KEY", "test-key")
+            .args([
+                "infinity",
+                "addons",
+                "events",
+                "owner/repo",
+                "--type",
+                "postgres",
+                "--event-type",
+                "restore",
+                "--cursor",
+                "cursor-token",
+                "--json",
+            ])
+            .output()?;
+
+        assert!(output.status.success());
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(parsed["next_cursor"], json!("next-token"));
+        assert_eq!(parsed["events"][0]["event_type"], json!("restore"));
+
+        Ok(())
+    })
+}
+
+#[test]
+fn addons_events_outputs_table() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_runtime(async {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "addons": [
+                    {
+                        "id": "addon-pg",
+                        "type": "postgres",
+                        "status": "active",
+                        "plan": "starter",
+                        "region": "nbg1"
+                    }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons/addon-pg/events"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "events": [
+                    {
+                        "id": "evt-1",
+                        "addon_id": "addon-pg",
+                        "event_type": "backup",
+                        "payload": {
+                            "size_bytes": 1024
+                        },
+                        "created_at": "2026-02-05T00:00:00Z"
+                    }
+                ],
+                "total": 1,
+                "next_cursor": "next-token"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+            .env("CODEX_INFINITY_BASE_URL", server.uri())
+            .env("CODEX_INFINITY_API_KEY", "test-key")
+            .args([
+                "infinity",
+                "addons",
+                "events",
+                "owner/repo",
+                "--type",
+                "postgres",
+            ])
+            .output()?;
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("created_at\tevent_type\tpayload"));
+        assert!(stdout.contains("2026-02-05T00:00:00Z\tbackup"));
+        assert!(stdout.contains("next_cursor\tnext-token"));
+
+        Ok(())
+    })
+}

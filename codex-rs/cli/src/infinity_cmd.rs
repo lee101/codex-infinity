@@ -52,7 +52,7 @@ enum InfinityCommand {
 
 #[derive(Debug, Parser)]
 #[command(
-    after_help = "Examples:\n  codex infinity addons backups owner/repo --type postgres\n  codex infinity addons backups owner/repo --type postgres --json\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes --json\n"
+    after_help = "Examples:\n  codex infinity addons backups owner/repo --type postgres\n  codex infinity addons backups owner/repo --type postgres --json\n  codex infinity addons events owner/repo --type postgres --limit 50\n  codex infinity addons events owner/repo --type postgres --event-type restore --json\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes --json\n"
 )]
 struct AddonsCli {
     #[command(subcommand)]
@@ -63,6 +63,8 @@ struct AddonsCli {
 enum AddonsCommand {
     /// List recent backups for an add-on.
     Backups(AddonBackupsCommand),
+    /// List recent events for an add-on.
+    Events(AddonEventsCommand),
     /// Restore an add-on from a backup object key or URL.
     Restore(AddonRestoreCommand),
 }
@@ -80,6 +82,33 @@ struct AddonBackupsCommand {
     /// Maximum number of backups to return (1-500).
     #[arg(long = "limit", default_value_t = 50, value_parser = parse_backup_limit, value_name = "N")]
     limit: usize,
+
+    /// Emit JSON instead of a table.
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AddonEventsCommand {
+    /// Repository in owner/repo format.
+    #[arg(value_name = "OWNER/REPO")]
+    repo: String,
+
+    /// Add-on type (postgres or mongo).
+    #[arg(long = "type", value_name = "TYPE", value_parser = ["postgres", "mongo", "mongodb"])]
+    addon_type: String,
+
+    /// Maximum number of events to return (1-500).
+    #[arg(long = "limit", default_value_t = 50, value_parser = parse_backup_limit, value_name = "N")]
+    limit: usize,
+
+    /// Cursor for pagination.
+    #[arg(long = "cursor", value_name = "CURSOR")]
+    cursor: Option<String>,
+
+    /// Filter by event type (e.g. backup, restore, billing).
+    #[arg(long = "event-type", value_name = "TYPE")]
+    event_type: Option<String>,
 
     /// Emit JSON instead of a table.
     #[arg(long = "json", default_value_t = false)]
@@ -175,6 +204,22 @@ struct AddonBackupsResponse {
     retention_days: i64,
     backup_enabled: bool,
     billing_enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AddonEventInfo {
+    id: Option<String>,
+    addon_id: Option<String>,
+    event_type: String,
+    payload: Option<serde_json::Value>,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AddonEventsResponse {
+    events: Vec<AddonEventInfo>,
+    total: usize,
+    next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +494,7 @@ async fn list_agents(client: &InfinityClient) -> anyhow::Result<()> {
 async fn run_addons_command(client: &InfinityClient, addons_cli: AddonsCli) -> anyhow::Result<()> {
     match addons_cli.cmd {
         AddonsCommand::Backups(cmd) => run_addon_backups(client, cmd).await,
+        AddonsCommand::Events(cmd) => run_addon_events(client, cmd).await,
         AddonsCommand::Restore(cmd) => run_addon_restore(client, cmd).await,
     }
 }
@@ -494,6 +540,52 @@ async fn run_addon_backups(
             format_bytes(backup.size_bytes),
             backup.object_key
         );
+    }
+
+    Ok(())
+}
+
+async fn run_addon_events(client: &InfinityClient, cmd: AddonEventsCommand) -> anyhow::Result<()> {
+    let AddonEventsCommand {
+        repo,
+        addon_type,
+        limit,
+        cursor,
+        event_type,
+        json,
+    } = cmd;
+    let addon = find_addon_by_type(client, &repo, &addon_type).await?;
+    let id = addon.id;
+    let mut path = format!("/api/projects/{repo}/addons/{id}/events?limit={limit}");
+    if let Some(event_type) = event_type.as_ref().filter(|value| !value.is_empty()) {
+        path.push_str(&format!("&event_type={event_type}"));
+    }
+    if let Some(cursor) = cursor.as_ref().filter(|value| !value.is_empty()) {
+        path.push_str(&format!("&cursor={cursor}"));
+    }
+    let response: AddonEventsResponse = client.get_json(&path).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+
+    if response.events.is_empty() {
+        println!("No events found");
+        return Ok(());
+    }
+
+    println!("created_at\tevent_type\tpayload");
+    for event in response.events {
+        let payload = match event.payload {
+            Some(value) => serde_json::to_string(&value)?,
+            None => "-".to_string(),
+        };
+        println!("{}\t{}\t{}", event.created_at, event.event_type, payload);
+    }
+
+    if let Some(cursor) = response.next_cursor {
+        println!("next_cursor\t{cursor}");
     }
 
     Ok(())

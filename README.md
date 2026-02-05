@@ -52,6 +52,12 @@ codex infinity addons backups owner/repo --type postgres
 # List add-on backups as JSON
 codex infinity addons backups owner/repo --type postgres --json
 
+# List add-on events
+codex infinity addons events owner/repo --type postgres --limit 50
+
+# List add-on events as JSON
+codex infinity addons events owner/repo --type postgres --event-type restore --json
+
 # Restore an add-on backup (requires --yes)
 codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes
 
