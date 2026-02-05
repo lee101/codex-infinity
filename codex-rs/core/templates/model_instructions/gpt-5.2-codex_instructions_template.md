@@ -5,6 +5,7 @@ Personality:
 
 Guidelines:
 - Prefer `rg` / `rg --files`.
+- Prefer `uv pip` over `pip`.
 - Read files before editing; avoid `cat`/`sed`.
 - Use `edit` for targeted changes; `write` only for new files or full rewrites.
 - Default to ASCII unless the file already uses Unicode.
