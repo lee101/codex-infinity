@@ -3,7 +3,7 @@ use lazy_static::lazy_static;
 use rand::Rng;
 
 const ANNOUNCEMENT_TIP_URL: &str =
-    "https://raw.githubusercontent.com/lee101/codex/main/announcement_tip.toml";
+    "https://raw.githubusercontent.com/lee101/codex-infinity/main/announcement_tip.toml";
 const RAW_TOOLTIPS: &str = include_str!("../tooltips.txt");
 
 lazy_static! {

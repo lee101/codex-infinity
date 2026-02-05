@@ -19,7 +19,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lee101/codex.git",
+    "url": "git+https://github.com/lee101/codex-infinity.git",
     "directory": "codex-cli"
   },
   "keywords": [
