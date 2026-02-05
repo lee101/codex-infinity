@@ -53,7 +53,7 @@ enum InfinityCommand {
 
 #[derive(Debug, Parser)]
 #[command(
-    after_help = "Examples:\n  codex infinity addons backups owner/repo --type postgres\n  codex infinity addons backups owner/repo --type postgres --json\n  codex infinity addons events owner/repo --type postgres --limit 50\n  codex infinity addons events owner/repo --type postgres --event-type restore --json\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes --json\n"
+    after_help = "Examples:\n  codex infinity addons backups owner/repo --type postgres\n  codex infinity addons backups owner/repo --type postgres --json\n  codex infinity addons events owner/repo --type postgres --limit 50\n  codex infinity addons events owner/repo --type postgres --event-type restore --cursor <opaque> --json\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes\n  codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes --json\n"
 )]
 struct AddonsCli {
     #[command(subcommand)]
