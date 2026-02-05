@@ -64,3 +64,4 @@ codex-utils-cargo-bin = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }

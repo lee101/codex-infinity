@@ -1261,6 +1261,7 @@ dependencies = [
  "tokio",
  "toml 0.9.5",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

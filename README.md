@@ -41,6 +41,26 @@ Run `codex-infinity` and select **Sign in with ChatGPT** to use your Plus, Pro, 
 
 You can also use Codex Infinity with an API key.
 
+## Codex Infinity CLI examples
+
+Use `codex infinity` to talk to the Codex Infinity control plane:
+
+```shell
+# List add-on backups
+codex infinity addons backups owner/repo --type postgres
+
+# List add-on backups as JSON
+codex infinity addons backups owner/repo --type postgres --json
+
+# Restore an add-on backup (requires --yes)
+codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes
+
+# Restore an add-on backup and print JSON
+codex infinity addons restore owner/repo --type postgres --object-key addon-backups/addon-id/2026/02/05/backup.dump --yes --json
+```
+
+Set `CODEX_INFINITY_API_KEY` (and optionally `CODEX_INFINITY_BASE_URL`) to authenticate.
+
 ## Features
 
 - **Autonomous operation** - Set it and let it run
