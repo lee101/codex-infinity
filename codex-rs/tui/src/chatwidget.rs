@@ -268,6 +268,7 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+const AUTO_NEXT_DONE_MARKER: &str = ".codex/auto-next.done";
 
 #[derive(Default)]
 struct RateLimitWarningState {
@@ -356,6 +357,152 @@ pub(crate) fn get_limits_duration(windows_minutes: i64) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoNextMode {
+    Steps,
+    Idea,
+}
+
+impl AutoNextMode {
+    fn initial(auto_next_steps: bool, auto_next_idea: bool) -> Option<Self> {
+        if auto_next_steps {
+            Some(Self::Steps)
+        } else if auto_next_idea {
+            Some(Self::Idea)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AutoNextDirective {
+    summary: String,
+    next: Option<String>,
+    is_done: bool,
+}
+
+fn strip_next_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.len() < 5 {
+        return None;
+    }
+    let (prefix, rest) = trimmed.split_at(5);
+    if prefix.eq_ignore_ascii_case("NEXT:") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn is_done_marker(text: &str) -> bool {
+    let trimmed = text
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'));
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "done" | "none" | "stop"
+    )
+}
+
+fn parse_auto_next_directive(message: &str) -> AutoNextDirective {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return AutoNextDirective::default();
+    }
+
+    let lines: Vec<&str> = message.lines().collect();
+    let mut next_index = None;
+    let mut next_inline = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(rest) = strip_next_prefix(line) {
+            next_index = Some(idx);
+            next_inline = Some(rest);
+        }
+    }
+
+    let mut summary = trimmed.to_string();
+    let mut next = None;
+    if let Some(idx) = next_index {
+        summary = lines[..idx].join("\n").trim().to_string();
+        let inline = next_inline.unwrap_or("").trim();
+        let next_text = if !inline.is_empty() {
+            inline.to_string()
+        } else {
+            lines[idx + 1..].join("\n")
+        };
+        let next_text = next_text.trim().to_string();
+        if !next_text.is_empty() {
+            next = Some(next_text);
+        }
+    }
+
+    let is_done = next.as_deref().is_some_and(is_done_marker);
+
+    AutoNextDirective {
+        summary,
+        next,
+        is_done,
+    }
+}
+
+fn consume_auto_next_done_marker(cwd: &PathBuf) -> bool {
+    let path = cwd.join(AUTO_NEXT_DONE_MARKER);
+    if std::fs::metadata(&path).is_ok() {
+        let _ = std::fs::remove_file(&path);
+        return true;
+    }
+    false
+}
+
+fn build_auto_prompt(mode: AutoNextMode, summary: &str, next: Option<&str>) -> String {
+    let (label, rule, default_task, done_hint, include_done_marker) = match mode {
+        AutoNextMode::Steps => (
+            "AUTONOMOUS MODE",
+            "Do not ask for permission or confirmation.",
+            "Pick the single best next step and do it now.",
+            "if no logical next steps remain",
+            true,
+        ),
+        AutoNextMode::Idea => (
+            "AUTONOMOUS IDEATION MODE",
+            "Do not offer choices.",
+            "Pick one high-impact improvement and implement it now.",
+            "if no further improvements remain",
+            false,
+        ),
+    };
+
+    let task = next
+        .and_then(|text| {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or(default_task);
+
+    let mut prompt = format!(
+        "{label}. {rule}\nTask:\n{task}\n\nAt the end, output exactly one of:\nNEXT: <one follow-up instruction>\nNEXT: DONE\nUse `NEXT: DONE` {done_hint}."
+    );
+
+    if include_done_marker {
+        prompt.push_str(&format!(" You may also touch `{AUTO_NEXT_DONE_MARKER}`."));
+    }
+
+    if !summary.trim().is_empty() {
+        prompt.push_str(&format!("\n\nPrevious work:\n{summary}"));
+    }
+
+    prompt
+}
+
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
     pub(crate) config: Config,
@@ -426,6 +573,7 @@ pub(crate) struct ChatWidget {
     auth_manager: Arc<AuthManager>,
     auto_next_steps: bool,
     auto_next_idea: bool,
+    auto_next_mode: Option<AutoNextMode>,
     models_manager: Arc<ModelsManager>,
     otel_manager: OtelManager,
     session_header: SessionHeader,
@@ -897,44 +1045,73 @@ impl ChatWidget {
         // Auto-prompt logic: if auto_next_steps or auto_next_idea is enabled and we're not in review mode,
         // automatically queue a follow-up prompt to continue working.
         if !self.is_review_mode {
-            let summary = last_agent_message
-                .as_deref()
-                .unwrap_or("(no summary provided)");
+            if let Some(mode) = self.auto_next_mode {
+                let summary_source = last_agent_message.as_deref().unwrap_or("");
+                let directive = parse_auto_next_directive(summary_source);
+                let summary = if directive.summary.trim().is_empty() {
+                    "(no summary provided)".to_string()
+                } else {
+                    directive.summary
+                };
 
-            if self.auto_next_steps {
-                let auto_prompt = format!(
-                    "You are in AUTONOMOUS MODE. Do not ask for permission or confirmation. \
-                    Pick the highest-impact next step and implement it now.\n\n\
-                    At the end of your response, output a section titled 'NEXT:' containing \
-                    a natural follow-up request a user would make, phrased as a direct instruction \
-                    (e.g., 'Add e2e tests for the new feature' or 'Refactor the error handling to use Result types'). \
-                    This will be automatically sent as the next prompt.\n\n\
-                    Previous work: {}",
-                    summary
-                );
-                self.add_to_history(history_cell::new_info_event(
-                    "Auto-next-steps: queuing detailed follow-up tasks.".to_string(),
-                    None,
-                ));
-                self.request_redraw();
-                self.submit_user_message(auto_prompt.into());
-            } else if self.auto_next_idea {
-                let auto_prompt = format!(
-                    "You are in AUTONOMOUS IDEATION MODE. Do not ask for permission or offer choices. \
-                    Pick the single best improvement idea and implement it immediately.\n\n\
-                    At the end of your response, output a section titled 'NEXT:' containing \
-                    a natural follow-up request a user would make to continue improving the project, \
-                    phrased as a direct instruction (e.g., 'Add caching to reduce API calls' or \
-                    'Improve accessibility with ARIA labels'). This will be automatically sent as the next prompt.\n\n\
-                    Previous work: {}",
-                    summary
-                );
-                self.add_to_history(history_cell::new_info_event(
-                    "Auto-next-idea: queuing autonomous ideation and implementation.".to_string(),
-                    None,
-                ));
-                self.request_redraw();
-                self.submit_user_message(auto_prompt.into());
+                match mode {
+                    AutoNextMode::Steps => {
+                        let done_from_marker = consume_auto_next_done_marker(&self.config.cwd);
+                        if directive.is_done || done_from_marker {
+                            if self.auto_next_idea {
+                                self.auto_next_mode = Some(AutoNextMode::Idea);
+                                let auto_prompt =
+                                    build_auto_prompt(AutoNextMode::Idea, &summary, None);
+                                self.add_to_history(history_cell::new_info_event(
+                                    "Auto-next-steps: done; switching to auto-next-idea."
+                                        .to_string(),
+                                    None,
+                                ));
+                                self.request_redraw();
+                                self.submit_user_message(auto_prompt.into());
+                            } else {
+                                self.auto_next_mode = None;
+                                self.add_to_history(history_cell::new_info_event(
+                                    "Auto-next-steps: done; stopping.".to_string(),
+                                    None,
+                                ));
+                            }
+                        } else {
+                            let auto_prompt = build_auto_prompt(
+                                AutoNextMode::Steps,
+                                &summary,
+                                directive.next.as_deref(),
+                            );
+                            self.add_to_history(history_cell::new_info_event(
+                                "Auto-next-steps: queued next step.".to_string(),
+                                None,
+                            ));
+                            self.request_redraw();
+                            self.submit_user_message(auto_prompt.into());
+                        }
+                    }
+                    AutoNextMode::Idea => {
+                        if directive.is_done {
+                            self.auto_next_mode = None;
+                            self.add_to_history(history_cell::new_info_event(
+                                "Auto-next-idea: done; stopping.".to_string(),
+                                None,
+                            ));
+                        } else {
+                            let auto_prompt = build_auto_prompt(
+                                AutoNextMode::Idea,
+                                &summary,
+                                directive.next.as_deref(),
+                            );
+                            self.add_to_history(history_cell::new_info_event(
+                                "Auto-next-idea: queued next idea.".to_string(),
+                                None,
+                            ));
+                            self.request_redraw();
+                            self.submit_user_message(auto_prompt.into());
+                        }
+                    }
+                }
             }
         }
 
@@ -2024,6 +2201,7 @@ impl ChatWidget {
             auth_manager,
             auto_next_steps,
             auto_next_idea,
+            auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(model_for_header),
@@ -2149,6 +2327,7 @@ impl ChatWidget {
             auth_manager,
             auto_next_steps,
             auto_next_idea,
+            auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(model_for_header),
@@ -2275,6 +2454,7 @@ impl ChatWidget {
             auth_manager,
             auto_next_steps,
             auto_next_idea,
+            auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(header_model),

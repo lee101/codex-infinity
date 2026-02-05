@@ -856,6 +856,7 @@ async fn make_chatwidget_manual(
         had_work_activity: false,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_mode: None,
         saw_plan_update_this_turn: false,
         last_separator_elapsed_secs: None,
         last_rendered_width: std::cell::Cell::new(None),
@@ -958,6 +959,27 @@ fn expect_auto_prompt(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> S
     }
 
     text
+}
+
+#[test]
+fn auto_next_directive_parsing_accepts_done_only_when_exact() {
+    let directive = parse_auto_next_directive("Summary\nNEXT: DONE");
+    assert_eq!(directive.summary, "Summary");
+    assert_eq!(directive.next.as_deref(), Some("DONE"));
+    assert!(directive.is_done);
+
+    let directive = parse_auto_next_directive("Summary\nNEXT: DONE (if no steps remain)");
+    assert_eq!(directive.summary, "Summary");
+    assert_eq!(directive.next.as_deref(), Some("DONE (if no steps remain)"));
+    assert!(!directive.is_done);
+}
+
+#[test]
+fn auto_next_directive_parsing_handles_multiline_next() {
+    let directive = parse_auto_next_directive("Did a thing\nNEXT:\nAdd tests\nThen docs");
+    assert_eq!(directive.summary, "Did a thing");
+    assert_eq!(directive.next.as_deref(), Some("Add tests\nThen docs"));
+    assert!(!directive.is_done);
 }
 
 fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
