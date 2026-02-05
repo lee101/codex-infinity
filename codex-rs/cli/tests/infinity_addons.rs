@@ -335,3 +335,62 @@ fn addons_events_outputs_table() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+#[test]
+fn addons_events_encodes_query_params() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_runtime(async {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "addons": [
+                    {
+                        "id": "addon-pg",
+                        "type": "postgres",
+                        "status": "active",
+                        "plan": "starter",
+                        "region": "nbg1"
+                    }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/projects/owner/repo/addons/addon-pg/events"))
+            .and(query_param("limit", "50"))
+            .and(query_param("event_type", "backup failed"))
+            .and(query_param("cursor", "cursor+token/=="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "events": [],
+                "total": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let output = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+            .env("CODEX_INFINITY_BASE_URL", server.uri())
+            .env("CODEX_INFINITY_API_KEY", "test-key")
+            .args([
+                "infinity",
+                "addons",
+                "events",
+                "owner/repo",
+                "--type",
+                "postgres",
+                "--event-type",
+                "backup failed",
+                "--cursor",
+                "cursor+token/==",
+            ])
+            .output()?;
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("No events found"));
+
+        Ok(())
+    })
+}
