@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::env;
 use std::process::Command;
+use url::form_urlencoded;
 
 #[derive(Debug, Parser)]
 pub struct InfinityCli {
@@ -556,13 +557,15 @@ async fn run_addon_events(client: &InfinityClient, cmd: AddonEventsCommand) -> a
     } = cmd;
     let addon = find_addon_by_type(client, &repo, &addon_type).await?;
     let id = addon.id;
-    let mut path = format!("/api/projects/{repo}/addons/{id}/events?limit={limit}");
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &limit.to_string());
     if let Some(event_type) = event_type.as_ref().filter(|value| !value.is_empty()) {
-        path.push_str(&format!("&event_type={event_type}"));
+        query.append_pair("event_type", event_type);
     }
     if let Some(cursor) = cursor.as_ref().filter(|value| !value.is_empty()) {
-        path.push_str(&format!("&cursor={cursor}"));
+        query.append_pair("cursor", cursor);
     }
+    let path = format!("/api/projects/{repo}/addons/{id}/events?{}", query.finish());
     let response: AddonEventsResponse = client.get_json(&path).await?;
 
     if json {
