@@ -84,7 +84,6 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::ModelProviderInfo;
-use crate::refusal_fallback;
 use crate::WireApi;
 use crate::client::ModelClient;
 use crate::client::ModelClientSession;
@@ -143,6 +142,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+use crate::refusal_fallback;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -186,8 +186,6 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
 use tokio::sync::watch;
-
-use crate::compact::build_compacted_history;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -291,14 +289,27 @@ impl Codex {
 
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override
-        // 2. conversation history => session_meta.base_instructions
-        // 3. base_intructions for current model
+        // 2. SYSTEM.md override
+        // 3. conversation history => session_meta.base_instructions
+        // 4. base_intructions for current model
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
-        let base_instructions = config
-            .base_instructions
-            .clone()
-            .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
+        let system_prompt_override =
+            Config::load_system_prompt_override(&config.config_layer_stack);
+        let system_prompt_append = Config::load_system_prompt_append(&config.config_layer_stack);
+        let history_base_instructions =
+            conversation_history.get_base_instructions().map(|s| s.text);
+        let base_instructions_override =
+            config.base_instructions.clone().or(system_prompt_override);
+        let base_instructions_from_history =
+            base_instructions_override.is_none() && history_base_instructions.is_some();
+        let mut base_instructions = base_instructions_override
+            .or_else(|| history_base_instructions.clone())
             .unwrap_or_else(|| model_info.get_model_instructions(config.model_personality));
+        if !base_instructions_from_history {
+            if let Some(append) = system_prompt_append {
+                base_instructions = format!("{base_instructions}\n\n{append}");
+            }
+        }
 
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
@@ -3612,7 +3623,10 @@ async fn try_run_sampling_request(
                     error_or_panic("OutputTextDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryDelta { delta, summary_index } => {
+            ResponseEvent::ReasoningSummaryDelta {
+                delta,
+                summary_index,
+            } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -3628,14 +3642,20 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
-                let item_id = active_item.as_ref().map(|item| item.id()).unwrap_or_default();
+                let item_id = active_item
+                    .as_ref()
+                    .map(|item| item.id())
+                    .unwrap_or_default();
                 let event = EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                     item_id,
                     summary_index,
                 });
                 sess.send_event(&turn_context, event).await;
             }
-            ResponseEvent::ReasoningContentDelta { delta, content_index } => {
+            ResponseEvent::ReasoningContentDelta {
+                delta,
+                content_index,
+            } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -5197,5 +5217,4 @@ mod tests {
 
         pretty_assertions::assert_eq!(output, expected);
     }
-
 }

@@ -1,9 +1,14 @@
 //! RA1 Art Generator tool - generates AI images via netwrck.com API.
 
-use mcp_types::{CallToolResult, ContentBlock, TextContent, Tool, ToolInputSchema};
-use schemars::r#gen::SchemaSettings;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
+use mcp_types::Tool;
+use mcp_types::ToolInputSchema;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::r#gen::SchemaSettings;
+use serde::Deserialize;
+use serde::Serialize;
 use std::env;
 
 const NETWRCK_API_KEY_ENV: &str = "NETWRCK_API_KEY";
@@ -66,9 +71,7 @@ pub fn create_tool_for_ra1_art_generator() -> Tool {
     }
 }
 
-pub async fn handle_ra1_art_generator(
-    arguments: Option<serde_json::Value>,
-) -> CallToolResult {
+pub async fn handle_ra1_art_generator(arguments: Option<serde_json::Value>) -> CallToolResult {
     let api_key = match env::var(NETWRCK_API_KEY_ENV) {
         Ok(key) => key,
         Err(_) => {

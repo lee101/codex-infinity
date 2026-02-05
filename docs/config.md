@@ -6,6 +6,17 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
+## System prompt files
+
+Codex can replace or append to the system prompt using files in `.codex/`:
+
+- Project override: `.codex/SYSTEM.md`
+- Project append: `.codex/APPEND_SYSTEM.md`
+- Global override: `~/.codex/SYSTEM.md`
+- Global append: `~/.codex/APPEND_SYSTEM.md`
+
+Project files take precedence over global files. The append file is applied on top of the chosen base instructions when starting a new session.
+
 ## Connecting to MCP servers
 
 Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:

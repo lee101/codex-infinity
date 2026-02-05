@@ -204,9 +204,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push(
             Line::from(vec![
                 "Website: ".dim(),
-                "https://codex-infinity.com"
-                    .cyan()
-                    .underlined(),
+                "https://codex-infinity.com".cyan().underlined(),
             ])
             .inset(Insets::tlbr(0, 2, 0, 0)),
         );

@@ -17,8 +17,9 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_reasoning_summary_text_delta;
 use core_test_support::responses::ev_reasoning_text_delta;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_once_any_post;
+use core_test_support::responses::mount_sse_sequence_any_post;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
@@ -28,6 +29,9 @@ use core_test_support::wait_for_event;
 use std::sync::Mutex;
 use tracing::Level;
 use tracing_test::traced_test;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::matchers::method;
 
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
@@ -112,9 +116,13 @@ async fn process_sse_emits_tracing_for_output_item() {
 #[tokio::test]
 #[traced_test]
 async fn process_sse_emits_failed_event_on_parse_error() {
-    let server = start_mock_server().await;
+    let server = MockServer::start().await;
 
-    mount_sse_once(&server, "data: not-json\n\n".to_string()).await;
+    Mock::given(method("POST"))
+        .respond_with(sse_response("data: not-json\n\n".to_string()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
@@ -155,7 +163,7 @@ async fn process_sse_emits_failed_event_on_parse_error() {
 async fn process_sse_records_failed_event_when_stream_closes_without_completed() {
     let server = start_mock_server().await;
 
-    mount_sse_once(&server, sse(vec![ev_assistant_message("id", "hi")])).await;
+    mount_sse_once_any_post(&server, sse(vec![ev_assistant_message("id", "hi")])).await;
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
@@ -314,7 +322,7 @@ async fn process_sse_failed_event_logs_parse_error() {
 async fn process_sse_failed_event_logs_missing_error() {
     let server = start_mock_server().await;
 
-    mount_sse_once(
+    mount_sse_once_any_post(
         &server,
         sse(vec![serde_json::json!({
             "type": "response.failed",
@@ -563,7 +571,7 @@ async fn record_responses_sets_span_fields_for_response_events() {
         ev_completed("resp-1"),
     ]);
 
-    mount_response_once(&server, sse_response(sse_body)).await;
+    mount_sse_sequence_any_post(&server, vec![sse_body, sse(vec![ev_completed("resp-2")])]).await;
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {

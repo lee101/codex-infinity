@@ -12,21 +12,39 @@ const __dirname = path.dirname(__filename);
 
 const { platform, arch } = process;
 
+function prefersGnu() {
+  if (platform !== "linux") {
+    return false;
+  }
+  try {
+    const report = process.report?.getReport?.();
+    return Boolean(report?.header?.glibcVersionRuntime);
+  } catch {
+    return false;
+  }
+}
+
 let targetTriples = [];
 switch (platform) {
   case "linux":
-  case "android":
+  case "android": {
+    const preferGnu = prefersGnu();
     switch (arch) {
       case "x64":
-        targetTriples = ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"];
+        targetTriples = preferGnu
+          ? ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+          : ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"];
         break;
       case "arm64":
-        targetTriples = ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
+        targetTriples = preferGnu
+          ? ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
+          : ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
         break;
       default:
         break;
     }
     break;
+  }
   case "darwin":
     switch (arch) {
       case "x64":
@@ -75,7 +93,12 @@ for (const triple of targetTriples) {
 }
 
 if (!binaryPath) {
-  throw new Error(`No binary found for platform: ${platform} (${arch}). Tried: ${targetTriples.join(", ")}`);
+  const tried = targetTriples.join(", ");
+  throw new Error(
+    `No binary found for platform: ${platform} (${arch}). Tried: ${tried}. ` +
+      "This usually means the npm package was published without native binaries. " +
+      "Reinstall from a fixed release or ask the publisher to populate vendor/ before publishing.",
+  );
 }
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to

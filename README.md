@@ -4,7 +4,7 @@
 
 <h1 align="center">Codex Infinity</h1>
 
-<p align="center"><code>npm i -g @lee101-3/codex-infinite</code></p>
+<p align="center"><code>npm i -g @codex-infinity/codex-infinity</code></p>
 
 <p align="center"><strong>Codex Infinity</strong> is a smarter coding agent that can run forever.</p>
 
@@ -30,7 +30,7 @@ codex-infinity --auto-next-steps --auto-next-idea
 ### Installation
 
 ```shell
-npm install -g @lee101-3/codex-infinite
+npm install -g @codex-infinity/codex-infinity
 ```
 
 Then simply run `codex-infinity` to get started.

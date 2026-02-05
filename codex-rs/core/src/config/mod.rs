@@ -29,9 +29,6 @@ use crate::features::FeatureOverrides;
 use crate::features::Features;
 use crate::features::FeaturesToml;
 use crate::git_info::resolve_root_git_project_for_trust;
-use crate::model_family::ModelFamily;
-use crate::model_family::derive_default_model_family;
-use crate::model_family::find_family_for_model;
 use crate::model_provider_info::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use crate::model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
@@ -42,6 +39,7 @@ use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
+use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::AltScreenMode;
@@ -136,6 +134,9 @@ const PROVIDER_MODEL_DEFAULTS: &[(&str, ProviderModelDefaults)] = &[
         },
     ),
 ];
+
+const SYSTEM_PROMPT_FILENAME: &str = "SYSTEM.md";
+const APPEND_SYSTEM_PROMPT_FILENAME: &str = "APPEND_SYSTEM.md";
 
 /// Infer the provider ID from a model name if no explicit provider is set.
 fn infer_provider_from_model(model: &str) -> Option<&'static str> {
@@ -1785,6 +1786,67 @@ impl Config {
             }
         }
         None
+    }
+
+    pub(crate) fn load_system_prompt_override(
+        config_layer_stack: &ConfigLayerStack,
+    ) -> Option<String> {
+        Self::load_system_prompt_from_layers(config_layer_stack, SYSTEM_PROMPT_FILENAME)
+    }
+
+    pub(crate) fn load_system_prompt_append(
+        config_layer_stack: &ConfigLayerStack,
+    ) -> Option<String> {
+        Self::load_system_prompt_from_layers(config_layer_stack, APPEND_SYSTEM_PROMPT_FILENAME)
+    }
+
+    fn load_system_prompt_from_layers(
+        config_layer_stack: &ConfigLayerStack,
+        filename: &str,
+    ) -> Option<String> {
+        if let Some(project_dir) = Self::find_project_config_folder(config_layer_stack) {
+            let path = project_dir.as_path().join(filename);
+            if let Some(contents) = Self::read_non_empty_prompt_file(&path) {
+                return Some(contents);
+            }
+        }
+
+        if let Some(user_dir) = Self::find_user_config_folder(config_layer_stack) {
+            let path = user_dir.as_path().join(filename);
+            if let Some(contents) = Self::read_non_empty_prompt_file(&path) {
+                return Some(contents);
+            }
+        }
+
+        None
+    }
+
+    fn find_project_config_folder(
+        config_layer_stack: &ConfigLayerStack,
+    ) -> Option<AbsolutePathBuf> {
+        config_layer_stack
+            .layers_high_to_low()
+            .into_iter()
+            .find_map(|layer| match layer.name {
+                ConfigLayerSource::Project { .. } => layer.config_folder(),
+                _ => None,
+            })
+    }
+
+    fn find_user_config_folder(config_layer_stack: &ConfigLayerStack) -> Option<AbsolutePathBuf> {
+        config_layer_stack
+            .get_user_layer()
+            .and_then(|layer| layer.config_folder())
+    }
+
+    fn read_non_empty_prompt_file(path: &Path) -> Option<String> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// If `path` is `Some`, attempts to read the file at the given path and
@@ -3773,8 +3835,8 @@ model_verbosity = "high"
             query_params: None,
             http_headers: None,
             env_http_headers: None,
-            request_max_retries: Some(4),
-            stream_max_retries: Some(10),
+            request_max_retries: Some(60),
+            stream_max_retries: Some(60),
             stream_idle_timeout_ms: Some(300_000),
             requires_openai_auth: false,
         };

@@ -35,9 +35,7 @@ fn init_backend() -> anyhow::Result<BackendContext> {
 
 pub async fn run_main(cli: Cli, _sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     match cli.command {
-        None => {
-            run_list_command(cli::ListCommand { json: false }).await
-        }
+        None => run_list_command(cli::ListCommand { json: false }).await,
         Some(cli::Command::Launch(cmd)) => run_launch_command(cmd).await,
         Some(cli::Command::List(cmd)) => run_list_command(cmd).await,
         Some(cli::Command::Status(cmd)) => run_status_command(cmd).await,
@@ -79,7 +77,10 @@ async fn run_launch_command(cmd: cli::LaunchCommand) -> anyhow::Result<()> {
     } else {
         println!(
             "Agent {} launched",
-            resp.agent.id.to_string().if_supports_color(Stream::Stdout, |t| t.cyan())
+            resp.agent
+                .id
+                .to_string()
+                .if_supports_color(Stream::Stdout, |t| t.cyan())
         );
         println!("  Name:   {}", resp.agent.name);
         println!("  Status: {}", format_status(&resp.agent.status));
@@ -213,9 +214,15 @@ async fn run_cancel_command(cmd: cli::CancelCommand) -> anyhow::Result<()> {
 fn format_status(status: &AgentStatus) -> String {
     let s = status.to_string();
     match status {
-        AgentStatus::Running => s.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
-        AgentStatus::Initializing => s.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string(),
-        AgentStatus::Stopped => s.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string(),
+        AgentStatus::Running => s
+            .if_supports_color(Stream::Stdout, |t| t.green())
+            .to_string(),
+        AgentStatus::Initializing => s
+            .if_supports_color(Stream::Stdout, |t| t.yellow())
+            .to_string(),
+        AgentStatus::Stopped => s
+            .if_supports_color(Stream::Stdout, |t| t.dimmed())
+            .to_string(),
         AgentStatus::Error => s.if_supports_color(Stream::Stdout, |t| t.red()).to_string(),
     }
 }

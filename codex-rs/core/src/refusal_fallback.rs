@@ -51,7 +51,9 @@ pub fn is_refusal(response_text: &str, had_tool_calls: bool) -> bool {
     }
 
     let lower = response_text.to_lowercase();
-    REFUSAL_INDICATORS.iter().any(|indicator| lower.contains(indicator))
+    REFUSAL_INDICATORS
+        .iter()
+        .any(|indicator| lower.contains(indicator))
 }
 
 /// Checks if OpenRouter fallback is available (OPENROUTER_API_KEY is set).
@@ -129,7 +131,10 @@ mod tests {
 
     #[test]
     fn refusal_not_allowed() {
-        assert!(is_refusal("Ok but I'm not able to help with that request.", false));
+        assert!(is_refusal(
+            "Ok but I'm not able to help with that request.",
+            false
+        ));
     }
 
     #[test]
@@ -139,12 +144,18 @@ mod tests {
 
     #[test]
     fn refusal_apologize_unable() {
-        assert!(is_refusal("I apologize, but I'm unable to proceed with that.", false));
+        assert!(is_refusal(
+            "I apologize, but I'm unable to proceed with that.",
+            false
+        ));
     }
 
     #[test]
     fn refusal_unfortunately_decline() {
-        assert!(is_refusal("Unfortunately, I have to decline this request.", false));
+        assert!(is_refusal(
+            "Unfortunately, I have to decline this request.",
+            false
+        ));
     }
 
     #[test]
@@ -164,12 +175,18 @@ mod tests {
 
     #[test]
     fn refusal_will_not_be_able() {
-        assert!(is_refusal("I will not be able to complete this task for you.", false));
+        assert!(is_refusal(
+            "I will not be able to complete this task for you.",
+            false
+        ));
     }
 
     #[test]
     fn refusal_cant_help_polite() {
-        assert!(is_refusal("I appreciate the question, but I can't help with that.", false));
+        assert!(is_refusal(
+            "I appreciate the question, but I can't help with that.",
+            false
+        ));
     }
 
     // === NON-REFUSAL CASES (should NOT be detected) ===
@@ -181,7 +198,10 @@ mod tests {
 
     #[test]
     fn non_refusal_code_explanation() {
-        assert!(!is_refusal("The function works by iterating over the list.", false));
+        assert!(!is_refusal(
+            "The function works by iterating over the list.",
+            false
+        ));
     }
 
     #[test]
@@ -191,7 +211,10 @@ mod tests {
 
     #[test]
     fn non_refusal_question() {
-        assert!(!is_refusal("Could you clarify what you mean by that?", false));
+        assert!(!is_refusal(
+            "Could you clarify what you mean by that?",
+            false
+        ));
     }
 
     #[test]
@@ -212,7 +235,10 @@ mod tests {
 
     #[test]
     fn non_refusal_suggestion() {
-        assert!(!is_refusal("You might want to try using a HashMap instead.", false));
+        assert!(!is_refusal(
+            "You might want to try using a HashMap instead.",
+            false
+        ));
     }
 
     #[test]
@@ -222,6 +248,9 @@ mod tests {
 
     #[test]
     fn non_refusal_error_explanation() {
-        assert!(!is_refusal("The error occurs because the variable is undefined.", false));
+        assert!(!is_refusal(
+            "The error occurs because the variable is undefined.",
+            false
+        ));
     }
 }

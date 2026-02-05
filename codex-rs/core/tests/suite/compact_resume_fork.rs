@@ -27,7 +27,7 @@ use core_test_support::load_default_config_for_test;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::mount_sse_once_match;
+use core_test_support::responses::mount_sse_sequence_any_post;
 use core_test_support::responses::sse;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -41,17 +41,6 @@ const AFTER_SECOND_RESUME: &str = "AFTER_SECOND_RESUME";
 
 fn network_disabled() -> bool {
     std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok()
-}
-
-fn body_contains_text(body: &str, text: &str) -> bool {
-    body.contains(&json_fragment(text))
-}
-
-fn json_fragment(text: &str) -> String {
-    serde_json::to_string(text)
-        .expect("serialize text to JSON")
-        .trim_matches('"')
-        .to_string()
 }
 
 fn filter_out_ghost_snapshot_entries(items: &[Value]) -> Vec<Value> {
@@ -896,43 +885,8 @@ async fn mount_initial_flow(server: &MockServer) -> Vec<ResponseMock> {
     let sse4 = sse(vec![ev_completed("r4")]);
     let sse5 = sse(vec![ev_completed("r5")]);
 
-    let match_first = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("\"text\":\"hello world\"")
-            && !body.contains(&format!("\"text\":\"{SUMMARY_TEXT}\""))
-            && !body.contains("\"text\":\"AFTER_COMPACT\"")
-            && !body.contains("\"text\":\"AFTER_RESUME\"")
-            && !body.contains("\"text\":\"AFTER_FORK\"")
-    };
-    let first = mount_sse_once_match(server, match_first, sse1).await;
-
-    let match_compact = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body_contains_text(body, SUMMARIZATION_PROMPT) || body.contains(&json_fragment(FIRST_REPLY))
-    };
-    let compact = mount_sse_once_match(server, match_compact, sse2).await;
-
-    let match_after_compact = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("\"text\":\"AFTER_COMPACT\"")
-            && !body.contains("\"text\":\"AFTER_RESUME\"")
-            && !body.contains("\"text\":\"AFTER_FORK\"")
-    };
-    let after_compact = mount_sse_once_match(server, match_after_compact, sse3).await;
-
-    let match_after_resume = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("\"text\":\"AFTER_RESUME\"")
-    };
-    let after_resume = mount_sse_once_match(server, match_after_resume, sse4).await;
-
-    let match_after_fork = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("\"text\":\"AFTER_FORK\"")
-    };
-    let after_fork = mount_sse_once_match(server, match_after_fork, sse5).await;
-
-    vec![first, compact, after_compact, after_resume, after_fork]
+    let request_log = mount_sse_sequence_any_post(server, vec![sse1, sse2, sse3, sse4, sse5]).await;
+    vec![request_log]
 }
 
 async fn mount_second_compact_flow(server: &MockServer) -> Vec<ResponseMock> {
@@ -942,19 +896,8 @@ async fn mount_second_compact_flow(server: &MockServer) -> Vec<ResponseMock> {
     ]);
     let sse7 = sse(vec![ev_completed("r7")]);
 
-    let match_second_compact = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("AFTER_FORK")
-    };
-    let second_compact = mount_sse_once_match(server, match_second_compact, sse6).await;
-
-    let match_after_second_resume = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains(&format!("\"text\":\"{AFTER_SECOND_RESUME}\""))
-    };
-    let after_second_resume = mount_sse_once_match(server, match_after_second_resume, sse7).await;
-
-    vec![second_compact, after_second_resume]
+    let request_log = mount_sse_sequence_any_post(server, vec![sse6, sse7]).await;
+    vec![request_log]
 }
 
 async fn start_test_conversation(

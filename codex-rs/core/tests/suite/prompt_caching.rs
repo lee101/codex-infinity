@@ -2,7 +2,6 @@
 
 use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_core::features::Feature;
-use codex_core::models_manager::model_info::BASE_INSTRUCTIONS;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_core::protocol::EventMsg;
@@ -208,7 +207,7 @@ async fn codex_mini_latest_tools() -> anyhow::Result<()> {
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let expected_instructions = [BASE_INSTRUCTIONS, APPLY_PATCH_TOOL_INSTRUCTIONS].join("\n");
+    let expected_instructions = include_str!("../../prompt_with_apply_patch_instructions.md");
 
     let body0 = req1.single_request().body_json();
     let instructions0 = body0["instructions"]

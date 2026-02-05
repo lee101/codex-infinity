@@ -151,7 +151,10 @@ impl InfinityClient {
                 let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << (attempt - 1)); // Exponential backoff
                 eprintln!(
                     "Retry {}/{} for {} (waiting {}ms)...",
-                    attempt, MAX_RETRIES - 1, url, delay_ms
+                    attempt,
+                    MAX_RETRIES - 1,
+                    url,
+                    delay_ms
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
@@ -171,7 +174,8 @@ impl InfinityClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
     }
 
     async fn try_get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> anyhow::Result<T> {

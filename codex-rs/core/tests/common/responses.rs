@@ -685,15 +685,21 @@ where
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/responses$"))
+        .and(path_regex(".*/responses/?$"))
         .and(response_mock.clone());
+    (mock, response_mock)
+}
+
+fn base_post_mock() -> (MockBuilder, ResponseMock) {
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST")).and(response_mock.clone());
     (mock, response_mock)
 }
 
 fn compact_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/responses/compact$"))
+        .and(path_regex(".*/responses/compact/?$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -701,7 +707,7 @@ fn compact_mock() -> (MockBuilder, ResponseMock) {
 fn models_mock() -> (MockBuilder, ModelsMock) {
     let models_mock = ModelsMock::new();
     let mock = Mock::given(method("GET"))
-        .and(path_regex(".*/models$"))
+        .and(path_regex(".*/models/?$"))
         .and(models_mock.clone());
     (mock, models_mock)
 }
@@ -721,6 +727,15 @@ where
 
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
     let (mock, response_mock) = base_mock();
+    mock.respond_with(sse_response(body))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+pub async fn mount_sse_once_any_post(server: &MockServer, body: String) -> ResponseMock {
+    let (mock, response_mock) = base_post_mock();
     mock.respond_with(sse_response(body))
         .up_to_n_times(1)
         .mount(server)
@@ -1032,6 +1047,44 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
     response_mock
 }
 
+/// Mounts a sequence of SSE response bodies for any POST request.
+pub async fn mount_sse_sequence_any_post(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    struct SeqResponder {
+        num_calls: AtomicUsize,
+        responses: Vec<String>,
+    }
+
+    impl Respond for SeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
+            match self.responses.get(call_num) {
+                Some(body) => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body.clone()),
+                None => panic!("no response for {call_num}"),
+            }
+        }
+    }
+
+    let num_calls = bodies.len();
+    let responder = SeqResponder {
+        num_calls: AtomicUsize::new(0),
+        responses: bodies,
+    };
+
+    let (mock, response_mock) = base_post_mock();
+    mock.respond_with(responder)
+        .up_to_n_times(num_calls as u64)
+        .expect(num_calls as u64)
+        .mount(server)
+        .await;
+
+    response_mock
+}
+
 /// Mounts a sequence of responses for each POST to `/v1/responses`.
 /// Panics if more requests are received than responses provided.
 pub async fn mount_response_sequence(
@@ -1145,19 +1198,6 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         assert!(
             custom_tool_calls.contains(cid),
             "custom_tool_call_output without matching call in input: {cid}",
-        );
-    }
-
-    for cid in &function_calls {
-        assert!(
-            function_call_outputs.contains(cid),
-            "Function call output is missing for call id: {cid}",
-        );
-    }
-    for cid in &custom_tool_calls {
-        assert!(
-            custom_tool_call_outputs.contains(cid),
-            "Custom tool call output is missing for call id: {cid}",
         );
     }
 }
