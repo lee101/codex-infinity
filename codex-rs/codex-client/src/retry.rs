@@ -1,6 +1,9 @@
 use crate::error::TransportError;
 use crate::request::Request;
+use http::HeaderMap;
+use http::header::RETRY_AFTER;
 use rand::Rng;
+use serde_json::Value;
 use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -25,9 +28,11 @@ impl RetryOn {
             return false;
         }
         match err {
-            TransportError::Http { status, .. } => {
-                (self.retry_429 && status.as_u16() == 429)
-                    || (self.retry_5xx && status.is_server_error())
+            TransportError::Http { status, body, .. } => {
+                if status.as_u16() == 429 {
+                    return self.retry_429 && !is_non_retryable_429(body.as_deref());
+                }
+                self.retry_5xx && status.is_server_error()
             }
             TransportError::Timeout | TransportError::Network(_) => self.retry_transport,
             _ => false,
@@ -35,8 +40,29 @@ impl RetryOn {
     }
 }
 
+const MAX_BACKOFF_MS: u64 = 120_000; // 120 seconds
+
+fn is_non_retryable_429(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+
+    let error_type = error.get("type").and_then(Value::as_str);
+    let error_code = error.get("code").and_then(Value::as_str);
+
+    matches!(
+        error_type,
+        Some("usage_limit_reached" | "usage_not_included")
+    ) || matches!(error_code, Some("insufficient_quota" | "quota_exceeded"))
+}
+
 pub fn backoff(base: Duration, attempt: u64) -> Duration {
-    const MAX_BACKOFF_MS: u64 = 60_000; // 60 seconds
     if attempt == 0 {
         return base;
     }
@@ -45,6 +71,29 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
     let raw = millis.saturating_mul(exp).min(MAX_BACKOFF_MS);
     let jitter: f64 = rand::rng().random_range(0.9..1.1);
     Duration::from_millis((raw as f64 * jitter) as u64)
+}
+
+fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?;
+    let value = value.to_str().ok()?;
+    let seconds = value.parse::<f64>().ok()?;
+    if seconds.is_sign_negative() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+fn retry_delay(policy: &RetryPolicy, err: &TransportError, attempt: u64) -> Duration {
+    if let TransportError::Http {
+        status, headers, ..
+    } = err
+        && status.as_u16() == 429
+        && let Some(headers) = headers
+        && let Some(delay) = retry_after_from_headers(headers)
+    {
+        return delay.min(Duration::from_millis(MAX_BACKOFF_MS));
+    }
+    backoff(policy.base_delay, attempt)
 }
 
 pub async fn run_with_retry<T, F, Fut>(
@@ -65,7 +114,7 @@ where
                     .retry_on
                     .should_retry(&err, attempt, policy.max_attempts) =>
             {
-                sleep(backoff(policy.base_delay, attempt + 1)).await;
+                sleep(retry_delay(&policy, &err, attempt + 1)).await;
             }
             Err(err) => return Err(err),
         }

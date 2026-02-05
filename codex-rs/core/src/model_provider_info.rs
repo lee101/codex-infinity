@@ -16,20 +16,26 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::env::VarError;
 use std::time::Duration;
 
 use crate::error::EnvVarError;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 60;
-const DEFAULT_REQUEST_MAX_RETRIES: u64 = 60;
+const DEFAULT_REQUEST_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `stream_max_retries`.
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
-const MAX_REQUEST_MAX_RETRIES: u64 = 100;
+const MAX_REQUEST_MAX_RETRIES: u64 = 200;
 pub const CHAT_WIRE_API_DEPRECATION_SUMMARY: &str = r#"Support for the "chat" wire API is deprecated and will soon be removed. Update your model provider definition in config.toml to use wire_api = "responses"."#;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const ANTHROPIC_PROVIDER_NAME: &str = "Anthropic";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
+const ANTHROPIC_OAUTH_TOKEN_ENV_VAR: &str = "ANTHROPIC_OAUTH_TOKEN";
+const CLAUDE_CODE_VERSION: &str = "2.1.2";
+const CLAUDE_CODE_OAUTH_BETA_HEADER: &str =
+    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
 
 /// Wire protocol that the provider speaks. Most third-party services only
 /// implement the classic OpenAI Chat Completions JSON schema, whereas OpenAI
@@ -107,6 +113,23 @@ pub struct ModelProviderInfo {
     pub requires_openai_auth: bool,
 }
 
+fn read_env_value(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::try_from(value)) {
+        headers.insert(name, value);
+    }
+}
+
+fn is_anthropic_oauth_token(token: &str) -> bool {
+    token.contains("sk-ant-oat")
+}
+
 impl ModelProviderInfo {
     fn build_header_map(&self) -> crate::error::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
@@ -151,7 +174,7 @@ impl ModelProviderInfo {
         let retry = ApiRetryConfig {
             max_attempts: self.request_max_retries(),
             base_delay: Duration::from_millis(200),
-            retry_429: false,
+            retry_429: true,
             retry_5xx: true,
             retry_transport: true,
         };
@@ -171,27 +194,58 @@ impl ModelProviderInfo {
         })
     }
 
+    pub fn extra_auth_headers(&self, token: &str) -> Option<HeaderMap> {
+        if !self.is_anthropic() || !is_anthropic_oauth_token(token) {
+            return None;
+        }
+        let mut headers = HeaderMap::new();
+        insert_header(
+            &mut headers,
+            "anthropic-dangerous-direct-browser-access",
+            "true",
+        );
+        insert_header(
+            &mut headers,
+            "anthropic-beta",
+            CLAUDE_CODE_OAUTH_BETA_HEADER,
+        );
+        insert_header(
+            &mut headers,
+            "user-agent",
+            &format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"),
+        );
+        insert_header(&mut headers, "x-app", "cli");
+        Some(headers)
+    }
+
     /// If `env_key` is Some, returns the API key for this provider if present
     /// (and non-empty) in the environment. If `env_key` is required but
     /// cannot be found, returns an error.
     pub fn api_key(&self) -> crate::error::Result<Option<String>> {
         match &self.env_key {
             Some(env_key) => {
-                let env_value = std::env::var(env_key);
-                env_value
-                    .and_then(|v| {
-                        if v.trim().is_empty() {
-                            Err(VarError::NotPresent)
-                        } else {
-                            Ok(Some(v))
-                        }
-                    })
-                    .map_err(|_| {
-                        crate::error::CodexErr::EnvVar(EnvVarError {
-                            var: env_key.clone(),
-                            instructions: self.env_key_instructions.clone(),
-                        })
-                    })
+                if env_key == ANTHROPIC_API_KEY_ENV_VAR || env_key == ANTHROPIC_OAUTH_TOKEN_ENV_VAR
+                {
+                    if let Some(token) = read_env_value(ANTHROPIC_OAUTH_TOKEN_ENV_VAR)
+                        .or_else(|| read_env_value(ANTHROPIC_API_KEY_ENV_VAR))
+                    {
+                        return Ok(Some(token));
+                    }
+                    return Err(crate::error::CodexErr::EnvVar(EnvVarError {
+                        var: format!(
+                            "{ANTHROPIC_OAUTH_TOKEN_ENV_VAR} or {ANTHROPIC_API_KEY_ENV_VAR}"
+                        ),
+                        instructions: self.env_key_instructions.clone(),
+                    }));
+                }
+
+                if let Some(value) = read_env_value(env_key) {
+                    return Ok(Some(value));
+                }
+                Err(crate::error::CodexErr::EnvVar(EnvVarError {
+                    var: env_key.clone(),
+                    instructions: self.env_key_instructions.clone(),
+                }))
             }
             None => Ok(None),
         }
@@ -257,8 +311,45 @@ impl ModelProviderInfo {
         }
     }
 
+    pub fn create_anthropic_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: Some(ANTHROPIC_BASE_URL.into()),
+            env_key: Some(ANTHROPIC_API_KEY_ENV_VAR.into()),
+            env_key_instructions: Some(
+                "Create a Claude API key at https://console.anthropic.com/settings/keys or export an OAuth token from Claude Code in ANTHROPIC_OAUTH_TOKEN."
+                    .into(),
+            ),
+            experimental_bearer_token: None,
+            wire_api: WireApi::Chat,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
+            || self.requires_openai_auth
+            || self
+                .base_url
+                .as_ref()
+                .is_some_and(|url| url.contains("openai.com"))
+    }
+
+    pub fn is_anthropic(&self) -> bool {
+        self.name == ANTHROPIC_PROVIDER_NAME
+            || self.env_key.as_deref().is_some_and(|key| {
+                key == ANTHROPIC_API_KEY_ENV_VAR || key == ANTHROPIC_OAUTH_TOKEN_ENV_VAR
+            })
+            || self
+                .base_url
+                .as_ref()
+                .is_some_and(|url| url.contains("anthropic.com"))
     }
 }
 
@@ -280,6 +371,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     // `model_providers` in config.toml to add their own providers.
     [
         ("openai", P::create_openai_provider()),
+        ("anthropic", P::create_anthropic_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),

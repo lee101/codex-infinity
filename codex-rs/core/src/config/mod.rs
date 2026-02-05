@@ -120,6 +120,13 @@ const PROVIDER_MODEL_DEFAULTS: &[(&str, ProviderModelDefaults)] = &[
         },
     ),
     (
+        "anthropic",
+        ProviderModelDefaults {
+            agentic: "claude-opus-4-5",
+            full_context: "claude-opus-4-5",
+        },
+    ),
+    (
         "xai",
         ProviderModelDefaults {
             agentic: "grok-code-fast-1",
@@ -144,6 +151,8 @@ fn infer_provider_from_model(model: &str) -> Option<&'static str> {
         Some("xai")
     } else if model.starts_with("gemini-") {
         Some("gemini")
+    } else if model.starts_with("claude-") {
+        Some("anthropic")
     } else if model.contains('/') {
         // Models with / prefix (like openrouter/polaris-alpha, moonshotai/kimi-linear-48b-a3b-instruct)
         Some("openrouter")

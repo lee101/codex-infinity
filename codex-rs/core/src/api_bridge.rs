@@ -109,29 +109,36 @@ pub(crate) fn auth_provider_from_auth(
     provider: &ModelProviderInfo,
 ) -> crate::error::Result<CoreAuthProvider> {
     if let Some(api_key) = provider.api_key()? {
+        let extra_headers = provider.extra_auth_headers(&api_key);
         return Ok(CoreAuthProvider {
             token: Some(api_key),
             account_id: None,
+            extra_headers,
         });
     }
 
     if let Some(token) = provider.experimental_bearer_token.clone() {
+        let extra_headers = provider.extra_auth_headers(&token);
         return Ok(CoreAuthProvider {
             token: Some(token),
             account_id: None,
+            extra_headers,
         });
     }
 
     if let Some(auth) = auth {
         let token = auth.get_token()?;
+        let extra_headers = provider.extra_auth_headers(&token);
         Ok(CoreAuthProvider {
             token: Some(token),
             account_id: auth.get_account_id(),
+            extra_headers,
         })
     } else {
         Ok(CoreAuthProvider {
             token: None,
             account_id: None,
+            extra_headers: None,
         })
     }
 }
@@ -153,6 +160,7 @@ struct UsageErrorBody {
 pub(crate) struct CoreAuthProvider {
     token: Option<String>,
     account_id: Option<String>,
+    extra_headers: Option<HeaderMap>,
 }
 
 impl ApiAuthProvider for CoreAuthProvider {
@@ -162,5 +170,9 @@ impl ApiAuthProvider for CoreAuthProvider {
 
     fn account_id(&self) -> Option<String> {
         self.account_id.clone()
+    }
+
+    fn extra_headers(&self) -> Option<HeaderMap> {
+        self.extra_headers.clone()
     }
 }

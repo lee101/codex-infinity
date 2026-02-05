@@ -8,7 +8,7 @@ use tracing::error;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
-const MAX_BACKOFF_MS: u64 = 60_000; // 60 seconds max backoff
+const MAX_BACKOFF_MS: u64 = 120_000; // 120 seconds max backoff
 
 /// Emit structured feedback metadata as key/value pairs.
 ///

@@ -146,6 +146,9 @@ fn apply_auth_headers(headers: &mut HeaderMap, auth: &impl AuthProvider) {
     {
         let _ = headers.insert("ChatGPT-Account-ID", header);
     }
+    if let Some(extra) = auth.extra_headers() {
+        headers.extend(extra);
+    }
 }
 
 async fn connect_websocket(

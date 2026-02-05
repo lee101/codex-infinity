@@ -42,6 +42,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
@@ -60,6 +61,7 @@ use codex_rmcp_client::OAuthCredentialsStoreMode;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
+use http::StatusCode;
 use mcp_types::CallToolResult;
 use mcp_types::ListResourceTemplatesRequestParams;
 use mcp_types::ListResourceTemplatesResult;
@@ -216,7 +218,7 @@ fn maybe_push_chat_wire_api_deprecation(
     config: &Config,
     post_session_configured_events: &mut Vec<Event>,
 ) {
-    if config.model_provider.wire_api != WireApi::Chat {
+    if config.model_provider.wire_api != WireApi::Chat || !config.model_provider.is_openai() {
         return;
     }
 
@@ -3098,6 +3100,7 @@ pub(crate) async fn run_turn(
 
     let mut client_session = turn_context.client.new_session();
     let mut tried_refusal_fallback = false;
+    let mut tried_provider_fallback = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -3221,6 +3224,22 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(e) => {
+                if !tried_provider_fallback
+                    && should_attempt_provider_fallback(&e)
+                    && let Some((fallback_session, fallback_label)) =
+                        build_provider_fallback_session(&sess, &turn_context).await
+                {
+                    tried_provider_fallback = true;
+                    client_session = fallback_session;
+                    sess.notify_background_event(
+                        &turn_context,
+                        format!(
+                            "Primary provider hit a retry limit. Switching to fallback provider: {fallback_label}"
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(&turn_context, event).await;
@@ -3231,6 +3250,87 @@ pub(crate) async fn run_turn(
     }
 
     last_agent_message
+}
+
+const OPENAI_PROVIDER_FALLBACK_MODEL: &str = "gpt-5.2-codex";
+const ANTHROPIC_PROVIDER_FALLBACK_MODEL: &str = "claude-opus-4-5";
+
+fn should_attempt_provider_fallback(err: &CodexErr) -> bool {
+    matches!(err, CodexErr::RetryLimit(limit) if limit.status == StatusCode::TOO_MANY_REQUESTS)
+}
+
+async fn build_provider_fallback_session(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Option<(ModelClientSession, String)> {
+    let current_provider = turn_context.client.get_provider();
+    let (fallback_provider_id, fallback_model, fallback_effort) = if current_provider.is_openai() {
+        (
+            "anthropic",
+            ANTHROPIC_PROVIDER_FALLBACK_MODEL,
+            turn_context.client.get_reasoning_effort(),
+        )
+    } else if current_provider.is_anthropic() {
+        (
+            "openai",
+            OPENAI_PROVIDER_FALLBACK_MODEL,
+            Some(ReasoningEffort::XHigh),
+        )
+    } else {
+        return None;
+    };
+
+    let config = turn_context.client.config();
+    let fallback_provider = config.model_providers.get(fallback_provider_id)?.clone();
+    if turn_context.final_output_json_schema.is_some()
+        && fallback_provider.wire_api == WireApi::Chat
+    {
+        return None;
+    }
+
+    let auth_manager = turn_context.client.get_auth_manager();
+    if !provider_has_credentials(&fallback_provider, auth_manager.clone()).await {
+        return None;
+    }
+
+    let fallback_model_info = crate::models_manager::model_info::with_config_overrides(
+        crate::models_manager::model_info::find_model_info_for_slug(fallback_model),
+        config.as_ref(),
+    );
+
+    let fb_client = ModelClient::new(
+        config,
+        auth_manager,
+        fallback_model_info,
+        turn_context.client.get_otel_manager(),
+        fallback_provider,
+        fallback_effort,
+        turn_context.client.get_reasoning_summary(),
+        sess.conversation_id,
+        turn_context.client.get_session_source(),
+    );
+    Some((
+        fb_client.new_session(),
+        format!("{fallback_provider_id}/{fallback_model}"),
+    ))
+}
+
+async fn provider_has_credentials(
+    provider: &ModelProviderInfo,
+    auth_manager: Option<Arc<AuthManager>>,
+) -> bool {
+    if provider.experimental_bearer_token.is_some() {
+        return true;
+    }
+    if provider.api_key().ok().flatten().is_some() {
+        return true;
+    }
+    if provider.requires_openai_auth
+        && let Some(manager) = auth_manager
+    {
+        return manager.auth().await.is_some();
+    }
+    false
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
