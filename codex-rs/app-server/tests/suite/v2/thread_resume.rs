@@ -27,7 +27,8 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const DEFAULT_BASE_INSTRUCTIONS: &str = "You are Codex, a coding assistant running in the Codex CLI. You help users by reading files, running commands, editing code, and writing files.";
+const DEFAULT_BASE_INSTRUCTIONS: &str =
+    "You are a coding assistant. Read files, run commands, edit code, and write files.";
 
 #[tokio::test]
 async fn thread_resume_returns_original_thread() -> Result<()> {
