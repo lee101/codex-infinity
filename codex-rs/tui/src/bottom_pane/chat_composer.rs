@@ -367,6 +367,12 @@ impl ChatComposer {
     /// that the composer can navigate cross-session history.
     pub(crate) fn set_history_metadata(&mut self, log_id: u64, entry_count: usize) {
         self.history.set_metadata(log_id, entry_count);
+        self.history.maybe_request_cwd_offsets(&self.app_event_tx);
+    }
+
+    pub(crate) fn set_history_cwd(&mut self, cwd: PathBuf) {
+        self.history.set_cwd(cwd);
+        self.history.maybe_request_cwd_offsets(&self.app_event_tx);
     }
 
     /// Integrate an asynchronous response to an on-demand history lookup. If
@@ -384,6 +390,15 @@ impl ChatComposer {
         // Composer history (↑/↓) stores plain text only; no UI element ranges/attachments to restore here.
         self.set_text_content(text, Vec::new(), Vec::new());
         true
+    }
+
+    pub(crate) fn on_history_cwd_offsets_response(
+        &mut self,
+        log_id: u64,
+        cwd: PathBuf,
+        offsets: Vec<usize>,
+    ) {
+        self.history.on_cwd_offsets_response(log_id, cwd, offsets);
     }
 
     /// Integrate pasted text into the composer.

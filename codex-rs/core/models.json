@@ -45,6 +45,49 @@
     },
     {
       "supports_reasoning_summaries": true,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "context_window": 272000,
+      "reasoning_summary_format": "experimental",
+      "slug": "gpt-5.3-codex",
+      "display_name": "gpt-5.3-codex",
+      "description": "Latest frontier agentic coding model.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.60.0",
+      "supported_in_api": true,
+      "upgrade": null,
+      "priority": 2,
+      "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
+      "experimental_supported_tools": []
+    },
+    {
+      "supports_reasoning_summaries": true,
       "support_verbosity": true,
       "default_verbosity": "low",
       "apply_patch_tool_type": "freeform",
@@ -85,7 +128,50 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 2,
+      "priority": 3,
+      "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
+      "experimental_supported_tools": []
+    },
+    {
+      "supports_reasoning_summaries": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "context_window": 272000,
+      "reasoning_summary_format": "none",
+      "slug": "gpt-5.3",
+      "display_name": "gpt-5.3",
+      "description": "Latest frontier model with improvements across knowledge, reasoning and coding",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations"
+        },
+        {
+          "effort": "medium",
+          "description": "Provides a solid balance of reasoning depth and latency for general-purpose tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Maximizes reasoning depth for complex or ambiguous problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning for complex problems"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.60.0",
+      "supported_in_api": true,
+      "upgrade": null,
+      "priority": 4,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -131,7 +217,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 3,
+      "priority": 5,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -173,7 +259,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 4,
+      "priority": 6,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -211,7 +297,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 5,
+      "priority": 7,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -253,7 +339,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 6,
+      "priority": 8,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -295,7 +381,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 7,
+      "priority": 9,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -341,7 +427,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 8,
+      "priority": 10,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     },
@@ -379,7 +465,7 @@
         "model": "gpt-5.2-codex",
         "migration_markdown": "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}, our latest frontier agentic coding model. It is smarter and faster than its predecessors and capable of long-running project-scale work. Learn more about {model_to} at https://openai.com/index/introducing-gpt-5-2-codex\n\nYou can continue using {model_from} if you prefer.\n"
       },
-      "priority": 9,
+      "priority": 11,
       "base_instructions": "You are a coding assistant. Read files, run commands, edit code, and write files.\n\nGuidelines:\n- Prefer `rg` / `rg --files`.\n- Prefer `uv pip` over `pip`.\n- Read files before editing; avoid `cat`/`sed`.\n- Use `edit` for targeted changes; `write` only for new files or full rewrites.\n- Default to ASCII unless the file already uses Unicode.\n- Fix root causes when possible; be ambitious, creative, and brilliant.\n- Avoid destructive git commands or reverting user work unless asked.\n- For reviews, focus on bugs, risks, regressions, and missing tests first.\n- If you notice unexpected changes, proceed carefully: preserve others' work, resolve conflicts thoroughly, and prefer extending over rewriting.\n\nOutput:\n- Use plain text; keep responses short and structured when helpful.\n- Wrap commands, file paths, env vars, and identifiers in backticks.\n- Provide file references as paths with optional line numbers; avoid dumping large files.\n",
       "experimental_supported_tools": []
     }

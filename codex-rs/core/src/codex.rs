@@ -436,6 +436,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     autonomy: AutonomySettings,
+    autonomy_prompt_counter: AtomicU64,
     next_internal_sub_id: AtomicU64,
 }
 
@@ -450,17 +451,97 @@ struct AutonomyPrompt {
     prompt: String,
 }
 
+fn strip_next_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.len() < 5 {
+        return None;
+    }
+    let (prefix, rest) = trimmed.split_at(5);
+    if prefix.eq_ignore_ascii_case("NEXT:") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn is_done_marker(text: &str) -> bool {
+    let trimmed = text
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'));
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "done" | "none" | "stop"
+    )
+}
+
+fn autonomy_stop_requested(summary: &str) -> bool {
+    let lines: Vec<&str> = summary.lines().collect();
+    let mut next_index = None;
+    let mut next_inline = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(rest) = strip_next_prefix(line) {
+            next_index = Some(idx);
+            next_inline = Some(rest);
+        }
+    }
+    let Some(idx) = next_index else {
+        return false;
+    };
+    let inline = next_inline.unwrap_or("").trim();
+    let next_text = if !inline.is_empty() {
+        inline.to_string()
+    } else {
+        lines[idx + 1..].join("\n")
+    };
+    is_done_marker(next_text.trim())
+}
+
+#[derive(Clone, Copy)]
+struct AutonomyPromptVariant {
+    preamble: &'static str,
+    rules: &'static str,
+}
+
+const AUTONOMY_PROMPT_VARIANTS: [AutonomyPromptVariant; 5] = [
+    AutonomyPromptVariant {
+        preamble: "AUTONOMY: keep going without asking the user questions.",
+        rules: "- Prefer repo-local actions (code/tests/docs).\n- Do not ask for credentials/secrets or external IDs.\n- Avoid verbatim repetition; do not quote the summary.\n- If truly blocked and no safe work remains, end with `NEXT: DONE` to stop auto-next.",
+    },
+    AutonomyPromptVariant {
+        preamble: "AUTONOMY LOOP: execute, validate, continue.",
+        rules: "- Tight loop: implement -> fmt -> tests.\n- If a step needs external access, add a dry-run/mock path or improve errors/docs instead.\n- Stop with `NEXT: DONE` if nothing safe remains.",
+    },
+    AutonomyPromptVariant {
+        preamble: "AUTONOMOUS CONTINUATION: make one concrete improvement per turn.",
+        rules: "- No questions to the user; no credential requests.\n- Vary the type of follow-up work to avoid loops.\n- Stop with `NEXT: DONE` when you're truly done or blocked.",
+    },
+    AutonomyPromptVariant {
+        preamble: "AUTONOMY: prefer doing over narrating.",
+        rules: "- Focus on correctness and maintainability.\n- Avoid repeating the same request/wording across turns.\n- If blocked on external input, do offline work or stop with `NEXT: DONE`.",
+    },
+    AutonomyPromptVariant {
+        preamble: "AUTONOMY (anti-loop): if you're stuck, change tactics.",
+        rules: "- If your last turn said you were blocked, do something different now (tests/docs/mocks) instead of restating it.\n- Do not ask the user to provide tokens/IDs/logs.\n- Stop with `NEXT: DONE` if no safe actions remain.",
+    },
+];
+
 impl AutonomySettings {
     fn is_enabled(self) -> bool {
         self.auto_next_steps || self.auto_next_idea
     }
 
-    fn plan_for_summary(self, summary: &str) -> Option<AutonomyPrompt> {
+    fn plan_for_summary(self, summary: &str, variant: usize) -> Option<AutonomyPrompt> {
         if !self.is_enabled() {
             return None;
         }
         let summary = summary.trim();
         if summary.is_empty() {
+            return None;
+        }
+        if autonomy_stop_requested(summary) {
             return None;
         }
         let background_message = match (self.auto_next_steps, self.auto_next_idea) {
@@ -469,17 +550,24 @@ impl AutonomySettings {
             (false, true) => "Auto-next-idea: proposing new high-impact work.",
             (false, false) => return None,
         };
+        let variant = AUTONOMY_PROMPT_VARIANTS[variant % AUTONOMY_PROMPT_VARIANTS.len()];
+
         let mut sections = Vec::new();
-        if self.auto_next_steps {
-            sections.push("Continue working autonomously on the current objectives. Break the overall goal into concrete next steps, execute them carefully in order, and run relevant tests as needed.");
+        sections.push(variant.preamble);
+        sections.push(variant.rules);
+        match (self.auto_next_steps, self.auto_next_idea) {
+            (true, false) => {
+                sections.push("Mode: next steps. Continue the current objective with concrete repo-local work. Run relevant tests and fix what breaks.");
+            }
+            (false, true) => {
+                sections.push("Mode: ideation. Do a quick feasibility scan, then list 10 concrete improvement ideas with 1-line rationale + feasibility note (already exists/partial/blocked). Rank (impact/effort/risk), pick #1, and implement it now. Run relevant tests.");
+            }
+            (true, true) => {
+                sections.push("Mode: full auto. If there are clear next steps on the current objective, do them; otherwise run the ideation process (10 ideas -> rank -> implement #1). Keep moving without asking the user questions.");
+            }
+            (false, false) => return None,
         }
-        if self.auto_next_idea {
-            sections.push("After finishing the current plan, shift into ideation mode and brainstorm at least three concrete improvements for this project. Pick the highest-impact idea and start executing it immediately.");
-        }
-        if self.auto_next_steps && self.auto_next_idea {
-            sections.push("Repeat this cycle indefinitely until a human interrupts you.");
-        }
-        sections.push("Use the latest summary of work below as context when outlining your follow-up actions.");
+        sections.push("Context: use the latest summary below. Do not repeat it verbatim.");
         let instructions = sections.join("\n\n");
         let prompt = format!("{instructions}\n\nLatest summary of work:\n{summary}");
         Some(AutonomyPrompt {
@@ -898,6 +986,7 @@ impl Session {
                 auto_next_steps: config.auto_next_steps,
                 auto_next_idea: config.auto_next_idea,
             },
+            autonomy_prompt_counter: AtomicU64::new(0),
             next_internal_sub_id: AtomicU64::new(0),
         });
 
@@ -994,7 +1083,10 @@ impl Session {
         let Some(summary) = last_agent_message else {
             return;
         };
-        let Some(plan) = self.autonomy.plan_for_summary(&summary) else {
+        let variant = self
+            .autonomy_prompt_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+        let Some(plan) = self.autonomy.plan_for_summary(&summary, variant) else {
             return;
         };
 
@@ -1038,7 +1130,8 @@ impl Session {
             text: prompt,
             text_elements: Vec::new(),
         }];
-        self.spawn_task(next_context, items, RegularTask).await;
+        self.spawn_task(next_context, items, RegularTask::new(false))
+            .await;
     }
 
     async fn get_total_token_usage(&self) -> i64 {
@@ -1749,6 +1842,25 @@ impl Session {
         state.replace_history(items);
     }
 
+    pub(crate) async fn remove_user_message_from_history_by_id(&self, message_id: &str) {
+        let mut state = self.state.lock().await;
+        let mut items = state.history.raw_items().to_vec();
+        let original_len = items.len();
+        items.retain(|item| {
+            !matches!(
+                item,
+                ResponseItem::Message {
+                    id: Some(id),
+                    role,
+                    ..
+                } if role == "user" && id == message_id
+            )
+        });
+        if items.len() != original_len {
+            state.replace_history(items);
+        }
+    }
+
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
@@ -2299,6 +2411,16 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::AddToHistory { text } => {
                 handlers::add_to_history(&sess, &config, text).await;
             }
+            Op::GetHistoryCwdOffsetsRequest { log_id, cwd } => {
+                handlers::get_history_cwd_offsets_request(
+                    &sess,
+                    &config,
+                    sub.id.clone(),
+                    log_id,
+                    cwd,
+                )
+                .await;
+            }
             Op::GetHistoryEntryRequest { offset, log_id } => {
                 handlers::get_history_entry_request(&sess, &config, sub.id.clone(), offset, log_id)
                     .await;
@@ -2453,7 +2575,7 @@ mod handlers {
         op: Op,
         previous_context: &mut Option<Arc<TurnContext>>,
     ) {
-        let (items, updates) = match op {
+        let (items, updates, record_user_message) = match op {
             Op::UserTurn {
                 cwd,
                 approval_policy,
@@ -2465,6 +2587,7 @@ mod handlers {
                 items,
                 collaboration_mode,
                 personality,
+                record_user_message,
             } => {
                 let collaboration_mode = collaboration_mode.or_else(|| {
                     Some(CollaborationMode {
@@ -2487,18 +2610,19 @@ mod handlers {
                         final_output_json_schema: Some(final_output_json_schema),
                         personality,
                     },
+                    record_user_message,
                 )
             }
             Op::UserInput {
                 items,
                 final_output_json_schema,
-            } => (
-                items,
-                SessionSettingsUpdate {
+            } => {
+                let updates = SessionSettingsUpdate {
                     final_output_json_schema: Some(final_output_json_schema),
                     ..Default::default()
-                },
-            ),
+                };
+                (items, updates, true)
+            }
             _ => unreachable!(),
         };
 
@@ -2519,8 +2643,29 @@ mod handlers {
             .get_otel_manager()
             .user_prompt(&items);
 
-        // Attempt to inject input into current task
-        if let Err(items) = sess.inject_input(items).await {
+        if record_user_message {
+            // Attempt to inject input into current task.
+            if let Err(items) = sess.inject_input(items).await {
+                let update_items = sess.build_settings_update_items(
+                    previous_context.as_ref(),
+                    &current_context,
+                    &previous_collaboration_mode,
+                    next_collaboration_mode.as_ref(),
+                );
+                if !update_items.is_empty() {
+                    sess.record_conversation_items(&current_context, &update_items)
+                        .await;
+                }
+
+                sess.refresh_mcp_servers_if_requested(&current_context)
+                    .await;
+                sess.spawn_task(Arc::clone(&current_context), items, RegularTask::new(true))
+                    .await;
+                *previous_context = Some(current_context);
+            }
+        } else {
+            // Internal follow-up turns should always start a new task so the prompt isn't persisted
+            // via the pending-input path.
             let update_items = sess.build_settings_update_items(
                 previous_context.as_ref(),
                 &current_context,
@@ -2534,7 +2679,7 @@ mod handlers {
 
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
-            sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
+            sess.spawn_task(Arc::clone(&current_context), items, RegularTask::new(false))
                 .await;
             *previous_context = Some(current_context);
         }
@@ -2631,11 +2776,52 @@ mod handlers {
 
     pub async fn add_to_history(sess: &Arc<Session>, config: &Arc<Config>, text: String) {
         let id = sess.conversation_id;
+        let cwd = {
+            let state = sess.state.lock().await;
+            state.session_configuration.cwd.clone()
+        };
         let config = Arc::clone(config);
         tokio::spawn(async move {
-            if let Err(e) = crate::message_history::append_entry(&text, &id, &config).await {
+            if let Err(e) =
+                crate::message_history::append_entry(&text, &id, Some(cwd), &config).await
+            {
                 warn!("failed to append to message history: {e}");
             }
+        });
+    }
+
+    pub async fn get_history_cwd_offsets_request(
+        sess: &Arc<Session>,
+        config: &Arc<Config>,
+        sub_id: String,
+        log_id: u64,
+        cwd: PathBuf,
+    ) {
+        let config = Arc::clone(config);
+        let sess_clone = Arc::clone(sess);
+
+        tokio::spawn(async move {
+            let cwd_for_scan = cwd.clone();
+            let offsets = tokio::task::spawn_blocking(move || {
+                crate::message_history::offsets_for_cwd(log_id, &cwd_for_scan, &config)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+            let event = Event {
+                id: sub_id,
+                msg: EventMsg::GetHistoryCwdOffsetsResponse(
+                    crate::protocol::GetHistoryCwdOffsetsResponseEvent {
+                        log_id,
+                        cwd,
+                        offsets,
+                    },
+                ),
+            };
+
+            sess_clone.send_event_raw(event).await;
         });
     }
 
@@ -3046,6 +3232,7 @@ pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    record_user_message: bool,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
     if input.is_empty() {
@@ -3081,10 +3268,25 @@ pub(crate) async fn run_turn(
             .await;
     }
 
+    let internal_user_prompt_id =
+        (!record_user_message).then(|| format!("internal-user-prompt:{}", turn_context.sub_id));
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
-    let response_item: ResponseItem = initial_input_for_turn.clone().into();
-    sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
-        .await;
+    let mut response_item: ResponseItem = initial_input_for_turn.clone().into();
+    if let (Some(id), ResponseItem::Message { id: item_id, .. }) =
+        (&internal_user_prompt_id, &mut response_item)
+    {
+        *item_id = Some(id.clone());
+    }
+
+    if record_user_message {
+        sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
+            .await;
+    } else {
+        // Record the internal prompt into the in-memory history only. It must be present for
+        // the duration of this turn, but should not be persisted or shown in the transcript.
+        sess.record_into_history(std::slice::from_ref(&response_item), turn_context.as_ref())
+            .await;
+    }
 
     if !skill_items.is_empty() {
         sess.record_conversation_items(&turn_context, &skill_items)
@@ -3122,6 +3324,19 @@ pub(crate) async fn run_turn(
 
         let sampling_request_input_messages = sampling_request_input
             .iter()
+            .filter(|item| {
+                let Some(internal_id) = internal_user_prompt_id.as_deref() else {
+                    return true;
+                };
+                !matches!(
+                    item,
+                    ResponseItem::Message {
+                        id: Some(id),
+                        role,
+                        ..
+                    } if role == "user" && id == internal_id
+                )
+            })
             .filter_map(|item| match parse_turn_item(item) {
                 Some(TurnItem::UserMessage(user_message)) => Some(user_message),
                 _ => None,
@@ -3249,11 +3464,15 @@ pub(crate) async fn run_turn(
         }
     }
 
+    if let Some(id) = internal_user_prompt_id {
+        sess.remove_user_message_from_history_by_id(&id).await;
+    }
+
     last_agent_message
 }
 
-const OPENAI_PROVIDER_FALLBACK_MODEL: &str = "gpt-5.2-codex";
-const ANTHROPIC_PROVIDER_FALLBACK_MODEL: &str = "claude-opus-4-5";
+const OPENAI_PROVIDER_FALLBACK_MODEL: &str = "gpt-5.3-codex";
+const ANTHROPIC_PROVIDER_FALLBACK_MODEL: &str = "claude-opus-4-6";
 
 fn should_attempt_provider_fallback(err: &CodexErr) -> bool {
     matches!(err, CodexErr::RetryLimit(limit) if limit.status == StatusCode::TOO_MANY_REQUESTS)
@@ -3491,7 +3710,6 @@ async fn run_sampling_request(
             return Err(err);
         }
 
-        // Use the configured provider-specific stream retry budget.
         let max_retries = turn_context.client.get_provider().stream_max_retries();
         if retries < max_retries {
             retries += 1;
@@ -4618,6 +4836,7 @@ mod tests {
                 auto_next_steps: config.auto_next_steps,
                 auto_next_idea: config.auto_next_idea,
             },
+            autonomy_prompt_counter: AtomicU64::new(0),
             next_internal_sub_id: AtomicU64::new(0),
         };
 
@@ -4730,6 +4949,7 @@ mod tests {
                 auto_next_steps: config.auto_next_steps,
                 auto_next_idea: config.auto_next_idea,
             },
+            autonomy_prompt_counter: AtomicU64::new(0),
             next_internal_sub_id: AtomicU64::new(0),
         });
 

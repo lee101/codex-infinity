@@ -257,8 +257,6 @@ pub async fn run_main(
         disable_command_timeouts: dangerously_disable_timeouts.then_some(true),
         passthrough_shell_environment: dangerously_disable_environment_wrapping.then_some(true),
         passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
-        auto_next_steps: cli.auto_next_steps.then_some(true),
-        auto_next_idea: cli.auto_next_idea.then_some(true),
         additional_writable_roots: additional_dirs,
         ..Default::default()
     };

@@ -59,6 +59,10 @@ pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
+fn default_true() -> bool {
+    true
+}
+
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct Submission {
@@ -102,6 +106,12 @@ pub enum Op {
     UserTurn {
         /// User input items, see `InputItem`
         items: Vec<UserInput>,
+
+        /// When false, the input should not be persisted or surfaced as an
+        /// explicit user message in the transcript. Intended for internally
+        /// generated follow-up turns (auto-next / autonomy).
+        #[serde(default = "default_true")]
+        record_user_message: bool,
 
         /// `cwd` to use with the [`SandboxPolicy`] and potentially tool calls
         /// such as `local_shell`.
@@ -227,6 +237,14 @@ pub enum Op {
 
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
+
+    /// Request the list of persistent message-history offsets associated with
+    /// a working directory.
+    ///
+    /// Intended for shell-style Up/Down navigation: front-ends can prioritize
+    /// entries from the current directory before falling back to global
+    /// history.
+    GetHistoryCwdOffsetsRequest { log_id: u64, cwd: PathBuf },
 
     /// Request the list of MCP tools available across all configured servers.
     /// Reply is delivered via `EventMsg::McpListToolsResponse`.
@@ -778,6 +796,9 @@ pub enum EventMsg {
 
     /// Response to GetHistoryEntryRequest.
     GetHistoryEntryResponse(GetHistoryEntryResponseEvent),
+
+    /// Response to GetHistoryCwdOffsetsRequest.
+    GetHistoryCwdOffsetsResponse(GetHistoryCwdOffsetsResponseEvent),
 
     /// List of MCP tools available to the agent.
     McpListToolsResponse(McpListToolsResponseEvent),
@@ -1974,6 +1995,15 @@ pub struct GetHistoryEntryResponseEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GetHistoryCwdOffsetsResponseEvent {
+    pub log_id: u64,
+    pub cwd: PathBuf,
+    /// Global history offsets (0-based line numbers) for entries recorded
+    /// under `cwd`, ordered oldest-to-newest.
+    pub offsets: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct McpListToolsResponseEvent {
     /// Fully qualified tool name -> tool definition.
     pub tools: std::collections::HashMap<String, McpTool>,
@@ -2508,7 +2538,7 @@ mod tests {
                 "model_provider_id": "openai",
                 "approval_policy": "never",
                 "sandbox_policy": {
-                    "type": "read-only"
+                    "mode": "read-only"
                 },
                 "cwd": "/home/user/project",
                 "reasoning_effort": "medium",

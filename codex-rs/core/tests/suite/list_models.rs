@@ -52,7 +52,9 @@ async fn list_models_returns_chatgpt_models() -> Result<()> {
 fn expected_models_for_api_key() -> Vec<ModelPreset> {
     vec![
         gpt_52_codex(),
+        gpt_53_codex(),
         gpt_5_2(),
+        gpt_5_3(),
         gpt_5_1_codex_max(),
         gpt_5_1_codex(),
         gpt_5_1_codex_mini(),
@@ -95,6 +97,38 @@ fn gpt_52_codex() -> ModelPreset {
             ),
         ],
         is_default: true,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gpt_53_codex() -> ModelPreset {
+    ModelPreset {
+        id: "gpt-5.3-codex".to_string(),
+        model: "gpt-5.3-codex".to_string(),
+        display_name: "gpt-5.3-codex".to_string(),
+        description: "Latest frontier agentic coding model.".to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![
+            effort(
+                ReasoningEffort::Low,
+                "Fast responses with lighter reasoning",
+            ),
+            effort(
+                ReasoningEffort::Medium,
+                "Balances speed and reasoning depth for everyday tasks",
+            ),
+            effort(
+                ReasoningEffort::High,
+                "Greater reasoning depth for complex problems",
+            ),
+            effort(
+                ReasoningEffort::XHigh,
+                "Extra high reasoning depth for complex problems",
+            ),
+        ],
+        is_default: false,
         upgrade: None,
         show_in_picker: true,
         supported_in_api: true,
@@ -216,6 +250,40 @@ fn gpt_5_2() -> ModelPreset {
                 (ReasoningEffort::XHigh, ReasoningEffort::XHigh),
             ]),
         )),
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gpt_5_3() -> ModelPreset {
+    ModelPreset {
+        id: "gpt-5.3".to_string(),
+        model: "gpt-5.3".to_string(),
+        display_name: "gpt-5.3".to_string(),
+        description:
+            "Latest frontier model with improvements across knowledge, reasoning and coding"
+                .to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![
+            effort(
+                ReasoningEffort::Low,
+                "Balances speed with some reasoning; useful for straightforward queries and short explanations",
+            ),
+            effort(
+                ReasoningEffort::Medium,
+                "Provides a solid balance of reasoning depth and latency for general-purpose tasks",
+            ),
+            effort(
+                ReasoningEffort::High,
+                "Maximizes reasoning depth for complex or ambiguous problems",
+            ),
+            effort(
+                ReasoningEffort::XHigh,
+                "Extra high reasoning for complex problems",
+            ),
+        ],
+        is_default: false,
+        upgrade: None,
         show_in_picker: true,
         supported_in_api: true,
     }

@@ -664,6 +664,10 @@ impl BottomPane {
         self.composer.set_history_metadata(log_id, entry_count);
     }
 
+    pub(crate) fn set_history_cwd(&mut self, cwd: PathBuf) {
+        self.composer.set_history_cwd(cwd);
+    }
+
     pub(crate) fn flush_paste_burst_if_due(&mut self) -> bool {
         self.composer.flush_paste_burst_if_due()
     }
@@ -685,6 +689,16 @@ impl BottomPane {
         if updated {
             self.request_redraw();
         }
+    }
+
+    pub(crate) fn on_history_cwd_offsets_response(
+        &mut self,
+        log_id: u64,
+        cwd: PathBuf,
+        offsets: Vec<usize>,
+    ) {
+        self.composer
+            .on_history_cwd_offsets_response(log_id, cwd, offsets);
     }
 
     pub(crate) fn on_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {

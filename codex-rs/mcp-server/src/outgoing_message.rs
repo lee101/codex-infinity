@@ -339,7 +339,7 @@ mod tests {
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
                 "sandbox_policy": {
-                    "type": "read-only"
+                    "mode": "read-only"
                 },
                 "cwd": "/home/user/project",
                 "reasoning_effort": session_configured_event.reasoning_effort,
@@ -404,7 +404,7 @@ mod tests {
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
                 "sandbox_policy": {
-                    "type": "read-only"
+                    "mode": "read-only"
                 },
                 "cwd": "/home/user/project",
                 "reasoning_effort": session_configured_event.reasoning_effort,

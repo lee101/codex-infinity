@@ -842,6 +842,11 @@ impl App {
         emit_deprecation_notice(&app_event_tx, ollama_chat_support_notice);
         emit_project_config_warnings(&app_event_tx, &config);
 
+        // The TUI implements auto-next itself (via NEXT: directives). Disable the core-level
+        // autonomy loop here to avoid dueling auto-prompts when auto-next is enabled.
+        config.auto_next_steps = false;
+        config.auto_next_idea = false;
+
         let thread_manager = Arc::new(ThreadManager::new(
             config.codex_home.clone(),
             auth_manager.clone(),

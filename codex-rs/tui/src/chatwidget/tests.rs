@@ -857,6 +857,8 @@ async fn make_chatwidget_manual(
         auto_next_steps: false,
         auto_next_idea: false,
         auto_next_mode: None,
+        auto_next_prompt_counter: 0,
+        last_auto_next_task: None,
         saw_plan_update_this_turn: false,
         last_separator_elapsed_secs: None,
         last_rendered_width: std::cell::Cell::new(None),
@@ -980,6 +982,76 @@ fn auto_next_directive_parsing_handles_multiline_next() {
     assert_eq!(directive.summary, "Did a thing");
     assert_eq!(directive.next.as_deref(), Some("Add tests\nThen docs"));
     assert!(!directive.is_done);
+}
+
+#[test]
+fn auto_next_directive_parsing_uses_first_next_for_summary_and_last_next_for_task() {
+    let directive = parse_auto_next_directive("Did work\nNEXT: First\nMore text\nNEXT: Second");
+    assert_eq!(directive.summary, "Did work");
+    assert_eq!(directive.next.as_deref(), Some("Second"));
+    assert!(!directive.is_done);
+}
+
+#[test]
+fn auto_next_sanitization_rejects_credential_requests_and_repeats() {
+    assert!(looks_like_user_input_request(
+        "Provide the Hetzner server id and token so I can run the probe."
+    ));
+    assert!(!looks_like_user_input_request(
+        "Add support for reading HETZNER_TOKEN from the environment."
+    ));
+
+    let sanitized = sanitize_auto_next_task(
+        Some("Provide the token so I can run it"),
+        Some("Add tests for the probe"),
+    );
+    assert!(sanitized.is_none());
+
+    let sanitized =
+        sanitize_auto_next_task(Some("Run   cargo   test\n-p codex-tui"), Some("Add docs"));
+    assert_eq!(sanitized.as_deref(), Some("Run cargo test -p codex-tui"));
+
+    let sanitized = sanitize_auto_next_task(
+        Some("Run cargo test -p codex-tui"),
+        Some("Run cargo test -p codex-tui"),
+    );
+    assert!(sanitized.is_none());
+}
+
+#[tokio::test]
+async fn auto_next_steps_submits_internal_turn_without_user_history() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.auto_next_steps = true;
+    chat.auto_next_mode = Some(AutoNextMode::Steps);
+
+    chat.on_task_complete(Some("Did work\nNEXT: Add tests".to_string()), false);
+
+    match op_rx.try_recv() {
+        Ok(Op::UserTurn {
+            record_user_message,
+            ..
+        }) => {
+            assert!(
+                !record_user_message,
+                "auto-next prompts should not be recorded as user messages"
+            );
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered.contains("AUTONOMOUS MODE"),
+        "internal auto-next prompt should not be rendered in the transcript"
+    );
 }
 
 fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {

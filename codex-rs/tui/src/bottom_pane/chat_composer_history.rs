@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -14,11 +15,22 @@ pub(crate) struct ChatComposerHistory {
     /// history file when the session started.
     history_entry_count: usize,
 
+    /// Session working directory used to prioritize history navigation.
+    history_cwd: Option<PathBuf>,
+
     /// Messages submitted by the user *during this UI session* (newest at END).
     local_history: Vec<String>,
 
     /// Cache of persistent history entries fetched on-demand.
     fetched_history: HashMap<usize, String>,
+
+    /// Persistent offsets recorded under `history_cwd` (oldest-to-newest).
+    cwd_offsets: Option<Vec<usize>>,
+    cwd_offsets_requested: bool,
+
+    /// Mapping from the UI's persistent-history indices (0..history_entry_count)
+    /// to history-file offsets, ordered oldest-to-newest.
+    persistent_order: Vec<usize>,
 
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
@@ -35,8 +47,12 @@ impl ChatComposerHistory {
         Self {
             history_log_id: None,
             history_entry_count: 0,
+            history_cwd: None,
             local_history: Vec::new(),
             fetched_history: HashMap::new(),
+            cwd_offsets: None,
+            cwd_offsets_requested: false,
+            persistent_order: Vec::new(),
             history_cursor: None,
             last_history_text: None,
         }
@@ -48,8 +64,36 @@ impl ChatComposerHistory {
         self.history_entry_count = entry_count;
         self.fetched_history.clear();
         self.local_history.clear();
+        self.cwd_offsets = None;
+        self.cwd_offsets_requested = false;
+        self.persistent_order = (0..entry_count).collect();
         self.history_cursor = None;
         self.last_history_text = None;
+    }
+
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.history_cwd = Some(cwd);
+        self.cwd_offsets = None;
+        self.cwd_offsets_requested = false;
+        self.persistent_order = (0..self.history_entry_count).collect();
+        self.reset_navigation();
+    }
+
+    pub fn maybe_request_cwd_offsets(&mut self, app_event_tx: &AppEventSender) {
+        if self.history_entry_count == 0 {
+            return;
+        }
+        if self.cwd_offsets.is_some() || self.cwd_offsets_requested {
+            return;
+        }
+        let (Some(log_id), Some(cwd)) = (&self.history_log_id, &self.history_cwd) else {
+            return;
+        };
+        self.cwd_offsets_requested = true;
+        app_event_tx.send(AppEvent::CodexOp(Op::GetHistoryCwdOffsetsRequest {
+            log_id: *log_id,
+            cwd: cwd.clone(),
+        }));
     }
 
     /// Record a message submitted by the user in the current session so it can
@@ -76,6 +120,19 @@ impl ChatComposerHistory {
         self.last_history_text = None;
     }
 
+    pub fn on_cwd_offsets_response(&mut self, log_id: u64, cwd: PathBuf, offsets: Vec<usize>) {
+        if self.history_log_id != Some(log_id) {
+            return;
+        }
+        if self.history_cwd.as_ref() != Some(&cwd) {
+            return;
+        }
+
+        self.cwd_offsets = Some(offsets);
+        self.rebuild_persistent_order();
+        self.reset_navigation();
+    }
+
     /// Should Up/Down key presses be interpreted as history navigation given
     /// the current content and cursor position of `textarea`?
     pub fn should_handle_navigation(&self, text: &str, cursor: usize) -> bool {
@@ -100,6 +157,8 @@ impl ChatComposerHistory {
     /// Handle <Up>. Returns true when the key was consumed and the caller
     /// should request a redraw.
     pub fn navigate_up(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
+        self.maybe_request_cwd_offsets(app_event_tx);
+
         let total_entries = self.history_entry_count + self.local_history.len();
         if total_entries == 0 {
             return None;
@@ -117,6 +176,8 @@ impl ChatComposerHistory {
 
     /// Handle <Down>.
     pub fn navigate_down(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
+        self.maybe_request_cwd_offsets(app_event_tx);
+
         let total_entries = self.history_entry_count + self.local_history.len();
         if total_entries == 0 {
             return None;
@@ -155,7 +216,18 @@ impl ChatComposerHistory {
         let text = entry?;
         self.fetched_history.insert(offset, text.clone());
 
-        if self.history_cursor == Some(offset as isize) {
+        let should_apply = self.history_cursor.is_some_and(|cursor| {
+            let Ok(cursor) = usize::try_from(cursor) else {
+                return false;
+            };
+            cursor < self.history_entry_count
+                && self
+                    .persistent_order
+                    .get(cursor)
+                    .is_some_and(|mapped_offset| *mapped_offset == offset)
+        });
+
+        if should_apply {
             self.last_history_text = Some(text.clone());
             return Some(text);
         }
@@ -180,6 +252,15 @@ impl ChatComposerHistory {
                 self.last_history_text = Some(text.clone());
                 return Some(text.clone());
             }
+        } else if let Some(offset) = self.persistent_order.get(global_idx).copied() {
+            if let Some(text) = self.fetched_history.get(&offset) {
+                self.last_history_text = Some(text.clone());
+                return Some(text.clone());
+            }
+            if let Some(log_id) = self.history_log_id {
+                let op = Op::GetHistoryEntryRequest { offset, log_id };
+                app_event_tx.send(AppEvent::CodexOp(op));
+            }
         } else if let Some(text) = self.fetched_history.get(&global_idx) {
             self.last_history_text = Some(text.clone());
             return Some(text.clone());
@@ -191,6 +272,39 @@ impl ChatComposerHistory {
             app_event_tx.send(AppEvent::CodexOp(op));
         }
         None
+    }
+
+    fn rebuild_persistent_order(&mut self) {
+        let Some(cwd_offsets) = self.cwd_offsets.as_ref() else {
+            self.persistent_order = (0..self.history_entry_count).collect();
+            return;
+        };
+
+        if cwd_offsets.is_empty() {
+            self.persistent_order = (0..self.history_entry_count).collect();
+            return;
+        }
+
+        let mut is_cwd = vec![false; self.history_entry_count];
+        for &offset in cwd_offsets {
+            if let Some(slot) = is_cwd.get_mut(offset) {
+                *slot = true;
+            }
+        }
+
+        let mut order = Vec::with_capacity(self.history_entry_count);
+        for offset in 0..self.history_entry_count {
+            if !is_cwd[offset] {
+                order.push(offset);
+            }
+        }
+        for &offset in cwd_offsets {
+            if offset < self.history_entry_count {
+                order.push(offset);
+            }
+        }
+
+        self.persistent_order = order;
     }
 }
 
@@ -296,5 +410,96 @@ mod tests {
         assert!(history.last_history_text.is_none());
 
         assert_eq!(Some("command3".into()), history.navigate_up(&tx));
+    }
+
+    #[test]
+    fn navigate_up_prioritizes_cwd_offsets_before_global_history() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+
+        let mut history = ChatComposerHistory::new();
+        history.set_metadata(1, 5);
+
+        let cwd = PathBuf::from("/repo");
+        history.set_cwd(cwd.clone());
+        history.on_cwd_offsets_response(1, cwd, vec![1, 3]);
+
+        // Newest should be the newest entry in the cwd set (offset 3).
+        assert!(history.navigate_up(&tx).is_none());
+        let event = rx.try_recv().expect("expected history entry request");
+        let AppEvent::CodexOp(history_request) = event else {
+            panic!("unexpected event variant");
+        };
+        assert_eq!(
+            history_request,
+            Op::GetHistoryEntryRequest {
+                log_id: 1,
+                offset: 3
+            }
+        );
+        assert_eq!(
+            history.on_entry_response(1, 3, Some("cwd-newest".into())),
+            Some("cwd-newest".into())
+        );
+
+        // Next should be the older cwd entry (offset 1).
+        assert!(history.navigate_up(&tx).is_none());
+        let event2 = rx
+            .try_recv()
+            .expect("expected second history entry request");
+        let AppEvent::CodexOp(history_request_2) = event2 else {
+            panic!("unexpected event variant");
+        };
+        assert_eq!(
+            history_request_2,
+            Op::GetHistoryEntryRequest {
+                log_id: 1,
+                offset: 1
+            }
+        );
+        assert_eq!(
+            history.on_entry_response(1, 1, Some("cwd-older".into())),
+            Some("cwd-older".into())
+        );
+
+        // After exhausting cwd entries, fall back to global history (newest non-cwd is offset 4).
+        assert!(history.navigate_up(&tx).is_none());
+        let event3 = rx.try_recv().expect("expected third history entry request");
+        let AppEvent::CodexOp(history_request_3) = event3 else {
+            panic!("unexpected event variant");
+        };
+        assert_eq!(
+            history_request_3,
+            Op::GetHistoryEntryRequest {
+                log_id: 1,
+                offset: 4
+            }
+        );
+    }
+
+    #[test]
+    fn empty_cwd_offsets_preserves_global_history_order() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+
+        let mut history = ChatComposerHistory::new();
+        history.set_metadata(1, 3);
+
+        let cwd = PathBuf::from("/new-repo");
+        history.set_cwd(cwd.clone());
+        history.on_cwd_offsets_response(1, cwd, Vec::new());
+
+        assert!(history.navigate_up(&tx).is_none());
+        let event = rx.try_recv().expect("expected AppEvent to be sent");
+        let AppEvent::CodexOp(history_request) = event else {
+            panic!("unexpected event variant");
+        };
+        assert_eq!(
+            history_request,
+            Op::GetHistoryEntryRequest {
+                log_id: 1,
+                offset: 2
+            }
+        );
     }
 }

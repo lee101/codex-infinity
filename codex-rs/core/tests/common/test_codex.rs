@@ -272,6 +272,7 @@ impl TestCodex {
                     text: prompt.into(),
                     text_elements: Vec::new(),
                 }],
+                record_user_message: true,
                 final_output_json_schema: None,
                 cwd: self.cwd.path().to_path_buf(),
                 approval_policy,

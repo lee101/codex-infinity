@@ -122,8 +122,8 @@ const PROVIDER_MODEL_DEFAULTS: &[(&str, ProviderModelDefaults)] = &[
     (
         "anthropic",
         ProviderModelDefaults {
-            agentic: "claude-opus-4-5",
-            full_context: "claude-opus-4-5",
+            agentic: "claude-opus-4-6",
+            full_context: "claude-opus-4-6",
         },
     ),
     (

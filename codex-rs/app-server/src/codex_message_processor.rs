@@ -3443,6 +3443,7 @@ impl CodexMessageProcessor {
         let _ = conversation
             .submit(Op::UserTurn {
                 items: mapped_items,
+                record_user_message: true,
                 cwd,
                 approval_policy,
                 sandbox_policy,

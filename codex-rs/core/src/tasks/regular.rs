@@ -12,8 +12,26 @@ use tracing::trace_span;
 use super::SessionTask;
 use super::SessionTaskContext;
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct RegularTask;
+#[derive(Clone, Copy)]
+pub(crate) struct RegularTask {
+    record_user_message: bool,
+}
+
+impl RegularTask {
+    pub(crate) fn new(record_user_message: bool) -> Self {
+        Self {
+            record_user_message,
+        }
+    }
+}
+
+impl Default for RegularTask {
+    fn default() -> Self {
+        Self {
+            record_user_message: true,
+        }
+    }
+}
 
 #[async_trait]
 impl SessionTask for RegularTask {
@@ -34,8 +52,14 @@ impl SessionTask for RegularTask {
         sess.services
             .otel_manager
             .apply_traceparent_parent(&run_turn_span);
-        run_turn(sess, ctx, input, cancellation_token)
-            .instrument(run_turn_span)
-            .await
+        run_turn(
+            sess,
+            ctx,
+            input,
+            self.record_user_message,
+            cancellation_token,
+        )
+        .instrument(run_turn_span)
+        .await
     }
 }

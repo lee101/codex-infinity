@@ -1290,6 +1290,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
                 text: follow_up_user.into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             final_output_json_schema: None,
             cwd: resumed.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,

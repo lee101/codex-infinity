@@ -102,6 +102,7 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
                 text: "please run a tool".into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,

@@ -540,6 +540,7 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
                 text: "call the rmcp image tool".into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,

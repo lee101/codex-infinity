@@ -74,6 +74,7 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
                 text: "run shell command".into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,

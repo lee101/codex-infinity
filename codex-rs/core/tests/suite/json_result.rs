@@ -78,6 +78,7 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
                 text: "hello world".into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             final_output_json_schema: Some(serde_json::from_str(SCHEMA)?),
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,

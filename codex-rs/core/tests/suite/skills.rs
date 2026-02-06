@@ -71,6 +71,7 @@ async fn user_turn_includes_skill_instructions() -> Result<()> {
                     path: skill_path.clone(),
                 },
             ],
+            record_user_message: true,
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,

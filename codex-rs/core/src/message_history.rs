@@ -5,7 +5,7 @@
 //! JSON-Lines tooling. Each record has the following schema:
 //!
 //! ````text
-//! {"conversation_id":"<uuid>","ts":<unix_seconds>,"text":"<message>"}
+//! {"session_id":"<uuid>","ts":<unix_seconds>,"text":"<message>","cwd":"<path>"}
 //! ````
 //!
 //! To minimise the chance of interleaved writes when multiple processes are
@@ -58,6 +58,8 @@ pub struct HistoryEntry {
     pub session_id: String,
     pub ts: u64,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 fn history_filepath(config: &Config) -> PathBuf {
@@ -72,6 +74,7 @@ fn history_filepath(config: &Config) -> PathBuf {
 pub(crate) async fn append_entry(
     text: &str,
     conversation_id: &ThreadId,
+    cwd: Option<PathBuf>,
     config: &Config,
 ) -> Result<()> {
     match config.history.persistence {
@@ -103,6 +106,7 @@ pub(crate) async fn append_entry(
         session_id: conversation_id.to_string(),
         ts,
         text: text.to_string(),
+        cwd,
     };
     let mut line = serde_json::to_string(&entry)
         .map_err(|e| std::io::Error::other(format!("failed to serialise history entry: {e}")))?;
@@ -263,6 +267,17 @@ pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<Hist
     lookup_history_entry(&path, log_id, offset)
 }
 
+/// Return the offsets of all history entries associated with `cwd` in the
+/// current history log. Offsets are zero-based and refer to the global line
+/// numbers in the history file.
+///
+/// Returns `None` when `log_id` does not match the current history file or when
+/// the file cannot be read.
+pub(crate) fn offsets_for_cwd(log_id: u64, cwd: &Path, config: &Config) -> Option<Vec<usize>> {
+    let path = history_filepath(config);
+    offsets_for_cwd_in_file(&path, log_id, cwd)
+}
+
 /// On Unix systems, ensure the file permissions are `0o600` (rw-------). If the
 /// permissions cannot be changed the error is propagated to the caller.
 #[cfg(unix)]
@@ -383,6 +398,81 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
     None
 }
 
+fn offsets_for_cwd_in_file(path: &Path, log_id: u64, cwd: &Path) -> Option<Vec<usize>> {
+    use std::io::BufRead;
+    use std::io::BufReader;
+
+    let file: File = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open history file for cwd scan");
+            return None;
+        }
+    };
+
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to stat history file");
+            return None;
+        }
+    };
+
+    let current_log_id = history_log_id(&metadata)?;
+    if log_id != 0 && current_log_id != log_id {
+        return None;
+    }
+
+    let cwd = cwd.to_path_buf();
+
+    for _ in 0..MAX_RETRIES {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let mut offsets = Vec::new();
+                let reader = BufReader::new(&file);
+                for (idx, line_res) in reader.lines().enumerate() {
+                    let line = match line_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to read line from history file during cwd scan"
+                            );
+                            return None;
+                        }
+                    };
+
+                    let entry = match serde_json::from_str::<HistoryEntry>(&line) {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "failed to parse history entry during cwd scan"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if entry.cwd.as_ref() == Some(&cwd) {
+                        offsets.push(idx);
+                    }
+                }
+                return Some(offsets);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to acquire shared lock on history file");
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(unix)]
 fn history_log_id(metadata: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -420,11 +510,13 @@ mod tests {
                 session_id: "first-session".to_string(),
                 ts: 1,
                 text: "first".to_string(),
+                cwd: None,
             },
             HistoryEntry {
                 session_id: "second-session".to_string(),
                 ts: 2,
                 text: "second".to_string(),
+                cwd: None,
             },
         ];
 
@@ -455,11 +547,13 @@ mod tests {
             session_id: "first-session".to_string(),
             ts: 1,
             text: "first".to_string(),
+            cwd: None,
         };
         let appended = HistoryEntry {
             session_id: "second-session".to_string(),
             ts: 2,
             text: "second".to_string(),
+            cwd: None,
         };
 
         let mut file = File::create(&history_path).expect("create history file");
@@ -506,9 +600,14 @@ mod tests {
 
         let history_path = codex_home.path().join("history.jsonl");
 
-        append_entry(&entry_one, &conversation_id, &config)
-            .await
-            .expect("write first entry");
+        append_entry(
+            &entry_one,
+            &conversation_id,
+            Some(codex_home.path().to_path_buf()),
+            &config,
+        )
+        .await
+        .expect("write first entry");
 
         let first_len = std::fs::metadata(&history_path).expect("metadata").len();
         let limit_bytes = first_len + 10;
@@ -516,9 +615,14 @@ mod tests {
         config.history.max_bytes =
             Some(usize::try_from(limit_bytes).expect("limit should fit into usize"));
 
-        append_entry(&entry_two, &conversation_id, &config)
-            .await
-            .expect("write second entry");
+        append_entry(
+            &entry_two,
+            &conversation_id,
+            Some(codex_home.path().to_path_buf()),
+            &config,
+        )
+        .await
+        .expect("write second entry");
 
         let contents = std::fs::read_to_string(&history_path).expect("read history");
 
@@ -553,15 +657,25 @@ mod tests {
 
         let history_path = codex_home.path().join("history.jsonl");
 
-        append_entry(&short_entry, &conversation_id, &config)
-            .await
-            .expect("write first entry");
+        append_entry(
+            &short_entry,
+            &conversation_id,
+            Some(codex_home.path().to_path_buf()),
+            &config,
+        )
+        .await
+        .expect("write first entry");
 
         let short_entry_len = std::fs::metadata(&history_path).expect("metadata").len();
 
-        append_entry(&long_entry, &conversation_id, &config)
-            .await
-            .expect("write second entry");
+        append_entry(
+            &long_entry,
+            &conversation_id,
+            Some(codex_home.path().to_path_buf()),
+            &config,
+        )
+        .await
+        .expect("write second entry");
 
         let two_entry_len = std::fs::metadata(&history_path).expect("metadata").len();
 
@@ -574,9 +688,14 @@ mod tests {
                 .expect("max bytes should fit into usize"),
         );
 
-        append_entry(&long_entry, &conversation_id, &config)
-            .await
-            .expect("write third entry");
+        append_entry(
+            &long_entry,
+            &conversation_id,
+            Some(codex_home.path().to_path_buf()),
+            &config,
+        )
+        .await
+        .expect("write third entry");
 
         let contents = std::fs::read_to_string(&history_path).expect("read history");
 
@@ -612,5 +731,33 @@ mod tests {
 
         assert_eq!(pruned_len, long_entry_len);
         assert!(pruned_len <= soft_cap_bytes.max(long_entry_len));
+    }
+
+    #[tokio::test]
+    async fn offsets_for_cwd_returns_matching_offsets() {
+        let codex_home = TempDir::new().expect("create temp dir");
+
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load config");
+
+        let conversation_id = ThreadId::new();
+        let cwd_one = codex_home.path().join("repo-one");
+        let cwd_two = codex_home.path().join("repo-two");
+
+        append_entry("first", &conversation_id, Some(cwd_one.clone()), &config)
+            .await
+            .expect("write first entry");
+
+        append_entry("second", &conversation_id, Some(cwd_two.clone()), &config)
+            .await
+            .expect("write second entry");
+
+        let (log_id, _count) = history_metadata(&config).await;
+
+        let offsets = offsets_for_cwd(log_id, &cwd_two, &config).expect("scan cwd offsets");
+        assert_eq!(offsets, vec![1]);
     }
 }

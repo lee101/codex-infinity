@@ -903,6 +903,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
+            record_user_message: true,
             cwd: config.cwd.clone(),
             approval_policy: config.approval_policy.value(),
             sandbox_policy: config.sandbox_policy.get().clone(),

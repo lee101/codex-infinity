@@ -316,7 +316,6 @@ pub async fn process_sse(
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) {
     let mut stream = stream.eventsource();
-    let mut response_error: Option<ApiError> = None;
 
     loop {
         let start = Instant::now();
@@ -332,10 +331,11 @@ pub async fn process_sse(
                 return;
             }
             Ok(None) => {
-                let error = response_error.unwrap_or(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
-                let _ = tx_event.send(Err(error)).await;
+                let _ = tx_event
+                    .send(Err(ApiError::Stream(
+                        "stream closed before response.completed".into(),
+                    )))
+                    .await;
                 return;
             }
             Err(_) => {
@@ -368,7 +368,8 @@ pub async fn process_sse(
             }
             Ok(None) => {}
             Err(error) => {
-                response_error = Some(error.into_api_error());
+                let _ = tx_event.send(Err(error.into_api_error())).await;
+                return;
             }
         };
     }

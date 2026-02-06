@@ -251,8 +251,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         additional_writable_roots: add_dir,
     };
 
-    let config =
+    let mut config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
+    // `codex-exec` is non-interactive; waiting through long SSE reconnect windows is surprising.
+    // Users can still opt into retries via config.toml (`stream_max_retries`).
+    if config.model_provider.stream_max_retries.is_none() {
+        config.model_provider.stream_max_retries = Some(0);
+    }
 
     if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
@@ -485,6 +490,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             let task_id = thread
                 .submit(Op::UserTurn {
                     items,
+                    record_user_message: true,
                     cwd: default_cwd,
                     approval_policy: default_approval_policy,
                     sandbox_policy: default_sandbox_policy.clone(),

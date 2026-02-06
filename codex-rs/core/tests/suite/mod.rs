@@ -50,6 +50,7 @@ mod pending_input;
 mod permissions_messages;
 mod personality;
 mod prompt_caching;
+mod provider_fallback;
 mod quota_exceeded;
 mod read_file;
 mod remote_models;

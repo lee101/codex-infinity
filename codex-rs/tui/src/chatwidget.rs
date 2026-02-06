@@ -415,21 +415,27 @@ fn parse_auto_next_directive(message: &str) -> AutoNextDirective {
     }
 
     let lines: Vec<&str> = message.lines().collect();
-    let mut next_index = None;
-    let mut next_inline = None;
+    let mut first_next_index = None;
+    let mut last_next_index = None;
+    let mut last_next_inline = None;
 
     for (idx, line) in lines.iter().enumerate() {
         if let Some(rest) = strip_next_prefix(line) {
-            next_index = Some(idx);
-            next_inline = Some(rest);
+            if first_next_index.is_none() {
+                first_next_index = Some(idx);
+            }
+            last_next_index = Some(idx);
+            last_next_inline = Some(rest);
         }
     }
 
     let mut summary = trimmed.to_string();
     let mut next = None;
-    if let Some(idx) = next_index {
-        summary = lines[..idx].join("\n").trim().to_string();
-        let inline = next_inline.unwrap_or("").trim();
+    if let Some(idx) = last_next_index {
+        if let Some(first_idx) = first_next_index {
+            summary = lines[..first_idx].join("\n").trim().to_string();
+        }
+        let inline = last_next_inline.unwrap_or("").trim();
         let next_text = if !inline.is_empty() {
             inline.to_string()
         } else {
@@ -459,24 +465,166 @@ fn consume_auto_next_done_marker(cwd: &PathBuf) -> bool {
     false
 }
 
-fn build_auto_prompt(mode: AutoNextMode, summary: &str, next: Option<&str>) -> String {
-    let (label, rule, default_task, done_hint, include_done_marker) = match mode {
+#[derive(Clone, Copy)]
+struct AutoPromptVariant {
+    rule: &'static str,
+    default_task: &'static str,
+    guidance: &'static str,
+}
+
+const AUTO_PROMPT_VARIANTS: usize = 5;
+
+const AUTO_NEXT_STEPS_VARIANTS: [AutoPromptVariant; AUTO_PROMPT_VARIANTS] = [
+    AutoPromptVariant {
+        rule: "AUTONOMY: do repo-local work; do not ask the user for input.",
+        default_task: "Pick the best next step you can execute right now and do it.",
+        guidance: "Constraints:\n- No credential/ID/log requests.\n- If blocked on external access, switch to offline work (tests, mocks, docs, better errors).\n- Do not repeat the context verbatim.\n- End with one *new* NEXT line, or NEXT: DONE.",
+    },
+    AutoPromptVariant {
+        rule: "AUTONOMY LOOP: implement, validate, continue.",
+        default_task: "Close one tight loop: implement -> fmt -> run relevant tests -> fix failures.",
+        guidance: "Rules:\n- Choose work you can do in this repo without user input.\n- If you notice a loop, change tactics (tests, docs, refactor) instead of restating blockers.\n- NEXT must be a single concise instruction.",
+    },
+    AutoPromptVariant {
+        rule: "AUTONOMY: prioritize correctness and maintainability.",
+        default_task: "Pick one concrete improvement, ship it, and validate (fmt/tests).",
+        guidance: "Rules:\n- Prefer specific, verifiable tasks (a failing test, a bug, an edge case).\n- If blocked, do offline hardening and end with NEXT: DONE.\n- Avoid verbatim repetition.",
+    },
+    AutoPromptVariant {
+        rule: "AUTONOMY (anti-loop): if stuck, change tactics.",
+        default_task: "Do the next useful repo-local thing (tests, refactor, docs, tooling).",
+        guidance: "Constraints:\n- Never output a NEXT that asks the user to do something.\n- If you truly cannot make safe progress, end with NEXT: DONE.\n- Keep the work varied to avoid loops.",
+    },
+    AutoPromptVariant {
+        rule: "AUTONOMY: keep moving; prefer small, high-leverage follow-ups.",
+        default_task: "Do the most natural follow-up (tests, edge cases, docs, polish), then validate it.",
+        guidance: "Rules:\n- No questions; no credentials.\n- Keep NEXT as exactly one line.\n- If you're done, NEXT: DONE.",
+    },
+];
+
+const AUTO_NEXT_IDEA_VARIANTS: [AutoPromptVariant; AUTO_PROMPT_VARIANTS] = [
+    AutoPromptVariant {
+        rule: "IDEATION: brainstorm, rank, then implement #1 immediately.",
+        default_task: "Generate 10 concrete improvement ideas, include feasibility checks, rank them (impact/effort/risk), then implement #1 now.",
+        guidance: "Process:\n- Do a quick repo scan first so ideas are grounded and not duplicates.\n- For each idea: 1-line rationale + feasibility note (exists/partial/blocked).\n- After ranking, implement #1 in this turn and run relevant tests.\n- Avoid repeating the same idea list verbatim across turns.",
+    },
+    AutoPromptVariant {
+        rule: "IDEATION: maximize impact per unit effort.",
+        default_task: "List 10 feasible improvements (brief reasoning), rank them, pick #1, and implement it now.",
+        guidance: "Constraints:\n- Check the repo first; note if an idea already exists.\n- No user questions; no credential requests.\n- Implement #1 immediately and validate with tests.",
+    },
+    AutoPromptVariant {
+        rule: "IDEATION: creative but concrete.",
+        default_task: "Find 10 specific, testable ideas (grounded in this repo), rank them, then implement #1 now.",
+        guidance: "Rules:\n- Each idea must name a concrete code area.\n- Note feasibility (exists/partial/blocked).\n- Implement #1 in this turn and validate.",
+    },
+    AutoPromptVariant {
+        rule: "IDEATION (anti-loop): change the direction each turn if needed.",
+        default_task: "Generate 10 grounded ideas, rank them, pick #1, and implement it now.",
+        guidance: "Constraints:\n- No generic filler; tie ideas to concrete code paths.\n- Don't reuse prior wording.\n- Run relevant tests after implementation.",
+    },
+    AutoPromptVariant {
+        rule: "IDEATION: decide for yourself and act.",
+        default_task: "List 10 candidate improvements, rank them, pick #1, and implement it now.",
+        guidance: "Rules:\n- Quick repo inspection first.\n- Keep the list tight; execution matters.\n- End with one NEXT line (or NEXT: DONE).",
+    },
+];
+
+fn normalize_auto_next_text(text: &str) -> String {
+    text.trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn looks_like_user_input_request(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with('?') {
+        return true;
+    }
+
+    let request_prefixes = [
+        "provide ", "send ", "share ", "paste ", "enter ", "give ", "tell ", "supply ", "set ",
+        "export ",
+    ];
+    let starts_with_request = request_prefixes
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if !starts_with_request {
+        return false;
+    }
+
+    // Heuristic: treat credential/input requests as invalid NEXT tasks to avoid loops.
+    let sensitive_markers = [
+        "token",
+        "api key",
+        "apikey",
+        "secret",
+        "credential",
+        "credentials",
+        "password",
+        "server id",
+        "access key",
+        "private key",
+        "log",
+        "logs",
+        "stack trace",
+        "trace",
+        "repro",
+        "reproduction",
+        "screenshot",
+    ];
+    sensitive_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower.contains("so i can")
+}
+
+fn sanitize_auto_next_task(next: Option<&str>, last_task: Option<&str>) -> Option<String> {
+    let next = next?;
+    let compact = next.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    if looks_like_user_input_request(&compact) {
+        return None;
+    }
+    if let Some(prev) = last_task
+        && normalize_auto_next_text(&compact) == normalize_auto_next_text(prev)
+    {
+        return None;
+    }
+    Some(compact)
+}
+
+fn build_auto_prompt(
+    mode: AutoNextMode,
+    variant: usize,
+    summary: &str,
+    next: Option<&str>,
+) -> String {
+    let (label, done_hint, include_done_marker, variants) = match mode {
         AutoNextMode::Steps => (
             "AUTONOMOUS MODE",
-            "Do not ask for permission or confirmation.",
-            "Pick the single best next step and do it now.",
             "if no logical next steps remain",
             true,
+            &AUTO_NEXT_STEPS_VARIANTS,
         ),
         AutoNextMode::Idea => (
             "AUTONOMOUS IDEATION MODE",
-            "Do not offer choices.",
-            "Pick one high-impact improvement and implement it now.",
             "if no further improvements remain",
             false,
+            &AUTO_NEXT_IDEA_VARIANTS,
         ),
     };
 
+    let variant = variants[variant % variants.len()];
     let task = next
         .and_then(|text| {
             let trimmed = text.trim();
@@ -486,10 +634,12 @@ fn build_auto_prompt(mode: AutoNextMode, summary: &str, next: Option<&str>) -> S
                 Some(trimmed)
             }
         })
-        .unwrap_or(default_task);
+        .unwrap_or(variant.default_task);
 
     let mut prompt = format!(
-        "{label}. {rule}\nTask:\n{task}\n\nAt the end, output exactly one of:\nNEXT: <one follow-up instruction>\nNEXT: DONE\nUse `NEXT: DONE` {done_hint}."
+        "{label}\n{rule}\n\nGoal:\n{task}\n\n{guidance}\n\nOutput must end with exactly one line:\nNEXT: <single imperative instruction>\nor\nNEXT: DONE\nUse `NEXT: DONE` {done_hint}.",
+        rule = variant.rule,
+        guidance = variant.guidance,
     );
 
     if include_done_marker {
@@ -497,7 +647,7 @@ fn build_auto_prompt(mode: AutoNextMode, summary: &str, next: Option<&str>) -> S
     }
 
     if !summary.trim().is_empty() {
-        prompt.push_str(&format!("\n\nPrevious work:\n{summary}"));
+        prompt.push_str(&format!("\n\nContext (do not quote verbatim):\n{summary}"));
     }
 
     prompt
@@ -574,6 +724,8 @@ pub(crate) struct ChatWidget {
     auto_next_steps: bool,
     auto_next_idea: bool,
     auto_next_mode: Option<AutoNextMode>,
+    auto_next_prompt_counter: usize,
+    last_auto_next_task: Option<String>,
     models_manager: Arc<ModelsManager>,
     otel_manager: OtelManager,
     session_header: SessionHeader,
@@ -876,6 +1028,7 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
+        self.bottom_pane.set_history_cwd(self.config.cwd.clone());
         self.set_skills(None);
         self.thread_id = Some(event.session_id);
         self.forked_from = event.forked_from_id;
@@ -1058,17 +1211,21 @@ impl ChatWidget {
                     AutoNextMode::Steps => {
                         let done_from_marker = consume_auto_next_done_marker(&self.config.cwd);
                         if directive.is_done || done_from_marker {
+                            self.last_auto_next_task = None;
                             if self.auto_next_idea {
                                 self.auto_next_mode = Some(AutoNextMode::Idea);
+                                let variant = self.auto_next_prompt_counter;
+                                self.auto_next_prompt_counter =
+                                    self.auto_next_prompt_counter.wrapping_add(1);
                                 let auto_prompt =
-                                    build_auto_prompt(AutoNextMode::Idea, &summary, None);
+                                    build_auto_prompt(AutoNextMode::Idea, variant, &summary, None);
                                 self.add_to_history(history_cell::new_info_event(
                                     "Auto-next-steps: done; switching to auto-next-idea."
                                         .to_string(),
                                     None,
                                 ));
                                 self.request_redraw();
-                                self.submit_user_message(auto_prompt.into());
+                                self.submit_internal_prompt(auto_prompt);
                             } else {
                                 self.auto_next_mode = None;
                                 self.add_to_history(history_cell::new_info_event(
@@ -1077,38 +1234,61 @@ impl ChatWidget {
                                 ));
                             }
                         } else {
+                            let next_task = sanitize_auto_next_task(
+                                directive.next.as_deref(),
+                                self.last_auto_next_task.as_deref(),
+                            );
+                            if let Some(task) = &next_task {
+                                self.last_auto_next_task = Some(task.clone());
+                            }
+                            let variant = self.auto_next_prompt_counter;
+                            self.auto_next_prompt_counter =
+                                self.auto_next_prompt_counter.wrapping_add(1);
                             let auto_prompt = build_auto_prompt(
                                 AutoNextMode::Steps,
+                                variant,
                                 &summary,
-                                directive.next.as_deref(),
+                                next_task.as_deref(),
                             );
                             self.add_to_history(history_cell::new_info_event(
                                 "Auto-next-steps: queued next step.".to_string(),
                                 None,
                             ));
                             self.request_redraw();
-                            self.submit_user_message(auto_prompt.into());
+                            self.submit_internal_prompt(auto_prompt);
                         }
                     }
                     AutoNextMode::Idea => {
                         if directive.is_done {
                             self.auto_next_mode = None;
+                            self.last_auto_next_task = None;
                             self.add_to_history(history_cell::new_info_event(
                                 "Auto-next-idea: done; stopping.".to_string(),
                                 None,
                             ));
                         } else {
+                            let next_task = sanitize_auto_next_task(
+                                directive.next.as_deref(),
+                                self.last_auto_next_task.as_deref(),
+                            );
+                            if let Some(task) = &next_task {
+                                self.last_auto_next_task = Some(task.clone());
+                            }
+                            let variant = self.auto_next_prompt_counter;
+                            self.auto_next_prompt_counter =
+                                self.auto_next_prompt_counter.wrapping_add(1);
                             let auto_prompt = build_auto_prompt(
                                 AutoNextMode::Idea,
+                                variant,
                                 &summary,
-                                directive.next.as_deref(),
+                                next_task.as_deref(),
                             );
                             self.add_to_history(history_cell::new_info_event(
                                 "Auto-next-idea: queued next idea.".to_string(),
                                 None,
                             ));
                             self.request_redraw();
-                            self.submit_user_message(auto_prompt.into());
+                            self.submit_internal_prompt(auto_prompt);
                         }
                     }
                 }
@@ -1744,6 +1924,19 @@ impl ChatWidget {
             .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
     }
 
+    fn on_get_history_cwd_offsets_response(
+        &mut self,
+        event: codex_core::protocol::GetHistoryCwdOffsetsResponseEvent,
+    ) {
+        let codex_core::protocol::GetHistoryCwdOffsetsResponseEvent {
+            log_id,
+            cwd,
+            offsets,
+        } = event;
+        self.bottom_pane
+            .on_history_cwd_offsets_response(log_id, cwd, offsets);
+    }
+
     fn on_shutdown_complete(&mut self) {
         self.request_immediate_exit();
     }
@@ -2202,6 +2395,8 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
+            auto_next_prompt_counter: 0,
+            last_auto_next_task: None,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(model_for_header),
@@ -2328,6 +2523,8 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
+            auto_next_prompt_counter: 0,
+            last_auto_next_task: None,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(model_for_header),
@@ -2455,6 +2652,8 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_mode: AutoNextMode::initial(auto_next_steps, auto_next_idea),
+            auto_next_prompt_counter: 0,
+            last_auto_next_task: None,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(header_model),
@@ -3058,6 +3257,7 @@ impl ChatWidget {
 
         let op = Op::UserTurn {
             items,
+            record_user_message: true,
             cwd: self.config.cwd.clone(),
             approval_policy: self.config.approval_policy.value(),
             sandbox_policy: self.config.sandbox_policy.get().clone(),
@@ -3093,6 +3293,45 @@ impl ChatWidget {
                 local_image_paths,
             ));
         }
+
+        self.needs_final_message_separator = false;
+    }
+
+    fn submit_internal_prompt(&mut self, text: String) {
+        if !self.is_session_configured() {
+            tracing::warn!("cannot submit internal prompt before session is configured; dropping");
+            return;
+        }
+
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        let items = vec![UserInput::Text {
+            text,
+            text_elements: Vec::new(),
+        }];
+
+        let op = Op::UserTurn {
+            items,
+            record_user_message: false,
+            cwd: self.config.cwd.clone(),
+            approval_policy: self.config.approval_policy.value(),
+            sandbox_policy: self.config.sandbox_policy.get().clone(),
+            model: self.stored_collaboration_mode.model().to_string(),
+            effort: self.stored_collaboration_mode.reasoning_effort(),
+            summary: self.config.model_reasoning_summary,
+            final_output_json_schema: None,
+            collaboration_mode: self
+                .collaboration_modes_enabled()
+                .then(|| self.stored_collaboration_mode.clone()),
+            personality: None,
+        };
+
+        self.codex_op_tx.send(op).unwrap_or_else(|e| {
+            tracing::error!("failed to send message: {e}");
+        });
 
         self.needs_final_message_separator = false;
     }
@@ -3211,6 +3450,9 @@ impl ChatWidget {
             EventMsg::WebSearchBegin(ev) => self.on_web_search_begin(ev),
             EventMsg::WebSearchEnd(ev) => self.on_web_search_end(ev),
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
+            EventMsg::GetHistoryCwdOffsetsResponse(ev) => {
+                self.on_get_history_cwd_offsets_response(ev)
+            }
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
             EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
@@ -3888,7 +4130,8 @@ impl ChatWidget {
         });
         let warn_for_model = preset.model.starts_with("gpt-5.1-codex")
             || preset.model.starts_with("gpt-5.1-codex-max")
-            || preset.model.starts_with("gpt-5.2");
+            || preset.model.starts_with("gpt-5.2")
+            || preset.model.starts_with("gpt-5.3");
 
         struct EffortChoice {
             stored: Option<ReasoningEffortConfig>,

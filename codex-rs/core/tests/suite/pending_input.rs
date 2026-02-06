@@ -13,7 +13,8 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::sync::oneshot;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
+use tokio::time::sleep;
 
 fn ev_message_item_done(id: &str, text: &str) -> Value {
     serde_json::json!({
