@@ -83,11 +83,13 @@ const binaryName = process.platform === "win32" ? "codex.exe" : "codex";
 // Find the first available binary
 let binaryPath = null;
 let archRoot = null;
+let selectedTriple = null;
 for (const triple of targetTriples) {
   archRoot = path.join(vendorRoot, triple);
   const candidatePath = path.join(archRoot, "codex", binaryName);
   if (existsSync(candidatePath)) {
     binaryPath = candidatePath;
+    selectedTriple = triple;
     break;
   }
 }
@@ -98,6 +100,21 @@ if (!binaryPath) {
     `No binary found for platform: ${platform} (${arch}). Tried: ${tried}. ` +
       "This usually means the npm package was published without native binaries. " +
       "Reinstall from a fixed release or ask the publisher to populate vendor/ before publishing.",
+  );
+}
+
+// If we're on Linux and do not appear to be running glibc, avoid attempting to
+// execute a GNU (glibc-linked) binary since it will likely fail with a vague
+// ENOENT/dynamic-linker error.
+if (
+  (platform === "linux" || platform === "android") &&
+  !prefersGnu() &&
+  selectedTriple?.includes("-gnu")
+) {
+  throw new Error(
+    "This release does not include a musl build of Codex. " +
+      "Your system does not appear to be running glibc, so the bundled GNU binary " +
+      "will not run. Use a glibc-based Linux distribution or install a musl-compatible build.",
   );
 }
 

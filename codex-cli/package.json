@@ -7,15 +7,21 @@
     "codex-infinity": "bin/codex-infinity.js"
   },
   "scripts": {
-    "prepack": "node scripts/verify_vendor.js"
+    "prepack": "CODEX_INFINITY_REQUIRED_GROUPS=linux-x64 node scripts/verify_vendor.js"
   },
   "type": "module",
   "engines": {
     "node": ">=16"
   },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "files": [
     "bin",
-    "vendor"
+    "vendor/x86_64-unknown-linux-gnu"
   ],
   "repository": {
     "type": "git",
