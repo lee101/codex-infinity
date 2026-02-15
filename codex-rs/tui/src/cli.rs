@@ -80,6 +80,14 @@ pub struct Cli {
     #[arg(long = "full-auto", default_value_t = false)]
     pub full_auto: bool,
 
+    /// After each Codex response, automatically ask it to continue with the natural next steps (including testing).
+    #[arg(long = "auto-next-steps", default_value_t = false)]
+    pub auto_next_steps: bool,
+
+    /// After each Codex response, automatically ask it to brainstorm new follow-on improvement ideas for this project.
+    #[arg(long = "auto-next-idea", default_value_t = false)]
+    pub auto_next_idea: bool,
+
     /// Skip all confirmation prompts and execute commands without sandboxing.
     /// EXTREMELY DANGEROUS. Intended solely for running in environments that are externally sandboxed.
     #[arg(
@@ -89,6 +97,30 @@ pub struct Cli {
         conflicts_with_all = ["approval_policy", "full_auto"]
     )]
     pub dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
+    #[arg(
+        long = "yolo2",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_disable_timeouts: bool,
+
+    /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
+    #[arg(
+        long = "yolo3",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_disable_environment_wrapping: bool,
+
+    /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
+    #[arg(
+        long = "yolo4",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_passthrough_stdio: bool,
 
     /// Tell the agent to use the specified directory as its working root.
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
