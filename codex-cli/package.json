@@ -1,22 +1,43 @@
 {
-  "name": "@openai/codex",
-  "version": "0.0.0-dev",
+  "name": "@codex-infinity/codex-infinity",
+  "version": "1.1.0",
   "license": "Apache-2.0",
+  "description": "Codex Infinity - a smarter coding agent that can run forever",
   "bin": {
-    "codex": "bin/codex.js"
+    "codex-infinity": "bin/codex-infinity.js"
+  },
+  "scripts": {
+    "prepack": "node -e \"process.env.CODEX_INFINITY_REQUIRED_GROUPS='any';require('child_process').execFileSync(process.execPath,['scripts/verify_vendor.js'],{stdio:'inherit'})\""
   },
   "type": "module",
   "engines": {
     "node": ">=16"
   },
+  "os": [
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "files": [
     "bin",
-    "vendor"
+    "vendor/x86_64-unknown-linux-gnu",
+    "vendor/x86_64-pc-windows-gnu",
+    "vendor/x86_64-pc-windows-msvc"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openai/codex.git",
+    "url": "git+https://github.com/lee101/codex-infinity.git",
     "directory": "codex-cli"
   },
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "cli",
+    "autonomous",
+    "codex"
+  ],
   "packageManager": "pnpm@10.29.3+sha512.498e1fb4cca5aa06c1dcf2611e6fafc50972ffe7189998c409e90de74566444298ffe43e6cd2acdc775ba1aa7cc5e092a8b7054c811ba8c5770f84693d33d2dc"
 }
