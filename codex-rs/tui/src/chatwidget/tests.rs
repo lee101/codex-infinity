@@ -1524,6 +1524,8 @@ async fn helpers_are_available_and_do_not_panic() {
         model: Some(resolved_model),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         otel_manager,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
     let mut w = ChatWidget::new(init, thread_manager);
     // Basic construction sanity.
@@ -1668,6 +1670,8 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -4245,6 +4249,8 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         model: Some(resolved_model.clone()),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         otel_manager,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new(init, thread_manager);
@@ -4294,6 +4300,8 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         model: Some(resolved_model.clone()),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         otel_manager,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new(init, thread_manager);
