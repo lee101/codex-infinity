@@ -1,59 +1,126 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  <img src="./.github/codex-infinity-200h.webp" alt="Codex Infinity" height="200" />
 </p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+
+<h1 align="center">Codex Infinity</h1>
+
+<p align="center"><code>npm i -g @codex-infinity/codex-infinity</code></p>
+
+<p align="center"><strong>Codex Infinity</strong> is a smarter coding agent that can run forever.</p>
+
+<p align="center">Based on <a href="https://github.com/openai/codex">OpenAI Codex CLI</a> with autonomous workflow extensions.</p>
 
 ---
 
+## What makes Codex Infinity different?
+
+Two arguments turn Codex into a fully autonomous coding agent:
+
+- **`--auto-next-steps`** -- After each response, automatically continues with the next logical steps (including testing)
+- **`--auto-next-idea`** -- Generates and implements new improvement ideas for your codebase
+
+```shell
+# Autonomous coding -- completes tasks then moves to the next one
+codex-infinity --auto-next-steps "fix all lint errors and add tests"
+
+# Fully autonomous -- dreams up and implements improvements forever
+codex-infinity --auto-next-steps --auto-next-idea
+
+# Full auto mode with autonomous continuation
+codex-infinity --full-auto --auto-next-steps
+```
+
 ## Quickstart
 
-### Installing and running Codex CLI
-
-Install globally with your preferred package manager:
-
 ```shell
-# Install using npm
-npm install -g @openai/codex
+npm install -g @codex-infinity/codex-infinity
 ```
 
+Then run `codex-infinity` to get started.
+
+### Authentication
+
+Run `codex-infinity` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
+
+Or use an API key:
+
 ```shell
-# Install using Homebrew
-brew install --cask codex
+export OPENAI_API_KEY=sk-...
+codex-infinity "your prompt"
 ```
 
-Then simply run `codex` to get started.
+## CLI flags
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+| Flag | Description |
+|------|-------------|
+| `--auto-next-steps` | Auto-continue with next logical steps after each response |
+| `--auto-next-idea` | Auto-brainstorm and implement new improvement ideas |
+| `--full-auto` | Low-friction sandboxed automatic execution |
+| `--yolo` | Skip approvals and sandbox (dangerous) |
+| `--yolo2` | Like yolo + disable command timeouts |
+| `--yolo3` | Like yolo2 + pass full host environment |
+| `--yolo4` | Like yolo3 + stream stdout/stderr directly |
+| `-m MODEL` | Select model (e.g. `gpt-5.3-codex`, `o3`) |
+| `--oss` | Use local model provider (LM Studio / Ollama) |
+| `--search` | Enable live web search |
+| `-i FILE` | Attach image(s) to initial prompt |
+| `--cd DIR` | Set working directory |
+| `--profile NAME` | Use config profile from config.toml |
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+## Examples
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+```shell
+# Fix a bug with full autonomy
+codex-infinity --full-auto --auto-next-steps "fix the failing test in auth.test.ts"
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+# Refactor with idea generation
+codex-infinity --auto-next-steps --auto-next-idea "refactor the API layer"
 
-</details>
+# Quick one-shot with yolo mode
+codex-infinity --yolo "add error handling to all API endpoints"
 
-### Using Codex with your ChatGPT plan
+# Use a specific model
+codex-infinity -m gpt-5.3-codex --auto-next-steps "optimize database queries"
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Team, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+# Use local models
+codex-infinity --oss -m llama3 "explain this codebase"
+```
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+## Features
+
+- **Autonomous operation** -- `--auto-next-steps` keeps it working without intervention
+- **Idea generation** -- `--auto-next-idea` brainstorms and implements improvements
+- **AnyLLM** -- OpenAI, local models via LM Studio/Ollama, bring your own provider
+- **Local execution** -- runs entirely on your machine
+- **Concise prompts** -- stripped-down system prompts for faster, more focused responses
+- **Higher reliability** -- increased retry limits for long-running autonomous sessions
+
+## Development
+
+### Build from source (Rust CLI)
+
+```bash
+cd codex-rs
+cargo build --release -p codex-tui
+./target/release/codex "your prompt here"
+```
+
+### Build npm package
+
+```bash
+cd codex-cli
+npm install
+```
+
+### Project structure
+
+- `codex-rs/` -- Rust workspace (TUI, core, sandbox, etc.)
+- `codex-cli/` -- npm package wrapper
+- `sdk/` -- TypeScript SDK
 
 ## Docs
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+Based on [OpenAI Codex CLI](https://github.com/openai/codex). Licensed under [Apache-2.0](LICENSE).
