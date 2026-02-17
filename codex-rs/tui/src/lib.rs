@@ -130,12 +130,18 @@ pub async fn run_main(
     mut cli: Cli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<AppExitInfo> {
+    // yolo2/3/4 imply yolo (bypass approvals + sandbox).
+    let effective_yolo = cli.dangerously_bypass_approvals_and_sandbox
+        || cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
             Some(AskForApproval::OnRequest),
         )
-    } else if cli.dangerously_bypass_approvals_and_sandbox {
+    } else if effective_yolo {
         (
             Some(SandboxMode::DangerFullAccess),
             Some(AskForApproval::Never),
@@ -701,6 +707,8 @@ async fn run_ratatui_app(
         prompt,
         images,
         no_alt_screen,
+        auto_next_steps,
+        auto_next_idea,
         ..
     } = cli;
 
@@ -720,6 +728,8 @@ async fn run_ratatui_app(
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,
+        auto_next_steps,
+        auto_next_idea,
     )
     .await;
 

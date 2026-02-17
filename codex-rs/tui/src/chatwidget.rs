@@ -417,9 +417,10 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) is_first_run: bool,
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) model: Option<String>,
-    // Shared latch so we only warn once about invalid status-line item IDs.
     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) otel_manager: OtelManager,
+    pub(crate) auto_next_steps: bool,
+    pub(crate) auto_next_idea: bool,
 }
 
 #[derive(Default)]
@@ -621,6 +622,8 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -1371,6 +1374,23 @@ impl ChatWidget {
         });
 
         self.maybe_show_pending_rate_limit_prompt();
+
+        // Auto-next: queue a continuation prompt after turn completes.
+        if !from_replay && self.queued_user_messages.is_empty() {
+            self.maybe_auto_next();
+        }
+    }
+
+    fn maybe_auto_next(&mut self) {
+        if self.auto_next_idea {
+            let prompt = "Continue: brainstorm a new improvement idea for this project and implement it. Think about what would make the biggest impact, then do it. Run tests to verify.";
+            self.queue_user_message(prompt.to_string().into());
+            self.maybe_send_next_queued_input();
+        } else if self.auto_next_steps {
+            let prompt = "Continue: what are the natural next steps? Implement them, including running any relevant tests.";
+            self.queue_user_message(prompt.to_string().into());
+            self.maybe_send_next_queued_input();
+        }
     }
 
     fn maybe_prompt_plan_implementation(&mut self) {
@@ -2570,6 +2590,8 @@ impl ChatWidget {
             model,
             status_line_invalid_items_warned,
             otel_manager,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
@@ -2686,6 +2708,8 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            auto_next_steps,
+            auto_next_idea,
         };
 
         widget.prefetch_rate_limits();
@@ -2738,6 +2762,8 @@ impl ChatWidget {
             model,
             status_line_invalid_items_warned,
             otel_manager,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
@@ -2853,6 +2879,8 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            auto_next_steps,
+            auto_next_idea,
         };
 
         widget.prefetch_rate_limits();
@@ -2894,6 +2922,8 @@ impl ChatWidget {
             model,
             status_line_invalid_items_warned,
             otel_manager,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
@@ -3009,6 +3039,8 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            auto_next_steps,
+            auto_next_idea,
         };
 
         widget.prefetch_rate_limits();

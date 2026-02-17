@@ -527,6 +527,8 @@ pub(crate) struct App {
     harness_overrides: ConfigOverrides,
     runtime_approval_policy_override: Option<AskForApproval>,
     runtime_sandbox_policy_override: Option<SandboxPolicy>,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -616,7 +618,6 @@ impl App {
             config: cfg,
             frame_requester: tui.frame_requester(),
             app_event_tx: self.app_event_tx.clone(),
-            // Fork/resume bootstraps here don't carry any prefilled message content.
             initial_user_message: None,
             enhanced_keys_supported: self.enhanced_keys_supported,
             auth_manager: self.auth_manager.clone(),
@@ -627,6 +628,8 @@ impl App {
             model: Some(self.chat_widget.current_model().to_string()),
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             otel_manager: self.otel_manager.clone(),
+            auto_next_steps: self.auto_next_steps,
+            auto_next_idea: self.auto_next_idea,
         }
     }
 
@@ -992,6 +995,8 @@ impl App {
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
+        auto_next_steps: bool,
+        auto_next_idea: bool,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -1089,6 +1094,8 @@ impl App {
                     model: Some(model.clone()),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 ChatWidget::new(init, thread_manager.clone())
             }
@@ -1107,7 +1114,6 @@ impl App {
                     initial_user_message: crate::chatwidget::create_initial_user_message(
                         initial_prompt.clone(),
                         initial_images.clone(),
-                        // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
                     enhanced_keys_supported,
@@ -1119,6 +1125,8 @@ impl App {
                     model: config.model.clone(),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
             }
@@ -1138,7 +1146,6 @@ impl App {
                     initial_user_message: crate::chatwidget::create_initial_user_message(
                         initial_prompt.clone(),
                         initial_images.clone(),
-                        // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
                     enhanced_keys_supported,
@@ -1150,6 +1157,8 @@ impl App {
                     model: config.model.clone(),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
             }
@@ -1174,6 +1183,8 @@ impl App {
             harness_overrides,
             runtime_approval_policy_override: None,
             runtime_sandbox_policy_override: None,
+            auto_next_steps,
+            auto_next_idea,
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
@@ -1382,7 +1393,6 @@ impl App {
                     config: self.config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: self.app_event_tx.clone(),
-                    // New sessions start without prefilled message content.
                     initial_user_message: None,
                     enhanced_keys_supported: self.enhanced_keys_supported,
                     auth_manager: self.auth_manager.clone(),
@@ -1393,6 +1403,8 @@ impl App {
                     model: Some(model),
                     status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
                     otel_manager: self.otel_manager.clone(),
+                    auto_next_steps: self.auto_next_steps,
+                    auto_next_idea: self.auto_next_idea,
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
                 self.reset_thread_event_state();
@@ -3076,6 +3088,8 @@ mod tests {
             harness_overrides: ConfigOverrides::default(),
             runtime_approval_policy_override: None,
             runtime_sandbox_policy_override: None,
+            auto_next_steps: false,
+            auto_next_idea: false,
             file_search,
             transcript_cells: Vec::new(),
             overlay: None,
@@ -3134,6 +3148,8 @@ mod tests {
                 harness_overrides: ConfigOverrides::default(),
                 runtime_approval_policy_override: None,
                 runtime_sandbox_policy_override: None,
+                auto_next_steps: false,
+                auto_next_idea: false,
                 file_search,
                 transcript_cells: Vec::new(),
                 overlay: None,
