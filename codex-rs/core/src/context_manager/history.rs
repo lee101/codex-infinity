@@ -134,6 +134,42 @@ impl ContextManager {
         }
     }
 
+    /// Remove items from the middle of history, keeping the oldest and newest
+    /// quarters intact. This "middle-out" strategy preserves the original task
+    /// context (head) and the most recent work (tail) while shedding the bulk
+    /// of intermediate history.
+    ///
+    /// On successive calls the middle section shrinks further — each call
+    /// removes 50% of whatever is currently in the middle — giving recursive
+    /// middle-out behaviour without requiring the caller to track state.
+    ///
+    /// Returns the number of items removed, or 0 if the history is too small
+    /// to trim further.
+    pub(crate) fn remove_middle_chunk(&mut self) -> usize {
+        let n = self.items.len();
+        if n < 4 {
+            // Too small to middle-out; remove the first item as a last resort.
+            if n > 0 {
+                self.remove_first_item();
+                return 1;
+            }
+            return 0;
+        }
+        let keep_head = n / 4;
+        let keep_tail = n / 4;
+        let drain_start = keep_head;
+        let drain_end = n.saturating_sub(keep_tail);
+        if drain_start >= drain_end {
+            return 0;
+        }
+        let removed = drain_end - drain_start;
+        self.items.drain(drain_start..drain_end);
+        // Repair any broken call/output pairs introduced by the drain.
+        normalize::remove_orphan_outputs(&mut self.items);
+        normalize::ensure_call_outputs_present(&mut self.items);
+        removed
+    }
+
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
