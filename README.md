@@ -1,7 +1,6 @@
 <p align="center">
   <img src="./.github/codex-infinity-200h.webp" alt="Codex Infinity" height="200" />
 </p>
-
 <h1 align="center">Codex Infinity</h1>
 
 <p align="center"><code>npm i -g @codex-infinity/codex-infinity</code></p>
