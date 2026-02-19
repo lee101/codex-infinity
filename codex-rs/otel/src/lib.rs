@@ -9,14 +9,20 @@ use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
 use crate::metrics::Result as MetricsResult;
-use crate::metrics::timer::Timer;
+pub use crate::metrics::timer::Timer;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
 use crate::otel_provider::OtelProvider;
 use codex_protocol::ThreadId;
+pub use codex_utils_string::sanitize_metric_tag_value;
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use serde::Serialize;
 use std::time::Duration;
 use strum_macros::Display;
+use tracing::debug;
+
+pub use crate::metrics::runtime_metrics::RuntimeMetricTotals;
+pub use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
 
 #[derive(Debug, Clone, Serialize, Display)]
 #[serde(rename_all = "snake_case")]
@@ -25,12 +31,21 @@ pub enum ToolDecisionSource {
     User,
 }
 
+/// Maps to core AuthMode to avoid a circular dependency on codex-core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum TelemetryAuthMode {
+    ApiKey,
+    Chatgpt,
+}
+
 #[derive(Debug, Clone)]
 pub struct OtelEventMetadata {
     pub(crate) conversation_id: ThreadId,
     pub(crate) auth_mode: Option<String>,
     pub(crate) account_id: Option<String>,
     pub(crate) account_email: Option<String>,
+    pub(crate) originator: String,
+    pub(crate) session_source: String,
     pub(crate) model: String,
     pub(crate) slug: String,
     pub(crate) log_user_prompts: bool,
@@ -136,6 +151,39 @@ impl OtelManager {
         metrics.shutdown()
     }
 
+    pub fn snapshot_metrics(&self) -> MetricsResult<ResourceMetrics> {
+        let Some(metrics) = &self.metrics else {
+            return Err(MetricsError::ExporterDisabled);
+        };
+        metrics.snapshot()
+    }
+
+    /// Collect and discard a runtime metrics snapshot to reset delta accumulators.
+    pub fn reset_runtime_metrics(&self) {
+        if self.metrics.is_none() {
+            return;
+        }
+        if let Err(err) = self.snapshot_metrics() {
+            debug!("runtime metrics reset skipped: {err}");
+        }
+    }
+
+    /// Collect a runtime metrics summary if debug snapshots are available.
+    pub fn runtime_metrics_summary(&self) -> Option<RuntimeMetricsSummary> {
+        let snapshot = match self.snapshot_metrics() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return None;
+            }
+        };
+        let summary = RuntimeMetricsSummary::from_snapshot(&snapshot);
+        if summary.is_empty() {
+            None
+        } else {
+            Some(summary)
+        }
+    }
+
     fn tags_with_metadata<'a>(
         &'a self,
         tags: &'a [(&'a str, &'a str)],
@@ -149,8 +197,18 @@ impl OtelManager {
         if !self.metrics_use_metadata_tags {
             return Ok(Vec::new());
         }
-        let mut tags = Vec::with_capacity(5);
+        let mut tags = Vec::with_capacity(6);
         Self::push_metadata_tag(&mut tags, "auth_mode", self.metadata.auth_mode.as_deref())?;
+        Self::push_metadata_tag(
+            &mut tags,
+            "session_source",
+            Some(self.metadata.session_source.as_str()),
+        )?;
+        Self::push_metadata_tag(
+            &mut tags,
+            "originator",
+            Some(self.metadata.originator.as_str()),
+        )?;
         Self::push_metadata_tag(&mut tags, "model", Some(self.metadata.model.as_str()))?;
         Self::push_metadata_tag(&mut tags, "app.version", Some(self.metadata.app_version))?;
         Ok(tags)
@@ -169,4 +227,12 @@ impl OtelManager {
         tags.push((key, value));
         Ok(())
     }
+}
+
+/// Start a metrics timer using the globally installed metrics client.
+pub fn start_global_timer(name: &str, tags: &[(&str, &str)]) -> MetricsResult<Timer> {
+    let Some(metrics) = crate::metrics::global() else {
+        return Err(MetricsError::ExporterDisabled);
+    };
+    metrics.start_timer(name, tags)
 }

@@ -18,6 +18,7 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::UnifiedExecResponse;
 use crate::unified_exec::WriteStdinRequest;
 use async_trait::async_trait;
+use codex_protocol::models::FunctionCallOutputBody;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +44,8 @@ struct ExecCommandArgs {
     sandbox_permissions: SandboxPermissions,
     #[serde(default)]
     justification: Option<String>,
+    #[serde(default)]
+    prefix_rule: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,8 +138,17 @@ impl ToolHandler for UnifiedExecHandler {
                     max_output_tokens,
                     sandbox_permissions,
                     justification,
+                    prefix_rule,
                     ..
                 } = args;
+
+                let features = session.features();
+                let request_rule_enabled = features.enabled(crate::features::Feature::RequestRule);
+                let prefix_rule = if request_rule_enabled {
+                    prefix_rule
+                } else {
+                    None
+                };
 
                 if sandbox_permissions.requires_escalated_permissions()
                     && !matches!(
@@ -144,10 +156,10 @@ impl ToolHandler for UnifiedExecHandler {
                         codex_protocol::protocol::AskForApproval::OnRequest
                     )
                 {
+                    let approval_policy = context.turn.approval_policy;
                     manager.release_process_id(&process_id).await;
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "approval policy is {policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {policy:?}",
-                        policy = context.turn.approval_policy
+                        "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
                     )));
                 }
 
@@ -180,9 +192,11 @@ impl ToolHandler for UnifiedExecHandler {
                             yield_time_ms,
                             max_output_tokens,
                             workdir,
+                            network: context.turn.network.clone(),
                             tty,
                             sandbox_permissions,
                             justification,
+                            prefix_rule,
                         },
                         &context,
                     )
@@ -226,8 +240,7 @@ impl ToolHandler for UnifiedExecHandler {
         let content = format_response(&response);
 
         Ok(ToolOutput::Function {
-            content,
-            content_items: None,
+            body: FunctionCallOutputBody::Text(content),
             success: Some(true),
         })
     }
@@ -236,7 +249,7 @@ impl ToolHandler for UnifiedExecHandler {
 fn get_command(args: &ExecCommandArgs, session_shell: Arc<Shell>) -> Vec<String> {
     let model_shell = args.shell.as_ref().map(|shell_str| {
         let mut shell = get_shell_by_model_provided_path(&PathBuf::from(shell_str));
-        shell.shell_snapshot = None;
+        shell.shell_snapshot = crate::shell::empty_shell_snapshot_receiver();
         shell
     });
 

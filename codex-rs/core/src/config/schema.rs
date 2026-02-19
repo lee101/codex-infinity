@@ -8,6 +8,8 @@ use schemars::schema::ObjectValidation;
 use schemars::schema::RootSchema;
 use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
+use serde_json::Map;
+use serde_json::Value;
 use std::path::Path;
 
 /// Schema for the `[features]` map with known + legacy keys only.
@@ -60,10 +62,29 @@ pub fn config_schema() -> RootSchema {
         .into_root_schema_for::<ConfigToml>()
 }
 
+/// Canonicalize a JSON value by sorting its keys.
+fn canonicalize(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = Map::with_capacity(map.len());
+            for (key, child) in entries {
+                sorted.insert(key.clone(), canonicalize(child));
+            }
+            Value::Object(sorted)
+        }
+        _ => value.clone(),
+    }
+}
+
 /// Render the config schema as pretty-printed JSON.
 pub fn config_schema_json() -> anyhow::Result<Vec<u8>> {
     let schema = config_schema();
-    let json = serde_json::to_vec_pretty(&schema)?;
+    let value = serde_json::to_value(schema)?;
+    let value = canonicalize(&value);
+    let json = serde_json::to_vec_pretty(&value)?;
     Ok(json)
 }
 
@@ -76,26 +97,13 @@ pub fn write_config_schema(out_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::canonicalize;
     use super::config_schema_json;
-    use serde_json::Map;
-    use serde_json::Value;
-    use similar::TextDiff;
+    use super::write_config_schema;
 
-    fn canonicalize(value: &Value) -> Value {
-        match value {
-            Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-            Value::Object(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-                let mut sorted = Map::with_capacity(map.len());
-                for (key, child) in entries {
-                    sorted.insert(key.clone(), canonicalize(child));
-                }
-                Value::Object(sorted)
-            }
-            _ => value.clone(),
-        }
-    }
+    use pretty_assertions::assert_eq;
+    use similar::TextDiff;
+    use tempfile::TempDir;
 
     #[test]
     fn config_schema_matches_fixture() {
@@ -123,5 +131,19 @@ mod tests {
 Run `just write-config-schema` to overwrite with your changes.\n\n{diff}"
             );
         }
+
+        // Make sure the version in the repo matches exactly: https://github.com/openai/codex/pull/10977.
+        let tmp = TempDir::new().expect("create temp dir");
+        let tmp_path = tmp.path().join("config.schema.json");
+        write_config_schema(&tmp_path).expect("write config schema to temp path");
+        let tmp_contents =
+            std::fs::read_to_string(&tmp_path).expect("read back config schema from temp path");
+        #[cfg(windows)]
+        let fixture = fixture.replace("\r\n", "\n");
+
+        assert_eq!(
+            fixture, tmp_contents,
+            "fixture should match exactly with generated schema"
+        );
     }
 }

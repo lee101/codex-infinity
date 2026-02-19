@@ -7,7 +7,7 @@ use chrono::Utc;
 use codex_core::AuthManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
-use codex_core::models_manager::manager::ModelsManager;
+use codex_core::protocol::AskForApproval;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::RateLimitWindow;
@@ -18,6 +18,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ReasoningEffort;
 use insta::assert_snapshot;
+use pretty_assertions::assert_eq;
 use ratatui::prelude::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -40,7 +41,7 @@ fn test_auth_manager(config: &Config) -> AuthManager {
 
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
     let context_window =
-        ModelsManager::construct_model_info_offline(model_slug, config).context_window;
+        codex_core::test_support::construct_model_info_offline(model_slug, config).context_window;
     TokenUsageInfo {
         total_token_usage: usage.clone(),
         last_token_usage: usage.clone(),
@@ -95,12 +96,13 @@ async fn status_snapshot_includes_reasoning_details() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
-    config.model_reasoning_effort = Some(ReasoningEffort::High);
     config.model_reasoning_summary = ReasoningSummary::Detailed;
     config
+        .permissions
         .sandbox_policy
         .set(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
+            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
@@ -123,6 +125,8 @@ async fn status_snapshot_includes_reasoning_details() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 72.5,
             window_minutes: Some(300),
@@ -138,9 +142,10 @@ async fn status_snapshot_includes_reasoning_details() {
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
 
+    let reasoning_effort_override = Some(Some(ReasoningEffort::High));
     let composite = new_status_output(
         &config,
         &auth_manager,
@@ -148,10 +153,13 @@ async fn status_snapshot_includes_reasoning_details() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        reasoning_effort_override,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -161,6 +169,71 @@ async fn status_snapshot_includes_reasoning_details() {
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_permissions_non_default_workspace_write_is_custom() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
+    config
+        .permissions
+        .sandbox_policy
+        .set(SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            read_only_access: Default::default(),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        })
+        .expect("set sandbox policy");
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        None,
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        captured_at,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered_lines = render_lines(&composite.display_lines(80));
+    let permissions_line = rendered_lines
+        .iter()
+        .find(|line| line.contains("Permissions:"))
+        .expect("permissions line");
+    let permissions_text = permissions_line
+        .split("Permissions:")
+        .nth(1)
+        .map(str::trim)
+        .map(|text| text.trim_end_matches('│'))
+        .map(str::trim);
+
+    assert_eq!(
+        permissions_text,
+        Some("Custom (workspace-write with network access, on-request)")
+    );
 }
 
 #[tokio::test]
@@ -185,7 +258,7 @@ async fn status_snapshot_includes_forked_from() {
         .single()
         .expect("valid time");
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let session_id =
         ThreadId::from_string("0f0f3c13-6cf9-4aa4-8b80-7d49c2f1be2e").expect("session id");
@@ -198,11 +271,14 @@ async fn status_snapshot_includes_forked_from() {
         Some(&token_info),
         &usage,
         &Some(session_id),
+        None,
         Some(forked_from),
         None,
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -236,6 +312,8 @@ async fn status_snapshot_includes_monthly_limit() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 12.0,
             window_minutes: Some(43_200),
@@ -247,7 +325,7 @@ async fn status_snapshot_includes_monthly_limit() {
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -256,10 +334,13 @@ async fn status_snapshot_includes_monthly_limit() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -282,6 +363,8 @@ async fn status_snapshot_shows_unlimited_credits() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -292,7 +375,7 @@ async fn status_snapshot_shows_unlimited_credits() {
         plan_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -301,10 +384,13 @@ async fn status_snapshot_shows_unlimited_credits() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let rendered = render_lines(&composite.display_lines(120));
     assert!(
@@ -326,6 +412,8 @@ async fn status_snapshot_shows_positive_credits() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -336,7 +424,7 @@ async fn status_snapshot_shows_positive_credits() {
         plan_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -345,10 +433,13 @@ async fn status_snapshot_shows_positive_credits() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let rendered = render_lines(&composite.display_lines(120));
     assert!(
@@ -370,6 +461,8 @@ async fn status_snapshot_hides_zero_credits() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -380,7 +473,7 @@ async fn status_snapshot_hides_zero_credits() {
         plan_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -389,10 +482,13 @@ async fn status_snapshot_hides_zero_credits() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let rendered = render_lines(&composite.display_lines(120));
     assert!(
@@ -412,6 +508,8 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -422,7 +520,7 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
         plan_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -431,10 +529,13 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let rendered = render_lines(&composite.display_lines(120));
     assert!(
@@ -464,7 +565,7 @@ async fn status_card_token_usage_excludes_cached_tokens() {
         .single()
         .expect("timestamp");
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -475,8 +576,11 @@ async fn status_card_token_usage_excludes_cached_tokens() {
         None,
         None,
         None,
+        None,
         now,
         &model_slug,
+        None,
+        None,
     );
     let rendered = render_lines(&composite.display_lines(120));
 
@@ -492,7 +596,6 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
-    config.model_reasoning_effort = Some(ReasoningEffort::High);
     config.model_reasoning_summary = ReasoningSummary::Detailed;
     config.cwd = PathBuf::from("/workspace/tests");
 
@@ -510,6 +613,8 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 72.5,
             window_minutes: Some(300),
@@ -521,8 +626,9 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
+    let reasoning_effort_override = Some(Some(ReasoningEffort::High));
     let composite = new_status_output(
         &config,
         &auth_manager,
@@ -530,10 +636,13 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        reasoning_effort_override,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(70));
     if cfg!(windows) {
@@ -567,7 +676,7 @@ async fn status_snapshot_shows_missing_limits_message() {
         .single()
         .expect("timestamp");
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -578,8 +687,11 @@ async fn status_snapshot_shows_missing_limits_message() {
         None,
         None,
         None,
+        None,
         now,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -612,6 +724,8 @@ async fn status_snapshot_includes_credits_and_limits() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 45.0,
             window_minutes: Some(300),
@@ -631,7 +745,7 @@ async fn status_snapshot_includes_credits_and_limits() {
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -640,10 +754,13 @@ async fn status_snapshot_includes_credits_and_limits() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -672,6 +789,8 @@ async fn status_snapshot_shows_empty_limits_message() {
     };
 
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -683,7 +802,7 @@ async fn status_snapshot_shows_empty_limits_message() {
         .expect("timestamp");
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -692,10 +811,13 @@ async fn status_snapshot_shows_empty_limits_message() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         captured_at,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -728,6 +850,8 @@ async fn status_snapshot_shows_stale_limits_message() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 72.5,
             window_minutes: Some(300),
@@ -744,7 +868,7 @@ async fn status_snapshot_shows_stale_limits_message() {
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
     let now = captured_at + ChronoDuration::minutes(20);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -753,10 +877,13 @@ async fn status_snapshot_shows_stale_limits_message() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         now,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -789,6 +916,8 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
         .single()
         .expect("timestamp");
     let snapshot = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
         primary: Some(RateLimitWindow {
             used_percent: 60.0,
             window_minutes: Some(300),
@@ -809,7 +938,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
     let now = captured_at + ChronoDuration::minutes(20);
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -818,10 +947,13 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
         &usage,
         &None,
         None,
+        None,
         Some(&rate_display),
         None,
         now,
         &model_slug,
+        None,
+        None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(80));
     if cfg!(windows) {
@@ -860,7 +992,7 @@ async fn status_context_window_uses_last_usage() {
         .single()
         .expect("timestamp");
 
-    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = TokenUsageInfo {
         total_token_usage: total_usage.clone(),
         last_token_usage: last_usage,
@@ -875,8 +1007,11 @@ async fn status_context_window_uses_last_usage() {
         None,
         None,
         None,
+        None,
         now,
         &model_slug,
+        None,
+        None,
     );
     let rendered_lines = render_lines(&composite.display_lines(80));
     let context_line = rendered_lines

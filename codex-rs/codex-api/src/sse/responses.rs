@@ -1,7 +1,7 @@
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
-use crate::rate_limits::parse_rate_limit;
+use crate::rate_limits::parse_all_rate_limits;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
@@ -24,6 +24,8 @@ use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::debug;
 use tracing::trace;
+
+const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
 
 /// Streams SSE events from an on-disk fixture for tests.
 pub fn stream_from_fixture(
@@ -52,12 +54,16 @@ pub fn spawn_response_stream(
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> ResponseStream {
-    let rate_limits = parse_rate_limit(&stream_response.headers);
+    let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
         .headers
         .get("X-Models-Etag")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let reasoning_included = stream_response
+        .headers
+        .get(X_REASONING_INCLUDED_HEADER)
+        .is_some();
     if let Some(turn_state) = turn_state.as_ref()
         && let Some(header_value) = stream_response
             .headers
@@ -68,11 +74,16 @@ pub fn spawn_response_stream(
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
-        if let Some(snapshot) = rate_limits {
+        for snapshot in rate_limit_snapshots {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
         }
         if let Some(etag) = models_etag {
             let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
+        }
+        if reasoning_included {
+            let _ = tx_event
+                .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
+                .await;
         }
         process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
@@ -146,12 +157,18 @@ struct ResponseCompletedOutputTokensDetails {
 #[derive(Deserialize, Debug)]
 pub struct ResponsesStreamEvent {
     #[serde(rename = "type")]
-    kind: String,
+    pub(crate) kind: String,
     response: Option<Value>,
     item: Option<Value>,
     delta: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+}
+
+impl ResponsesStreamEvent {
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
 }
 
 #[derive(Debug)]
@@ -222,6 +239,8 @@ pub fn process_responses_event(
                             .message
                             .unwrap_or_else(|| "Invalid request.".to_string());
                         response_error = ApiError::InvalidRequest { message };
+                    } else if is_server_overloaded_error(&error) {
+                        response_error = ApiError::ServerOverloaded;
                     } else {
                         let delay = try_parse_retry_after(&error);
                         let message = error.message.unwrap_or_default();
@@ -235,6 +254,17 @@ pub fn process_responses_event(
                 "response.failed event received".into(),
             )));
         }
+        "response.incomplete" => {
+            let reason = event.response.as_ref().and_then(|response| {
+                response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+            });
+            let reason = reason.unwrap_or("unknown");
+            let message = format!("Incomplete response returned, reason: {reason}");
+            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+        }
         "response.completed" => {
             if let Some(resp_val) = event.response {
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
@@ -242,6 +272,7 @@ pub fn process_responses_event(
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
+                            can_append: false,
                         }));
                     }
                     Err(err) => {
@@ -259,6 +290,7 @@ pub fn process_responses_event(
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id.unwrap_or_default(),
                             token_usage: resp.usage.map(Into::into),
+                            can_append: true,
                         }));
                     }
                     Err(err) => {
@@ -273,6 +305,7 @@ pub fn process_responses_event(
             return Ok(Some(ResponseEvent::Completed {
                 response_id: String::new(),
                 token_usage: None,
+                can_append: true,
             }));
         }
         "response.output_item.added" => {
@@ -280,7 +313,7 @@ pub fn process_responses_event(
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
                     return Ok(Some(ResponseEvent::OutputItemAdded(item)));
                 }
-                debug!("failed to parse ResponseItem from output_item.done");
+                debug!("failed to parse ResponseItem from output_item.added");
             }
         }
         "response.reasoning_summary_part.added" => {
@@ -405,6 +438,11 @@ fn is_invalid_prompt_error(error: &Error) -> bool {
     error.code.as_deref() == Some("invalid_prompt")
 }
 
+fn is_server_overloaded_error(error: &Error) -> bool {
+    error.code.as_deref() == Some("server_is_overloaded")
+        || error.code.as_deref() == Some("slow_down")
+}
+
 fn rate_limit_regex() -> &'static regex_lite::Regex {
     static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
     #[expect(clippy::unwrap_used)]
@@ -418,6 +456,7 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use bytes::Bytes;
+    use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
     use futures::stream;
     use pretty_assertions::assert_eq;
@@ -481,7 +520,8 @@ mod tests {
             "item": {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "Hello"}]
+                "content": [{"type": "output_text", "text": "Hello"}],
+                "phase": "commentary"
             }
         })
         .to_string();
@@ -512,8 +552,11 @@ mod tests {
 
         assert_matches!(
             &events[0],
-            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }))
-                if role == "assistant"
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+                role,
+                phase: Some(MessagePhase::Commentary),
+                ..
+            })) if role == "assistant"
         );
 
         assert_matches!(
@@ -526,9 +569,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                can_append,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(!can_append);
             }
             other => panic!("unexpected third event: {other:?}"),
         }
@@ -563,7 +608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_done_emits_completed() {
+    async fn response_done_emits_incremental_completed() {
         let done = json!({
             "type": "response.done",
             "response": {
@@ -588,9 +633,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                can_append,
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_some());
+                assert!(*can_append);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -613,9 +660,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                can_append,
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_none());
+                assert!(*can_append);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -651,9 +700,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                can_append,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(!can_append);
             }
             other => panic!("unexpected event: {other:?}"),
         }

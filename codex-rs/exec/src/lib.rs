@@ -13,21 +13,23 @@ pub mod exec_events;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
-use codex_common::oss::ensure_oss_provider_ready;
-use codex_common::oss::get_default_model_for_oss_provider;
-use codex_common::oss::ollama_chat_deprecation_notice;
+use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::NewThread;
-use codex_core::OLLAMA_CHAT_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::auth::enforce_login_restrictions;
+use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
+use codex_core::config_loader::ConfigLoadError;
+use codex_core::config_loader::format_config_error_with_source;
+use codex_core::format_exec_policy_error_with_source;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::protocol::AskForApproval;
@@ -41,24 +43,33 @@ use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_oss::ensure_oss_provider_ready;
+use codex_utils_oss::get_default_model_for_oss_provider;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 use supports_color::Stream;
+use tokio::sync::Mutex;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_thread_path_by_id_str;
+use codex_core::find_thread_path_by_name_str;
 
 enum InitialOperation {
     UserTurn {
@@ -68,6 +79,13 @@ enum InitialOperation {
     Review {
         review_request: ReviewRequest,
     },
+}
+
+#[derive(Clone)]
+struct ThreadEventEnvelope {
+    thread_id: codex_protocol::ThreadId,
+    thread: Arc<codex_core::CodexThread>,
+    event: Event,
 }
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
@@ -84,22 +102,18 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         config_profile,
         full_auto,
         dangerously_bypass_approvals_and_sandbox,
-        dangerously_disable_timeouts,
-        dangerously_disable_environment_wrapping,
-        dangerously_passthrough_stdio,
-        auto_next_steps,
-        auto_next_idea,
         cwd,
         skip_git_repo_check,
         add_dir,
+        ephemeral,
         color,
         last_message_file,
         json: json_mode,
-        include_plan_tool,
         sandbox_mode: sandbox_mode_cli_arg,
         prompt,
         output_schema: output_schema_path,
         config_overrides,
+        ..
     } = cli;
 
     let (stdout_with_ansi, stderr_with_ansi) = match color {
@@ -150,29 +164,52 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let config_toml = {
-        let codex_home = match find_codex_home() {
-            Ok(codex_home) => codex_home,
-            Err(err) => {
-                eprintln!("Error finding codex home: {err}");
-                std::process::exit(1);
-            }
-        };
-
-        match load_config_as_toml_with_cli_overrides(
-            &codex_home,
-            &config_cwd,
-            cli_kv_overrides.clone(),
-        )
-        .await
-        {
-            Ok(config_toml) => config_toml,
-            Err(err) => {
-                eprintln!("Error loading config.toml: {err}");
-                std::process::exit(1);
-            }
+    let codex_home = match find_codex_home() {
+        Ok(codex_home) => codex_home,
+        Err(err) => {
+            eprintln!("Error finding codex home: {err}");
+            std::process::exit(1);
         }
     };
+
+    #[allow(clippy::print_stderr)]
+    let config_toml = match load_config_as_toml_with_cli_overrides(
+        &codex_home,
+        &config_cwd,
+        cli_kv_overrides.clone(),
+    )
+    .await
+    {
+        Ok(config_toml) => config_toml,
+        Err(err) => {
+            let config_error = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
+                .map(ConfigLoadError::config_error);
+            if let Some(config_error) = config_error {
+                eprintln!(
+                    "Error loading config.toml:\n{}",
+                    format_config_error_with_source(config_error)
+                );
+            } else {
+                eprintln!("Error loading config.toml: {err}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let cloud_auth_manager = AuthManager::shared(
+        codex_home.clone(),
+        false,
+        config_toml.cli_auth_credentials_store.unwrap_or_default(),
+    );
+    let chatgpt_base_url = config_toml
+        .chatgpt_base_url
+        .clone()
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
+    let cloud_requirements =
+        cloud_requirements_loader(cloud_auth_manager, chatgpt_base_url, codex_home.clone());
 
     let model_provider = if oss {
         let resolved = resolve_oss_provider(
@@ -185,7 +222,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             Some(provider)
         } else {
             return Err(anyhow::anyhow!(
-                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}, {OLLAMA_CHAT_PROVIDER_ID} in config.toml"
+                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID} in config.toml"
             ));
         }
     } else {
@@ -204,13 +241,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         None // No model specified, will use the default.
     };
 
-    // Handle yolo flag hierarchy: yolo4 implies yolo3, yolo3 implies yolo2, yolo2 implies yolo
-    let dangerously_disable_timeouts = dangerously_disable_timeouts
-        || dangerously_disable_environment_wrapping
-        || dangerously_passthrough_stdio;
-    let dangerously_disable_environment_wrapping =
-        dangerously_disable_environment_wrapping || dangerously_passthrough_stdio;
-
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
@@ -222,35 +252,43 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         cwd: resolved_cwd,
         model_provider: model_provider.clone(),
         codex_linux_sandbox_exe,
+        js_repl_node_path: None,
         base_instructions: None,
         developer_instructions: None,
+        personality: None,
         compact_prompt: None,
-        include_apply_patch_tool: include_plan_tool.then_some(true),
+        include_apply_patch_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
-        disable_command_timeouts: dangerously_disable_timeouts.then_some(true),
-        passthrough_shell_environment: dangerously_disable_environment_wrapping.then_some(true),
-        passthrough_shell_stdio: dangerously_passthrough_stdio.then_some(true),
-        auto_next_steps: auto_next_steps.then_some(true),
-        auto_next_idea: auto_next_idea.then_some(true),
+        ephemeral: ephemeral.then_some(true),
         additional_writable_roots: add_dir,
     };
 
-    let config =
-        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
+    let config = ConfigBuilder::default()
+        .cli_overrides(cli_kv_overrides)
+        .harness_overrides(overrides)
+        .cloud_requirements(cloud_requirements)
+        .build()
+        .await?;
+
+    #[allow(clippy::print_stderr)]
+    match check_execpolicy_for_warnings(&config.config_layer_stack).await {
+        Ok(None) => {}
+        Ok(Some(err)) | Err(err) => {
+            eprintln!(
+                "Error loading rules:\n{}",
+                format_exec_policy_error_with_source(&err)
+            );
+            std::process::exit(1);
+        }
+    }
+
+    set_default_client_residency_requirement(config.enforce_residency.value());
 
     if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
-
-    let ollama_chat_support_notice = match ollama_chat_deprecation_notice(&config).await {
-        Ok(notice) => notice,
-        Err(err) => {
-            tracing::warn!(?err, "Failed to detect Ollama wire API");
-            None
-        }
-    };
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, false)
@@ -284,12 +322,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             last_message_file.clone(),
         )),
     };
-    if let Some(notice) = ollama_chat_support_notice {
-        event_processor.process_event(Event {
-            id: String::new(),
-            msg: EventMsg::DeprecationNotice(notice),
-        });
-    }
+    let required_mcp_servers: HashSet<String> = config
+        .mcp_servers
+        .get()
+        .iter()
+        .filter(|(_, server)| server.enabled && server.required)
+        .map(|(name, _)| name.clone())
+        .collect();
 
     if oss {
         // We're in the oss section, so provider_id should be Some
@@ -309,12 +348,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     let default_cwd = config.cwd.to_path_buf();
-    let default_approval_policy = config.approval_policy.value();
-    let default_sandbox_policy = config.sandbox_policy.get();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;
 
-    if !skip_git_repo_check && get_git_repo_root(&default_cwd).is_none() {
+    // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
+    // since the user is explicitly running in an externally sandboxed environment.
+    if !skip_git_repo_check
+        && !dangerously_bypass_approvals_and_sandbox
+        && get_git_repo_root(&default_cwd).is_none()
+    {
         eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
         std::process::exit(1);
     }
@@ -324,11 +368,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         true,
         config.cli_auth_credentials_store_mode,
     );
-    let thread_manager = ThreadManager::new(
+    let thread_manager = Arc::new(ThreadManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),
         SessionSource::Exec,
-    );
+    ));
     let default_model = thread_manager
         .get_models_manager()
         .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)
@@ -336,7 +380,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewThread {
-        thread_id: _,
+        thread_id: primary_thread_id,
         thread,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
@@ -378,6 +422,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 .collect();
             items.push(UserInput::Text {
                 text: prompt_text.clone(),
+                // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
             let output_schema = load_output_schema(output_schema_path.clone());
@@ -397,6 +442,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 .collect();
             items.push(UserInput::Text {
                 text: prompt_text.clone(),
+                // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
             let output_schema = load_output_schema(output_schema_path);
@@ -416,40 +462,47 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     info!("Codex initialized with event: {session_configured:?}");
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEventEnvelope>();
+    let attached_threads = Arc::new(Mutex::new(HashSet::from([primary_thread_id])));
+    spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone());
+
     {
         let thread = thread.clone();
         tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::debug!("Keyboard interrupt");
+                // Immediately notify Codex to abort any in-flight task.
+                thread.submit(Op::Interrupt).await.ok();
+            }
+        });
+    }
+
+    {
+        let thread_manager = Arc::clone(&thread_manager);
+        let attached_threads = Arc::clone(&attached_threads);
+        let tx = tx.clone();
+        let mut thread_created_rx = thread_manager.subscribe_thread_created();
+        tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::debug!("Keyboard interrupt");
-                        // Immediately notify Codex to abort any in‑flight task.
-                        thread.submit(Op::Interrupt).await.ok();
-
-                        // Exit the inner loop and return to the main input prompt. The codex
-                        // will emit a `TurnInterrupted` (Error) event which is drained later.
-                        break;
-                    }
-                    res = thread.next_event() => match res {
-                        Ok(event) => {
-                            debug!("Received event: {event:?}");
-
-                            let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
-                            if let Err(e) = tx.send(event) {
-                                error!("Error sending event: {e:?}");
-                                break;
+                match thread_created_rx.recv().await {
+                    Ok(thread_id) => {
+                        if attached_threads.lock().await.contains(&thread_id) {
+                            continue;
+                        }
+                        match thread_manager.get_thread(thread_id).await {
+                            Ok(thread) => {
+                                attached_threads.lock().await.insert(thread_id);
+                                spawn_thread_listener(thread_id, thread, tx.clone());
                             }
-                            if is_shutdown_complete {
-                                info!("Received shutdown event, exiting event loop.");
-                                break;
+                            Err(err) => {
+                                warn!("failed to attach listener for thread {thread_id}: {err}")
                             }
-                        },
-                        Err(e) => {
-                            error!("Error receiving event: {e:?}");
-                            break;
                         }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        warn!("thread_created receiver lagged; skipping resync");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -471,6 +524,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     summary: default_summary,
                     final_output_json_schema: output_schema,
                     collaboration_mode: None,
+                    personality: None,
                 })
                 .await?;
             info!("Sent prompt with event ID: {task_id}");
@@ -487,7 +541,21 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // Track whether a fatal error was reported by the server so we can
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
-    while let Some(event) = rx.recv().await {
+    let mut shutdown_requested = false;
+    while let Some(envelope) = rx.recv().await {
+        let ThreadEventEnvelope {
+            thread_id,
+            thread,
+            event,
+        } = envelope;
+        if matches!(event.msg, EventMsg::Error(_)) {
+            error_seen = true;
+        }
+        if shutdown_requested
+            && !matches!(&event.msg, EventMsg::ShutdownComplete | EventMsg::Error(_))
+        {
+            continue;
+        }
         if let EventMsg::ElicitationRequest(ev) = &event.msg {
             // Automatically cancel elicitation requests in exec mode.
             thread
@@ -498,18 +566,37 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 })
                 .await?;
         }
-        if matches!(event.msg, EventMsg::Error(_)) {
+        if let EventMsg::McpStartupUpdate(update) = &event.msg
+            && required_mcp_servers.contains(&update.server)
+            && let codex_core::protocol::McpStartupStatus::Failed { error } = &update.status
+        {
             error_seen = true;
+            eprintln!(
+                "Required MCP server '{}' failed to initialize: {error}",
+                update.server
+            );
+            if !shutdown_requested {
+                thread.submit(Op::Shutdown).await?;
+                shutdown_requested = true;
+            }
         }
-        let shutdown: CodexStatus = event_processor.process_event(event);
+        if thread_id != primary_thread_id && matches!(&event.msg, EventMsg::TurnComplete(_)) {
+            continue;
+        }
+        let shutdown = event_processor.process_event(event);
+        if thread_id != primary_thread_id && matches!(shutdown, CodexStatus::InitiateShutdown) {
+            continue;
+        }
         match shutdown {
             CodexStatus::Running => continue,
             CodexStatus::InitiateShutdown => {
-                thread.submit(Op::Shutdown).await?;
+                if !shutdown_requested {
+                    thread.submit(Op::Shutdown).await?;
+                    shutdown_requested = true;
+                }
             }
-            CodexStatus::Shutdown => {
-                break;
-            }
+            CodexStatus::Shutdown if thread_id == primary_thread_id => break,
+            CodexStatus::Shutdown => continue,
         }
     }
     event_processor.print_final_output();
@@ -518,6 +605,42 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     Ok(())
+}
+
+fn spawn_thread_listener(
+    thread_id: codex_protocol::ThreadId,
+    thread: Arc<codex_core::CodexThread>,
+    tx: tokio::sync::mpsc::UnboundedSender<ThreadEventEnvelope>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match thread.next_event().await {
+                Ok(event) => {
+                    debug!("Received event: {event:?}");
+
+                    let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
+                    if let Err(err) = tx.send(ThreadEventEnvelope {
+                        thread_id,
+                        thread: Arc::clone(&thread),
+                        event,
+                    }) {
+                        error!("Error sending event: {err:?}");
+                        break;
+                    }
+                    if is_shutdown_complete {
+                        info!(
+                            "Received shutdown event for thread {thread_id}, exiting event loop."
+                        );
+                        break;
+                    }
+                }
+                Err(err) => {
+                    error!("Error receiving event: {err:?}");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn resolve_resume_path(
@@ -532,7 +655,7 @@ async fn resolve_resume_path(
             Some(config.cwd.as_path())
         };
         match codex_core::RolloutRecorder::find_latest_thread_path(
-            &config.codex_home,
+            config,
             1,
             None,
             codex_core::ThreadSortKey::UpdatedAt,
@@ -550,8 +673,13 @@ async fn resolve_resume_path(
             }
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
-        let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
-        Ok(path)
+        if Uuid::parse_str(id_str).is_ok() {
+            let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        } else {
+            let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        }
     } else {
         Ok(None)
     }

@@ -33,6 +33,8 @@ use crate::protocol::common::GitSha;
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
     pub client_info: ClientInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<InitializeCapabilities>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
@@ -41,6 +43,19 @@ pub struct ClientInfo {
     pub name: String,
     pub title: Option<String>,
     pub version: String,
+}
+
+/// Client-declared capabilities negotiated during initialize.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeCapabilities {
+    /// Opt into receiving experimental API methods and fields.
+    #[serde(default)]
+    pub experimental_api: bool,
+    /// Exact notification method names that should be suppressed for this
+    /// connection (for example `codex/event/session_configured`).
+    #[ts(optional = nullable)]
+    pub opt_out_notification_methods: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -503,17 +518,14 @@ impl From<CoreTextElement> for V1TextElement {
     fn from(value: CoreTextElement) -> Self {
         Self {
             byte_range: value.byte_range.into(),
-            placeholder: value.placeholder,
+            placeholder: value._placeholder_for_conversion_only().map(str::to_string),
         }
     }
 }
 
 impl From<V1TextElement> for CoreTextElement {
     fn from(value: V1TextElement) -> Self {
-        Self {
-            byte_range: value.byte_range.into(),
-            placeholder: value.placeholder,
-        }
+        Self::new(value.byte_range.into(), value.placeholder)
     }
 }
 

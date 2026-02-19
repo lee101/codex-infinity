@@ -1,7 +1,7 @@
 use clap::Parser;
 use clap::ValueHint;
-use codex_common::ApprovalModeCliArg;
-use codex_common::CliConfigOverrides;
+use codex_utils_cli::ApprovalModeCliArg;
+use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -58,7 +58,7 @@ pub struct Cli {
     #[arg(long = "oss", default_value_t = false)]
     pub oss: bool,
 
-    /// Specify which local provider to use (lmstudio, ollama, or ollama-chat).
+    /// Specify which local provider to use (lmstudio or ollama).
     /// If not specified with --oss, will use config default or show selection.
     #[arg(long = "local-provider")]
     pub oss_provider: Option<String>,
@@ -70,7 +70,7 @@ pub struct Cli {
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
     #[arg(long = "sandbox", short = 's')]
-    pub sandbox_mode: Option<codex_common::SandboxModeCliArg>,
+    pub sandbox_mode: Option<codex_utils_cli::SandboxModeCliArg>,
 
     /// Configure when the model requires human approval before executing a command.
     #[arg(long = "ask-for-approval", short = 'a')]
@@ -101,7 +101,6 @@ pub struct Cli {
     /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
     #[arg(
         long = "yolo2",
-        alias = "dangerously-disable-timeouts",
         default_value_t = false,
         conflicts_with_all = ["approval_policy", "full_auto"]
     )]
@@ -110,7 +109,6 @@ pub struct Cli {
     /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
     #[arg(
         long = "yolo3",
-        alias = "dangerously-disable-env-wrapping",
         default_value_t = false,
         conflicts_with_all = ["approval_policy", "full_auto"]
     )]
@@ -119,7 +117,6 @@ pub struct Cli {
     /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
     #[arg(
         long = "yolo4",
-        alias = "dangerously-passthrough-stdio",
         default_value_t = false,
         conflicts_with_all = ["approval_policy", "full_auto"]
     )]

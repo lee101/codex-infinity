@@ -12,6 +12,7 @@ use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -32,6 +33,7 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: Some(100),
             cursor: None,
+            include_hidden: None,
         })
         .await?;
 
@@ -50,8 +52,10 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
         Model {
             id: "gpt-5.2-codex".to_string(),
             model: "gpt-5.2-codex".to_string(),
+            upgrade: None,
             display_name: "gpt-5.2-codex".to_string(),
             description: "Latest frontier agentic coding model.".to_string(),
+            hidden: false,
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Low,
@@ -72,13 +76,17 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
                 },
             ],
             default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            supports_personality: false,
             is_default: true,
         },
         Model {
             id: "gpt-5.1-codex-max".to_string(),
             model: "gpt-5.1-codex-max".to_string(),
+            upgrade: Some("gpt-5.2-codex".to_string()),
             display_name: "gpt-5.1-codex-max".to_string(),
             description: "Codex-optimized flagship for deep and fast reasoning.".to_string(),
+            hidden: false,
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Low,
@@ -99,13 +107,17 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
                 },
             ],
             default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            supports_personality: false,
             is_default: false,
         },
         Model {
             id: "gpt-5.1-codex-mini".to_string(),
             model: "gpt-5.1-codex-mini".to_string(),
+            upgrade: Some("gpt-5.2-codex".to_string()),
             display_name: "gpt-5.1-codex-mini".to_string(),
             description: "Optimized for codex. Cheaper, faster, but less capable.".to_string(),
+            hidden: false,
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Medium,
@@ -118,15 +130,19 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
                 },
             ],
             default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            supports_personality: false,
             is_default: false,
         },
         Model {
             id: "gpt-5.2".to_string(),
             model: "gpt-5.2".to_string(),
+            upgrade: Some("gpt-5.2-codex".to_string()),
             display_name: "gpt-5.2".to_string(),
             description:
                 "Latest frontier model with improvements across knowledge, reasoning and coding"
                     .to_string(),
+            hidden: false,
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Low,
@@ -151,11 +167,45 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
                 },
             ],
             default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            supports_personality: false,
             is_default: false,
         },
     ];
 
     assert_eq!(items, expected_models);
+    assert!(next_cursor.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_models_includes_hidden_models() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(100),
+            cursor: None,
+            include_hidden: Some(true),
+        })
+        .await?;
+
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    let ModelListResponse {
+        data: items,
+        next_cursor,
+    } = to_response::<ModelListResponse>(response)?;
+
+    assert!(items.iter().any(|item| item.hidden));
     assert!(next_cursor.is_none());
     Ok(())
 }
@@ -172,6 +222,7 @@ async fn list_models_pagination_works() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: Some(1),
             cursor: None,
+            include_hidden: None,
         })
         .await?;
 
@@ -194,6 +245,7 @@ async fn list_models_pagination_works() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: Some(1),
             cursor: Some(next_cursor.clone()),
+            include_hidden: None,
         })
         .await?;
 
@@ -216,6 +268,7 @@ async fn list_models_pagination_works() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: Some(1),
             cursor: Some(third_cursor.clone()),
+            include_hidden: None,
         })
         .await?;
 
@@ -238,6 +291,7 @@ async fn list_models_pagination_works() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: Some(1),
             cursor: Some(fourth_cursor.clone()),
+            include_hidden: None,
         })
         .await?;
 
@@ -270,6 +324,7 @@ async fn list_models_rejects_invalid_cursor() -> Result<()> {
         .send_list_models_request(ModelListParams {
             limit: None,
             cursor: Some("invalid".to_string()),
+            include_hidden: None,
         })
         .await?;
 

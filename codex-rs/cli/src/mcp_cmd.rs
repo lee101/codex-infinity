@@ -5,26 +5,28 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use clap::ArgGroup;
-use codex_common::CliConfigOverrides;
-use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_global_mcp_servers;
 use codex_core::config::types::McpServerConfig;
 use codex_core::config::types::McpServerTransportConfig;
+use codex_core::mcp::auth::McpOAuthLoginSupport;
 use codex_core::mcp::auth::compute_auth_statuses;
+use codex_core::mcp::auth::oauth_login_support;
 use codex_core::protocol::McpAuthStatus;
 use codex_rmcp_client::delete_oauth_tokens;
 use codex_rmcp_client::perform_oauth_login;
-use codex_rmcp_client::supports_oauth_login;
+use codex_utils_cli::CliConfigOverrides;
+use codex_utils_cli::format_env_display::format_env_display;
 
 /// Subcommands:
-/// - `serve`  — run the MCP server on stdio
 /// - `list`   — list configured servers (with `--json`)
 /// - `get`    — show a single server (with `--json`)
 /// - `add`    — add a server launcher entry to `~/.codex/config.toml`
 /// - `remove` — delete a server entry
+/// - `login`  — authenticate with MCP server using OAuth
+/// - `logout` — remove OAuth credentials for MCP server
 #[derive(Debug, clap::Parser)]
 pub struct McpCli {
     #[clap(flatten)]
@@ -241,11 +243,13 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
     let new_entry = McpServerConfig {
         transport: transport.clone(),
         enabled: true,
+        required: false,
         disabled_reason: None,
         startup_timeout_sec: None,
         tool_timeout_sec: None,
         enabled_tools: None,
         disabled_tools: None,
+        scopes: None,
     };
 
     servers.insert(name.clone(), new_entry);
@@ -258,33 +262,25 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
 
     println!("Added global MCP server '{name}'.");
 
-    if let McpServerTransportConfig::StreamableHttp {
-        url,
-        bearer_token_env_var: None,
-        http_headers,
-        env_http_headers,
-    } = transport
-    {
-        match supports_oauth_login(&url).await {
-            Ok(true) => {
-                println!("Detected OAuth support. Starting OAuth flow…");
-                perform_oauth_login(
-                    &name,
-                    &url,
-                    config.mcp_oauth_credentials_store_mode,
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    &Vec::new(),
-                    config.mcp_oauth_callback_port,
-                )
-                .await?;
-                println!("Successfully logged in.");
-            }
-            Ok(false) => {}
-            Err(_) => println!(
-                "MCP server may or may not require login. Run `codex mcp login {name}` to login."
-            ),
+    match oauth_login_support(&transport).await {
+        McpOAuthLoginSupport::Supported(oauth_config) => {
+            println!("Detected OAuth support. Starting OAuth flow…");
+            perform_oauth_login(
+                &name,
+                &oauth_config.url,
+                config.mcp_oauth_credentials_store_mode,
+                oauth_config.http_headers,
+                oauth_config.env_http_headers,
+                &Vec::new(),
+                config.mcp_oauth_callback_port,
+            )
+            .await?;
+            println!("Successfully logged in.");
         }
+        McpOAuthLoginSupport::Unsupported => {}
+        McpOAuthLoginSupport::Unknown(_) => println!(
+            "MCP server may or may not require login. Run `codex mcp login {name}` to login."
+        ),
     }
 
     Ok(())
@@ -346,6 +342,11 @@ async fn run_login(config_overrides: &CliConfigOverrides, login_args: LoginArgs)
         } => (url.clone(), http_headers.clone(), env_http_headers.clone()),
         _ => bail!("OAuth login is only supported for streamable HTTP servers."),
     };
+
+    let mut scopes = scopes;
+    if scopes.is_empty() {
+        scopes = server.scopes.clone().unwrap_or_default();
+    }
 
     perform_oauth_login(
         &name,

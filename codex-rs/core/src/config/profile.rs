@@ -3,6 +3,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::config::types::Personality;
+use crate::config::types::WindowsToml;
 use crate::protocol::AskForApproval;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
@@ -24,10 +26,15 @@ pub struct ConfigProfile {
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub personality: Option<Personality>,
     pub chatgpt_base_url: Option<String>,
+    /// Optional path to a file containing model instructions.
+    pub model_instructions_file: Option<AbsolutePathBuf>,
+    pub js_repl_node_path: Option<AbsolutePathBuf>,
+    /// Deprecated: ignored. Use `model_instructions_file`.
+    #[schemars(skip)]
     pub experimental_instructions_file: Option<AbsolutePathBuf>,
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
-    pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
@@ -35,11 +42,8 @@ pub struct ConfigProfile {
     pub tools_view_image: Option<bool>,
     pub web_search: Option<WebSearchMode>,
     pub analytics: Option<crate::config::types::AnalyticsConfigToml>,
-    pub disable_command_timeouts: Option<bool>,
-    pub passthrough_shell_environment: Option<bool>,
-    pub passthrough_shell_stdio: Option<bool>,
-    pub auto_next_steps: Option<bool>,
-    pub auto_next_idea: Option<bool>,
+    #[serde(default)]
+    pub windows: Option<WindowsToml>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
     // Injects known feature keys into the schema and forbids unknown keys.

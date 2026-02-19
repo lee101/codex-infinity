@@ -1,13 +1,15 @@
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::types::McpServerConfig;
 use crate::config::types::Notice;
+use crate::path_utils::resolve_symlink_write_paths;
+use crate::path_utils::write_atomically;
 use anyhow::Context;
+use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
 use tokio::task;
 use toml_edit::ArrayOfTables;
 use toml_edit::DocumentMut;
@@ -23,6 +25,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active (or default) model personality.
+    SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -49,6 +53,24 @@ pub enum ConfigEdit {
     },
     /// Remove the value stored at the exact dotted path.
     ClearPath { segments: Vec<String> },
+}
+
+pub fn status_line_items_edit(items: &[String]) -> ConfigEdit {
+    if items.is_empty() {
+        return ConfigEdit::ClearPath {
+            segments: vec!["tui".to_string(), "status_line".to_string()],
+        };
+    }
+
+    let mut array = toml_edit::Array::new();
+    for item in items {
+        array.push(item.clone());
+    }
+
+    ConfigEdit::SetPath {
+        segments: vec!["tui".to_string(), "status_line".to_string()],
+        value: TomlItem::Value(array.into()),
+    }
 }
 
 // TODO(jif) move to a dedicated file
@@ -147,6 +169,9 @@ mod document_helpers {
         if !config.enabled {
             entry["enabled"] = value(false);
         }
+        if config.required {
+            entry["required"] = value(true);
+        }
         if let Some(timeout) = config.startup_timeout_sec {
             entry["startup_timeout_sec"] = value(timeout.as_secs_f64());
         }
@@ -162,6 +187,11 @@ mod document_helpers {
             && !disabled_tools.is_empty()
         {
             entry["disabled_tools"] = array_from_iter(disabled_tools.iter().cloned());
+        }
+        if let Some(scopes) = &config.scopes
+            && !scopes.is_empty()
+        {
+            entry["scopes"] = array_from_iter(scopes.iter().cloned());
         }
 
         entry
@@ -268,6 +298,10 @@ impl ConfigDocument {
                 );
                 mutated
             }),
+            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
+                &["personality"],
+                personality.map(|personality| value(personality.to_string())),
+            )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
                 &[Notice::TABLE_KEY, "hide_full_access_warning"],
@@ -625,10 +659,14 @@ pub fn apply_blocking(
     }
 
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let serialized = match std::fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
+    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let serialized = match write_paths.read_path {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err.into()),
+        },
+        None => String::new(),
     };
 
     let doc = if serialized.is_empty() {
@@ -654,21 +692,12 @@ pub fn apply_blocking(
         return Ok(());
     }
 
-    std::fs::create_dir_all(codex_home).with_context(|| {
+    write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(|| {
         format!(
-            "failed to create Codex home directory at {}",
-            codex_home.display()
+            "failed to persist config.toml at {}",
+            write_paths.write_path.display()
         )
     })?;
-
-    let tmp = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp.path(), document.doc.to_string()).with_context(|| {
-        format!(
-            "failed to write temporary config file at {}",
-            tmp.path().display()
-        )
-    })?;
-    tmp.persist(config_path)?;
 
     Ok(())
 }
@@ -713,6 +742,12 @@ impl ConfigEditsBuilder {
             model: model.map(ToOwned::to_owned),
             effort,
         });
+        self
+    }
+
+    pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
+        self.edits
+            .push(ConfigEdit::SetModelPersonality { personality });
         self
     }
 
@@ -784,6 +819,44 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_windows_sandbox_mode(mut self, mode: &str) -> Self {
+        let segments = if let Some(profile) = self.profile.as_ref() {
+            vec![
+                "profiles".to_string(),
+                profile.clone(),
+                "windows".to_string(),
+                "sandbox".to_string(),
+            ]
+        } else {
+            vec!["windows".to_string(), "sandbox".to_string()]
+        };
+        self.edits.push(ConfigEdit::SetPath {
+            segments,
+            value: value(mode),
+        });
+        self
+    }
+
+    pub fn clear_legacy_windows_sandbox_keys(mut self) -> Self {
+        for key in [
+            "experimental_windows_sandbox",
+            "elevated_windows_sandbox",
+            "enable_experimental_windows_sandbox",
+        ] {
+            let mut segments = vec!["features".to_string(), key.to_string()];
+            if let Some(profile) = self.profile.as_ref() {
+                segments = vec![
+                    "profiles".to_string(),
+                    profile.clone(),
+                    "features".to_string(),
+                    key.to_string(),
+                ];
+            }
+            self.edits.push(ConfigEdit::ClearPath { segments });
+        }
+        self
+    }
+
     pub fn with_edits<I>(mut self, edits: I) -> Self
     where
         I: IntoIterator<Item = ConfigEdit>,
@@ -813,6 +886,8 @@ mod tests {
     use crate::config::types::McpServerTransportConfig;
     use codex_protocol::openai_models::ReasoningEffort;
     use pretty_assertions::assert_eq;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
     use toml::Value as TomlValue;
 
@@ -950,6 +1025,71 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
             fast_tbl.get("model").and_then(|v| v.as_str()),
             Some("o4-mini")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_set_model_writes_through_symlink_chain() {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+        let target_dir = tempdir().expect("target dir");
+        let target_path = target_dir.path().join(CONFIG_TOML_FILE);
+        let link_path = codex_home.join("config-link.toml");
+        let config_path = codex_home.join(CONFIG_TOML_FILE);
+
+        symlink(&target_path, &link_path).expect("symlink link");
+        symlink("config-link.toml", &config_path).expect("symlink config");
+
+        apply_blocking(
+            codex_home,
+            None,
+            &[ConfigEdit::SetModel {
+                model: Some("gpt-5.1-codex".to_string()),
+                effort: Some(ReasoningEffort::High),
+            }],
+        )
+        .expect("persist");
+
+        let meta = std::fs::symlink_metadata(&config_path).expect("config metadata");
+        assert!(meta.file_type().is_symlink());
+
+        let contents = std::fs::read_to_string(&target_path).expect("read target");
+        let expected = r#"model = "gpt-5.1-codex"
+model_reasoning_effort = "high"
+"#;
+        assert_eq!(contents, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_set_model_replaces_symlink_on_cycle() {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+        let link_a = codex_home.join("a.toml");
+        let link_b = codex_home.join("b.toml");
+        let config_path = codex_home.join(CONFIG_TOML_FILE);
+
+        symlink("b.toml", &link_a).expect("symlink a");
+        symlink("a.toml", &link_b).expect("symlink b");
+        symlink("a.toml", &config_path).expect("symlink config");
+
+        apply_blocking(
+            codex_home,
+            None,
+            &[ConfigEdit::SetModel {
+                model: Some("gpt-5.1-codex".to_string()),
+                effort: None,
+            }],
+        )
+        .expect("persist");
+
+        let meta = std::fs::symlink_metadata(&config_path).expect("config metadata");
+        assert!(!meta.file_type().is_symlink());
+
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let expected = r#"model = "gpt-5.1-codex"
+"#;
+        assert_eq!(contents, expected);
     }
 
     #[test]
@@ -1292,11 +1432,13 @@ gpt-5 = "gpt-5.1"
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: Some(vec!["one".to_string(), "two".to_string()]),
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1314,11 +1456,13 @@ gpt-5 = "gpt-5.1"
                     env_http_headers: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(5)),
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: Some(vec!["forbidden".to_string()]),
+                scopes: None,
             },
         );
 
@@ -1379,11 +1523,13 @@ foo = { command = "cmd" }
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1423,11 +1569,13 @@ foo = { command = "cmd" } # keep me
                     cwd: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1466,11 +1614,13 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
                     cwd: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 
@@ -1510,11 +1660,13 @@ foo = { command = "cmd" }
                     cwd: None,
                 },
                 enabled: false,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
         );
 

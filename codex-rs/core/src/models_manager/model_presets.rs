@@ -1,8 +1,9 @@
-use codex_app_server_protocol::AuthMode;
+use crate::auth::AuthMode;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::default_input_modalities;
 use indoc::indoc;
 use once_cell::sync::Lazy;
 
@@ -10,7 +11,7 @@ pub const HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG: &str = "hide_gpt5_1_migration_pro
 pub const HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG: &str =
     "hide_gpt-5.1-codex-max_migration_prompt";
 
-static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
+pub(crate) static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
     vec![
         ModelPreset {
             id: "gpt-5.2-codex".to_string(),
@@ -36,10 +37,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Extra high reasoning depth for complex problems".to_string(),
                 },
             ],
+            supports_personality: true,
             is_default: true,
             upgrade: None,
             show_in_picker: true,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5.1-codex-max".to_string(),
@@ -65,10 +68,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Extra high reasoning depth for complex problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: true,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5.1-codex-mini".to_string(),
@@ -87,10 +92,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                         .to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: true,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5.2".to_string(),
@@ -116,10 +123,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Extra high reasoning depth for complex problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: true,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "bengalfox".to_string(),
@@ -145,10 +154,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Extra high reasoning depth for complex problems".to_string(),
                 },
             ],
+            supports_personality: true,
             is_default: false,
             upgrade: None,
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "boomslang".to_string(),
@@ -174,10 +185,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Extra high reasoning depth for complex problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: None,
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         // Deprecated models.
         ModelPreset {
@@ -200,10 +213,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Maximizes reasoning depth for complex or ambiguous problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5-codex-mini".to_string(),
@@ -221,10 +236,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Maximizes reasoning depth for complex or ambiguous problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5.1-codex".to_string(),
@@ -247,10 +264,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                         .to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5".to_string(),
@@ -276,10 +295,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Maximizes reasoning depth for complex or ambiguous problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
         ModelPreset {
             id: "gpt-5.1".to_string(),
@@ -301,10 +322,12 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                     description: "Maximizes reasoning depth for complex or ambiguous problems".to_string(),
                 },
             ],
+            supports_personality: false,
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
             show_in_picker: false,
             supported_in_api: true,
+            input_modalities: default_input_modalities(),
         },
     ]
 });
@@ -334,11 +357,6 @@ fn gpt_52_codex_upgrade() -> ModelUpgrade {
 
 pub(super) fn builtin_model_presets(_auth_mode: Option<AuthMode>) -> Vec<ModelPreset> {
     PRESETS.iter().cloned().collect()
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn all_model_presets() -> &'static Vec<ModelPreset> {
-    &PRESETS
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
 use crate::key_hint::is_altgr;
+use codex_protocol::user_input::ByteRange;
+use codex_protocol::user_input::TextElement as UserTextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -23,7 +25,15 @@ fn is_word_separator(ch: char) -> bool {
 
 #[derive(Debug, Clone)]
 struct TextElement {
+    id: u64,
     range: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextElementSnapshot {
+    pub(crate) id: u64,
+    pub(crate) range: Range<usize>,
+    pub(crate) text: String,
 }
 
 #[derive(Debug)]
@@ -33,6 +43,7 @@ pub(crate) struct TextArea {
     wrap_cache: RefCell<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
+    next_element_id: u64,
     kill_buffer: String,
 }
 
@@ -56,14 +67,45 @@ impl TextArea {
             wrap_cache: RefCell::new(None),
             preferred_col: None,
             elements: Vec::new(),
+            next_element_id: 1,
             kill_buffer: String::new(),
         }
     }
 
-    pub fn set_text(&mut self, text: &str) {
+    /// Replace the textarea text and clear any existing text elements.
+    pub fn set_text_clearing_elements(&mut self, text: &str) {
+        self.set_text_inner(text, None);
+    }
+
+    /// Replace the textarea text and set the provided text elements.
+    pub fn set_text_with_elements(&mut self, text: &str, elements: &[UserTextElement]) {
+        self.set_text_inner(text, Some(elements));
+    }
+
+    fn set_text_inner(&mut self, text: &str, elements: Option<&[UserTextElement]>) {
+        // Stage 1: replace the raw text and keep the cursor in a safe byte range.
         self.text = text.to_string();
         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
+        // Stage 2: rebuild element ranges from scratch against the new text.
         self.elements.clear();
+        if let Some(elements) = elements {
+            for elem in elements {
+                let mut start = elem.byte_range.start.min(self.text.len());
+                let mut end = elem.byte_range.end.min(self.text.len());
+                start = self.clamp_pos_to_char_boundary(start);
+                end = self.clamp_pos_to_char_boundary(end);
+                if start >= end {
+                    continue;
+                }
+                let id = self.next_element_id();
+                self.elements.push(TextElement {
+                    id,
+                    range: start..end,
+                });
+            }
+            self.elements.sort_by_key(|e| e.range.start);
+        }
+        // Stage 3: clamp the cursor and reset derived state tied to the prior content.
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
         self.wrap_cache.replace(None);
         self.preferred_col = None;
@@ -722,10 +764,42 @@ impl TextArea {
             .collect()
     }
 
-    pub fn element_payload_starting_at(&self, pos: usize) -> Option<String> {
-        let pos = pos.min(self.text.len());
-        let elem = self.elements.iter().find(|e| e.range.start == pos)?;
-        self.text.get(elem.range.clone()).map(str::to_string)
+    pub fn text_elements(&self) -> Vec<UserTextElement> {
+        self.elements
+            .iter()
+            .map(|e| {
+                let placeholder = self.text.get(e.range.clone()).map(str::to_string);
+                UserTextElement::new(
+                    ByteRange {
+                        start: e.range.start,
+                        end: e.range.end,
+                    },
+                    placeholder,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn text_element_snapshots(&self) -> Vec<TextElementSnapshot> {
+        self.elements
+            .iter()
+            .filter_map(|element| {
+                self.text
+                    .get(element.range.clone())
+                    .map(|text| TextElementSnapshot {
+                        id: element.id,
+                        range: element.range.clone(),
+                        text: text.to_string(),
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn element_id_for_exact_range(&self, range: Range<usize>) -> Option<u64> {
+        self.elements
+            .iter()
+            .find(|element| element.range == range)
+            .map(|element| element.id)
     }
 
     /// Renames a single text element in-place, keeping it atomic.
@@ -797,19 +871,73 @@ impl TextArea {
         true
     }
 
-    pub fn insert_element(&mut self, text: &str) {
+    pub fn insert_element(&mut self, text: &str) -> u64 {
         let start = self.clamp_pos_for_insertion(self.cursor_pos);
         self.insert_str_at(start, text);
         let end = start + text.len();
-        self.add_element(start..end);
+        let id = self.add_element(start..end);
         // Place cursor at end of inserted element
         self.set_cursor(end);
+        id
     }
 
-    fn add_element(&mut self, range: Range<usize>) {
-        let elem = TextElement { range };
+    /// Mark an existing text range as an atomic element without changing the text.
+    ///
+    /// This is used to convert already-typed tokens (like `/plan`) into elements
+    /// so they render and edit atomically. Overlapping or duplicate ranges are ignored.
+    pub fn add_element_range(&mut self, range: Range<usize>) -> Option<u64> {
+        let start = self.clamp_pos_to_char_boundary(range.start.min(self.text.len()));
+        let end = self.clamp_pos_to_char_boundary(range.end.min(self.text.len()));
+        if start >= end {
+            return None;
+        }
+        if self
+            .elements
+            .iter()
+            .any(|e| e.range.start == start && e.range.end == end)
+        {
+            return None;
+        }
+        if self
+            .elements
+            .iter()
+            .any(|e| start < e.range.end && end > e.range.start)
+        {
+            return None;
+        }
+        let id = self.next_element_id();
+        self.elements.push(TextElement {
+            id,
+            range: start..end,
+        });
+        self.elements.sort_by_key(|e| e.range.start);
+        Some(id)
+    }
+
+    pub fn remove_element_range(&mut self, range: Range<usize>) -> bool {
+        let start = self.clamp_pos_to_char_boundary(range.start.min(self.text.len()));
+        let end = self.clamp_pos_to_char_boundary(range.end.min(self.text.len()));
+        if start >= end {
+            return false;
+        }
+        let len_before = self.elements.len();
+        self.elements
+            .retain(|elem| elem.range.start != start || elem.range.end != end);
+        len_before != self.elements.len()
+    }
+
+    fn add_element(&mut self, range: Range<usize>) -> u64 {
+        let id = self.next_element_id();
+        let elem = TextElement { id, range };
         self.elements.push(elem);
         self.elements.sort_by_key(|e| e.range.start);
+        id
+    }
+
+    fn next_element_id(&mut self) -> u64 {
+        let id = self.next_element_id;
+        self.next_element_id = self.next_element_id.saturating_add(1);
+        id
     }
 
     fn find_element_containing(&self, pos: usize) -> Option<usize> {
@@ -1108,6 +1236,22 @@ impl StatefulWidgetRef for &TextArea {
 }
 
 impl TextArea {
+    pub(crate) fn render_ref_masked(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        state: &mut TextAreaState,
+        mask_char: char,
+    ) {
+        let lines = self.wrapped_lines(area.width);
+        let scroll = self.effective_scroll(area.height, &lines, state.scroll);
+        state.scroll = scroll;
+
+        let start = scroll as usize;
+        let end = (scroll + area.height).min(lines.len() as u16) as usize;
+        self.render_lines_masked(area, buf, &lines, start..end, mask_char);
+    }
+
     fn render_lines(
         &self,
         area: Rect,
@@ -1135,6 +1279,26 @@ impl TextArea {
                 let style = Style::default().fg(Color::Cyan);
                 buf.set_string(area.x + x_off, y, styled, style);
             }
+        }
+    }
+
+    fn render_lines_masked(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        lines: &[Range<usize>],
+        range: std::ops::Range<usize>,
+        mask_char: char,
+    ) {
+        for (row, idx) in range.enumerate() {
+            let r = &lines[idx];
+            let y = area.y + row as u16;
+            let line_range = r.start..r.end - 1;
+            let masked = self.text[line_range.clone()]
+                .chars()
+                .map(|_| mask_char)
+                .collect::<String>();
+            buf.set_string(area.x, y, &masked, Style::default());
         }
     }
 }
@@ -1251,7 +1415,7 @@ mod tests {
         let mut t = TextArea::new();
         t.insert_str("abcd");
         t.set_cursor(1);
-        t.set_text("你");
+        t.set_text_clearing_elements("你");
         assert_eq!(t.cursor(), 0);
         t.insert_str("a");
         assert_eq!(t.text(), "a你");
@@ -1281,6 +1445,21 @@ mod tests {
         t.set_cursor(t.text().len());
         t.delete_forward(1);
         assert_eq!(t.text(), "b");
+    }
+
+    #[test]
+    fn delete_forward_deletes_element_at_left_edge() {
+        let mut t = TextArea::new();
+        t.insert_str("a");
+        t.insert_element("<element>");
+        t.insert_str("b");
+
+        let elem_start = t.elements[0].range.start;
+        t.set_cursor(elem_start);
+        t.delete_forward(1);
+
+        assert_eq!(t.text(), "ab");
+        assert_eq!(t.cursor(), elem_start);
     }
 
     #[test]
@@ -1933,7 +2112,7 @@ mod tests {
             for _ in 0..base_len {
                 base.push_str(&rand_grapheme(&mut rng));
             }
-            ta.set_text(&base);
+            ta.set_text_clearing_elements(&base);
             // Choose a valid char boundary for initial cursor
             let mut boundaries: Vec<usize> = vec![0];
             boundaries.extend(ta.text().char_indices().map(|(i, _)| i).skip(1));

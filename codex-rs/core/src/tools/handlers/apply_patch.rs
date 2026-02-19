@@ -1,3 +1,4 @@
+use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -109,8 +110,7 @@ impl ToolHandler for ApplyPatchHandler {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
                         Ok(ToolOutput::Function {
-                            content,
-                            content_items: None,
+                            body: FunctionCallOutputBody::Text(content),
                             success: Some(true),
                         })
                     }
@@ -143,10 +143,12 @@ impl ToolHandler for ApplyPatchHandler {
                             turn: turn.as_ref(),
                             call_id: call_id.clone(),
                             tool_name: tool_name.to_string(),
+                            network_attempt_id: None,
                         };
                         let out = orchestrator
                             .run(&mut runtime, &req, &tool_ctx, &turn, turn.approval_policy)
-                            .await;
+                            .await
+                            .map(|result| result.output);
                         let event_ctx = ToolEventCtx::new(
                             session.as_ref(),
                             turn.as_ref(),
@@ -155,8 +157,7 @@ impl ToolHandler for ApplyPatchHandler {
                         );
                         let content = emitter.finish(event_ctx, out).await?;
                         Ok(ToolOutput::Function {
-                            content,
-                            content_items: None,
+                            body: FunctionCallOutputBody::Text(content),
                             success: Some(true),
                         })
                     }
@@ -205,8 +206,7 @@ pub(crate) async fn intercept_apply_patch(
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
                     Ok(Some(ToolOutput::Function {
-                        content,
-                        content_items: None,
+                        body: FunctionCallOutputBody::Text(content),
                         success: Some(true),
                     }))
                 }
@@ -234,16 +234,17 @@ pub(crate) async fn intercept_apply_patch(
                         turn,
                         call_id: call_id.to_string(),
                         tool_name: tool_name.to_string(),
+                        network_attempt_id: None,
                     };
                     let out = orchestrator
                         .run(&mut runtime, &req, &tool_ctx, turn, turn.approval_policy)
-                        .await;
+                        .await
+                        .map(|result| result.output);
                     let event_ctx =
                         ToolEventCtx::new(session, turn, call_id, tracker.as_ref().copied());
                     let content = emitter.finish(event_ctx, out).await?;
                     Ok(Some(ToolOutput::Function {
-                        content,
-                        content_items: None,
+                        body: FunctionCallOutputBody::Text(content),
                         success: Some(true),
                     }))
                 }

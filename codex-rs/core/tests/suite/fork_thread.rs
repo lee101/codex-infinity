@@ -1,8 +1,4 @@
-use codex_core::CodexAuth;
-use codex_core::ModelProviderInfo;
 use codex_core::NewThread;
-use codex_core::ThreadManager;
-use codex_core::built_in_model_providers;
 use codex_core::parse_turn_item;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -10,20 +6,17 @@ use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
 use codex_protocol::items::TurnItem;
 use codex_protocol::user_input::UserInput;
-use core_test_support::load_default_config_for_test;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
-
-/// Build minimal SSE stream with completed marker using the JSON fixture.
-fn sse_completed(id: &str) -> String {
-    core_test_support::load_sse_fixture_with_id("../fixtures/completed_template.json", id)
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_thread_twice_drops_to_first_message() {
@@ -31,7 +24,7 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // Start a mock server that completes three turns.
     let server = MockServer::start().await;
-    let sse = sse_completed("resp");
+    let sse = sse(vec![ev_response_created("resp"), ev_completed("resp")]);
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(sse.clone(), "text/event-stream");
@@ -44,25 +37,11 @@ async fn fork_thread_twice_drops_to_first_message() {
         .mount(&server)
         .await;
 
-    // Configure Codex to use the mock server.
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&home).await;
-    config.model_provider = model_provider.clone();
-    let config_for_fork = config.clone();
-
-    let thread_manager = ThreadManager::with_models_provider(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-    );
-    let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config)
-        .await
-        .expect("create conversation");
+    let mut builder = test_codex();
+    let test = builder.build(&server).await.expect("create conversation");
+    let codex = test.codex.clone();
+    let thread_manager = test.thread_manager.clone();
+    let config_for_fork = test.config.clone();
 
     // Send three user messages; wait for three completed turns.
     for text in ["first", "second", "third"] {
@@ -80,7 +59,7 @@ async fn fork_thread_twice_drops_to_first_message() {
     }
 
     // Request history from the base conversation to obtain rollout path.
-    let base_path = codex.rollout_path();
+    let base_path = codex.rollout_path().expect("rollout path");
 
     // GetHistory flushes before returning the path; no wait needed.
 
@@ -131,11 +110,11 @@ async fn fork_thread_twice_drops_to_first_message() {
         thread: codex_fork1,
         ..
     } = thread_manager
-        .fork_thread(1, config_for_fork.clone(), base_path.clone())
+        .fork_thread(1, config_for_fork.clone(), base_path.clone(), false)
         .await
         .expect("fork 1");
 
-    let fork1_path = codex_fork1.rollout_path();
+    let fork1_path = codex_fork1.rollout_path().expect("rollout path");
 
     // GetHistory on fork1 flushed; the file is ready.
     let fork1_items = read_items(&fork1_path);
@@ -150,11 +129,11 @@ async fn fork_thread_twice_drops_to_first_message() {
         thread: codex_fork2,
         ..
     } = thread_manager
-        .fork_thread(0, config_for_fork.clone(), fork1_path.clone())
+        .fork_thread(0, config_for_fork.clone(), fork1_path.clone(), false)
         .await
         .expect("fork 2");
 
-    let fork2_path = codex_fork2.rollout_path();
+    let fork2_path = codex_fork2.rollout_path().expect("rollout path");
     // GetHistory on fork2 flushed; the file is ready.
     let fork1_items = read_items(&fork1_path);
     let fork1_user_inputs = find_user_input_positions(&fork1_items);

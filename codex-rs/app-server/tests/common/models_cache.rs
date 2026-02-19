@@ -1,11 +1,12 @@
 use chrono::DateTime;
 use chrono::Utc;
-use codex_core::models_manager::model_presets::all_model_presets;
+use codex_core::test_support::all_model_presets;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::openai_models::default_input_modalities;
 use serde_json::json;
 use std::path::Path;
 
@@ -27,6 +28,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         priority,
         upgrade: preset.upgrade.as_ref().map(|u| u.into()),
         base_instructions: "base instructions".to_string(),
+        model_messages: None,
         supports_reasoning_summaries: false,
         support_verbosity: false,
         default_verbosity: None,
@@ -37,6 +39,8 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
+        input_modalities: default_input_modalities(),
+        prefer_websockets: false,
     }
 }
 
@@ -74,9 +78,11 @@ pub fn write_models_cache_with_models(
     let cache_path = codex_home.join("models_cache.json");
     // DateTime<Utc> serializes to RFC3339 format by default with serde
     let fetched_at: DateTime<Utc> = Utc::now();
+    let client_version = codex_core::models_manager::client_version_to_whole();
     let cache = json!({
         "fetched_at": fetched_at,
         "etag": null,
+        "client_version": client_version,
         "models": models
     });
     std::fs::write(cache_path, serde_json::to_string_pretty(&cache)?)

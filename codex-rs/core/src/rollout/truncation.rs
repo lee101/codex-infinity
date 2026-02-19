@@ -85,6 +85,8 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            end_turn: None,
+            phase: None,
         }
     }
 
@@ -95,6 +97,8 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            end_turn: None,
+            phase: None,
         }
     }
 
@@ -189,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_session_prefix_messages_when_truncating_rollout_from_start() {
         let (session, turn_context) = make_session_and_context().await;
-        let mut items = session.build_initial_context(&turn_context);
+        let mut items = session.build_initial_context(&turn_context).await;
         items.push(user_msg("feature request"));
         items.push(assistant_msg("ack"));
         items.push(user_msg("second question"));

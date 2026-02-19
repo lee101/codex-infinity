@@ -2,19 +2,29 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use wiremock::matchers::body_string_contains;
-use wiremock::ResponseTemplate;
+use codex_core::CodexAuth;
+use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::openai_models::ConfigShellToolType;
+use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_models_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -28,6 +38,8 @@ use image::Rgba;
 use image::load_from_memory;
 use serde_json::Value;
 use tokio::time::Duration;
+use wiremock::BodyPrintLimit;
+use wiremock::MockServer;
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
@@ -66,7 +78,9 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
     if let Some(parent) = abs_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let image = ImageBuffer::from_pixel(4096, 1024, Rgba([20u8, 40, 60, 255]));
+    let original_width = 2304;
+    let original_height = 864;
+    let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([20u8, 40, 60, 255]));
     image.save(&abs_path)?;
 
     let response = sse(vec![
@@ -91,10 +105,17 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        // Empirically, image attachment can be slow under Bazel/RBE.
+        Duration::from_secs(10),
+    )
+    .await;
 
     let body = mock.single_request().body_json();
     let image_message =
@@ -125,8 +146,8 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
     let (width, height) = resized.dimensions();
     assert!(width <= 2048);
     assert!(height <= 768);
-    assert!(width < 4096);
-    assert!(height < 1024);
+    assert!(width < original_width);
+    assert!(height < original_height);
 
     Ok(())
 }
@@ -149,7 +170,9 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     if let Some(parent) = abs_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let image = ImageBuffer::from_pixel(4096, 1024, Rgba([255u8, 0, 0, 255]));
+    let original_width = 2304;
+    let original_height = 864;
+    let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([255u8, 0, 0, 255]));
     image.save(&abs_path)?;
 
     let call_id = "view-image-call";
@@ -184,6 +207,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -261,8 +285,117 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     let (resized_width, resized_height) = resized.dimensions();
     assert!(resized_width <= 2048);
     assert!(resized_height <= 768);
-    assert!(resized_width < 4096);
-    assert!(resized_height < 1024);
+    assert!(resized_width < original_width);
+    assert!(resized_height < original_height);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn js_repl_view_image_tool_attaches_local_image() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.features.enable(Feature::JsRepl);
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let call_id = "js-repl-view-image";
+    let js_input = r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const imagePath = path.join(codex.tmpDir, "js-repl-view-image.png");
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await fs.writeFile(imagePath, png);
+const out = await codex.tool("view_image", { path: imagePath });
+console.log(out.output?.body?.text ?? "");
+"#;
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_custom_tool_call(call_id, "js_repl", js_input),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    let session_model = session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "use js_repl to write an image and attach it".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_model,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let req = mock.single_request();
+    let (js_repl_output, js_repl_success) = req
+        .custom_tool_call_output_content_and_success(call_id)
+        .expect("custom tool output present");
+    let js_repl_output = js_repl_output.expect("custom tool output text present");
+    if js_repl_output.contains("Node runtime not found")
+        || js_repl_output.contains("Node runtime too old for js_repl")
+    {
+        eprintln!("Skipping js_repl image test: {js_repl_output}");
+        return Ok(());
+    }
+    assert_ne!(
+        js_repl_success,
+        Some(false),
+        "js_repl call failed unexpectedly: {js_repl_output}"
+    );
+
+    let body = req.body_json();
+    let image_message =
+        find_image_message(&body).expect("pending input image message not included in request");
+    let image_url = image_message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|span| {
+                if span.get("type").and_then(Value::as_str) == Some("input_image") {
+                    span.get("image_url").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("image_url present");
+    assert!(
+        image_url.starts_with("data:image/png;base64,"),
+        "expected png data URL, got {image_url}"
+    );
 
     Ok(())
 }
@@ -316,6 +449,7 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -390,6 +524,7 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -483,6 +618,7 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -503,6 +639,121 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
     assert!(
         find_image_message(&body_with_tool_output).is_none(),
         "missing file should not produce an input_image message"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    // Use MockServer directly (not start_mock_server) so the first /models request returns our
+    // text-only model. start_mock_server mounts empty models first, causing get_model_info to
+    // fall back to model_info_from_slug with default_input_modalities (Text+Image), which would
+    // incorrectly allow view_image.
+    let server = MockServer::builder()
+        .body_print_limit(BodyPrintLimit::Limited(80_000))
+        .start()
+        .await;
+    let model_slug = "text-only-view-image-test-model";
+    let text_only_model = ModelInfo {
+        slug: model_slug.to_string(),
+        display_name: "Text-only view_image test model".to_string(),
+        description: Some("Remote model for view_image unsupported-path coverage".to_string()),
+        default_reasoning_level: Some(ReasoningEffort::Medium),
+        supported_reasoning_levels: vec![ReasoningEffortPreset {
+            effort: ReasoningEffort::Medium,
+            description: ReasoningEffort::Medium.to_string(),
+        }],
+        shell_type: ConfigShellToolType::ShellCommand,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        input_modalities: vec![InputModality::Text],
+        prefer_websockets: false,
+        priority: 1,
+        upgrade: None,
+        base_instructions: "base instructions".to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: false,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: None,
+        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        supports_parallel_tool_calls: false,
+        context_window: Some(272_000),
+        auto_compact_token_limit: None,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: Vec::new(),
+    };
+    mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![text_only_model],
+        },
+    )
+    .await;
+
+    let TestCodex { codex, cwd, .. } = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.features.enable(Feature::RemoteModels);
+            config.model = Some(model_slug.to_string());
+        })
+        .build(&server)
+        .await?;
+
+    let rel_path = "assets/example.png";
+    let abs_path = cwd.path().join(rel_path);
+    if let Some(parent) = abs_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let image = ImageBuffer::from_pixel(20, 20, Rgba([255u8, 0, 0, 255]));
+    image.save(&abs_path)?;
+
+    let call_id = "view-image-unsupported-model";
+    let arguments = serde_json::json!({ "path": rel_path }).to_string();
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "view_image", &arguments),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "please attach the image".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: model_slug.to_string(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let output_text = mock
+        .single_request()
+        .function_call_output_content_and_success(call_id)
+        .and_then(|(content, _)| content)
+        .expect("output text present");
+    assert_eq!(
+        output_text,
+        "view_image is not allowed because you do not support image inputs"
     );
 
     Ok(())
@@ -565,6 +816,7 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
             effort: None,
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 

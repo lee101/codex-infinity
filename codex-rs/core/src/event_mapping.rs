@@ -5,6 +5,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::items::WebSearchItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -17,15 +18,11 @@ use codex_protocol::user_input::UserInput;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::user_instructions::SkillInstructions;
-use crate::user_instructions::UserInstructions;
+use crate::instructions::SkillInstructions;
+use crate::instructions::UserInstructions;
+use crate::session_prefix::is_session_prefix;
 use crate::user_shell_command::is_user_shell_command_text;
-
-fn is_session_prefix(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let lowered = trimmed.to_ascii_lowercase();
-    lowered.starts_with("<environment_context>")
-}
+use crate::web_search::web_search_action_detail;
 
 fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     if UserInstructions::is_user_instructions(message)
@@ -52,7 +49,7 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                 }
                 content.push(UserInput::Text {
                     text: text.clone(),
-                    // Plain text conversion has no UI element ranges.
+                    // Model input content does not carry UI element ranges.
                     text_elements: Vec::new(),
                 });
             }
@@ -73,7 +70,11 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     Some(UserMessageItem::new(&content))
 }
 
-fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMessageItem {
+fn parse_agent_message(
+    id: Option<&String>,
+    message: &[ContentItem],
+    phase: Option<MessagePhase>,
+) -> AgentMessageItem {
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
@@ -89,16 +90,23 @@ fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMes
         }
     }
     let id = id.cloned().unwrap_or_else(|| Uuid::new_v4().to_string());
-    AgentMessageItem { id, content }
+    AgentMessageItem { id, content, phase }
 }
 
 pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
     match item {
-        ResponseItem::Message { role, content, id } => match role.as_str() {
+        ResponseItem::Message {
+            role,
+            content,
+            id,
+            phase,
+            ..
+        } => match role.as_str() {
             "user" => parse_user_message(content).map(TurnItem::UserMessage),
             "assistant" => Some(TurnItem::AgentMessage(parse_agent_message(
                 id.as_ref(),
                 content,
+                phase.clone(),
             ))),
             "system" => None,
             _ => None,
@@ -130,14 +138,17 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
                 raw_content,
             }))
         }
-        ResponseItem::WebSearchCall {
-            id,
-            action: WebSearchAction::Search { query },
-            ..
-        } => Some(TurnItem::WebSearch(WebSearchItem {
-            id: id.clone().unwrap_or_default(),
-            query: query.clone().unwrap_or_default(),
-        })),
+        ResponseItem::WebSearchCall { id, action, .. } => {
+            let (action, query) = match action {
+                Some(action) => (action.clone(), web_search_action_detail(action)),
+                None => (WebSearchAction::Other, String::new()),
+            };
+            Some(TurnItem::WebSearch(WebSearchItem {
+                id: id.clone().unwrap_or_default(),
+                query,
+                action,
+            }))
+        }
         _ => None,
     }
 }
@@ -147,6 +158,7 @@ mod tests {
     use super::parse_turn_item;
     use codex_protocol::items::AgentMessageContent;
     use codex_protocol::items::TurnItem;
+    use codex_protocol::items::WebSearchItem;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::ReasoningItemReasoningSummary;
@@ -174,6 +186,8 @@ mod tests {
                     image_url: img2.clone(),
                 },
             ],
+            end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -215,6 +229,8 @@ mod tests {
                     text: user_text.clone(),
                 },
             ],
+            end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -255,6 +271,8 @@ mod tests {
                     text: user_text.clone(),
                 },
             ],
+            end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -283,6 +301,8 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "<user_instructions>test_text</user_instructions>".to_string(),
                 }],
+                end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -290,6 +310,8 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
+                end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -297,6 +319,8 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
+                end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -305,6 +329,8 @@ mod tests {
                     text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
                         .to_string(),
                 }],
+                end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -312,6 +338,8 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
+                end_turn: None,
+            phase: None,
             },
         ];
 
@@ -329,6 +357,8 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "Hello from Codex".to_string(),
             }],
+            end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected agent message turn item");
@@ -413,18 +443,104 @@ mod tests {
         let item = ResponseItem::WebSearchCall {
             id: Some("ws_1".to_string()),
             status: Some("completed".to_string()),
-            action: WebSearchAction::Search {
+            action: Some(WebSearchAction::Search {
                 query: Some("weather".to_string()),
-            },
+                queries: None,
+            }),
         };
 
         let turn_item = parse_turn_item(&item).expect("expected web search turn item");
 
         match turn_item {
-            TurnItem::WebSearch(search) => {
-                assert_eq!(search.id, "ws_1");
-                assert_eq!(search.query, "weather");
-            }
+            TurnItem::WebSearch(search) => assert_eq!(
+                search,
+                WebSearchItem {
+                    id: "ws_1".to_string(),
+                    query: "weather".to_string(),
+                    action: WebSearchAction::Search {
+                        query: Some("weather".to_string()),
+                        queries: None,
+                    },
+                }
+            ),
+            other => panic!("expected TurnItem::WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_open_page_call() {
+        let item = ResponseItem::WebSearchCall {
+            id: Some("ws_open".to_string()),
+            status: Some("completed".to_string()),
+            action: Some(WebSearchAction::OpenPage {
+                url: Some("https://example.com".to_string()),
+            }),
+        };
+
+        let turn_item = parse_turn_item(&item).expect("expected web search turn item");
+
+        match turn_item {
+            TurnItem::WebSearch(search) => assert_eq!(
+                search,
+                WebSearchItem {
+                    id: "ws_open".to_string(),
+                    query: "https://example.com".to_string(),
+                    action: WebSearchAction::OpenPage {
+                        url: Some("https://example.com".to_string()),
+                    },
+                }
+            ),
+            other => panic!("expected TurnItem::WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_find_in_page_call() {
+        let item = ResponseItem::WebSearchCall {
+            id: Some("ws_find".to_string()),
+            status: Some("completed".to_string()),
+            action: Some(WebSearchAction::FindInPage {
+                url: Some("https://example.com".to_string()),
+                pattern: Some("needle".to_string()),
+            }),
+        };
+
+        let turn_item = parse_turn_item(&item).expect("expected web search turn item");
+
+        match turn_item {
+            TurnItem::WebSearch(search) => assert_eq!(
+                search,
+                WebSearchItem {
+                    id: "ws_find".to_string(),
+                    query: "'needle' in https://example.com".to_string(),
+                    action: WebSearchAction::FindInPage {
+                        url: Some("https://example.com".to_string()),
+                        pattern: Some("needle".to_string()),
+                    },
+                }
+            ),
+            other => panic!("expected TurnItem::WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_partial_web_search_call_without_action_as_other() {
+        let item = ResponseItem::WebSearchCall {
+            id: Some("ws_partial".to_string()),
+            status: Some("in_progress".to_string()),
+            action: None,
+        };
+
+        let turn_item = parse_turn_item(&item).expect("expected web search turn item");
+        match turn_item {
+            TurnItem::WebSearch(search) => assert_eq!(
+                search,
+                WebSearchItem {
+                    id: "ws_partial".to_string(),
+                    query: String::new(),
+                    action: WebSearchAction::Other,
+                }
+            ),
             other => panic!("expected TurnItem::WebSearch, got {other:?}"),
         }
     }

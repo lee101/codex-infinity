@@ -1,10 +1,12 @@
 //! RA1 Art Generator tool - generates AI images via netwrck.com API.
 
-use mcp_types::{CallToolResult, ContentBlock, TextContent, Tool, ToolInputSchema};
+use rmcp::model::{CallToolResult, Tool};
 use schemars::r#gen::SchemaSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Map as JsonObject;
 use std::env;
+use std::sync::Arc;
 
 const NETWRCK_API_KEY_ENV: &str = "NETWRCK_API_KEY";
 const RA1_API_URL: &str = "https://netwrck.com/api/ra1-art-generator";
@@ -49,38 +51,50 @@ pub fn create_tool_for_ra1_art_generator() -> Tool {
     let schema_value =
         serde_json::to_value(&schema).expect("RA1 tool schema should serialise to JSON");
 
-    let tool_input_schema =
-        serde_json::from_value::<ToolInputSchema>(schema_value).unwrap_or_else(|e| {
-            panic!("failed to create Tool from schema: {e}");
-        });
+    let mut schema_object = match schema_value {
+        serde_json::Value::Object(object) => object,
+        _ => panic!("tool schema should serialize to a JSON object"),
+    };
+    let mut input_schema = JsonObject::new();
+    for key in ["properties", "required", "type", "$defs", "definitions"] {
+        if let Some(val) = schema_object.remove(key) {
+            input_schema.insert(key.to_string(), val);
+        }
+    }
+    let tool_input_schema = Arc::new(input_schema);
 
     Tool {
-        name: "ra1-art-generator".to_string(),
+        name: "ra1-art-generator".into(),
         title: Some("RA1 Art Generator".to_string()),
         input_schema: tool_input_schema,
         output_schema: None,
         description: Some(
-            "Generate AI images using the RA1 art generator. Returns an image URL.".to_string(),
+            "Generate AI images using the RA1 art generator. Returns an image URL.".into(),
         ),
         annotations: None,
+        execution: None,
+        icons: None,
+        meta: None,
+    }
+}
+
+fn error_result(msg: String) -> CallToolResult {
+    CallToolResult {
+        content: vec![rmcp::model::Content::text(msg)],
+        is_error: Some(true),
+        structured_content: None,
+        meta: None,
     }
 }
 
 pub async fn handle_ra1_art_generator(
-    arguments: Option<serde_json::Value>,
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> CallToolResult {
+    let arguments = arguments.map(serde_json::Value::Object);
     let api_key = match env::var(NETWRCK_API_KEY_ENV) {
         Ok(key) => key,
         Err(_) => {
-            return CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    r#type: "text".to_string(),
-                    text: format!("{NETWRCK_API_KEY_ENV} environment variable not set"),
-                    annotations: None,
-                })],
-                is_error: Some(true),
-                structured_content: None,
-            };
+            return error_result(format!("{NETWRCK_API_KEY_ENV} environment variable not set"));
         }
     };
 
@@ -88,27 +102,13 @@ pub async fn handle_ra1_art_generator(
         Some(json_val) => match serde_json::from_value(json_val) {
             Ok(p) => p,
             Err(e) => {
-                return CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent {
-                        r#type: "text".to_string(),
-                        text: format!("Failed to parse parameters: {e}"),
-                        annotations: None,
-                    })],
-                    is_error: Some(true),
-                    structured_content: None,
-                };
+                return error_result(format!("Failed to parse parameters: {e}"));
             }
         },
         None => {
-            return CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    r#type: "text".to_string(),
-                    text: "Missing arguments; the `prompt` field is required.".to_string(),
-                    annotations: None,
-                })],
-                is_error: Some(true),
-                structured_content: None,
-            };
+            return error_result(
+                "Missing arguments; the `prompt` field is required.".to_string(),
+            );
         }
     };
 
@@ -130,15 +130,7 @@ pub async fn handle_ra1_art_generator(
     {
         Ok(r) => r,
         Err(e) => {
-            return CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    r#type: "text".to_string(),
-                    text: format!("HTTP request failed: {e}"),
-                    annotations: None,
-                })],
-                is_error: Some(true),
-                structured_content: None,
-            };
+            return error_result(format!("HTTP request failed: {e}"));
         }
     };
 
@@ -146,63 +138,30 @@ pub async fn handle_ra1_art_generator(
     let body = match response.text().await {
         Ok(b) => b,
         Err(e) => {
-            return CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    r#type: "text".to_string(),
-                    text: format!("Failed to read response body: {e}"),
-                    annotations: None,
-                })],
-                is_error: Some(true),
-                structured_content: None,
-            };
+            return error_result(format!("Failed to read response body: {e}"));
         }
     };
 
     if !status.is_success() {
         if let Ok(err) = serde_json::from_str::<Ra1ArtGeneratorError>(&body) {
-            return CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    r#type: "text".to_string(),
-                    text: format!("API error: {}", err.error),
-                    annotations: None,
-                })],
-                is_error: Some(true),
-                structured_content: None,
-            };
+            return error_result(format!("API error: {}", err.error));
         }
-        return CallToolResult {
-            content: vec![ContentBlock::TextContent(TextContent {
-                r#type: "text".to_string(),
-                text: format!("API error ({}): {}", status, body),
-                annotations: None,
-            })],
-            is_error: Some(true),
-            structured_content: None,
-        };
+        return error_result(format!("API error ({}): {body}", status));
     }
 
     match serde_json::from_str::<Ra1ArtGeneratorResponse>(&body) {
         Ok(resp) => CallToolResult {
-            content: vec![ContentBlock::TextContent(TextContent {
-                r#type: "text".to_string(),
-                text: format!(
-                    "Image generated successfully!\nURL: {}\nPrompt: {}\nSize: {}\nCost: ${}",
-                    resp.image_url, resp.prompt_used, resp.size_used, resp.cost
-                ),
-                annotations: None,
-            })],
+            content: vec![rmcp::model::Content::text(format!(
+                "Image generated successfully!\nURL: {}\nPrompt: {}\nSize: {}\nCost: ${}",
+                resp.image_url, resp.prompt_used, resp.size_used, resp.cost
+            ))],
             is_error: Some(false),
             structured_content: None,
+            meta: None,
         },
-        Err(e) => CallToolResult {
-            content: vec![ContentBlock::TextContent(TextContent {
-                r#type: "text".to_string(),
-                text: format!("Failed to parse API response: {e}\nRaw: {body}"),
-                annotations: None,
-            })],
-            is_error: Some(true),
-            structured_content: None,
-        },
+        Err(e) => error_result(format!(
+            "Failed to parse API response: {e}\nRaw: {body}"
+        )),
     }
 }
 
@@ -213,7 +172,7 @@ mod tests {
     #[test]
     fn verify_ra1_tool_json_schema() {
         let tool = create_tool_for_ra1_art_generator();
-        assert_eq!(tool.name, "ra1-art-generator");
+        assert_eq!(tool.name.as_ref(), "ra1-art-generator");
         assert!(tool.description.is_some());
         let schema = serde_json::to_value(&tool.input_schema).unwrap();
         let props = schema.get("properties").unwrap();

@@ -72,6 +72,8 @@ jobs:
     needs: metadata
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_LTO: ${{ contains(needs.metadata.outputs.version, '-alpha') && 'thin' || 'fat' }}
     defaults:
       run:
         working-directory: codex-rs
@@ -93,15 +95,83 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@1.92
+      - name: Install UBSan runtime (musl)
+        if: ${{ matrix.install_musl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libubsan1
+          fi
+
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: ${{ matrix.target }}
 
       - if: ${{ matrix.install_musl }}
+        name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - if: ${{ matrix.install_musl }}
         name: Install musl build dependencies
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - if: ${{ matrix.install_musl }}
+        name: Configure rustc UBSan wrapper (musl host)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          set -euo pipefail
+          ubsan=""
+          if command -v ldconfig >/dev/null 2>&1; then
+            ubsan="$(ldconfig -p | grep -m1 'libubsan\.so\.1' | sed -E 's/.*=> (.*)$/\1/')"
+          fi
+          wrapper_root="${RUNNER_TEMP:-/tmp}"
+          wrapper="${wrapper_root}/rustc-ubsan-wrapper"
+          cat > "${wrapper}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ -n "${ubsan}" ]]; then
+            export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
+          fi
+          exec "\$1" "\${@:2}"
+          EOF
+          chmod +x "${wrapper}"
+          echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
+          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
+
+      - if: ${{ matrix.install_musl }}
+        name: Clear sanitizer flags (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clear global Rust flags so host/proc-macro builds don't pull in UBSan.
+          echo "RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_ENCODED_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "RUSTDOCFLAGS=" >> "$GITHUB_ENV"
+          # Override any runner-level Cargo config rustflags as well.
+          echo "CARGO_BUILD_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
+
+          sanitize_flags() {
+            local input="$1"
+            input="${input//-fsanitize=undefined/}"
+            input="${input//-fno-sanitize-recover=undefined/}"
+            input="${input//-fno-sanitize-trap=undefined/}"
+            echo "$input"
+          }
+
+          cflags="$(sanitize_flags "${CFLAGS-}")"
+          cxxflags="$(sanitize_flags "${CXXFLAGS-}")"
+          echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
       - name: Build exec server binaries
         run: cargo build --release --target ${{ matrix.target }} --bin codex-exec-mcp-server --bin codex-execve-wrapper
@@ -181,11 +251,11 @@ jobs:
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential bison autoconf gettext
+            DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential bison autoconf gettext libncursesw5-dev
           elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y git gcc gcc-c++ make bison autoconf gettext
+            dnf install -y git gcc gcc-c++ make bison autoconf gettext ncurses-devel
           elif command -v yum >/dev/null 2>&1; then
-            yum install -y git gcc gcc-c++ make bison autoconf gettext
+            yum install -y git gcc gcc-c++ make bison autoconf gettext ncurses-devel
           else
             echo "Unsupported package manager in container"
             exit 1
@@ -198,7 +268,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/bminor/bash /tmp/bash
+          git clone --depth 1 https://github.com/bolinfest/bash /tmp/bash
           cd /tmp/bash
           git fetch --depth 1 origin a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
           git checkout a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
@@ -240,7 +310,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/bminor/bash /tmp/bash
+          git clone --depth 1 https://github.com/bolinfest/bash /tmp/bash
           cd /tmp/bash
           git fetch --depth 1 origin a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
           git checkout a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
@@ -259,6 +329,212 @@ jobs:
           path: artifacts/**
           if-no-files-found: error
 
+  zsh-linux:
+    name: Build zsh (Linux) - ${{ matrix.variant }} - ${{ matrix.target }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            variant: ubuntu-24.04
+            image: ubuntu:24.04
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            variant: ubuntu-22.04
+            image: ubuntu:22.04
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            variant: debian-12
+            image: debian:12
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            variant: debian-11
+            image: debian:11
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            variant: centos-9
+            image: quay.io/centos/centos:stream9
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: ubuntu-24.04
+            image: arm64v8/ubuntu:24.04
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: ubuntu-22.04
+            image: arm64v8/ubuntu:22.04
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: ubuntu-20.04
+            image: arm64v8/ubuntu:20.04
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: debian-12
+            image: arm64v8/debian:12
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: debian-11
+            image: arm64v8/debian:11
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            variant: centos-9
+            image: quay.io/centos/centos:stream9
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential bison autoconf gettext libncursesw5-dev
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y git gcc gcc-c++ make bison autoconf gettext ncurses-devel
+          elif command -v yum >/dev/null 2>&1; then
+            yum install -y git gcc gcc-c++ make bison autoconf gettext ncurses-devel
+          else
+            echo "Unsupported package manager in container"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build patched zsh
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://git.code.sf.net/p/zsh/code /tmp/zsh
+          cd /tmp/zsh
+          git fetch --depth 1 origin 77045ef899e53b9598bebc5a41db93a548a40ca6
+          git checkout 77045ef899e53b9598bebc5a41db93a548a40ca6
+          git apply "${GITHUB_WORKSPACE}/shell-tool-mcp/patches/zsh-exec-wrapper.patch"
+          ./Util/preconfig
+          ./configure
+          cores="$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN)"
+          make -j"${cores}"
+
+          dest="${GITHUB_WORKSPACE}/artifacts/vendor/${{ matrix.target }}/zsh/${{ matrix.variant }}"
+          mkdir -p "$dest"
+          cp Src/zsh "$dest/zsh"
+
+      - name: Smoke test zsh exec wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          cat > "$tmpdir/exec-wrapper" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          : "${CODEX_WRAPPER_LOG:?missing CODEX_WRAPPER_LOG}"
+          printf '%s\n' "$@" > "$CODEX_WRAPPER_LOG"
+          file="$1"
+          shift
+          if [[ "$#" -eq 0 ]]; then
+            exec "$file"
+          fi
+          arg0="$1"
+          shift
+          exec -a "$arg0" "$file" "$@"
+          EOF
+          chmod +x "$tmpdir/exec-wrapper"
+
+          CODEX_WRAPPER_LOG="$tmpdir/wrapper.log" \
+          EXEC_WRAPPER="$tmpdir/exec-wrapper" \
+          /tmp/zsh/Src/zsh -fc '/bin/echo smoke-zsh' > "$tmpdir/stdout.txt"
+
+          grep -Fx "smoke-zsh" "$tmpdir/stdout.txt"
+          grep -Fx "/bin/echo" "$tmpdir/wrapper.log"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shell-tool-mcp-zsh-${{ matrix.target }}-${{ matrix.variant }}
+          path: artifacts/**
+          if-no-files-found: error
+
+  zsh-darwin:
+    name: Build zsh (macOS) - ${{ matrix.variant }} - ${{ matrix.target }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+            variant: macos-15
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            variant: macos-14
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v autoconf >/dev/null 2>&1; then
+            brew install autoconf
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build patched zsh
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://git.code.sf.net/p/zsh/code /tmp/zsh
+          cd /tmp/zsh
+          git fetch --depth 1 origin 77045ef899e53b9598bebc5a41db93a548a40ca6
+          git checkout 77045ef899e53b9598bebc5a41db93a548a40ca6
+          git apply "${GITHUB_WORKSPACE}/shell-tool-mcp/patches/zsh-exec-wrapper.patch"
+          ./Util/preconfig
+          ./configure
+          cores="$(getconf _NPROCESSORS_ONLN)"
+          make -j"${cores}"
+
+          dest="${GITHUB_WORKSPACE}/artifacts/vendor/${{ matrix.target }}/zsh/${{ matrix.variant }}"
+          mkdir -p "$dest"
+          cp Src/zsh "$dest/zsh"
+
+      - name: Smoke test zsh exec wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          cat > "$tmpdir/exec-wrapper" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          : "${CODEX_WRAPPER_LOG:?missing CODEX_WRAPPER_LOG}"
+          printf '%s\n' "$@" > "$CODEX_WRAPPER_LOG"
+          file="$1"
+          shift
+          if [[ "$#" -eq 0 ]]; then
+            exec "$file"
+          fi
+          arg0="$1"
+          shift
+          exec -a "$arg0" "$file" "$@"
+          EOF
+          chmod +x "$tmpdir/exec-wrapper"
+
+          CODEX_WRAPPER_LOG="$tmpdir/wrapper.log" \
+          EXEC_WRAPPER="$tmpdir/exec-wrapper" \
+          /tmp/zsh/Src/zsh -fc '/bin/echo smoke-zsh' > "$tmpdir/stdout.txt"
+
+          grep -Fx "smoke-zsh" "$tmpdir/stdout.txt"
+          grep -Fx "/bin/echo" "$tmpdir/wrapper.log"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shell-tool-mcp-zsh-${{ matrix.target }}-${{ matrix.variant }}
+          path: artifacts/**
+          if-no-files-found: error
+
   package:
     name: Package npm module
     needs:
@@ -266,6 +542,8 @@ jobs:
       - rust-binaries
       - bash-linux
       - bash-darwin
+      - zsh-linux
+      - zsh-darwin
     runs-on: ubuntu-latest
     env:
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
@@ -276,7 +554,6 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.8.1
           run_install: false
 
       - name: Setup Node.js
@@ -340,7 +617,8 @@ jobs:
           chmod +x \
             "$staging"/vendor/*/codex-exec-mcp-server \
             "$staging"/vendor/*/codex-execve-wrapper \
-            "$staging"/vendor/*/bash/*/bash
+            "$staging"/vendor/*/bash/*/bash \
+            "$staging"/vendor/*/zsh/*/zsh
 
       - name: Create npm tarball
         shell: bash
@@ -369,12 +647,6 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.8.1
-          run_install: false
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -382,6 +654,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           scope: "@openai"
 
+      # Trusted publishing requires npm CLI version 11.5.1 or later.
       - name: Update npm
         run: npm install -g npm@latest
 

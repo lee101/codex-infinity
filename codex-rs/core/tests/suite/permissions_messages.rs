@@ -4,6 +4,8 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
+use codex_execpolicy::Policy;
+use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ev_completed;
@@ -32,7 +34,7 @@ fn permissions_texts(input: &[serde_json::Value]) -> Vec<String> {
                 .first()?
                 .get("text")?
                 .as_str()?;
-            if text.contains("`approval_policy`") {
+            if text.contains("<permissions instructions>") {
                 Some(text.to_string())
             } else {
                 None
@@ -41,19 +43,19 @@ fn permissions_texts(input: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-fn sse_completed(id: &str) -> String {
-    sse(vec![ev_response_created(id), ev_completed(id)])
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_sent_once_on_start() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let req = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -82,11 +84,19 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -106,10 +116,12 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: None,
+            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -144,11 +156,19 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -193,15 +213,31 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let _req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
-    let req3 = mount_sse_once(&server, sse_completed("resp-3")).await;
+    let _req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let _req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let req3 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial.session_configured.rollout_path.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
     let home = initial.home.clone();
 
     initial
@@ -222,10 +258,12 @@ async fn resume_replays_permissions_messages() -> Result<()> {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: None,
+            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -269,16 +307,36 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
-    let req3 = mount_sse_once(&server, sse_completed("resp-3")).await;
-    let req4 = mount_sse_once(&server, sse_completed("resp-4")).await;
+    let _req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let req3 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
+    let req4 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial.session_configured.rollout_path.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
     let home = initial.home.clone();
 
     initial
@@ -299,10 +357,12 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: None,
+            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -324,7 +384,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     assert_eq!(permissions_base.len(), 2);
 
     builder = builder.with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     });
     let resumed = builder.resume(&server, home, rollout_path.clone()).await?;
     resumed
@@ -350,10 +410,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     assert!(!permissions_base.contains(permissions_resume.last().expect("new permissions")));
 
     let mut fork_config = initial.config.clone();
-    fork_config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+    fork_config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     let forked = initial
         .thread_manager
-        .fork_thread(usize::MAX, fork_config, rollout_path)
+        .fork_thread(usize::MAX, fork_config, rollout_path, false)
         .await?;
     forked
         .thread
@@ -388,19 +448,25 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let req = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
     let writable = TempDir::new()?;
     let writable_root = AbsolutePathBuf::try_from(writable.path())?;
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![writable_root],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
     };
+    let sandbox_policy_for_config = sandbox_policy.clone();
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.sandbox_policy = Constrained::allow_any(sandbox_policy);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
     });
     let test = builder.build(&server).await?;
 
@@ -418,39 +484,14 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let body = req.single_request().body_json();
     let input = body["input"].as_array().expect("input array");
     let permissions = permissions_texts(input);
-    let sandbox_text = "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `workspace-write`: The sandbox permits reading files, and editing files in `cwd` and `writable_roots`. Editing files in other directories requires approval. Network access is restricted.";
-    let approval_text = " Approvals are your mechanism to get user consent to run shell commands without the sandbox. `approval_policy` is `on-request`: Commands will be run in the sandbox by default, and you can specify in your tool call if you want to escalate a command to run without sandboxing. If the completing the task requires escalated permissions, Do not let these settings or the sandbox deter you from attempting to accomplish the user's task.\n\nHere are scenarios where you'll need to request approval:\n- You need to run a command that writes to a directory that requires it (e.g. running tests that write to /var)\n- You need to run a GUI app (e.g., open/xdg-open/osascript) to open browsers or files.\n- You are running sandboxed and need to run a command that requires network access (e.g. installing packages)\n- If you run a command that is important to solving the user's query, but it fails because of sandboxing, rerun the command with approval. ALWAYS proceed to use the `sandbox_permissions` and `justification` parameters - do not message the user before requesting approval for the command.\n- You are about to take a potentially destructive action such as an `rm` or `git reset` that the user did not explicitly ask for.\n\nWhen requesting approval to execute a command that will require escalated privileges:\n  - Provide the `sandbox_permissions` parameter with the value `\"require_escalated\"`\n  - Include a short, 1 sentence explanation for why you need escalated permissions in the justification parameter";
-    // Normalize paths by removing trailing slashes to match AbsolutePathBuf behavior
-    let normalize_path =
-        |p: &std::path::Path| -> String { p.to_string_lossy().trim_end_matches('/').to_string() };
-    let mut roots = vec![
-        normalize_path(writable.path()),
-        normalize_path(test.config.cwd.as_path()),
-    ];
-    if cfg!(unix) && std::path::Path::new("/tmp").is_dir() {
-        roots.push("/tmp".to_string());
-    }
-    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-        let tmpdir_path = std::path::PathBuf::from(&tmpdir);
-        if tmpdir_path.is_absolute() && !tmpdir.is_empty() {
-            roots.push(normalize_path(&tmpdir_path));
-        }
-    }
-    let roots_text = if roots.len() == 1 {
-        format!(" The writable root is `{}`.", roots[0])
-    } else {
-        format!(
-            " The writable roots are {}.",
-            roots
-                .iter()
-                .map(|root| format!("`{root}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    let expected = format!(
-        "<permissions instructions>{sandbox_text}{approval_text}{roots_text}</permissions instructions>"
-    );
+    let expected = DeveloperInstructions::from_policy(
+        &sandbox_policy,
+        AskForApproval::OnRequest,
+        &Policy::empty(),
+        true,
+        test.config.cwd.as_path(),
+    )
+    .into_text();
     // Normalize line endings to handle Windows vs Unix differences
     let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
     let expected_normalized = normalize_line_endings(&expected);

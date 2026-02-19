@@ -1,7 +1,7 @@
 #![expect(clippy::expect_used)]
 
 use codex_utils_cargo_bin::CargoBinError;
-use codex_utils_cargo_bin::find_resource;
+use ctor::ctor;
 use tempfile::TempDir;
 
 use codex_core::CodexThread;
@@ -12,11 +12,18 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::PathBuf;
 
+pub mod context_snapshot;
 pub mod process;
 pub mod responses;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
+
+#[ctor]
+fn enable_deterministic_unified_exec_process_ids_for_tests() {
+    codex_core::test_support::set_thread_manager_test_mode(true);
+    codex_core::test_support::set_deterministic_process_ids(true);
+}
 
 #[track_caller]
 pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s> {
@@ -147,40 +154,6 @@ pub fn load_sse_fixture_with_id_from_str(raw: &str, id: &str) -> String {
         .collect()
 }
 
-/// Same as [`load_sse_fixture`], but replaces the placeholder `__ID__` in the
-/// fixture template with the supplied identifier before parsing. This lets a
-/// single JSON template be reused by multiple tests that each need a unique
-/// `response_id`.
-pub fn load_sse_fixture_with_id(path: impl AsRef<std::path::Path>, id: &str) -> String {
-    let p = path.as_ref();
-    let full_path = match find_resource!(p) {
-        Ok(p) => p,
-        Err(err) => panic!(
-            "failed to find fixture template at {:?}: {err}",
-            path.as_ref()
-        ),
-    };
-
-    let raw = std::fs::read_to_string(full_path).expect("read fixture template");
-    let replaced = raw.replace("__ID__", id);
-    let events: Vec<serde_json::Value> =
-        serde_json::from_str(&replaced).expect("parse JSON fixture");
-    events
-        .into_iter()
-        .map(|e| {
-            let kind = e
-                .get("type")
-                .and_then(|v| v.as_str())
-                .expect("fixture event missing type");
-            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
-                format!("event: {kind}\n\n")
-            } else {
-                format!("event: {kind}\ndata: {e}\n\n")
-            }
-        })
-        .collect()
-}
-
 pub async fn wait_for_event<F>(codex: &CodexThread, predicate: F) -> codex_core::protocol::EventMsg
 where
     F: FnMut(&codex_core::protocol::EventMsg) -> bool,
@@ -209,7 +182,7 @@ where
     use tokio::time::timeout;
     loop {
         // Allow a bit more time to accommodate async startup work (e.g. config IO, tool discovery)
-        let ev = timeout(wait_time.max(Duration::from_secs(5)), codex.next_event())
+        let ev = timeout(wait_time.max(Duration::from_secs(10)), codex.next_event())
             .await
             .expect("timeout waiting for event")
             .expect("stream ended unexpectedly");

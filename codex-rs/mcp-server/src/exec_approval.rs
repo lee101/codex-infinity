@@ -6,20 +6,16 @@ use codex_core::protocol::Op;
 use codex_core::protocol::ReviewDecision;
 use codex_protocol::ThreadId;
 use codex_protocol::parse_command::ParsedCommand;
-use mcp_types::ElicitRequest;
-use mcp_types::ElicitRequestParamsRequestedSchema;
-use mcp_types::JSONRPCErrorError;
-use mcp_types::ModelContextProtocolRequest;
-use mcp_types::RequestId;
+use rmcp::model::ErrorData;
+use rmcp::model::RequestId;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use serde_json::json;
 use tracing::error;
 
-use crate::codex_tool_runner::INVALID_PARAMS_ERROR_CODE;
-
-/// Conforms to [`mcp_types::ElicitRequestParams`] so that it can be used as the
-/// `params` field of an [`ElicitRequest`].
+/// Conforms to the MCP elicitation request params shape, so it can be used as
+/// the `params` field of an `elicitation/create` request.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExecApprovalElicitRequestParams {
     // These fields are required so that `params`
@@ -27,7 +23,7 @@ pub struct ExecApprovalElicitRequestParams {
     pub message: String,
 
     #[serde(rename = "requestedSchema")]
-    pub requested_schema: ElicitRequestParamsRequestedSchema,
+    pub requested_schema: Value,
 
     // These are additional fields the client can use to
     // correlate the request with the codex tool call.
@@ -64,6 +60,7 @@ pub(crate) async fn handle_exec_approval_request(
     codex_parsed_cmd: Vec<ParsedCommand>,
     thread_id: ThreadId,
 ) {
+    let approval_id = call_id.clone();
     let escaped_command =
         shlex::try_join(command.iter().map(String::as_str)).unwrap_or_else(|_| command.join(" "));
     let message = format!(
@@ -73,11 +70,7 @@ pub(crate) async fn handle_exec_approval_request(
 
     let params = ExecApprovalElicitRequestParams {
         message,
-        requested_schema: ElicitRequestParamsRequestedSchema {
-            r#type: "object".to_string(),
-            properties: json!({}),
-            required: None,
-        },
+        requested_schema: json!({"type":"object","properties":{}}),
         thread_id,
         codex_elicitation: "exec-approval".to_string(),
         codex_mcp_tool_call_id: tool_call_id.clone(),
@@ -94,14 +87,7 @@ pub(crate) async fn handle_exec_approval_request(
             error!("{message}");
 
             outgoing
-                .send_error(
-                    request_id.clone(),
-                    JSONRPCErrorError {
-                        code: INVALID_PARAMS_ERROR_CODE,
-                        message,
-                        data: None,
-                    },
-                )
+                .send_error(request_id.clone(), ErrorData::invalid_params(message, None))
                 .await;
 
             return;
@@ -109,22 +95,24 @@ pub(crate) async fn handle_exec_approval_request(
     };
 
     let on_response = outgoing
-        .send_request(ElicitRequest::METHOD, Some(params_json))
+        .send_request("elicitation/create", Some(params_json))
         .await;
 
     // Listen for the response on a separate task so we don't block the main agent loop.
     {
         let codex = codex.clone();
+        let approval_id = approval_id.clone();
         let event_id = event_id.clone();
         tokio::spawn(async move {
-            on_exec_approval_response(event_id, on_response, codex).await;
+            on_exec_approval_response(approval_id, event_id, on_response, codex).await;
         });
     }
 }
 
 async fn on_exec_approval_response(
+    approval_id: String,
     event_id: String,
-    receiver: tokio::sync::oneshot::Receiver<mcp_types::Result>,
+    receiver: tokio::sync::oneshot::Receiver<serde_json::Value>,
     codex: Arc<CodexThread>,
 ) {
     let response = receiver.await;
@@ -148,7 +136,8 @@ async fn on_exec_approval_response(
 
     if let Err(err) = codex
         .submit(Op::ExecApproval {
-            id: event_id,
+            id: approval_id,
+            turn_id: Some(event_id),
             decision: response.decision,
         })
         .await
