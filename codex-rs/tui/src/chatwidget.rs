@@ -597,6 +597,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // Review requests queued while a task/review is already running
+    queued_review_requests: VecDeque<ReviewRequest>,
     /// Terminal-appropriate keybinding for popping the most-recently queued
     /// message back into the composer.  Determined once at construction time via
     /// [`queued_message_edit_binding_for_terminal`] and propagated to
@@ -665,7 +667,45 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     auto_next_steps: bool,
     auto_next_idea: bool,
+    auto_next_counter: usize,
 }
+
+const AUTO_NEXT_STEPS_PROMPTS: &[&str] = &[
+    "Continue: you're the owner of this project. What are the natural next steps from what was just done? Do whatever you think matters most -- could be implementation, testing, cleanup, anything. Take initiative.",
+    "Continue: step back and look at what just happened. As the project owner, what would you do next? Maybe there's follow-up work, maybe something needs testing, maybe something else entirely catches your eye. Your call.",
+    "Continue: you have full ownership here. Review the recent work and decide what needs attention next -- could be edge cases, could be new functionality, could be a code review pass. Whatever you'd do if this were your project.",
+    "Continue: think like the maintainer of this project. What's the most valuable thing to do right now given what was just completed? Trust your judgment -- implement whatever you think is right and verify it works.",
+    "Continue: look at the current state of things with fresh eyes. What stands out as the next thing to tackle? You have the freedom to go in whatever direction makes sense -- build, fix, test, refactor, your call.",
+    "Continue: as project owner, assess where things stand after the last round. What would you prioritize next? Don't just follow a checklist -- think about what actually matters and do that.",
+    "Continue: take stock of what's been done and what's ahead. You own this -- pick the next move that creates the most value, whether that's hardening what exists, building something new, or something else entirely.",
+];
+
+const AUTO_NEXT_IDEA_PROMPTS: &[&str] = &[
+    "Continue: you own this project. Come up with the next improvement you'd make if you were sitting down to work on it. Could be anything -- a feature, a fix, a refactor, better tests. Whatever you think has the most impact. Go for it.",
+    "Continue: explore the codebase and see what jumps out at you. Maybe there are TODOs, FIXMEs, or rough spots that deserve attention. Maybe you spot something else entirely. Trust your instincts as project owner and act on what you find.",
+    "Continue: think about this project's performance. Are there bottlenecks, inefficiencies, or things that could be faster? If something stands out, optimize it. If not, whatever else catches your eye is fair game too.",
+    "Continue: put on your code reviewer hat. Read through the codebase looking for things you'd flag -- error handling gaps, unclear logic, potential bugs. Pick the most important thing you find and fix it.",
+    "Continue: think about test coverage. Are there important paths that aren't well tested? Or maybe the existing tests could be stronger? If testing is in good shape, go wherever else your instincts lead you.",
+    "Continue: consider the user experience of this project. What would make it nicer to use, easier to understand, or more delightful? Could be UX, DX, CLI ergonomics, anything user-facing. Or if something else feels more important, do that.",
+    "Continue: look for opportunities to simplify. Duplicated code, overly complex patterns, things that could be cleaner. But don't force it -- if the code is already clean, find something else that would benefit from your attention.",
+    "Continue: think about what would surprise and delight someone using this project. A nice polish, a clever feature, a thoughtful default. Or maybe there's something more fundamental that needs doing. You're the owner -- your call.",
+    "Continue: examine how this project handles failure cases. Network errors, bad input, resource exhaustion, unexpected state. If you find fragility, harden it. If it's solid, take your energy wherever it's most needed.",
+    "Continue: look at the project's interfaces and APIs. Are they consistent, intuitive, well-designed? If something could be better, improve it. Or if a completely different area calls to you, go there instead.",
+    "Continue: think about security. Input validation, access control, data handling. If you spot a concern, address it. If security looks solid, channel your effort into whatever else would make this project better.",
+    "Continue: look at the project's observability -- logging, errors, diagnostics. Would you be able to debug a problem in production? Improve what needs improving, or pivot to whatever you think matters more.",
+    "Continue: scan for anything outdated -- deprecated patterns, stale code, old approaches that have better alternatives now. Modernize what you find, or if everything looks current, find another way to move the project forward.",
+    "Continue: think about this project at scale. What would be the first thing to break under heavy load or with many more users? If you see a scaling concern, address it. Otherwise, go with whatever improvement excites you.",
+    "Continue: look at the project's configuration, defaults, and setup experience. Is anything confusing or could be smoother? Improve it if so, or find another area where your effort would have the most impact.",
+    "Continue: consider the data structures and algorithms used throughout the project. Is everything fit for purpose, or could something be more efficient or clearer? Refactor if you see an opportunity, or work on whatever else feels right.",
+    "Continue: think about what would make this codebase a joy to work in. Better naming, clearer structure, more obvious patterns. Make one improvement that future-you would thank present-you for.",
+    "Continue: look at the boundaries between modules and components. Are the interfaces clean? Is coupling appropriate? If you see something to improve, do it. If not, take initiative on whatever else would benefit the project.",
+    "Continue: imagine handing this project to a new team member. What would confuse them? What would slow them down? Make one change that improves the experience of working in this codebase.",
+    "Continue: look for implicit assumptions, magic numbers, or hardcoded values that should be explicit. Or maybe there's a completely different improvement that would be more valuable. You decide -- you own this project.",
+    "Continue: think about concurrency and async patterns in the project. Any race conditions, ordering issues, or synchronization concerns? Fix what you find, or if that area is solid, pursue whatever other improvement you think is best.",
+    "Continue: examine the build process, dev workflow, or CI setup. Is there friction that could be reduced? If so, smooth it out. If not, spend your energy on whatever you think will move the project forward most.",
+    "Continue: look at the type system usage. Could stronger types, better enums, or more precise interfaces catch bugs earlier? Tighten things up if you see an opportunity, or go wherever else your project-owner instincts lead you.",
+    "Continue: take a fresh look at the whole project. What's the single most impactful thing you could do right now to make it better? Don't overthink it -- trust your gut, pick something, and execute.",
+];
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
 ///
@@ -1428,12 +1468,20 @@ impl ChatWidget {
     }
 
     fn maybe_auto_next(&mut self) {
-        if self.auto_next_idea {
-            let prompt = "Continue: brainstorm a new improvement idea for this project and implement it. Think about what would make the biggest impact, then do it. Run tests to verify.";
-            self.queue_user_message(prompt.to_string().into());
-            self.maybe_send_next_queued_input();
+        let prompt = if self.auto_next_idea {
+            let prompts = AUTO_NEXT_IDEA_PROMPTS;
+            let p = prompts[self.auto_next_counter % prompts.len()];
+            self.auto_next_counter += 1;
+            Some(p)
         } else if self.auto_next_steps {
-            let prompt = "Continue: what are the natural next steps? Implement them, including running any relevant tests.";
+            let prompts = AUTO_NEXT_STEPS_PROMPTS;
+            let p = prompts[self.auto_next_counter % prompts.len()];
+            self.auto_next_counter += 1;
+            Some(p)
+        } else {
+            None
+        };
+        if let Some(prompt) = prompt {
             self.queue_user_message(prompt.to_string().into());
             self.maybe_send_next_queued_input();
         }
@@ -2794,6 +2842,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
@@ -2824,6 +2873,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             auto_next_steps,
             auto_next_idea,
+            auto_next_counter: 0,
         };
 
         widget.prefetch_rate_limits();
@@ -2972,6 +3022,7 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
@@ -2998,6 +3049,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             auto_next_steps,
             auto_next_idea,
+            auto_next_counter: 0,
         };
 
         widget.prefetch_rate_limits();
@@ -3131,6 +3183,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
@@ -3161,6 +3214,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             auto_next_steps,
             auto_next_idea,
+            auto_next_counter: 0,
         };
 
         widget.prefetch_rate_limits();
@@ -4465,6 +4519,8 @@ impl ChatWidget {
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
             self.submit_user_message(user_message);
+        } else if let Some(review_request) = self.queued_review_requests.pop_front() {
+            self.submit_op(Op::Review { review_request });
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_queued_user_messages();
@@ -7176,6 +7232,14 @@ impl ChatWidget {
     }
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&mut self, op: Op) {
+        if let Op::Review { review_request } = &op
+            && (self.bottom_pane.is_task_running() || self.is_review_mode)
+        {
+            self.queued_review_requests
+                .push_back(review_request.clone());
+            return;
+        }
+
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
         if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {

@@ -102,6 +102,7 @@ use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
@@ -1649,6 +1650,7 @@ async fn make_chatwidget_manual(
         quit_shortcut_expires_at: None,
         quit_shortcut_key: None,
         is_review_mode: false,
+        queued_review_requests: VecDeque::new(),
         pre_review_token_info: None,
         needs_final_message_separator: false,
         had_work_activity: false,
@@ -5981,6 +5983,63 @@ async fn disabled_slash_command_while_task_running_snapshot() {
     );
     let blob = lines_to_single_string(cells.last().unwrap());
     assert_snapshot!(blob);
+}
+
+#[tokio::test]
+async fn review_command_with_args_while_task_running_queues_op() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(true);
+    chat.bottom_pane.set_composer_text(
+        "/review verify formatting".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Review,
+        "verify formatting".to_string(),
+        Vec::new(),
+    );
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert_eq!(
+        chat.queued_review_requests,
+        VecDeque::from([ReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: "verify formatting".to_string(),
+            },
+            user_facing_hint: None,
+        }]),
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "review op should be queued while task runs"
+    );
+
+    // No immediate history event is expected while queuing.
+    assert!(rx.try_recv().is_err());
+
+    chat.on_task_complete(None, false);
+
+    match op_rx
+        .try_recv()
+        .expect("queued review should be submitted after turn completes")
+    {
+        Op::Review { review_request } => {
+            assert_eq!(
+                review_request,
+                ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "verify formatting".to_string(),
+                    },
+                    user_facing_hint: None,
+                }
+            );
+        }
+        other => panic!("expected Op::Review, got {other:?}"),
+    }
+    assert!(chat.queued_review_requests.is_empty());
+    assert!(chat.bottom_pane.is_task_running());
 }
 
 #[tokio::test]
