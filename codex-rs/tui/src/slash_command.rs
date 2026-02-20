@@ -132,7 +132,6 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
-            | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
@@ -149,11 +148,12 @@ impl SlashCommand {
             | SlashCommand::Apps
             | SlashCommand::Feedback
             | SlashCommand::Quit
-            | SlashCommand::Exit => true,
-            SlashCommand::Rollout => true,
-            SlashCommand::TestApproval => true,
-            SlashCommand::Collab => true,
-            SlashCommand::Agent => true,
+            | SlashCommand::Exit
+            | SlashCommand::Review => true,
+            SlashCommand::Rollout
+            | SlashCommand::TestApproval
+            | SlashCommand::Collab
+            | SlashCommand::Agent => true,
             SlashCommand::Statusline => false,
         }
     }
