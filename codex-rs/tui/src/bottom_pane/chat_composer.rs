@@ -5579,6 +5579,45 @@ mod tests {
     }
 
     #[test]
+    fn slash_review_with_args_is_allowed_while_task_running() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_task_running(true);
+        composer
+            .textarea
+            .set_text_clearing_elements("/review check this patch");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::CommandWithArgs(cmd, args, _) => {
+                assert_eq!(cmd.command(), "review");
+                assert_eq!(args, "check this patch");
+            }
+            InputResult::Command(_) => panic!("expected args for '/review'"),
+            InputResult::Submitted { text, .. } => {
+                panic!("expected command, but composer submitted literal text: {text}")
+            }
+            InputResult::Queued { .. } => {
+                panic!("expected CommandWithArgs result while task running")
+            }
+            InputResult::None => panic!("expected command result for '/review'"),
+        }
+    }
+
+    #[test]
     fn slash_command_disabled_while_task_running_keeps_text() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
@@ -5594,15 +5633,13 @@ mod tests {
             false,
         );
         composer.set_task_running(true);
-        composer
-            .textarea
-            .set_text_clearing_elements("/review these changes");
+        composer.textarea.set_text_clearing_elements("/model");
 
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(InputResult::None, result);
-        assert_eq!("/review these changes", composer.textarea.text());
+        assert_eq!("/model", composer.textarea.text());
 
         let mut found_error = false;
         while let Ok(event) = rx.try_recv() {

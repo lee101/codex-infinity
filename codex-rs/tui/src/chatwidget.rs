@@ -563,6 +563,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // Review requests queued while a task/review is already running
+    queued_review_requests: VecDeque<ReviewRequest>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -2682,6 +2684,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2853,6 +2856,7 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -3005,6 +3009,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_review_requests: VecDeque::new(),
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -4309,6 +4314,8 @@ impl ChatWidget {
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
             self.submit_user_message(user_message);
+        } else if let Some(review_request) = self.queued_review_requests.pop_front() {
+            self.submit_op(Op::Review { review_request });
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_queued_user_messages();
@@ -6815,6 +6822,14 @@ impl ChatWidget {
     }
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&mut self, op: Op) {
+        if let Op::Review { review_request } = &op
+            && (self.bottom_pane.is_task_running() || self.is_review_mode)
+        {
+            self.queued_review_requests
+                .push_back(review_request.clone());
+            return;
+        }
+
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
         if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
