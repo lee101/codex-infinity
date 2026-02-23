@@ -1,5 +1,10 @@
 # Codex CLI (Rust Implementation)
 
+> **New:** `--auto-next-steps` and `--auto-next-idea` let Codex keep going without manual prompts.  
+> Use `--auto-next-steps` to have Codex automatically continue with whatever natural follow-up work (including running relevant tests) makes sense after each response.  
+> Use `--auto-next-idea` to have Codex continually brainstorm fresh, creative improvements for the current project.  
+> Enable both flags together for a “full auto” loop: Codex will alternate between advancing the existing plan and proposing new avenues to explore, so the session never idles unless you intervene.
+
 We provide Codex CLI as a standalone, native executable to ensure a zero-dependency install.
 
 ## Installing Codex
@@ -44,6 +49,19 @@ npx @modelcontextprotocol/inspector codex mcp-server
 
 Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.toml`, and `codex mcp-server` to run the MCP server directly.
 
+#### RA1 Art Generator Tool
+
+The MCP server includes an optional `ra1-art-generator` tool for generating AI images via [netwrck.com](https://netwrck.com). The tool is automatically enabled when the `NETWRCK_API_KEY` environment variable is set.
+
+```shell
+export NETWRCK_API_KEY="your-api-key"
+codex mcp-server
+```
+
+When enabled, the tool accepts:
+- `prompt` (required): Description of the image to generate
+- `size` (optional): Image dimensions (e.g. "1024x1024", "1360x768")
+
 ### Notifications
 
 You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS. When Codex detects that it is running under WSL 2 inside Windows Terminal (`WT_SESSION` is set), the TUI automatically falls back to native Windows toast notifications so approval prompts and completed turns surface even though Windows Terminal does not implement OSC 9.
@@ -52,6 +70,30 @@ You can enable notifications by configuring a script that is run whenever the ag
 
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
 Use `codex exec --ephemeral ...` to run without persisting session rollout files to disk.
+
+### Use `@` for file search
+
+Typing `@` triggers a fuzzy-filename search over the workspace root. Use up/down to select among the results and Tab or Enter to replace the `@` with the selected path. You can use Esc to cancel the search.
+
+### Esc–Esc to edit a previous message
+
+When the chat composer is empty, press Esc to prime “backtrack” mode. Press Esc again to open a transcript preview highlighting the last user message; press Esc repeatedly to step to older user messages. Press Enter to confirm and Codex will fork the conversation from that point, trim the visible transcript accordingly, and pre‑fill the composer with the selected user message so you can edit and resubmit it.
+
+In the transcript preview, the footer shows an `Esc edit prev` hint while editing is active.
+
+### `--cd`/`-C` flag
+
+Sometimes it is not convenient to `cd` to the directory you want Codex to use as the "working root" before running Codex. Fortunately, `codex` supports a `--cd` option so you can specify whatever folder you want. You can confirm that Codex is honoring `--cd` by double-checking the **workdir** it reports in the TUI at the start of a new session.
+
+### Shell completions
+
+Generate shell completion scripts via:
+
+```shell
+codex completion bash
+codex completion zsh
+codex completion fish
+```
 
 ### Experimenting with the Codex Sandbox
 

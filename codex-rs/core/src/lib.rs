@@ -52,6 +52,7 @@ mod mcp_tool_call;
 mod memories;
 mod mentions;
 mod message_history;
+mod model_family;
 mod model_provider_info;
 pub mod path_utils;
 pub mod personality_migration;

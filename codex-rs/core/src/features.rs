@@ -119,6 +119,8 @@ pub enum Feature {
     ChildAgentsMd,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
+    /// Allow the agent to use the plan tool to communicate progress.
+    PlanTool,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
@@ -325,9 +327,9 @@ impl Features {
             include_apply_patch_tool: config_profile.include_apply_patch_tool,
             experimental_use_freeform_apply_patch: config_profile
                 .experimental_use_freeform_apply_patch,
-
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
             tools_web_search: config_profile.tools_web_search,
+            ..Default::default()
         };
         profile_legacy.apply(&mut features);
         if let Some(profile_features) = config_profile.features.as_ref() {
@@ -421,6 +423,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GhostCommit,
         key: "undo",
+        stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::PlanTool,
+        key: "plan_tool",
         stage: Stage::Stable,
         default_enabled: false,
     },

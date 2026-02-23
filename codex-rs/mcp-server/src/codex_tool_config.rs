@@ -171,15 +171,23 @@ impl CodexToolCallParam {
         // Build the `ConfigOverrides` recognized by codex-core.
         let overrides = ConfigOverrides {
             model,
+            review_model: None,
             config_profile: profile,
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy.map(Into::into),
             sandbox_mode: sandbox.map(Into::into),
+            model_provider: None,
             codex_linux_sandbox_exe,
             base_instructions,
             developer_instructions,
             compact_prompt,
-            ..Default::default()
+            include_apply_patch_tool: None,
+            show_raw_agent_reasoning: None,
+            tools_web_search_request: None,
+            js_repl_node_path: None,
+            personality: None,
+            ephemeral: Some(false),
+            additional_writable_roots: Vec::new(),
         };
 
         let cli_overrides = cli_overrides

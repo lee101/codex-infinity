@@ -21,6 +21,8 @@ use std::time::Duration;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 60;
 const DEFAULT_REQUEST_MAX_RETRIES: u64 = 100;
+const GOOGLE_GENERATIVE_AI_API_KEY: &str = "GOOGLE_GENERATIVE_AI_API_KEY";
+const GEMINI_API_KEY: &str = "GEMINI_API_KEY";
 /// Hard cap for user-configured `stream_max_retries`.
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
@@ -183,6 +185,12 @@ impl ModelProviderInfo {
                 let api_key = std::env::var(env_key)
                     .ok()
                     .filter(|v| !v.trim().is_empty())
+                    .or_else(|| {
+                        (env_key == GOOGLE_GENERATIVE_AI_API_KEY)
+                            .then(|| std::env::var(GEMINI_API_KEY).ok())
+                            .flatten()
+                            .filter(|v| !v.trim().is_empty())
+                    })
                     .ok_or_else(|| {
                         crate::error::CodexErr::EnvVar(EnvVarError {
                             var: env_key.clone(),
@@ -264,6 +272,7 @@ impl ModelProviderInfo {
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 
+pub const BUILT_IN_OSS_MODEL_PROVIDER_ID: &str = "oss";
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 
@@ -284,6 +293,86 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
         (
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
+        ),
+        (
+            "gemini",
+            P {
+                name: "Google Gemini".into(),
+                base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
+                env_key: Some(GOOGLE_GENERATIVE_AI_API_KEY.into()),
+                env_key_instructions: Some(
+                    "Create a Gemini API key at https://ai.google.dev/gemini-api/docs/api-key and export GOOGLE_GENERATIVE_AI_API_KEY (or GEMINI_API_KEY)."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+                supports_websockets: false,
+            },
+        ),
+        (
+            "openrouter",
+            P {
+                name: "OpenRouter".into(),
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                env_key: Some("OPENROUTER_API_KEY".into()),
+                env_key_instructions: Some(
+                    "Generate a key at https://openrouter.ai/settings/keys and export OPENROUTER_API_KEY."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Responses,
+                query_params: None,
+                http_headers: Some(
+                    [
+                        (
+                            "HTTP-Referer".to_string(),
+                            "https://github.com/openai/codex".to_string(),
+                        ),
+                        ("X-Title".to_string(), "Codex CLI".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+                supports_websockets: false,
+            },
+        ),
+        (
+            "xai",
+            P {
+                name: "xAI".into(),
+                base_url: Some("https://api.x.ai/v1".into()),
+                env_key: Some("XAI_API_KEY".into()),
+                env_key_instructions: Some(
+                    "Create a key via https://docs.x.ai/docs/getting-started and export XAI_API_KEY."
+                        .into(),
+                ),
+                experimental_bearer_token: None,
+                wire_api: WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+                supports_websockets: false,
+            },
+        ),
+        (
+            BUILT_IN_OSS_MODEL_PROVIDER_ID,
+            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
         ),
     ]
     .into_iter()
@@ -333,6 +422,31 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    fn with_env_var(name: &str, value: Option<&str>) {
+        if let Some(value) = value {
+            // SAFETY: Tests run with single-threaded execution and isolate
+            // environment mutations with the `serial` test harness.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        } else {
+            // SAFETY: Tests run with single-threaded execution and isolate
+            // environment mutations with the `serial` test harness.
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn scoped_env_var(name: &str, value: Option<&str>) -> impl FnOnce() {
+        let previous = std::env::var(name).ok();
+        with_env_var(name, value);
+        move || match previous {
+            Some(previous) => with_env_var(name, Some(previous.as_str())),
+            None => with_env_var(name, None),
+        }
+    }
 
     #[test]
     fn test_deserialize_ollama_model_provider_toml() {
@@ -437,5 +551,39 @@ wire_api = "chat"
 
         let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
         assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_api_key_prefers_google_generative_ai_api_key_for_gemini_provider() {
+        let reset_google = scoped_env_var(GOOGLE_GENERATIVE_AI_API_KEY, Some("google-key"));
+        let reset_gemini = scoped_env_var(GEMINI_API_KEY, Some("fallback-key"));
+        let provider = built_in_model_providers()
+            .get("gemini")
+            .expect("provider should exist")
+            .clone();
+
+        let key = provider.api_key().expect("api key should be found");
+        assert_eq!(Some("google-key".to_string()), key);
+
+        reset_gemini();
+        reset_google();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_api_key_falls_back_to_gemini_api_key_for_gemini_provider() {
+        let reset_google = scoped_env_var(GOOGLE_GENERATIVE_AI_API_KEY, None);
+        let reset_gemini = scoped_env_var(GEMINI_API_KEY, Some("fallback-key"));
+        let provider = built_in_model_providers()
+            .get("gemini")
+            .expect("provider should exist")
+            .clone();
+
+        let key = provider.api_key().expect("api key should be found");
+        assert_eq!(Some("fallback-key".to_string()), key);
+
+        reset_gemini();
+        reset_google();
     }
 }

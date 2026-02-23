@@ -1004,6 +1004,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if subcommand_cli.dangerously_bypass_approvals_and_sandbox {
         interactive.dangerously_bypass_approvals_and_sandbox = true;
     }
+    if subcommand_cli.dangerously_disable_timeouts {
+        interactive.dangerously_disable_timeouts = true;
+    }
     if let Some(cwd) = subcommand_cli.cwd {
         interactive.cwd = Some(cwd);
     }

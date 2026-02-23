@@ -41,6 +41,8 @@ async fn run_test_cmd(tmp: TempDir, cmd: Vec<&str>) -> Result<ExecToolCallOutput
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         justification: None,
         arg0: None,
+        disable_timeout: false,
+        passthrough_stdio: false,
     };
 
     let policy = SandboxPolicy::new_read_only_policy();

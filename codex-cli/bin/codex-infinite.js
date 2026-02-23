@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unified entry point for the Codex CLI.
+// Unified entry point for Codex Infinite CLI.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "fs";
@@ -23,16 +23,16 @@ const PLATFORM_PACKAGE_BY_TARGET = {
 
 const { platform, arch } = process;
 
-let targetTriple = null;
+let targetTriples = [];
 switch (platform) {
   case "linux":
   case "android":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-unknown-linux-musl";
+        targetTriples = ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"];
         break;
       case "arm64":
-        targetTriple = "aarch64-unknown-linux-musl";
+        targetTriples = ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
         break;
       default:
         break;
@@ -41,10 +41,10 @@ switch (platform) {
   case "darwin":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-apple-darwin";
+        targetTriples = ["x86_64-apple-darwin"];
         break;
       case "arm64":
-        targetTriple = "aarch64-apple-darwin";
+        targetTriples = ["aarch64-apple-darwin"];
         break;
       default:
         break;
@@ -53,10 +53,10 @@ switch (platform) {
   case "win32":
     switch (arch) {
       case "x64":
-        targetTriple = "x86_64-pc-windows-msvc";
+        targetTriples = ["x86_64-pc-windows-msvc"];
         break;
       case "arm64":
-        targetTriple = "aarch64-pc-windows-msvc";
+        targetTriples = ["aarch64-pc-windows-msvc"];
         break;
       default:
         break;
@@ -66,56 +66,28 @@ switch (platform) {
     break;
 }
 
-if (!targetTriple) {
+if (targetTriples.length === 0) {
   throw new Error(`Unsupported platform: ${platform} (${arch})`);
 }
 
-const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
-if (!platformPackage) {
-  throw new Error(`Unsupported target triple: ${targetTriple}`);
-}
+const vendorRoot = path.join(__dirname, "..", "vendor");
+const binaryName = process.platform === "win32" ? "codex.exe" : "codex";
 
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const localVendorRoot = path.join(__dirname, "..", "vendor");
-const localBinaryPath = path.join(
-  localVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);
-
-let vendorRoot;
-try {
-  const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
-  vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
-} catch {
-  if (existsSync(localBinaryPath)) {
-    vendorRoot = localVendorRoot;
-  } else {
-    const packageManager = detectPackageManager();
-    const updateCommand =
-      packageManager === "bun"
-        ? "bun install -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
-    throw new Error(
-      `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
-    );
+// Find the first available binary
+let binaryPath = null;
+let archRoot = null;
+for (const triple of targetTriples) {
+  archRoot = path.join(vendorRoot, triple);
+  const candidatePath = path.join(archRoot, "codex", binaryName);
+  if (existsSync(candidatePath)) {
+    binaryPath = candidatePath;
+    break;
   }
 }
 
-if (!vendorRoot) {
-  const packageManager = detectPackageManager();
-  const updateCommand =
-    packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : "npm install -g @openai/codex@latest";
-  throw new Error(
-    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
-  );
+if (!binaryPath) {
+  throw new Error(`No binary found for platform: ${platform} (${arch}). Tried: ${targetTriples.join(", ")}`);
 }
-
-const archRoot = path.join(vendorRoot, targetTriple);
-const binaryPath = path.join(archRoot, "codex", codexBinaryName);
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
