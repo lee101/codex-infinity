@@ -668,6 +668,7 @@ pub(crate) struct ChatWidget {
     auto_next_steps: bool,
     auto_next_idea: bool,
     auto_next_counter: usize,
+    auto_next_done_file: PathBuf,
 }
 
 const AUTO_NEXT_STEPS_PROMPTS: &[&str] = &[
@@ -706,6 +707,9 @@ const AUTO_NEXT_IDEA_PROMPTS: &[&str] = &[
     "Continue: look at the type system usage. Could stronger types, better enums, or more precise interfaces catch bugs earlier? Tighten things up if you see an opportunity, or go wherever else your project-owner instincts lead you.",
     "Continue: take a fresh look at the whole project. What's the single most impactful thing you could do right now to make it better? Don't overthink it -- trust your gut, pick something, and execute.",
 ];
+
+const AUTO_NEXT_DONE_SUFFIX_STEPS: &str = "\n\nIMPORTANT: If you have genuinely completed all follow-up work and there are no more natural next steps remaining, you MUST write the single word DONE to the file at: ";
+const AUTO_NEXT_DONE_SUFFIX_IDEA: &str = "\n\nIMPORTANT: If you still have follow-up work from what you just completed, finish that first before exploring new areas. Only move to new ideas when your current thread of work is complete.\n\nWhen you have genuinely exhausted ALL ideas and improvements for this project -- when there is truly nothing more you would do -- you MUST write the single word DONE to the file at: ";
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
 ///
@@ -1468,23 +1472,37 @@ impl ChatWidget {
     }
 
     fn maybe_auto_next(&mut self) {
+        // If the agent already signaled completion, stop auto-nexting.
+        if self.auto_next_done_file.exists() {
+            return;
+        }
+        let done_path = self.auto_next_done_file.display();
         let prompt = if self.auto_next_idea {
             let prompts = AUTO_NEXT_IDEA_PROMPTS;
-            let p = prompts[self.auto_next_counter % prompts.len()];
+            let base = prompts[self.auto_next_counter % prompts.len()];
             self.auto_next_counter += 1;
-            Some(p)
+            Some(format!("{base}{AUTO_NEXT_DONE_SUFFIX_IDEA}{done_path}"))
         } else if self.auto_next_steps {
             let prompts = AUTO_NEXT_STEPS_PROMPTS;
-            let p = prompts[self.auto_next_counter % prompts.len()];
+            let base = prompts[self.auto_next_counter % prompts.len()];
             self.auto_next_counter += 1;
-            Some(p)
+            Some(format!("{base}{AUTO_NEXT_DONE_SUFFIX_STEPS}{done_path}"))
         } else {
             None
         };
         if let Some(prompt) = prompt {
-            self.queue_user_message(prompt.to_string().into());
+            self.queue_user_message(prompt.into());
             self.maybe_send_next_queued_input();
         }
+    }
+
+    fn init_auto_next_done_file() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-auto-next-done-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     fn maybe_prompt_plan_implementation(&mut self) {
@@ -2874,6 +2892,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_done_file: Self::init_auto_next_done_file(),
         };
 
         widget.prefetch_rate_limits();
@@ -3050,6 +3069,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_done_file: Self::init_auto_next_done_file(),
         };
 
         widget.prefetch_rate_limits();
@@ -3215,6 +3235,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_done_file: Self::init_auto_next_done_file(),
         };
 
         widget.prefetch_rate_limits();
