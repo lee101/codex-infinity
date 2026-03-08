@@ -10,8 +10,6 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use portable_pty::native_pty_system;
 use portable_pty::CommandBuilder;
-use portable_pty::PtySize;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -20,6 +18,7 @@ use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::PtyHandles;
 use crate::process::SpawnedProcess;
+use crate::process::TerminalSize;
 
 /// Returns true when ConPTY support is available (Windows only).
 #[cfg(windows)]
@@ -35,10 +34,27 @@ pub fn conpty_supported() -> bool {
 
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    #[cfg(unix)]
+    process_group_id: Option<u32>,
 }
 
 impl ChildTerminator for PtyChildTerminator {
     fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(process_group_id) = self.process_group_id {
+            // Match the pipe backend's hard-kill behavior so descendant
+            // processes from interactive shells/REPLs do not survive shutdown.
+            // Also try the direct child killer in case the cached PGID is stale.
+            let process_group_kill_result =
+                crate::process_group::kill_process_group(process_group_id);
+            let child_kill_result = self.killer.kill();
+            return match child_kill_result {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == ErrorKind::NotFound => process_group_kill_result,
+                Err(err) => process_group_kill_result.or(Err(err)),
+            };
+        }
+
         self.killer.kill()
     }
 }
@@ -55,25 +71,21 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     }
 }
 
-/// Spawn a process attached to a PTY, returning handles for stdin, output, and exit.
+/// Spawn a process attached to a PTY, returning handles for stdin, split output, and exit.
 pub async fn spawn_process(
     program: &str,
     args: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
     arg0: &Option<String>,
+    size: TerminalSize,
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for PTY spawn");
     }
 
     let pty_system = platform_native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let pair = pty_system.openpty(size.into())?;
 
     let mut command_builder = CommandBuilder::new(arg0.as_ref().unwrap_or(&program.to_string()));
     command_builder.cwd(cwd);
@@ -86,21 +98,24 @@ pub async fn spawn_process(
     }
 
     let mut child = pair.slave.spawn_command(command_builder)?;
+    #[cfg(unix)]
+    // portable-pty establishes the spawned PTY child as a new session leader on
+    // Unix, so PID == PGID and we can reuse the pipe backend's process-group
+    // hard-kill semantics for descendants.
+    let process_group_id = child.process_id();
     let killer = child.clone_killer();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (output_tx, _) = broadcast::channel::<Vec<u8>>(256);
-    let initial_output_rx = output_tx.subscribe();
-
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let mut reader = pair.master.try_clone_reader()?;
-    let output_tx_clone = output_tx.clone();
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = output_tx_clone.send(buf[..n].to_vec());
+                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                 }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -152,11 +167,13 @@ pub async fn spawn_process(
         _master: pair.master,
     };
 
-    let (handle, output_rx) = ProcessHandle::new(
+    let handle = ProcessHandle::new(
         writer_tx,
-        output_tx,
-        initial_output_rx,
-        Box::new(PtyChildTerminator { killer }),
+        Box::new(PtyChildTerminator {
+            killer,
+            #[cfg(unix)]
+            process_group_id,
+        }),
         reader_handle,
         Vec::new(),
         writer_handle,
@@ -168,7 +185,8 @@ pub async fn spawn_process(
 
     Ok(SpawnedProcess {
         session: handle,
-        output_rx,
+        stdout_rx,
+        stderr_rx,
         exit_rx,
     })
 }

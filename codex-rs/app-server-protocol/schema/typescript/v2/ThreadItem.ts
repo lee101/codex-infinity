@@ -8,6 +8,8 @@ import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionStatus } from "./CommandExecutionStatus";
+import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
+import type { DynamicToolCallStatus } from "./DynamicToolCallStatus";
 import type { FileUpdateChange } from "./FileUpdateChange";
 import type { McpToolCallError } from "./McpToolCallError";
 import type { McpToolCallResult } from "./McpToolCallResult";
@@ -50,6 +52,10 @@ durationMs: number | null, } | { "type": "fileChange", id: string, changes: Arra
 /**
  * The duration of the MCP tool call in milliseconds.
  */
+durationMs: number | null, } | { "type": "dynamicToolCall", id: string, tool: string, arguments: JsonValue, status: DynamicToolCallStatus, contentItems: Array<DynamicToolCallOutputContentItem> | null, success: boolean | null, 
+/**
+ * The duration of the dynamic tool call in milliseconds.
+ */
 durationMs: number | null, } | { "type": "collabAgentToolCall", 
 /**
  * Unique identifier for this collab tool call.
@@ -79,4 +85,4 @@ prompt: string | null,
 /**
  * Last known status of the target agents, when available.
  */
-agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: string, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };
+agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: string, } | { "type": "imageGeneration", id: string, status: string, revisedPrompt: string | null, result: string, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };

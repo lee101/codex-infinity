@@ -49,6 +49,7 @@ use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::OutputBuffer;
 use crate::unified_exec::process::OutputHandles;
+use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
 use crate::unified_exec::resolve_max_tokens;
 
@@ -528,6 +529,7 @@ impl UnifiedExecProcessManager {
         &self,
         env: &ExecRequest,
         tty: bool,
+        mut spawn_lifecycle: SpawnLifecycleHandle,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         let (program, args) = env
             .command
@@ -541,6 +543,7 @@ impl UnifiedExecProcessManager {
                 env.cwd.as_path(),
                 &env.env,
                 &env.arg0,
+                codex_utils_pty::TerminalSize::default(),
             )
             .await
         } else {
@@ -555,7 +558,8 @@ impl UnifiedExecProcessManager {
         };
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, env.sandbox).await
+        spawn_lifecycle.after_spawn();
+        UnifiedExecProcess::from_spawned(spawned, env.sandbox, spawn_lifecycle).await
     }
 
     pub(super) async fn open_session_with_sandbox(
@@ -569,7 +573,8 @@ impl UnifiedExecProcessManager {
             Some(context.session.conversation_id),
         ));
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new(self);
+        let mut runtime =
+            UnifiedExecRuntime::new(self, context.turn.tools_config.unified_exec_backend);
         let exec_approval_requirement = context
             .session
             .services
@@ -590,12 +595,13 @@ impl UnifiedExecProcessManager {
             network: request.network.clone(),
             tty: request.tty,
             sandbox_permissions: request.sandbox_permissions,
+            additional_permissions: request.additional_permissions.clone(),
             justification: request.justification.clone(),
             exec_approval_requirement,
         };
         let tool_ctx = ToolCtx {
-            session: context.session.as_ref(),
-            turn: context.turn.as_ref(),
+            session: context.session.clone(),
+            turn: context.turn.clone(),
             call_id: context.call_id.clone(),
             tool_name: "exec_command".to_string(),
         };
@@ -604,7 +610,7 @@ impl UnifiedExecProcessManager {
                 &mut runtime,
                 &req,
                 &tool_ctx,
-                context.turn.as_ref(),
+                &context.turn,
                 context.turn.approval_policy.value(),
             )
             .await

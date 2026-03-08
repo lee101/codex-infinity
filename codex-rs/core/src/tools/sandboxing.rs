@@ -10,22 +10,25 @@ use crate::error::CodexErr;
 use crate::protocol::SandboxPolicy;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxManager;
+use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::SandboxTransformError;
 use crate::state::SessionServices;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
+use futures::Future;
+use futures::future::BoxFuture;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::path::Path;
-
-use futures::Future;
-use futures::future::BoxFuture;
-use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ApprovalStore {
@@ -87,7 +90,7 @@ where
 
     let decision = fetch().await;
 
-    services.otel_manager.counter(
+    services.session_telemetry.counter(
         "codex.approval.requested",
         1,
         &[
@@ -108,8 +111,8 @@ where
 
 #[derive(Clone)]
 pub(crate) struct ApprovalCtx<'a> {
-    pub session: &'a Session,
-    pub turn: &'a TurnContext,
+    pub session: &'a Arc<Session>,
+    pub turn: &'a Arc<TurnContext>,
     pub call_id: &'a str,
     pub retry_reason: Option<String>,
     pub network_approval_context: Option<NetworkApprovalContext>,
@@ -200,6 +203,27 @@ pub(crate) enum SandboxOverride {
     BypassSandboxFirstAttempt,
 }
 
+pub(crate) fn sandbox_override_for_first_attempt(
+    sandbox_permissions: SandboxPermissions,
+    exec_approval_requirement: &ExecApprovalRequirement,
+) -> SandboxOverride {
+    // ExecPolicy `Allow` can intentionally imply full trust (Skip + bypass_sandbox=true),
+    // which supersedes `with_additional_permissions` sandboxed execution hints.
+    if sandbox_permissions.requires_escalated_permissions()
+        || matches!(
+            exec_approval_requirement,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: true,
+                ..
+            }
+        )
+    {
+        SandboxOverride::BypassSandboxFirstAttempt
+    } else {
+        SandboxOverride::NoOverride
+    }
+}
+
 pub(crate) trait Approvable<Req> {
     type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
 
@@ -267,9 +291,9 @@ pub(crate) trait Sandboxable {
     }
 }
 
-pub(crate) struct ToolCtx<'a> {
-    pub session: &'a Session,
-    pub turn: &'a TurnContext,
+pub(crate) struct ToolCtx {
+    pub session: Arc<Session>,
+    pub turn: Arc<TurnContext>,
     pub call_id: String,
     pub tool_name: String,
 }
@@ -281,7 +305,7 @@ pub(crate) enum ToolError {
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
-    fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx<'_>) -> Option<NetworkApprovalSpec> {
+    fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec> {
         None
     }
 
@@ -296,6 +320,8 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 pub(crate) struct SandboxAttempt<'a> {
     pub sandbox: crate::exec::SandboxType,
     pub policy: &'a crate::protocol::SandboxPolicy,
+    pub file_system_policy: &'a FileSystemSandboxPolicy,
+    pub network_policy: NetworkSandboxPolicy,
     pub enforce_managed_network: bool,
     pub(crate) manager: &'a SandboxManager,
     pub(crate) sandbox_cwd: &'a Path,
@@ -314,10 +340,14 @@ impl<'a> SandboxAttempt<'a> {
             .transform(crate::sandboxing::SandboxTransformRequest {
                 spec,
                 policy: self.policy,
+                file_system_policy: self.file_system_policy,
+                network_policy: self.network_policy,
                 sandbox: self.sandbox,
                 enforce_managed_network: self.enforce_managed_network,
                 network,
                 sandbox_policy_cwd: self.sandbox_cwd,
+                #[cfg(target_os = "macos")]
+                macos_seatbelt_profile_extensions: None,
                 codex_linux_sandbox_exe: self.codex_linux_sandbox_exe,
                 use_linux_sandbox_bwrap: self.use_linux_sandbox_bwrap,
                 windows_sandbox_level: self.windows_sandbox_level,
@@ -328,6 +358,7 @@ impl<'a> SandboxAttempt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandboxing::SandboxPermissions;
     use codex_protocol::protocol::NetworkAccess;
     use codex_protocol::protocol::RejectConfig;
     use pretty_assertions::assert_eq;
@@ -398,6 +429,34 @@ mod tests {
                 reason: None,
                 proposed_execpolicy_amendment: None,
             }
+        );
+    }
+
+    #[test]
+    fn additional_permissions_allow_bypass_sandbox_first_attempt_when_execpolicy_skips() {
+        assert_eq!(
+            sandbox_override_for_first_attempt(
+                SandboxPermissions::WithAdditionalPermissions,
+                &ExecApprovalRequirement::Skip {
+                    bypass_sandbox: true,
+                    proposed_execpolicy_amendment: None,
+                },
+            ),
+            SandboxOverride::BypassSandboxFirstAttempt
+        );
+    }
+
+    #[test]
+    fn guardian_bypasses_sandbox_for_explicit_escalation_on_first_attempt() {
+        assert_eq!(
+            sandbox_override_for_first_attempt(
+                SandboxPermissions::RequireEscalated,
+                &ExecApprovalRequirement::Skip {
+                    bypass_sandbox: false,
+                    proposed_execpolicy_amendment: None,
+                },
+            ),
+            SandboxOverride::BypassSandboxFirstAttempt
         );
     }
 }

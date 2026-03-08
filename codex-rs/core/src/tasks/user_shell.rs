@@ -14,7 +14,7 @@ use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::StdoutStream;
 use crate::exec::StreamOutput;
-use crate::exec::execute_exec_env;
+use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
 use crate::parse_command::parse_command;
 use crate::protocol::EventMsg;
@@ -36,6 +36,8 @@ use super::SessionTaskContext;
 use crate::codex::Session;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 
 const USER_SHELL_TIMEOUT_MS: u64 = 60 * 60 * 1000; // 1 hour
 
@@ -66,6 +68,10 @@ impl SessionTask for UserShellCommandTask {
         TaskKind::Regular
     }
 
+    fn span_name(&self) -> &'static str {
+        "session_task.user_shell"
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -94,7 +100,7 @@ pub(crate) async fn execute_user_shell_command(
 ) {
     session
         .services
-        .otel_manager
+        .session_telemetry
         .counter("codex.task.user_shell", 1, &[]);
 
     if mode == UserShellCommandMode::StandaloneTurn {
@@ -147,6 +153,7 @@ pub(crate) async fn execute_user_shell_command(
         )
         .await;
 
+    let sandbox_policy = SandboxPolicy::DangerFullAccess;
     let exec_env = ExecRequest {
         command: exec_command.clone(),
         cwd: cwd.clone(),
@@ -161,6 +168,9 @@ pub(crate) async fn execute_user_shell_command(
         sandbox: SandboxType::None,
         windows_sandbox_level: turn_context.windows_sandbox_level,
         sandbox_permissions: SandboxPermissions::UseDefault,
+        sandbox_policy: sandbox_policy.clone(),
+        file_system_sandbox_policy: FileSystemSandboxPolicy::from(&sandbox_policy),
+        network_sandbox_policy: NetworkSandboxPolicy::from(&sandbox_policy),
         justification: None,
         arg0: None,
     };
@@ -171,8 +181,7 @@ pub(crate) async fn execute_user_shell_command(
         tx_event: session.get_tx_event(),
     });
 
-    let sandbox_policy = SandboxPolicy::DangerFullAccess;
-    let exec_result = execute_exec_env(exec_env, &sandbox_policy, stdout_stream)
+    let exec_result = execute_exec_request(exec_env, &sandbox_policy, stdout_stream, None)
         .or_cancel(&cancellation_token)
         .await;
 

@@ -12,7 +12,7 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::WarningEvent;
 use codex_config::CONFIG_TOML_FILE;
-use codex_otel::OtelManager;
+use codex_otel::SessionTelemetry;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -62,6 +62,9 @@ impl Stage {
 
     pub fn experimental_announcement(self) -> Option<&'static str> {
         match self {
+            Stage::Experimental {
+                announcement: "", ..
+            } => None,
             Stage::Experimental { announcement, .. } => Some(announcement),
             _ => None,
         }
@@ -88,6 +91,8 @@ pub enum Feature {
     ShellZshFork,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
+    /// Allow requesting additional filesystem permissions while staying sandboxed.
+    RequestPermissions,
     /// Allow the model to request web searches that fetch live content.
     WebSearchRequest,
     /// Allow the model to request web searches that fetch cached content.
@@ -117,6 +122,8 @@ pub enum Feature {
     MemoryTool,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
+    /// Allow `detail: "original"` image outputs on supported models.
+    ImageDetailOriginal,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
     /// Allow the agent to use the plan tool to communicate progress.
@@ -127,6 +134,10 @@ pub enum Feature {
     Collab,
     /// Enable apps.
     Apps,
+    /// Enable plugins.
+    Plugins,
+    /// Allow the model to invoke the built-in image generation tool.
+    ImageGeneration,
     /// Route apps MCP calls through the configured gateway.
     AppsMcpGateway,
     /// Allow prompting and installing missing MCP dependencies.
@@ -134,11 +145,27 @@ pub enum Feature {
     /// Prompt for missing skill env var dependencies.
     SkillEnvVarDependencyPrompt,
     /// Steer feature flag - when enabled, Enter submits immediately instead of queuing.
+    /// Kept for config backward compatibility; behavior is always steer-enabled.
     Steer,
+    /// Allow request_user_input in Default collaboration mode.
+    DefaultModeRequestUserInput,
+    /// Enable guardian subagent approvals.
+    GuardianApproval,
     /// Enable collaboration modes (Plan, Default).
+    /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
     CollaborationModes,
+    /// Route MCP tool approval prompts through the MCP elicitation request path.
+    ToolCallMcpElicitation,
     /// Enable personality selection in the TUI.
     Personality,
+    /// Enable native artifact tools.
+    Artifact,
+    /// Enable Fast mode selection in the TUI and request layer.
+    FastMode,
+    /// Enable voice transcription in the TUI composer.
+    VoiceTranscription,
+    /// Enable experimental realtime voice conversation mode in the TUI.
+    RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
     /// Use the Responses API WebSocket transport for OpenAI by default.
@@ -193,10 +220,17 @@ impl FeatureOverrides {
     fn apply(self, features: &mut Features) {
         LegacyFeatureToggles {
             include_apply_patch_tool: self.include_apply_patch_tool,
-            tools_web_search: self.web_search_request,
             ..Default::default()
         }
         .apply(features);
+        if let Some(enabled) = self.web_search_request {
+            if enabled {
+                features.enable(Feature::WebSearchRequest);
+            } else {
+                features.disable(Feature::WebSearchRequest);
+            }
+            features.record_legacy_usage("web_search_request", Feature::WebSearchRequest);
+        }
     }
 }
 
@@ -229,6 +263,14 @@ impl Features {
         self
     }
 
+    pub fn set_enabled(&mut self, f: Feature, enabled: bool) -> &mut Self {
+        if enabled {
+            self.enable(f)
+        } else {
+            self.disable(f)
+        }
+    }
+
     pub fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature) {
         let (summary, details) = legacy_usage_notice(alias, feature);
         self.legacy_usages.insert(LegacyFeatureUsage {
@@ -250,7 +292,7 @@ impl Features {
         self.legacy_usages.iter()
     }
 
-    pub fn emit_metrics(&self, otel: &OtelManager) {
+    pub fn emit_metrics(&self, otel: &SessionTelemetry) {
         for feature in FEATURES {
             if matches!(feature.stage, Stage::Removed) {
                 continue;
@@ -314,7 +356,6 @@ impl Features {
         let base_legacy = LegacyFeatureToggles {
             experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-            tools_web_search: cfg.tools.as_ref().and_then(|t| t.web_search),
             ..Default::default()
         };
         base_legacy.apply(&mut features);
@@ -328,7 +369,6 @@ impl Features {
             experimental_use_freeform_apply_patch: config_profile
                 .experimental_use_freeform_apply_patch,
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
-            tools_web_search: config_profile.tools_web_search,
             ..Default::default()
         };
         profile_legacy.apply(&mut features);
@@ -337,16 +377,20 @@ impl Features {
         }
 
         overrides.apply(&mut features);
-        if features.enabled(Feature::JsReplToolsOnly) && !features.enabled(Feature::JsRepl) {
-            tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
-            features.disable(Feature::JsReplToolsOnly);
-        }
+        features.normalize_dependencies();
 
         features
     }
 
     pub fn enabled_features(&self) -> Vec<Feature> {
         self.enabled.iter().copied().collect()
+    }
+
+    pub(crate) fn normalize_dependencies(&mut self) {
+        if self.enabled(Feature::JsReplToolsOnly) && !self.enabled(Feature::JsRepl) {
+            tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
+            self.disable(Feature::JsReplToolsOnly);
+        }
     }
 }
 
@@ -356,7 +400,6 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
         Feature::WebSearchRequest | Feature::WebSearchCached => {
             let label = match alias {
                 "web_search" => "[features].web_search",
-                "tools.web_search" => "[tools].web_search",
                 "features.web_search_request" | "web_search_request" => {
                     "[features].web_search_request"
                 }
@@ -388,13 +431,20 @@ fn web_search_details() -> &'static str {
 }
 
 /// Keys accepted in `[features]` tables.
-fn feature_for_key(key: &str) -> Option<Feature> {
+pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
     for spec in FEATURES {
         if spec.key == key {
             return Some(spec.id);
         }
     }
     legacy::feature_for_key(key)
+}
+
+pub(crate) fn canonical_feature_for_key(key: &str) -> Option<Feature> {
+    FEATURES
+        .iter()
+        .find(|spec| spec.key == key)
+        .map(|spec| spec.id)
 }
 
 /// Returns `true` if the provided string matches a known feature toggle key.
@@ -459,7 +509,11 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::JsRepl,
         key: "js_repl",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Experimental {
+            name: "JavaScript REPL",
+            menu_description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities. Requires Node >= v22.22.0 installed.",
+            announcement: "NEW: JavaScript REPL is now available in /experimental. Enable it, then start a new chat or restart Codex to use it.",
+        },
         default_enabled: false,
     },
     FeatureSpec {
@@ -502,12 +556,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Removed,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::MemoryTool,
-        key: "memory_tool",
+        key: "memories",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -518,8 +572,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ImageDetailOriginal,
+        key: "image_detail_original",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ApplyPatchFreeform,
         key: "apply_patch_freeform",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RequestPermissions,
+        key: "request_permissions",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -599,6 +665,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::Plugins,
+        key: "plugins",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ImageGeneration,
+        key: "image_generation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::AppsMcpGateway,
         key: "apps_mcp_gateway",
         stage: Stage::UnderDevelopment,
@@ -619,14 +697,36 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Steer,
         key: "steer",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::DefaultModeRequestUserInput,
+        key: "default_mode_request_user_input",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianApproval,
+        key: "guardian_approval",
+        stage: Stage::Experimental {
+            name: "Guardian approvals",
+            menu_description: "Let a guardian subagent review `on-request` approval prompts instead of showing them to you, including sandbox escapes and blocked network access.",
+            announcement: "",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,
         key: "collaboration_modes",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ToolCallMcpElicitation,
+        key: "tool_call_mcp_elicitation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Personality,
@@ -635,9 +735,37 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::Artifact,
+        key: "artifact",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::FastMode,
+        key: "fast_mode",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::VoiceTranscription,
+        key: "voice_transcription",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RealtimeConversation,
+        key: "realtime_conversation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::PreventIdleSleep,
         key: "prevent_idle_sleep",
-        stage: if cfg!(target_os = "macos") {
+        stage: if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             Stage::Experimental {
                 name: "Prevent sleep while running",
                 menu_description: "Keep your computer awake while Codex is running a thread.",
@@ -736,10 +864,9 @@ mod tests {
     fn default_enabled_features_are_stable() {
         for spec in FEATURES {
             if spec.default_enabled {
-                assert_eq!(
-                    spec.stage,
-                    Stage::Stable,
-                    "feature `{}` is enabled by default but is not stable ({:?})",
+                assert!(
+                    matches!(spec.stage, Stage::Stable | Stage::Removed),
+                    "feature `{}` is enabled by default but is not stable/removed ({:?})",
                     spec.key,
                     spec.stage
                 );
@@ -765,6 +892,46 @@ mod tests {
             Stage::UnderDevelopment
         );
         assert_eq!(Feature::UseLinuxSandboxBwrap.default_enabled(), false);
+    }
+
+    #[test]
+    fn js_repl_is_experimental_and_user_toggleable() {
+        let spec = Feature::JsRepl.info();
+        let stage = spec.stage;
+        let expected_node_version = include_str!("../../node-version.txt").trim_end();
+
+        assert!(matches!(stage, Stage::Experimental { .. }));
+        assert_eq!(stage.experimental_menu_name(), Some("JavaScript REPL"));
+        assert_eq!(
+            stage.experimental_menu_description().map(str::to_owned),
+            Some(format!(
+                "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities. Requires Node >= v{expected_node_version} installed."
+            ))
+        );
+        assert_eq!(Feature::JsRepl.default_enabled(), false);
+    }
+
+    #[test]
+    fn guardian_approval_is_experimental_and_user_toggleable() {
+        let spec = Feature::GuardianApproval.info();
+        let stage = spec.stage;
+
+        assert!(matches!(stage, Stage::Experimental { .. }));
+        assert_eq!(stage.experimental_menu_name(), Some("Guardian approvals"));
+        assert_eq!(
+            stage.experimental_menu_description().map(str::to_owned),
+            Some(
+                "Let a guardian subagent review `on-request` approval prompts instead of showing them to you, including sandbox escapes and blocked network access.".to_string()
+            )
+        );
+        assert_eq!(stage.experimental_announcement(), None);
+        assert_eq!(Feature::GuardianApproval.default_enabled(), false);
+    }
+
+    #[test]
+    fn image_generation_is_under_development() {
+        assert_eq!(Feature::ImageGeneration.stage(), Stage::UnderDevelopment);
+        assert_eq!(Feature::ImageGeneration.default_enabled(), false);
     }
 
     #[test]

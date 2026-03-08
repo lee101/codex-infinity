@@ -6,6 +6,7 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
@@ -28,9 +29,9 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
 async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()> {
@@ -78,7 +79,10 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
     Ok(())
 }
 
-async fn spawn_websocket_server(codex_home: &Path, bind_addr: SocketAddr) -> Result<Child> {
+pub(super) async fn spawn_websocket_server(
+    codex_home: &Path,
+    bind_addr: SocketAddr,
+) -> Result<Child> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
@@ -106,14 +110,14 @@ async fn spawn_websocket_server(codex_home: &Path, bind_addr: SocketAddr) -> Res
     Ok(process)
 }
 
-fn reserve_local_addr() -> Result<SocketAddr> {
+pub(super) fn reserve_local_addr() -> Result<SocketAddr> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     drop(listener);
     Ok(addr)
 }
 
-async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
+pub(super) async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
     let url = format!("ws://{bind_addr}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -129,7 +133,11 @@ async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
     }
 }
 
-async fn send_initialize_request(stream: &mut WsClient, id: i64, client_name: &str) -> Result<()> {
+pub(super) async fn send_initialize_request(
+    stream: &mut WsClient,
+    id: i64,
+    client_name: &str,
+) -> Result<()> {
     let params = InitializeParams {
         client_info: ClientInfo {
             name: client_name.to_string(),
@@ -157,7 +165,7 @@ async fn send_config_read_request(stream: &mut WsClient, id: i64) -> Result<()> 
     .await
 }
 
-async fn send_request(
+pub(super) async fn send_request(
     stream: &mut WsClient,
     method: &str,
     id: i64,
@@ -167,6 +175,7 @@ async fn send_request(
         id: RequestId::Integer(id),
         method: method.to_string(),
         params,
+        trace: None,
     });
     send_jsonrpc(stream, message).await
 }
@@ -179,7 +188,10 @@ async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<
         .context("failed to send websocket frame")
 }
 
-async fn read_response_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCResponse> {
+pub(super) async fn read_response_for_id(
+    stream: &mut WsClient,
+    id: i64,
+) -> Result<JSONRPCResponse> {
     let target_id = RequestId::Integer(id);
     loop {
         let message = read_jsonrpc_message(stream).await?;
@@ -189,6 +201,56 @@ async fn read_response_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCR
             return Ok(response);
         }
     }
+}
+
+pub(super) async fn read_notification_for_method(
+    stream: &mut WsClient,
+    method: &str,
+) -> Result<JSONRPCNotification> {
+    loop {
+        let message = read_jsonrpc_message(stream).await?;
+        if let JSONRPCMessage::Notification(notification) = message
+            && notification.method == method
+        {
+            return Ok(notification);
+        }
+    }
+}
+
+pub(super) async fn read_response_and_notification_for_method(
+    stream: &mut WsClient,
+    id: i64,
+    method: &str,
+) -> Result<(JSONRPCResponse, JSONRPCNotification)> {
+    let target_id = RequestId::Integer(id);
+    let mut response = None;
+    let mut notification = None;
+
+    while response.is_none() || notification.is_none() {
+        let message = read_jsonrpc_message(stream).await?;
+        match message {
+            JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
+                response = Some(candidate);
+            }
+            JSONRPCMessage::Notification(candidate) if candidate.method == method => {
+                if notification.replace(candidate).is_some() {
+                    bail!(
+                        "received duplicate notification for method `{method}` before completing paired read"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(response) = response else {
+        bail!("response must be set before returning");
+    };
+    let Some(notification) = notification else {
+        bail!("notification must be set before returning");
+    };
+
+    Ok((response, notification))
 }
 
 async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCError> {
@@ -203,7 +265,7 @@ async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCErro
     }
 }
 
-async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
+pub(super) async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
     loop {
         let frame = timeout(DEFAULT_READ_TIMEOUT, stream.next())
             .await
@@ -226,7 +288,7 @@ async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
     }
 }
 
-async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<()> {
+pub(super) async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<()> {
     match timeout(wait_for, stream.next()).await {
         Ok(Some(Ok(frame))) => bail!("unexpected frame while waiting for silence: {frame:?}"),
         Ok(Some(Err(err))) => bail!("unexpected websocket read error: {err}"),
@@ -235,7 +297,7 @@ async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<
     }
 }
 
-fn create_config_toml(
+pub(super) fn create_config_toml(
     codex_home: &Path,
     server_uri: &str,
     approval_policy: &str,

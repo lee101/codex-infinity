@@ -1,4 +1,6 @@
+pub(crate) mod agent_jobs;
 pub mod apply_patch;
+mod artifacts;
 mod dynamic;
 mod grep_files;
 mod js_repl;
@@ -15,11 +17,20 @@ mod test_sync;
 pub(crate) mod unified_exec;
 mod view_image;
 
+use codex_utils_absolute_path::AbsolutePathBufGuard;
 pub use plan::PLAN_TOOL;
 use serde::Deserialize;
+use serde_json::Value;
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::function_tool::FunctionCallError;
+use crate::sandboxing::SandboxPermissions;
+use crate::sandboxing::normalize_additional_permissions;
 pub use apply_patch::ApplyPatchHandler;
+pub use artifacts::ArtifactsHandler;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
 pub use grep_files::GrepFilesHandler;
 pub use js_repl::JsReplHandler;
@@ -48,4 +59,90 @@ where
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
+}
+
+fn parse_arguments_with_base_path<T>(
+    arguments: &str,
+    base_path: &Path,
+) -> Result<T, FunctionCallError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let _guard = AbsolutePathBufGuard::new(base_path);
+    parse_arguments(arguments)
+}
+
+fn resolve_workdir_base_path(
+    arguments: &str,
+    default_cwd: &Path,
+) -> Result<PathBuf, FunctionCallError> {
+    let arguments: Value = parse_arguments(arguments)?;
+    Ok(arguments
+        .get("workdir")
+        .and_then(Value::as_str)
+        .filter(|workdir| !workdir.is_empty())
+        .map(PathBuf::from)
+        .map_or_else(
+            || default_cwd.to_path_buf(),
+            |workdir| crate::util::resolve_path(default_cwd, &workdir),
+        ))
+}
+
+/// Validates feature/policy constraints for `with_additional_permissions` and
+/// normalizes any path-based permissions. Errors if the request is invalid.
+pub(super) fn normalize_and_validate_additional_permissions(
+    request_permission_enabled: bool,
+    approval_policy: AskForApproval,
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<PermissionProfile>,
+    _cwd: &Path,
+) -> Result<Option<PermissionProfile>, String> {
+    let uses_additional_permissions = matches!(
+        sandbox_permissions,
+        SandboxPermissions::WithAdditionalPermissions
+    );
+
+    if !request_permission_enabled
+        && (uses_additional_permissions || additional_permissions.is_some())
+    {
+        return Err(
+            "additional permissions are disabled; enable `features.request_permission` before using `with_additional_permissions`"
+                .to_string(),
+        );
+    }
+
+    if uses_additional_permissions {
+        if !matches!(approval_policy, AskForApproval::OnRequest) {
+            return Err(format!(
+                "approval policy is {approval_policy:?}; reject command — you cannot request additional permissions unless the approval policy is OnRequest"
+            ));
+        }
+        let Some(additional_permissions) = additional_permissions else {
+            return Err(
+                "missing `additional_permissions`; provide at least one of `network`, `file_system`, or `macos` when using `with_additional_permissions`"
+                    .to_string(),
+            );
+        };
+        #[cfg(not(target_os = "macos"))]
+        if additional_permissions.macos.is_some() {
+            return Err("`additional_permissions.macos` is only supported on macOS".to_string());
+        }
+        let normalized = normalize_additional_permissions(additional_permissions)?;
+        if normalized.is_empty() {
+            return Err(
+                "`additional_permissions` must include at least one requested permission in `network`, `file_system`, or `macos`"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(normalized));
+    }
+
+    if additional_permissions.is_some() {
+        Err(
+            "`additional_permissions` requires `sandbox_permissions` set to `with_additional_permissions`"
+                .to_string(),
+        )
+    } else {
+        Ok(None)
+    }
 }
