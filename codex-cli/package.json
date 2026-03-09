@@ -1,6 +1,6 @@
 {
   "name": "@codex-infinity/codex-infinity",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "license": "Apache-2.0",
   "description": "Codex Infinity - a smarter coding agent that can run forever",
   "bin": {

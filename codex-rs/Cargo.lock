@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-client"
-version = "0.0.0"
+version = "0.56.0"
 dependencies = [
  "codex-app-server",
  "codex-app-server-protocol",
