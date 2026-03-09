@@ -6,7 +6,6 @@ use crate::config_loader::FeatureRequirementsToml;
 use crate::config_loader::NetworkConstraints;
 use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
-use crate::test_support;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::models::ContentItem;
 use core_test_support::context_snapshot;
@@ -18,12 +17,11 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use insta::Settings;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 #[test]
 fn build_guardian_transcript_keeps_original_numbering() {
@@ -255,7 +253,7 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
     let config = Arc::new(config);
-    let models_manager = Arc::new(test_support::models_manager_with_provider(
+    let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
         config.codex_home.clone(),
         Arc::clone(&session.services.auth_manager),
         config.model_provider.clone(),
@@ -337,14 +335,19 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     assert_eq!(assessment.risk_score, 35);
 
     let request = request_log.single_request();
-    assert_snapshot!(
-        "guardian_review_request_layout",
-        context_snapshot::format_labeled_requests_snapshot(
-            "Guardian review request layout",
-            &[("Guardian Review Request", &request)],
-            &ContextSnapshotOptions::default(),
-        )
-    );
+    let mut settings = Settings::clone_current();
+    settings.set_snapshot_path("snapshots");
+    settings.set_prepend_module_to_snapshot(false);
+    settings.bind(|| {
+        assert_snapshot!(
+            "codex_core__guardian__tests__guardian_review_request_layout",
+            context_snapshot::format_labeled_requests_snapshot(
+                "Guardian review request layout",
+                &[("Guardian Review Request", &request)],
+                &ContextSnapshotOptions::default(),
+            )
+        );
+    });
 
     Ok(())
 }

@@ -771,10 +771,45 @@ impl App {
     }
 
     async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
-        let mut config = self.rebuild_config_for_cwd(self.config.cwd.clone()).await?;
+        let mut config = self
+            .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.clone())
+            .await?;
         self.apply_runtime_policy_overrides(&mut config);
         self.config = config;
         Ok(())
+    }
+
+    async fn refresh_in_memory_config_from_disk_best_effort(&mut self, action: &str) {
+        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+            tracing::warn!(
+                error = %err,
+                action,
+                "failed to refresh config before thread transition; continuing with current in-memory config"
+            );
+        }
+    }
+
+    async fn rebuild_config_for_resume_or_fallback(
+        &mut self,
+        current_cwd: &Path,
+        resume_cwd: PathBuf,
+    ) -> Result<Config> {
+        match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
+            Ok(config) => Ok(config),
+            Err(err) => {
+                if crate::cwds_differ(current_cwd, &resume_cwd) {
+                    Err(err)
+                } else {
+                    let resume_cwd_display = resume_cwd.display().to_string();
+                    tracing::warn!(
+                        error = %err,
+                        cwd = %resume_cwd_display,
+                        "failed to rebuild config for same-cwd resume; using current in-memory config"
+                    );
+                    Ok(self.config.clone())
+                }
+            }
+        }
     }
 
     fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
@@ -1139,6 +1174,15 @@ impl App {
                     ))
                 }
             }
+            EventMsg::RequestPermissions(ev) => Some(ThreadInteractiveRequest::Approval(
+                ApprovalRequest::Permissions {
+                    thread_id,
+                    thread_label,
+                    call_id: ev.call_id.clone(),
+                    reason: ev.reason.clone(),
+                    permissions: ev.permissions.clone(),
+                },
+            )),
             _ => None,
         }
     }
@@ -1485,6 +1529,8 @@ impl App {
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history.
+        self.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
+            .await;
         let model = self.chat_widget.current_model().to_string();
         let config = self.fresh_session_config();
         let summary = session_summary(
@@ -2091,19 +2137,17 @@ impl App {
                                 return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                             }
                         };
-                        let mut resume_config = if crate::cwds_differ(&current_cwd, &resume_cwd) {
-                            match self.rebuild_config_for_cwd(resume_cwd).await {
-                                Ok(cfg) => cfg,
-                                Err(err) => {
-                                    self.chat_widget.add_error_message(format!(
-                                        "Failed to rebuild configuration for resume: {err}"
-                                    ));
-                                    return Ok(AppRunControl::Continue);
-                                }
+                        let mut resume_config = match self
+                            .rebuild_config_for_resume_or_fallback(&current_cwd, resume_cwd)
+                            .await
+                        {
+                            Ok(cfg) => cfg,
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to rebuild configuration for resume: {err}"
+                                ));
+                                return Ok(AppRunControl::Continue);
                             }
-                        } else {
-                            // No rebuild needed: current_cwd comes from self.config.cwd.
-                            self.config.clone()
                         };
                         self.apply_runtime_policy_overrides(&mut resume_config);
                         let summary = session_summary(
@@ -2178,6 +2222,8 @@ impl App {
                 self.chat_widget
                     .add_plain_history_lines(vec!["/fork".magenta().into()]);
                 if let Some(path) = self.chat_widget.rollout_path() {
+                    self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
+                        .await;
                     // Fresh threads expose a precomputed path, but the file is
                     // materialized lazily on first user message.
                     if path.exists() {
@@ -3213,6 +3259,30 @@ impl App {
                         "E X E C".to_string(),
                     ));
                 }
+                ApprovalRequest::Permissions {
+                    permissions,
+                    reason,
+                    ..
+                } => {
+                    let _ = tui.enter_alt_screen();
+                    let mut lines = Vec::new();
+                    if let Some(reason) = reason {
+                        lines.push(Line::from(vec!["Reason: ".into(), reason.italic()]));
+                        lines.push(Line::from(""));
+                    }
+                    if let Some(rule_line) =
+                        crate::bottom_pane::format_additional_permissions_rule(&permissions)
+                    {
+                        lines.push(Line::from(vec![
+                            "Permission rule: ".into(),
+                            rule_line.cyan(),
+                        ]));
+                    }
+                    self.overlay = Some(Overlay::new_static_with_renderables(
+                        vec![Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))],
+                        "P E R M I S S I O N S".to_string(),
+                    ));
+                }
                 ApprovalRequest::McpElicitation {
                     server_name,
                     message,
@@ -3332,7 +3402,7 @@ impl App {
     fn handle_codex_event_now(&mut self, event: Event) {
         let needs_refresh = matches!(
             event.msg,
-            EventMsg::SessionConfigured(_) | EventMsg::TokenCount(_)
+            EventMsg::SessionConfigured(_) | EventMsg::TurnStarted(_) | EventMsg::TokenCount(_)
         );
         // This guard is only for intentional thread-switch shutdowns.
         // App-exit shutdowns are tracked by `pending_shutdown_exit_thread_id`
@@ -3894,6 +3964,7 @@ mod tests {
                     proposed_execpolicy_amendment: None,
                     proposed_network_policy_amendments: None,
                     additional_permissions: None,
+                    skill_metadata: None,
                     available_decisions: None,
                     parsed_cmd: Vec::new(),
                 },
@@ -4822,6 +4893,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_turn_started_refreshes_status_line_with_runtime_context_window() {
+        let mut app = make_test_app().await;
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextWindowSize]);
+
+        assert_eq!(app.chat_widget.status_line_text(), None);
+
+        app.handle_codex_event_now(Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                model_context_window: Some(950_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+
+        assert_eq!(
+            app.chat_widget.status_line_text(),
+            Some("950K window".into())
+        );
+    }
+
+    #[tokio::test]
     async fn open_agent_picker_keeps_missing_threads_for_replay() -> Result<()> {
         let mut app = make_test_app().await;
         let thread_id = ThreadId::new();
@@ -5034,6 +5128,7 @@ mod tests {
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         additional_permissions: None,
+                        skill_metadata: None,
                         available_decisions: None,
                         parsed_cmd: Vec::new(),
                     },
@@ -5125,6 +5220,7 @@ mod tests {
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         additional_permissions: None,
+                        skill_metadata: None,
                         available_decisions: None,
                         parsed_cmd: Vec::new(),
                     },
@@ -5901,6 +5997,95 @@ mod tests {
             app_enabled_in_effective_config(&app.config, &app_id),
             Some(false)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_best_effort_keeps_current_config_on_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let original_config = app.config.clone();
+
+        app.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
+            .await;
+
+        assert_eq!(app.config, original_config);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_uses_active_chat_widget_cwd() -> Result<()> {
+        let mut app = make_test_app().await;
+        let original_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: next_cwd.clone(),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        assert_eq!(app.chat_widget.config_ref().cwd, next_cwd);
+        assert_eq!(app.config.cwd, original_cwd);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_config = app.config.clone();
+        let current_cwd = current_config.cwd.clone();
+
+        let resume_config = app
+            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.clone())
+            .await?;
+
+        assert_eq!(resume_config, current_config);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_errors_when_cwd_changes() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        let result = app
+            .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
+            .await;
+
+        assert!(result.is_err());
         Ok(())
     }
 
