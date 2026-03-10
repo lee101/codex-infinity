@@ -90,6 +90,8 @@ use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
+use codex_app_server_protocol::PluginUninstallParams;
+use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::ProductSurface as ApiProductSurface;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
@@ -217,6 +219,7 @@ use codex_core::plugins::MarketplaceError;
 use codex_core::plugins::MarketplacePluginSourceSummary;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
+use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
 use codex_core::plugins::load_plugin_apps;
 use codex_core::read_head_for_summary;
 use codex_core::read_session_meta_line;
@@ -709,6 +712,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::PluginInstall { request_id, params } => {
                 self.plugin_install(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::PluginUninstall { request_id, params } => {
+                self.plugin_uninstall(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::TurnStart { request_id, params } => {
@@ -1642,9 +1649,10 @@ impl CodexMessageProcessor {
                 None => ExecExpiration::DefaultTimeout,
             }
         };
+        let sandbox_cwd = self.config.cwd.clone();
         let exec_params = ExecParams {
             command,
-            cwd,
+            cwd: cwd.clone(),
             expiration,
             env,
             network: started_network_proxy
@@ -1665,7 +1673,7 @@ impl CodexMessageProcessor {
             Some(policy) => match self.config.permissions.sandbox_policy.can_set(&policy) {
                 Ok(()) => {
                     let file_system_sandbox_policy =
-                        codex_protocol::permissions::FileSystemSandboxPolicy::from(&policy);
+                        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, &sandbox_cwd);
                     let network_sandbox_policy =
                         codex_protocol::permissions::NetworkSandboxPolicy::from(&policy);
                     (policy, file_system_sandbox_policy, network_sandbox_policy)
@@ -1690,7 +1698,6 @@ impl CodexMessageProcessor {
         let codex_linux_sandbox_exe = self.arg0_paths.codex_linux_sandbox_exe.clone();
         let outgoing = self.outgoing.clone();
         let request_for_task = request.clone();
-        let sandbox_cwd = self.config.cwd.clone();
         let started_network_proxy_for_task = started_network_proxy;
         let use_linux_sandbox_bwrap = self.config.features.enabled(Feature::UseLinuxSandboxBwrap);
         let size = match size.map(crate::command_exec::terminal_size_from_protocol) {
@@ -5510,6 +5517,57 @@ impl CodexMessageProcessor {
                             format!("failed to install plugin: {err}"),
                         )
                         .await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn plugin_uninstall(
+        &self,
+        request_id: ConnectionRequestId,
+        params: PluginUninstallParams,
+    ) {
+        let plugins_manager = self.thread_manager.plugins_manager();
+
+        match plugins_manager.uninstall_plugin(params.plugin_id).await {
+            Ok(()) => {
+                self.clear_plugin_related_caches();
+                self.outgoing
+                    .send_response(request_id, PluginUninstallResponse {})
+                    .await;
+            }
+            Err(err) => {
+                if err.is_invalid_request() {
+                    self.send_invalid_request_error(request_id, err.to_string())
+                        .await;
+                    return;
+                }
+
+                match err {
+                    CorePluginUninstallError::Config(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("failed to clear plugin config: {err}"),
+                        )
+                        .await;
+                    }
+                    CorePluginUninstallError::Join(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("failed to uninstall plugin: {err}"),
+                        )
+                        .await;
+                    }
+                    CorePluginUninstallError::Store(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("failed to uninstall plugin: {err}"),
+                        )
+                        .await;
+                    }
+                    CorePluginUninstallError::InvalidPluginId(_) => {
+                        unreachable!("invalid plugin ids are handled above");
                     }
                 }
             }

@@ -867,6 +867,30 @@
             },
             "method": {
               "enum": [
+                "plugin/uninstall"
+              ],
+              "title": "Plugin/uninstallRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/PluginUninstallParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Plugin/uninstallRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "turn/start"
               ],
               "title": "Turn/startRequestMethod",
@@ -6438,6 +6462,13 @@
         }
       ]
     },
+    "PermissionGrantScope": {
+      "enum": [
+        "turn",
+        "session"
+      ],
+      "type": "string"
+    },
     "PermissionProfile": {
       "properties": {
         "file_system": {
@@ -6509,6 +6540,14 @@
       "properties": {
         "permissions": {
           "$ref": "#/definitions/GrantedPermissionProfile"
+        },
+        "scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PermissionGrantScope"
+            }
+          ],
+          "default": "turn"
         }
       },
       "required": [
@@ -6713,6 +6752,10 @@
           "description": "Reject MCP elicitation prompts.",
           "type": "boolean"
         },
+        "request_permissions": {
+          "description": "Reject approval prompts related to built-in permission requests.",
+          "type": "boolean"
+        },
         "rules": {
           "description": "Reject prompts triggered by execpolicy `prompt` rules.",
           "type": "boolean"
@@ -6724,6 +6767,7 @@
       },
       "required": [
         "mcp_elicitations",
+        "request_permissions",
         "rules",
         "sandbox_approval"
       ],
@@ -9193,6 +9237,9 @@
                   "mcp_elicitations": {
                     "type": "boolean"
                   },
+                  "request_permissions": {
+                    "type": "boolean"
+                  },
                   "rules": {
                     "type": "boolean"
                   },
@@ -9202,6 +9249,7 @@
                 },
                 "required": [
                   "mcp_elicitations",
+                  "request_permissions",
                   "rules",
                   "sandbox_approval"
                 ],
@@ -12563,6 +12611,24 @@
           "name",
           "source"
         ],
+        "type": "object"
+      },
+      "PluginUninstallParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pluginId"
+        ],
+        "title": "PluginUninstallParams",
+        "type": "object"
+      },
+      "PluginUninstallResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "PluginUninstallResponse",
         "type": "object"
       },
       "ProductSurface": {
