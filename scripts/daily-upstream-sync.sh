@@ -25,6 +25,9 @@ for cmd in cargo npm git; do
     command -v "$cmd" >/dev/null || { echo "FATAL: $cmd not found in PATH"; exit 1; }
 done
 
+# use passphrase-less key for cron (id_ed25519 requires agent)
+export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/codex_agent_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
 cd "$REPO_DIR"
 
 if ! git remote get-url upstream &>/dev/null; then
@@ -110,9 +113,9 @@ grep -q "auto_next_steps" codex-rs/tui/src/cli.rs || echo "WARN: auto_next_steps
 grep -q "yolo2" codex-rs/tui/src/cli.rs || echo "WARN: yolo2 flag missing"
 
 # build
-echo "Building codex-tui..."
+echo "Building codex-cli..."
 cd "$REPO_DIR/codex-rs"
-if cargo build --release -p codex-tui 2>&1; then
+if cargo build --release -p codex-cli 2>&1; then
     echo "Build succeeded"
 else
     echo "Build failed. Aborting merge."
@@ -143,11 +146,14 @@ git commit -m "Codex Infinity v${NEW_VERSION} - merge upstream + maintain custom
 echo "Committed merge"
 
 # push
-git push origin main 2>&1 || echo "WARN: git push failed"
+if ! git push origin main 2>&1; then
+    echo "ERROR: git push failed"
+    exit 1
+fi
 
 # npm publish
 cd "$REPO_DIR/codex-cli"
-npm publish --access public 2>&1 || echo "WARN: npm publish failed (may need auth)"
+npm publish --access public 2>&1 || { echo "ERROR: npm publish failed"; exit 1; }
 
 echo "=== Sync completed at $(date) ==="
 
