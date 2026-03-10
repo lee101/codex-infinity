@@ -132,7 +132,12 @@ pub struct RealtimeAudioFrame {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct RealtimeHandoffMessage {
+pub struct RealtimeTranscriptDelta {
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeTranscriptEntry {
     pub role: String,
     pub text: String,
 }
@@ -142,7 +147,7 @@ pub struct RealtimeHandoffRequested {
     pub handoff_id: String,
     pub item_id: String,
     pub input_transcript: String,
-    pub messages: Vec<RealtimeHandoffMessage>,
+    pub active_transcript: Vec<RealtimeTranscriptEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -151,6 +156,8 @@ pub enum RealtimeEvent {
         session_id: String,
         instructions: Option<String>,
     },
+    InputTranscriptDelta(RealtimeTranscriptDelta),
+    OutputTranscriptDelta(RealtimeTranscriptDelta),
     AudioOut(RealtimeAudioFrame),
     ConversationItemAdded(Value),
     ConversationItemDone {
@@ -527,6 +534,7 @@ pub struct RejectConfig {
     /// Reject prompts triggered by execpolicy `prompt` rules.
     pub rules: bool,
     /// Reject approval prompts related to built-in permission requests.
+    #[serde(default)]
     pub request_permissions: bool,
     /// Reject MCP elicitation prompts.
     pub mcp_elicitations: bool,
@@ -1233,6 +1241,8 @@ pub enum EventMsg {
 
     ItemStarted(ItemStartedEvent),
     ItemCompleted(ItemCompletedEvent),
+    HookStarted(HookStartedEvent),
+    HookCompleted(HookCompletedEvent),
 
     AgentMessageContentDelta(AgentMessageContentDeltaEvent),
     PlanDelta(PlanDeltaEvent),
@@ -1259,6 +1269,97 @@ pub enum EventMsg {
     CollabResumeBegin(CollabResumeBeginEvent),
     /// Collab interaction: resume end.
     CollabResumeEnd(CollabResumeEndEvent),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEventName {
+    SessionStart,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookHandlerType {
+    Command,
+    Prompt,
+    Agent,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookExecutionMode {
+    Sync,
+    Async,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookScope {
+    Thread,
+    Turn,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Blocked,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOutputEntryKind {
+    Warning,
+    Stop,
+    Feedback,
+    Context,
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct HookOutputEntry {
+    pub kind: HookOutputEntryKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct HookRunSummary {
+    pub id: String,
+    pub event_name: HookEventName,
+    pub handler_type: HookHandlerType,
+    pub execution_mode: HookExecutionMode,
+    pub scope: HookScope,
+    pub source_path: PathBuf,
+    pub display_order: i64,
+    pub status: HookRunStatus,
+    pub status_message: Option<String>,
+    #[ts(type = "number")]
+    pub started_at: i64,
+    #[ts(type = "number | null")]
+    pub completed_at: Option<i64>,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    pub entries: Vec<HookOutputEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct HookStartedEvent {
+    pub turn_id: Option<String>,
+    pub run: HookRunSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct HookCompletedEvent {
+    pub turn_id: Option<String>,
+    pub run: HookRunSummary,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3389,6 +3490,26 @@ mod tests {
                 mcp_elicitations: false,
             }
             .rejects_request_permissions()
+        );
+    }
+
+    #[test]
+    fn reject_config_defaults_missing_request_permissions_to_false() {
+        let decoded = serde_json::from_value::<RejectConfig>(serde_json::json!({
+            "sandbox_approval": true,
+            "rules": false,
+            "mcp_elicitations": true,
+        }))
+        .expect("legacy reject config should deserialize");
+
+        assert_eq!(
+            decoded,
+            RejectConfig {
+                sandbox_approval: true,
+                rules: false,
+                request_permissions: false,
+                mcp_elicitations: true,
+            }
         );
     }
 
