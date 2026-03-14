@@ -77,6 +77,8 @@ mod exec_policy;
 mod fork_thread;
 mod grep_files;
 mod hierarchical_agents;
+#[cfg(not(target_os = "windows"))]
+mod hooks;
 mod image_rollout;
 mod items;
 mod js_repl;
@@ -121,6 +123,7 @@ mod shell_serialization;
 mod shell_snapshot;
 mod skill_approval;
 mod skills;
+mod spawn_agent_description;
 mod sqlite_state;
 mod stream_error_allows_next_turn;
 mod stream_no_completed;

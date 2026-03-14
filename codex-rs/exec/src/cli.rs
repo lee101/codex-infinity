@@ -59,49 +59,6 @@ pub struct Cli {
     )]
     pub dangerously_bypass_approvals_and_sandbox: bool,
 
-    /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo2",
-        alias = "dangerously-disable-timeouts",
-        default_value_t = false,
-        conflicts_with = "full_auto"
-    )]
-    pub dangerously_disable_timeouts: bool,
-
-    /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo3",
-        alias = "dangerously-disable-env-wrapping",
-        default_value_t = false,
-        conflicts_with = "full_auto"
-    )]
-    pub dangerously_disable_environment_wrapping: bool,
-
-    /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
-    #[arg(
-        long = "yolo4",
-        alias = "dangerously-passthrough-stdio",
-        default_value_t = false,
-        conflicts_with = "full_auto"
-    )]
-    pub dangerously_passthrough_stdio: bool,
-
-    /// Automatically queue detailed next-step prompts after each assistant reply, continuing until interrupted.
-    #[arg(
-        long = "auto-next-steps",
-        default_value_t = false,
-        conflicts_with = "full_auto"
-    )]
-    pub auto_next_steps: bool,
-
-    /// After completing the current plan, autonomously ideate and begin the next high-impact task.
-    #[arg(
-        long = "auto-next-idea",
-        default_value_t = false,
-        conflicts_with = "full_auto"
-    )]
-    pub auto_next_idea: bool,
-
     /// Tell the agent to use the specified directory as its working root.
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     pub cwd: Option<PathBuf>,
@@ -141,10 +98,6 @@ pub struct Cli {
         global = true
     )]
     pub json: bool,
-
-    /// Whether to include the plan tool in the conversation.
-    #[arg(long = "include-plan-tool", default_value_t = false)]
-    pub include_plan_tool: bool,
 
     /// Specifies file where the last message from the agent should be written.
     #[arg(
@@ -224,7 +177,7 @@ pub struct ResumeArgs {
 impl From<ResumeArgsRaw> for ResumeArgs {
     fn from(raw: ResumeArgsRaw) -> Self {
         // When --last is used without an explicit prompt, treat the positional as the prompt
-        // (clap can’t express this conditional positional meaning cleanly).
+        // (clap can't express this conditional positional meaning cleanly).
         let (session_id, prompt) = if raw.last && raw.prompt.is_none() {
             (None, raw.session_id)
         } else {

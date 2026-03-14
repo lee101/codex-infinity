@@ -20,6 +20,7 @@ use codex_core::features::Features;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::RequestId;
 use codex_protocol::models::MacOsAutomationPermission;
+use codex_protocol::models::MacOsContactsPermission;
 use codex_protocol::models::MacOsPreferencesPermission;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ElicitationAction;
@@ -29,6 +30,7 @@ use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -59,7 +61,7 @@ pub(crate) enum ApprovalRequest {
         thread_label: Option<String>,
         call_id: String,
         reason: Option<String>,
-        permissions: PermissionProfile,
+        permissions: RequestPermissionProfile,
     },
     ApplyPatch {
         thread_id: ThreadId,
@@ -254,7 +256,11 @@ impl ApprovalOverlay {
             return;
         };
         if request.thread_label().is_none() {
-            let cell = history_cell::new_approval_decision_cell(command.to_vec(), decision.clone());
+            let cell = history_cell::new_approval_decision_cell(
+                command.to_vec(),
+                decision.clone(),
+                history_cell::ApprovalDecisionActor::User,
+            );
             self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
         }
         let thread_id = request.thread_id();
@@ -271,7 +277,7 @@ impl ApprovalOverlay {
     fn handle_permissions_decision(
         &self,
         call_id: &str,
-        permissions: &PermissionProfile,
+        permissions: &RequestPermissionProfile,
         decision: ReviewDecision,
     ) {
         let Some(request) = self.current_request.as_ref() else {
@@ -566,7 +572,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 header.push(Line::from(vec!["Reason: ".into(), reason.clone().italic()]));
                 header.push(Line::from(""));
             }
-            if let Some(rule_line) = format_additional_permissions_rule(permissions) {
+            if let Some(rule_line) = format_requested_permissions_rule(permissions) {
                 header.push(Line::from(vec![
                     "Permission rule: ".into(),
                     rule_line.cyan(),
@@ -800,6 +806,17 @@ pub(crate) fn format_additional_permissions_rule(
         if macos.macos_calendar {
             parts.push("macOS calendar".to_string());
         }
+        if macos.macos_reminders {
+            parts.push("macOS reminders".to_string());
+        }
+        if !matches!(macos.macos_contacts, MacOsContactsPermission::None) {
+            let value = match macos.macos_contacts {
+                MacOsContactsPermission::None => "none",
+                MacOsContactsPermission::ReadOnly => "readonly",
+                MacOsContactsPermission::ReadWrite => "readwrite",
+            };
+            parts.push(format!("macOS contacts {value}"));
+        }
     }
 
     if parts.is_empty() {
@@ -807,6 +824,12 @@ pub(crate) fn format_additional_permissions_rule(
     } else {
         Some(parts.join("; "))
     }
+}
+
+pub(crate) fn format_requested_permissions_rule(
+    permissions: &RequestPermissionProfile,
+) -> Option<String> {
+    format_additional_permissions_rule(&permissions.clone().into())
 }
 
 fn patch_options() -> Vec<ApprovalOption> {
@@ -945,7 +968,7 @@ mod tests {
             thread_label: None,
             call_id: "test".to_string(),
             reason: Some("need workspace access".to_string()),
-            permissions: PermissionProfile {
+            permissions: RequestPermissionProfile {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
                 }),
@@ -953,7 +976,6 @@ mod tests {
                     read: Some(vec![absolute_path("/tmp/readme.txt")]),
                     write: Some(vec![absolute_path("/tmp/out.txt")]),
                 }),
-                ..Default::default()
             },
         }
     }
@@ -1401,8 +1423,11 @@ mod tests {
                         "com.apple.Calendar".to_string(),
                         "com.apple.Notes".to_string(),
                     ]),
+                    macos_launch_services: false,
                     macos_accessibility: true,
                     macos_calendar: true,
+                    macos_reminders: true,
+                    macos_contacts: MacOsContactsPermission::None,
                 }),
                 ..Default::default()
             }),
@@ -1479,7 +1504,11 @@ mod tests {
             "-lc".into(),
             "git add tui/src/render/mod.rs tui/src/render/renderable.rs".into(),
         ];
-        let cell = history_cell::new_approval_decision_cell(command, ReviewDecision::Approved);
+        let cell = history_cell::new_approval_decision_cell(
+            command,
+            ReviewDecision::Approved,
+            history_cell::ApprovalDecisionActor::User,
+        );
         let lines = cell.display_lines(28);
         let rendered: Vec<String> = lines
             .iter()

@@ -158,42 +158,6 @@ impl ContextManager {
         }
     }
 
-    /// Remove items from the middle of history, keeping the oldest and newest
-    /// quarters intact. This "middle-out" strategy preserves the original task
-    /// context (head) and the most recent work (tail) while shedding the bulk
-    /// of intermediate history.
-    ///
-    /// On successive calls the middle section shrinks further — each call
-    /// removes 50% of whatever is currently in the middle — giving recursive
-    /// middle-out behaviour without requiring the caller to track state.
-    ///
-    /// Returns the number of items removed, or 0 if the history is too small
-    /// to trim further.
-    pub(crate) fn remove_middle_chunk(&mut self) -> usize {
-        let n = self.items.len();
-        if n < 4 {
-            // Too small to middle-out; remove the first item as a last resort.
-            if n > 0 {
-                self.remove_first_item();
-                return 1;
-            }
-            return 0;
-        }
-        let keep_head = n / 4;
-        let keep_tail = n / 4;
-        let drain_start = keep_head;
-        let drain_end = n.saturating_sub(keep_tail);
-        if drain_start >= drain_end {
-            return 0;
-        }
-        let removed = drain_end - drain_start;
-        self.items.drain(drain_start..drain_end);
-        // Repair any broken call/output pairs introduced by the drain.
-        normalize::remove_orphan_outputs(&mut self.items);
-        normalize::ensure_call_outputs_present(&mut self.items);
-        removed
-    }
-
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
@@ -380,9 +344,6 @@ impl ContextManager {
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
 
-        //rewrite image_gen_calls to messages to support stateless input
-        normalize::rewrite_image_generation_calls_for_stateless_input(&mut self.items);
-
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
@@ -412,6 +373,8 @@ impl ContextManager {
             | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::ToolSearchOutput { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
@@ -449,6 +412,8 @@ fn is_api_message(message: &ResponseItem) -> bool {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::LocalShellCall { .. }
@@ -641,12 +606,14 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         ResponseItem::Message { role, .. } => role == "assistant",
         ResponseItem::Reasoning { .. }
         | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other => false,
@@ -656,7 +623,9 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
 pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
     matches!(
         item,
-        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+        ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
     ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
 }
 

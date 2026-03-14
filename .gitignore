@@ -91,4 +91,3 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
-codex-cli/vendor/
