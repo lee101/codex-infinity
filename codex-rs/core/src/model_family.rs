@@ -175,6 +175,9 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
     // Production models.
     } else if slug.starts_with("gpt-5-codex")
         || slug.starts_with("gpt-5.1-codex")
+        || slug.starts_with("gpt-5.2-codex")
+        || slug.starts_with("gpt-5.3-codex")
+        || slug.starts_with("gpt-5.4-codex")
         || slug.starts_with("codex-")
     {
         model_family!(
@@ -194,6 +197,39 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             default_verbosity: Some(Verbosity::Low),
             base_instructions: GPT_5_1_INSTRUCTIONS.to_string(),
             default_reasoning_effort: Some(ReasoningEffort::Medium),
+        )
+    } else if slug.starts_with("gpt-5.4") {
+        model_family!(
+            slug, "gpt-5.4",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
+        )
+    } else if slug.starts_with("gpt-5.3") {
+        model_family!(
+            slug, "gpt-5.3",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
+        )
+    } else if slug.starts_with("gpt-5.2") {
+        model_family!(
+            slug, "gpt-5.2",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
         )
     } else if slug.starts_with("gpt-5") {
         model_family!(
