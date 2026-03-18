@@ -12,20 +12,20 @@ echo "=== Codex Infinity upstream sync started at $(date) ==="
 export HOME="/home/lee"
 export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:$HOME/.nvm/versions/node/v22.17.0/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
-# source env without -u (bashrc may reference unset vars)
 set +e
 [ -f "$HOME/.profile" ] && source "$HOME/.profile" 2>/dev/null
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
 set -e
 
-# source API keys if available
 [ -f "$HOME/.cron-env" ] && source "$HOME/.cron-env"
 
-for cmd in cargo npm git; do
+# unset ANTHROPIC_API_KEY so claude uses its default auth
+unset ANTHROPIC_API_KEY
+
+for cmd in claude npm git; do
     command -v "$cmd" >/dev/null || { echo "FATAL: $cmd not found in PATH"; exit 1; }
 done
 
-# use passphrase-less key for cron (id_ed25519 requires agent)
 export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/codex_agent_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
 cd "$REPO_DIR"
@@ -36,126 +36,66 @@ fi
 git fetch upstream
 
 UPSTREAM_HEAD=$(git rev-parse upstream/main)
-LOCAL_HEAD=$(git rev-parse HEAD)
+LOCAL_MERGE_BASE=$(git merge-base HEAD upstream/main 2>/dev/null || echo "none")
+UPSTREAM_ALREADY_MERGED=$(git merge-base --is-ancestor upstream/main HEAD 2>/dev/null && echo "yes" || echo "no")
 
-if [ "$UPSTREAM_HEAD" = "$LOCAL_HEAD" ]; then
+if [ "$UPSTREAM_ALREADY_MERGED" = "yes" ]; then
     echo "Already up to date with upstream."
     exit 0
 fi
 
-echo "Upstream has new commits (local: ${LOCAL_HEAD:0:8}, upstream: ${UPSTREAM_HEAD:0:8})"
+BEHIND_COUNT=$(git rev-list HEAD..upstream/main --count)
+echo "Upstream has $BEHIND_COUNT new commits. Running Claude to merge..."
 
-# our files to always keep ours on conflict
-OUR_FILES=(
-    "README.md"
-    "codex-cli/package.json"
-    "codex-cli/bin/codex-infinity.js"
-    "codex-cli/scripts/verify_vendor.js"
-    "scripts/daily-upstream-sync.sh"
-)
+timeout 3600 claude -p --dangerously-skip-permissions --model sonnet --verbose <<'PROMPT'
+You are the automated daily sync bot for Codex Infinity, a fork of openai/codex.
+Your job: merge upstream/main, preserve all customizations, build, verify, version bump, commit, push, and npm publish.
 
-# attempt merge
-if git merge upstream/main --no-edit 2>&1; then
-    echo "Clean merge succeeded"
-else
-    CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-    CONFLICT_COUNT=$(echo "$CONFLICTS" | grep -c . || true)
-    echo "Merge has $CONFLICT_COUNT conflicts"
+OUR CUSTOMIZATIONS (preserve ALL of these -- if a merge conflict touches these, keep OURS):
 
-    if [ "$CONFLICT_COUNT" -gt 20 ]; then
-        echo "ABORT: Too many conflicts ($CONFLICT_COUNT). Needs manual merge."
-        git merge --abort
-        exit 1
-    fi
+1. Package: @codex-infinity/codex-infinity in codex-cli/package.json (name, description, bin, repository)
+2. Entry points: codex-cli/bin/codex-infinity.js, codex-cli/bin/codex-infinite.js (keep our versions)
+3. verify_vendor.js: codex-cli/scripts/verify_vendor.js (keep ours)
+4. README.md: keep our Pi Infinity branded README, NOT the upstream one
+5. scripts/daily-upstream-sync.sh: keep ours
+6. Rust CLI flags in codex-rs/tui/src/cli.rs: --auto-next-steps, --auto-next-idea, --yolo2, --yolo3, --yolo4
+7. Rust AutoNext prompts in codex-rs/tui/src/chatwidget.rs: AUTO_NEXT_STEPS_PROMPTS, AUTO_NEXT_IDEA_PROMPTS
+8. Model family entries in codex-rs/core/src/model_family.rs: gpt-5.2/5.3/5.4 with concise GPT_5_CODEX_INSTRUCTIONS
+9. Concise prompting: codex-rs/core/gpt_5_codex_prompt.md is our preferred prompt (68 lines). New models should use it, NOT the verbose gpt_5_1_prompt.md (331 lines)
+10. Logo/branding: .github/codex-infinity-200h.webp
 
-    # auto-resolve: keep ours for known custom files
-    for f in "${OUR_FILES[@]}"; do
-        if echo "$CONFLICTS" | grep -q "^${f}$"; then
-            echo "Keeping ours: $f"
-            git checkout --ours "$f" && git add "$f"
-        fi
-    done
+STEPS (execute in order):
+1. Run: git diff HEAD..upstream/main --stat (understand what changed)
+2. Run: git merge upstream/main --no-edit
+3. If conflicts: resolve them preserving our customizations. For our custom files (package.json, README, bin/codex-infinity.js, daily-upstream-sync.sh, verify_vendor.js) ALWAYS keep ours. For Cargo.lock accept theirs. For Rust source conflicts, merge carefully keeping our custom flags/features.
+4. Verify customizations survived:
+   - grep -q "codex-infinity" codex-cli/package.json
+   - grep -q "auto_next_steps" codex-rs/tui/src/cli.rs
+   - grep -q "yolo2" codex-rs/tui/src/cli.rs
+   - grep -q "auto_next_idea" codex-rs/tui/src/cli.rs
+   If any check fails, investigate and fix before proceeding.
+5. Check if upstream added any new model series (e.g. gpt-5.5, gpt-6). If so, add entries in model_family.rs using GPT_5_CODEX_INSTRUCTIONS (the concise prompt). Keep prompting minimal.
+6. Build: cd /home/lee/code/codex/codex-rs && cargo build --release -p codex-cli
+7. Copy binary: cp /home/lee/code/codex/codex-rs/target/release/codex /home/lee/code/codex/codex-cli/vendor/x86_64-unknown-linux-gnu/codex/codex
+8. Bump patch version in codex-cli/package.json (increment the patch number)
+9. git add the changed files (README.md, codex-cli/package.json, codex-rs/core/src/model_family.rs, codex-cli/vendor/x86_64-unknown-linux-gnu/codex/codex, and any other changed files)
+10. git commit with message: "Codex Infinity vX.Y.Z - merge upstream + maintain custom features"
+11. git push origin main
+12. cd /home/lee/code/codex/codex-cli && npm publish --access public
 
-    # for Cargo.lock, accept theirs (will regenerate)
-    if echo "$CONFLICTS" | grep -q "Cargo.lock"; then
-        echo "Accepting theirs for Cargo.lock (will regenerate)"
-        git checkout --theirs codex-rs/Cargo.lock && git add codex-rs/Cargo.lock
-    fi
+SAFETY:
+- If cargo build fails, try to fix the issue (max 2 attempts). If still failing, abort: git merge --abort or git reset --hard HEAD~1
+- If npm publish fails, log the error but still exit 0 (push already succeeded).
+- NEVER force push. NEVER rewrite history.
+- If >20 conflicting files, abort and log a summary.
+PROMPT
 
-    # check remaining conflicts
-    REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-    if [ -n "$REMAINING" ]; then
-        echo "REMAINING CONFLICTS need manual resolution:"
-        echo "$REMAINING"
-        echo "Attempting claude merge..."
-
-        # try claude if available, with timeout
-        if command -v claude &>/dev/null; then
-            timeout 1800 claude -p --dangerously-skip-permissions --model sonnet --verbose \
-                "Resolve remaining merge conflicts in this repo. Keep our custom features (yolo flags, auto-next, codex-infinity branding). Accept upstream structural changes. Files: $REMAINING" \
-                2>&1 || {
-                echo "Claude merge failed or timed out. Manual intervention needed."
-                git merge --abort 2>/dev/null || true
-                exit 1
-            }
-        else
-            echo "claude not available. Manual merge needed."
-            git merge --abort
-            exit 1
-        fi
-    fi
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "WARNING: Claude exited with code $EXIT_CODE"
 fi
 
-# verify our customizations survived
-echo "Verifying customizations..."
-grep -q "codex-infinity" codex-cli/package.json || echo "WARN: codex-infinity branding missing from package.json"
-grep -q "auto_next_steps" codex-rs/tui/src/cli.rs || echo "WARN: auto_next_steps flag missing"
-grep -q "yolo2" codex-rs/tui/src/cli.rs || echo "WARN: yolo2 flag missing"
-
-# build
-echo "Building codex-cli..."
-cd "$REPO_DIR/codex-rs"
-if cargo build --release -p codex-cli 2>&1; then
-    echo "Build succeeded"
-else
-    echo "Build failed. Aborting merge."
-    cd "$REPO_DIR"
-    git merge --abort 2>/dev/null || git reset --hard HEAD~1
-    exit 1
-fi
-
-# copy binary
-VENDOR_DIR="$REPO_DIR/codex-cli/vendor/x86_64-unknown-linux-gnu/codex"
-mkdir -p "$VENDOR_DIR"
-cp "$REPO_DIR/codex-rs/target/release/codex" "$VENDOR_DIR/codex"
-echo "Binary copied to vendor"
-
-# bump patch version
-cd "$REPO_DIR"
-CURRENT_VERSION=$(node -p "require('./codex-cli/package.json').version")
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
-NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-cd codex-cli
-npm version "$NEW_VERSION" --no-git-tag-version
-cd "$REPO_DIR"
-echo "Version bumped: $CURRENT_VERSION -> $NEW_VERSION"
-
-# commit
-git add -A
-git commit -m "Codex Infinity v${NEW_VERSION} - merge upstream + maintain custom features"
-echo "Committed merge"
-
-# push
-if ! git push origin main 2>&1; then
-    echo "ERROR: git push failed"
-    exit 1
-fi
-
-# npm publish
-cd "$REPO_DIR/codex-cli"
-npm publish --access public 2>&1 || { echo "ERROR: npm publish failed"; exit 1; }
-
-echo "=== Sync completed at $(date) ==="
+echo "=== Sync completed at $(date) (exit: $EXIT_CODE) ==="
 
 # keep only last 30 logs
 ls -t "$LOG_DIR"/upstream-sync-*.log 2>/dev/null | tail -n +31 | xargs -r rm
