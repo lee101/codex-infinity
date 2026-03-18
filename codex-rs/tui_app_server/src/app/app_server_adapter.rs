@@ -492,6 +492,7 @@ fn server_notification_thread_events(
                 id: String::new(),
                 msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
                     session_id: notification.session_id,
+                    version: notification.version,
                 }),
             }],
         )),
@@ -667,13 +668,33 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
                 .map(codex_app_server_protocol::UserInput::into_core)
                 .collect(),
         })),
-        ThreadItem::AgentMessage { id, text, phase } => {
-            Some(TurnItem::AgentMessage(AgentMessageItem {
-                id: id.clone(),
-                content: vec![AgentMessageContent::Text { text: text.clone() }],
-                phase: phase.clone(),
-            }))
-        }
+        ThreadItem::AgentMessage {
+            id,
+            text,
+            phase,
+            memory_citation,
+        } => Some(TurnItem::AgentMessage(AgentMessageItem {
+            id: id.clone(),
+            content: vec![AgentMessageContent::Text { text: text.clone() }],
+            phase: phase.clone(),
+            memory_citation: memory_citation.clone().map(|citation| {
+                codex_protocol::memory_citation::MemoryCitation {
+                    entries: citation
+                        .entries
+                        .into_iter()
+                        .map(
+                            |entry| codex_protocol::memory_citation::MemoryCitationEntry {
+                                path: entry.path,
+                                line_start: entry.line_start,
+                                line_end: entry.line_end,
+                                note: entry.note,
+                            },
+                        )
+                        .collect(),
+                    rollout_ids: citation.thread_ids,
+                }
+            }),
+        })),
         ThreadItem::Plan { id, text } => Some(TurnItem::Plan(PlanItem {
             id: id.clone(),
             text: text.clone(),
@@ -896,6 +917,7 @@ mod tests {
                     id: item_id,
                     text: "Hello from your coding assistant.".to_string(),
                     phase: Some(MessagePhase::FinalAnswer),
+                    memory_citation: None,
                 },
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -920,13 +942,19 @@ mod tests {
         );
         assert_eq!(completed.turn_id, turn_id);
         match &completed.item {
-            TurnItem::AgentMessage(AgentMessageItem { id, content, phase }) => {
+            TurnItem::AgentMessage(AgentMessageItem {
+                id,
+                content,
+                phase,
+                memory_citation,
+            }) => {
                 assert_eq!(id, "msg_123");
                 let [AgentMessageContent::Text { text }] = content.as_slice() else {
                     panic!("expected a single text content item");
                 };
                 assert_eq!(text, "Hello from your coding assistant.");
                 assert_eq!(*phase, Some(MessagePhase::FinalAnswer));
+                assert_eq!(*memory_citation, None);
             }
             _ => panic!("expected bridged agent message item"),
         }
@@ -1110,6 +1138,7 @@ mod tests {
                                 id: "assistant-1".to_string(),
                                 text: "hi".to_string(),
                                 phase: Some(MessagePhase::FinalAnswer),
+                                memory_citation: None,
                             },
                         ],
                         status: TurnStatus::Completed,

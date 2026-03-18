@@ -717,6 +717,7 @@ async fn chatgpt_auth_sends_correct_request() {
 
     let mut model_provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
     model_provider.base_url = Some(format!("{}/api/codex", server.uri()));
+    model_provider.supports_websockets = false;
     let mut builder = test_codex()
         .with_auth(create_dummy_codex_auth())
         .with_config(move |config| {
@@ -791,6 +792,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 
     let model_provider = ModelProviderInfo {
         base_url: Some(format!("{}/v1", server.uri())),
+        supports_websockets: false,
         ..built_in_model_providers(/* openai_base_url */ None)["openai"].clone()
     };
 
@@ -1832,7 +1834,6 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         config.model_verbosity,
         false,
         false,
-        false,
         None,
     );
     let mut client_session = client.new_session();
@@ -1968,6 +1969,7 @@ async fn token_count_includes_rate_limits_snapshot() {
 
     let mut provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
     provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
 
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("test"))

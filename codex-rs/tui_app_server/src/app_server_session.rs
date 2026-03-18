@@ -1117,6 +1117,7 @@ mod tests {
                             id: "assistant-1".to_string(),
                             text: "assistant reply".to_string(),
                             phase: None,
+                            memory_citation: None,
                         },
                     ],
                     status: TurnStatus::Completed,
