@@ -291,6 +291,15 @@
         }
       ]
     },
+    "CommandExecutionSource": {
+      "enum": [
+        "agent",
+        "userShell",
+        "unifiedExecStartup",
+        "unifiedExecInteraction"
+      ],
+      "type": "string"
+    },
     "CommandExecutionStatus": {
       "enum": [
         "inProgress",
@@ -583,6 +592,19 @@
             "unknown"
           ],
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom"
+          ],
+          "title": "CustomSessionSource",
+          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -993,6 +1015,14 @@
                 "string",
                 "null"
               ]
+            },
+            "source": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionSource"
+                }
+              ],
+              "default": "agent"
             },
             "status": {
               "$ref": "#/definitions/CommandExecutionStatus"
