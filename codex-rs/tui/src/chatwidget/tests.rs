@@ -1778,6 +1778,8 @@ async fn helpers_are_available_and_do_not_panic() {
         startup_tooltip_override: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
     let mut w = ChatWidget::new(init, thread_manager);
     // Basic construction sanity.
@@ -1935,6 +1937,10 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        auto_next_steps: false,
+        auto_next_idea: false,
+        auto_next_counter: 0,
+        auto_next_done_file: ChatWidget::init_auto_next_done_file(),
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
     };
@@ -5717,6 +5723,8 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         startup_tooltip_override: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new(init, thread_manager);
@@ -5767,6 +5775,8 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         startup_tooltip_override: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new(init, thread_manager);

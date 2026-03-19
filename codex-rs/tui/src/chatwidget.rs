@@ -850,6 +850,18 @@ const AUTO_NEXT_IDEA_PROMPTS: &[&str] = &[
     "Continue: take a fresh look at the whole project. What's the single most impactful thing you could do right now to make it better? Don't overthink it -- trust your gut, pick something, and execute.",
 ];
 
+/// Review/test prompts injected periodically (every REVIEW_INTERVAL iterations) to
+/// ensure quality, catch regressions, and prevent drift during autonomous work.
+const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
+    "PAUSE -- third-person review checkpoint. Step back from the work you've been doing and assess it as if you're a senior engineer reviewing someone else's work:\n\n1. Run `git diff` to see all uncommitted changes. Read through them critically.\n2. Run the project's test suite. If tests fail, fix them before doing anything else.\n3. Look at the diff from a third-person perspective: is the code correct? Are there untested paths? Any regressions introduced? Repeated patterns that should be extracted?\n4. If you've been making changes without running tests, run them now.\n5. Fix any issues you find before continuing to new work.\n\nBe honest -- if the recent work has quality problems, address them. If tests are missing for new code, write them. Only continue to new work after you're confident the codebase is in good shape.",
+    "PAUSE -- quality gate. Before continuing, do a self-review:\n\n1. Run `git diff --stat` to see what files changed and how much.\n2. Run tests. If any fail, that's your top priority.\n3. Review your recent changes as a code reviewer would: are there bugs? Missing error handling? Untested code paths? Code that doesn't match the project's conventions?\n4. Check if you've been repeating similar work or going in circles. If so, step back and reconsider your approach.\n5. If you wrote new functions or modules without tests, write tests now.\n\nDo not skip this review. Fix everything you find before moving on.",
+    "PAUSE -- testing and integration check. As a QA engineer looking at recent changes:\n\n1. Run the full test suite. Note any failures.\n2. Look at `git diff` -- for every new function or changed behavior, ask: is this tested? If not, add a test.\n3. Check for regressions: did any changes break existing functionality?\n4. Look for code you've written that duplicates existing utilities or patterns in the codebase.\n5. Verify any new code integrates properly with the rest of the system.\n\nFix all issues found. Quality comes before quantity -- untested code is a liability.",
+    "PAUSE -- architecture review. Take a high-level look at everything done so far:\n\n1. Run `git log --oneline` and `git diff --stat` to see the full picture of changes.\n2. Are the changes cohesive or scattered? If scattered, consider whether you're drifting from the main goal.\n3. Run tests. Fix failures.\n4. Look for: dead code introduced, imports added but not used, TODO comments left behind, debug prints left in.\n5. Check if your changes would make sense to another developer reading the code for the first time.\n\nClean up anything that doesn't meet a professional standard before continuing.",
+];
+
+/// How often to inject a review prompt (every N iterations).
+const REVIEW_INTERVAL: usize = 3;
+
 const AUTO_NEXT_DONE_SUFFIX_STEPS: &str = "\n\nIMPORTANT: If you have genuinely completed all follow-up work and there are no more natural next steps remaining, you MUST write the single word DONE to the file at: ";
 const AUTO_NEXT_DONE_SUFFIX_IDEA: &str = "\n\nIMPORTANT: If you still have follow-up work from what you just completed, finish that first before exploring new areas. Only move to new ideas when your current thread of work is complete.\n\nWhen you have genuinely exhausted ALL ideas and improvements for this project -- when there is truly nothing more you would do -- you MUST write the single word DONE to the file at: ";
 
@@ -1843,7 +1855,25 @@ impl ChatWidget {
             return;
         }
         let done_path = self.auto_next_done_file.display();
-        let prompt = if self.auto_next_idea {
+
+        // Every REVIEW_INTERVAL iterations, inject a review/test prompt instead
+        // of the regular next-idea/next-steps prompt. This ensures periodic
+        // self-correction: run tests, review diffs, fix regressions before
+        // continuing to new work.
+        let is_review_turn =
+            (self.auto_next_idea || self.auto_next_steps) && self.auto_next_counter > 0 && self.auto_next_counter % REVIEW_INTERVAL == 0;
+
+        let prompt = if is_review_turn {
+            let review_idx = (self.auto_next_counter / REVIEW_INTERVAL) - 1;
+            let base = AUTO_NEXT_REVIEW_PROMPTS[review_idx % AUTO_NEXT_REVIEW_PROMPTS.len()];
+            let suffix = if self.auto_next_idea {
+                AUTO_NEXT_DONE_SUFFIX_IDEA
+            } else {
+                AUTO_NEXT_DONE_SUFFIX_STEPS
+            };
+            self.auto_next_counter += 1;
+            Some(format!("{base}{suffix}{done_path}"))
+        } else if self.auto_next_idea {
             let prompts = AUTO_NEXT_IDEA_PROMPTS;
             let base = prompts[self.auto_next_counter % prompts.len()];
             self.auto_next_counter += 1;
