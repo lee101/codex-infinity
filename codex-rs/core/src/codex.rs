@@ -125,6 +125,8 @@ use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
@@ -3950,6 +3952,45 @@ impl Session {
             .await
     }
 
+    pub(crate) async fn sync_mcp_request_headers_for_turn(&self, turn_context: &TurnContext) {
+        let mut request_headers = HeaderMap::new();
+        let session_id = self.conversation_id.to_string();
+        if let Ok(value) = HeaderValue::from_str(&session_id) {
+            request_headers.insert("session_id", value.clone());
+            request_headers.insert("x-client-request-id", value);
+        }
+        if let Some(turn_metadata) = turn_context.turn_metadata_state.current_header_value()
+            && let Ok(value) = HeaderValue::from_str(&turn_metadata)
+        {
+            request_headers.insert(crate::X_CODEX_TURN_METADATA_HEADER, value);
+        }
+
+        let request_headers = if request_headers.is_empty() {
+            None
+        } else {
+            Some(request_headers)
+        };
+        self.services
+            .mcp_connection_manager
+            .read()
+            .await
+            .set_request_headers_for_server(
+                crate::mcp::CODEX_APPS_MCP_SERVER_NAME,
+                request_headers,
+            );
+    }
+
+    pub(crate) async fn clear_mcp_request_headers(&self) {
+        self.services
+            .mcp_connection_manager
+            .read()
+            .await
+            .set_request_headers_for_server(
+                crate::mcp::CODEX_APPS_MCP_SERVER_NAME,
+                /*request_headers*/ None,
+            );
+    }
+
     pub(crate) async fn parse_mcp_tool_name(
         &self,
         name: &str,
@@ -4781,9 +4822,12 @@ mod handlers {
         };
 
         let skills_manager = &sess.services.skills_manager;
+        let config = sess.get_config().await;
         let mut skills = Vec::new();
         for cwd in cwds {
-            let outcome = skills_manager.skills_for_cwd(&cwd, force_reload).await;
+            let outcome = skills_manager
+                .skills_for_cwd(&cwd, config.as_ref(), force_reload)
+                .await;
             let errors = super::errors_to_info(&outcome.errors);
             let skills_metadata = super::skills_to_info(&outcome.skills, &outcome.disabled_paths);
             skills.push(SkillsListEntry {

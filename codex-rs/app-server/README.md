@@ -115,10 +115,7 @@ Example with notification opt-out:
     },
     "capabilities": {
       "experimentalApi": true,
-      "optOutNotificationMethods": [
-        "thread/started",
-        "item/agentMessage/delta"
-      ]
+      "optOutNotificationMethods": ["thread/started", "item/agentMessage/delta"]
     }
   }
 }
@@ -165,7 +162,7 @@ Example with notification opt-out:
 - `experimentalFeature/list` — list feature flags with stage metadata (`beta`, `underDevelopment`, `stable`, etc.), enabled/default-enabled state, and cursor pagination. For non-beta flags, `displayName`/`description`/`announcement` are `null`.
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
-- `plugin/list` — list discovered plugin marketplaces and plugin state, including effective marketplace install/auth policy metadata. `interface.category` uses the marketplace category when present; otherwise it falls back to the plugin manifest category. Pass `forceRemoteSync: true` to refresh curated plugin state before listing (**under development; do not call from production clients yet**).
+- `plugin/list` — list discovered plugin marketplaces and plugin state, including effective marketplace install/auth policy metadata and best-effort `featuredPluginIds` for the official curated marketplace. `interface.category` uses the marketplace category when present; otherwise it falls back to the plugin manifest category. Pass `forceRemoteSync: true` to refresh curated plugin state before listing (**under development; do not call from production clients yet**).
 - `plugin/read` — read one plugin by `marketplacePath` plus `pluginName`, returning marketplace info, a list-style `summary`, manifest descriptions/interface metadata, and bundled skills/apps/MCP server names (**under development; do not call from production clients yet**).
 - `skills/changed` — notification emitted when watched local skill files change.
 - `app/list` — list available apps.
@@ -228,7 +225,11 @@ Start a fresh thread when you need a new Codex conversation.
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
 
-To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, including `approvalsReviewer`:
+To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, including `approvalsReviewer`.
+
+By default, resume uses the latest persisted `model` and `reasoningEffort` values associated with the thread. Supplying any of `model`, `modelProvider`, `config.model`, or `config.model_reasoning_effort` disables that persisted fallback and uses the explicit overrides plus normal config resolution instead.
+
+Example:
 
 ```json
 { "method": "thread/resume", "id": 11, "params": {
@@ -301,10 +302,13 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
 
 ```json
-{ "method": "thread/status/changed", "params": {
+{
+  "method": "thread/status/changed",
+  "params": {
     "threadId": "thr_123",
     "status": { "type": "active", "activeFlags": [] }
-} }
+  }
+}
 ```
 
 ### Example: Unsubscribe from a loaded thread
@@ -953,10 +957,7 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
     "reason": "Select a workspace root",
     "permissions": {
       "fileSystem": {
-        "write": [
-          "/Users/me/project",
-          "/Users/me/shared"
-        ]
+        "write": ["/Users/me/project", "/Users/me/shared"]
       }
     }
   }
@@ -972,9 +973,7 @@ The client responds with `result.permissions`, which should be the granted subse
     "scope": "session",
     "permissions": {
       "fileSystem": {
-        "write": [
-          "/Users/me/project"
-        ]
+        "write": ["/Users/me/project"]
       }
     }
   }

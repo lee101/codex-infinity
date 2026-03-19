@@ -2004,6 +2004,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-exec-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codex-app-server-protocol",
+ "codex-utils-cargo-bin",
+ "futures",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
 dependencies = [
@@ -2327,7 +2345,6 @@ dependencies = [
  "icu_decimal",
  "icu_locale_core",
  "icu_provider",
- "mime_guess",
  "pretty_assertions",
  "schemars 0.8.22",
  "serde",
@@ -2758,6 +2775,7 @@ dependencies = [
  "base64 0.22.1",
  "codex-utils-cache",
  "image",
+ "mime_guess",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -3068,6 +3086,8 @@ dependencies = [
  "ctor 0.6.3",
  "futures",
  "notify",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "pretty_assertions",
  "regex-lite",
  "reqwest",
@@ -3076,6 +3096,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "walkdir",
  "wiremock",
  "zstd",
