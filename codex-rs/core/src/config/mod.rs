@@ -3023,5 +3023,3 @@ mod codex_infinity_tests {
         );
     }
 }
-
-#[cfg(test)]

@@ -184,6 +184,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         config_overrides,
         progress_cursor,
+        ..
     } = cli;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {

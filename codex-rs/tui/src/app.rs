@@ -2642,6 +2642,110 @@ impl App {
 
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenForkPicker => {
+                match crate::resume_picker::run_fork_picker(
+                    tui,
+                    &self.config,
+                    /*show_all*/ false,
+                )
+                .await?
+                {
+                    SessionSelection::Fork(target_session) => {
+                        let current_cwd = self.config.cwd.clone();
+                        let fork_cwd = match crate::resolve_cwd_for_resume_or_fork(
+                            tui,
+                            &self.config,
+                            &current_cwd,
+                            target_session.thread_id,
+                            &target_session.path,
+                            CwdPromptAction::Fork,
+                            /*allow_prompt*/ true,
+                        )
+                        .await?
+                        {
+                            crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Exit => {
+                                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+                            }
+                        };
+                        let mut fork_config = match self
+                            .rebuild_config_for_resume_or_fallback(&current_cwd, fork_cwd)
+                            .await
+                        {
+                            Ok(cfg) => cfg,
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to rebuild configuration for fork: {err}"
+                                ));
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
+                        self.apply_runtime_policy_overrides(&mut fork_config);
+                        let summary = session_summary(
+                            self.chat_widget.token_usage(),
+                            self.chat_widget.thread_id(),
+                            self.chat_widget.thread_name(),
+                        );
+                        self.session_telemetry.counter(
+                            "codex.thread.fork",
+                            /*inc*/ 1,
+                            &[("source", "fork_picker")],
+                        );
+                        match self
+                            .server
+                            .fork_thread(
+                                usize::MAX,
+                                fork_config.clone(),
+                                target_session.path.clone(),
+                                /*persist_extended_history*/ false,
+                                /*parent_trace*/ None,
+                            )
+                            .await
+                        {
+                            Ok(forked) => {
+                                self.shutdown_current_thread().await;
+                                self.config = fork_config;
+                                tui.set_notification_method(self.config.tui_notification_method);
+                                self.file_search.update_search_dir(self.config.cwd.clone());
+                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                    tui,
+                                    self.config.clone(),
+                                );
+                                self.chat_widget = ChatWidget::new_from_existing(
+                                    init,
+                                    forked.thread,
+                                    forked.session_configured,
+                                );
+                                self.reset_thread_event_state();
+                                if let Some(summary) = summary {
+                                    let mut lines: Vec<Line<'static>> =
+                                        vec![summary.usage_line.clone().into()];
+                                    if let Some(command) = summary.resume_command {
+                                        let spans = vec![
+                                            "To continue this session, run ".into(),
+                                            command.cyan(),
+                                        ];
+                                        lines.push(spans.into());
+                                    }
+                                    self.chat_widget.add_plain_history_lines(lines);
+                                }
+                            }
+                            Err(err) => {
+                                let path_display = target_session.path.display();
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to fork session from {path_display}: {err}"
+                                ));
+                            }
+                        }
+                    }
+                    SessionSelection::Exit
+                    | SessionSelection::StartFresh
+                    | SessionSelection::Resume(_) => {}
+                }
+
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
