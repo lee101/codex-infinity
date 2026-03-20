@@ -185,8 +185,8 @@ def main() -> int:
                 print(
                     f"Staged version {version} for release in {staging_dir_str}\n\n"
                     "Verify the CLI:\n"
-                    f"    node {staging_dir_str}/bin/codex.js --version\n"
-                    f"    node {staging_dir_str}/bin/codex.js --help\n\n"
+                    f"    node {staging_dir_str}/bin/codex-infinity.js --version\n"
+                    f"    node {staging_dir_str}/bin/codex-infinity.js --help\n\n"
                 )
             elif package == "codex-responses-api-proxy":
                 print(
@@ -238,12 +238,11 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     package_json_path: Path | None = None
 
     if package == "codex":
-        bin_dir = staging_dir / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(CODEX_CLI_ROOT / "bin" / "codex.js", bin_dir / "codex.js")
-        rg_manifest = CODEX_CLI_ROOT / "bin" / "rg"
-        if rg_manifest.exists():
-            shutil.copy2(rg_manifest, bin_dir / "rg")
+        shutil.copytree(CODEX_CLI_ROOT / "bin", staging_dir / "bin")
+        shutil.copytree(CODEX_CLI_ROOT / "scripts", staging_dir / "scripts")
+        vendor_src = CODEX_CLI_ROOT / "vendor"
+        if vendor_src.exists():
+            shutil.copytree(vendor_src, staging_dir / "vendor")
 
         readme_src = REPO_ROOT / "README.md"
         if readme_src.exists():
@@ -301,18 +300,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             package_json = json.load(fh)
         package_json["version"] = version
 
-    if package == "codex":
-        package_json["files"] = ["bin"]
-        package_json["optionalDependencies"] = {
-            CODEX_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
-                f"npm:{CODEX_NPM_NAME}@"
-                f"{compute_platform_package_version(version, CODEX_PLATFORM_PACKAGES[platform_package]['npm_tag'])}"
-            )
-            for platform_package in PACKAGE_EXPANSIONS["codex"]
-            if platform_package != "codex"
-        }
-
-    elif package == "codex-sdk":
+    if package == "codex-sdk":
         scripts = package_json.get("scripts")
         if isinstance(scripts, dict):
             scripts.pop("prepare", None)
@@ -426,8 +414,16 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
             cwd=staging_dir,
             text=True,
         )
+        json_start = stdout.find("[")
+        json_end = stdout.rfind("]")
+        if json_start == -1 or json_end == -1 or json_end < json_start:
+            json_start = stdout.find("{")
+            json_end = stdout.rfind("}")
+        if json_start == -1 or json_end == -1 or json_end < json_start:
+            raise RuntimeError("Failed to locate npm pack JSON output.")
+        json_payload = stdout[json_start : json_end + 1]
         try:
-            pack_output = json.loads(stdout)
+            pack_output = json.loads(json_payload)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Failed to parse npm pack output.") from exc
 

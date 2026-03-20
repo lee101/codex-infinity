@@ -1639,7 +1639,7 @@ fn validate_mcp_server_name(server_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn mcp_init_error_display(
+pub(crate) fn mcp_init_error_display(
     server_name: &str,
     entry: Option<&McpAuthStatusEntry>,
     err: &StartupOutcomeError,

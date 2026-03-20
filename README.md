@@ -37,6 +37,8 @@ npm install -g @codex-infinity/codex-infinity
 
 Then run `codex-infinity` to get started.
 
+By default, `codex-infinity` runs on `gpt-5.4`. Override it with `-m/--model`, `-c model=...`, or your `~/.codex/config.toml`.
+
 ### Authentication
 
 Run `codex-infinity` and select **Sign in with ChatGPT** to use your Plus, Pro, Team, Edu, or Enterprise plan.
@@ -59,7 +61,7 @@ codex-infinity "your prompt"
 | `--yolo2` | Like yolo + disable command timeouts |
 | `--yolo3` | Like yolo2 + pass full host environment |
 | `--yolo4` | Like yolo3 + stream stdout/stderr directly |
-| `-m MODEL` | Select model (e.g. `gpt-5.4-codex`, `o3`) |
+| `-m MODEL` | Select model (e.g. `gpt-5.4`, `o3`) |
 | `--oss` | Use local model provider (LM Studio / Ollama) |
 | `--search` | Enable live web search |
 | `-i FILE` | Attach image(s) to initial prompt |
@@ -79,7 +81,7 @@ codex-infinity --auto-next-steps --auto-next-idea "refactor the API layer"
 codex-infinity --yolo "add error handling to all API endpoints"
 
 # Use a specific model
-codex-infinity -m gpt-5.4-codex --auto-next-steps "optimize database queries"
+codex-infinity -m gpt-5.4 --auto-next-steps "optimize database queries"
 
 # Use local models
 codex-infinity --oss -m llama3 "explain this codebase"

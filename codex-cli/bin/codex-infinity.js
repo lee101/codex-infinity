@@ -79,6 +79,8 @@ if (targetTriples.length === 0) {
 
 const vendorRoot = path.join(__dirname, "..", "vendor");
 const binaryName = process.platform === "win32" ? "codex.exe" : "codex";
+const DEFAULT_MODEL_ENV_VAR = "CODEX_INFINITE_DEFAULT_MODEL";
+const DEFAULT_MODEL = "gpt-5.4";
 
 // Find the first available binary
 let binaryPath = null;
@@ -159,6 +161,45 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
+function hasExplicitModelOverride(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--model" || arg === "-m") {
+      return true;
+    }
+    if (arg.startsWith("--model=")) {
+      return true;
+    }
+    if (arg.startsWith("-m") && arg.length > 2) {
+      return true;
+    }
+    if ((arg === "--config" || arg === "-c") && i + 1 < args.length) {
+      const value = args[i + 1].trimStart();
+      if (value.startsWith("model=")) {
+        return true;
+      }
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--config=")) {
+      const value = arg.slice("--config=".length).trimStart();
+      if (value.startsWith("model=")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function usesLocalModelProvider(args) {
+  return args.some(
+    (arg) =>
+      arg === "--oss" ||
+      arg === "--local-provider" ||
+      arg.startsWith("--local-provider="),
+  );
+}
+
 const additionalDirs = [];
 const pathDir = path.join(archRoot, "path");
 if (existsSync(pathDir)) {
@@ -172,6 +213,13 @@ const packageManagerEnvVar =
     ? "CODEX_INFINITE_MANAGED_BY_BUN"
     : "CODEX_INFINITE_MANAGED_BY_NPM";
 env[packageManagerEnvVar] = "1";
+if (
+  !env[DEFAULT_MODEL_ENV_VAR] &&
+  !hasExplicitModelOverride(process.argv.slice(2)) &&
+  !usesLocalModelProvider(process.argv.slice(2))
+) {
+  env[DEFAULT_MODEL_ENV_VAR] = DEFAULT_MODEL;
+}
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",

@@ -2283,8 +2283,11 @@ pub fn create_tools_json_for_responses_api(
 ) -> crate::error::Result<Vec<serde_json::Value>> {
     let mut tools_json = Vec::new();
 
-    for tool in tools {
+    for (i, tool) in tools.iter().enumerate() {
         let json = serde_json::to_value(tool)?;
+        let tool_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+        let tool_name = json.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        tracing::info!("tools[{i}] type={tool_type} name={tool_name}");
         tools_json.push(json);
     }
 
