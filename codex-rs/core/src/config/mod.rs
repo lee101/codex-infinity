@@ -140,6 +140,7 @@ pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
 pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
+const CODEX_INFINITE_DEFAULT_MODEL_ENV_VAR: &str = "CODEX_INFINITE_DEFAULT_MODEL";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const OPENAI_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
@@ -2090,6 +2091,25 @@ pub(crate) fn resolve_web_search_mode_for_turn(
     WebSearchMode::Disabled
 }
 
+fn codex_infinite_default_model_from_env() -> Option<String> {
+    std::env::var(CODEX_INFINITE_DEFAULT_MODEL_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_configured_model(
+    model_override: Option<String>,
+    profile_model: Option<String>,
+    config_model: Option<String>,
+    env_default_model: Option<String>,
+) -> Option<String> {
+    model_override
+        .or(profile_model)
+        .or(config_model)
+        .or(env_default_model)
+}
+
 impl Config {
     #[cfg(test)]
     fn load_from_base_config_with_overrides(
@@ -2487,7 +2507,12 @@ impl Config {
 
         let forced_login_method = cfg.forced_login_method;
 
-        let model = model.or(config_profile.model).or(cfg.model);
+        let model = resolve_configured_model(
+            model,
+            config_profile.model,
+            cfg.model,
+            codex_infinite_default_model_from_env(),
+        );
         let service_tier = service_tier_override
             .unwrap_or_else(|| config_profile.service_tier.or(cfg.service_tier));
         let service_tier = match service_tier {
@@ -2975,3 +3000,28 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod codex_infinity_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_configured_model_uses_codex_infinite_env_fallback_last() {
+        assert_eq!(
+            resolve_configured_model(None, None, None, Some("gpt-5.4".to_string())).as_deref(),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            resolve_configured_model(
+                Some("gpt-4.1".to_string()),
+                Some("gpt-5.1".to_string()),
+                Some("gpt-5.4".to_string()),
+                Some("gpt-5.4".to_string()),
+            )
+            .as_deref(),
+            Some("gpt-4.1")
+        );
+    }
+}
+
+#[cfg(test)]
