@@ -1,8 +1,10 @@
 use clap::Parser;
 use codex_app_server::AppServerTransport;
 use codex_app_server::run_main_with_transport;
+use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_core::config_loader::LoaderOverrides;
+use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
@@ -20,13 +22,19 @@ struct AppServerArgs {
         default_value = AppServerTransport::DEFAULT_LISTEN_URL
     )]
     listen: AppServerTransport,
+
+    /// Session source used to derive product restrictions and metadata.
+    #[arg(
+        long = "session-source",
+        value_name = "SOURCE",
+        default_value = "vscode",
+        value_parser = SessionSource::from_startup_arg
+    )]
+    session_source: SessionSource,
 }
 
 fn main() -> anyhow::Result<()> {
-    if codex_core::maybe_run_zsh_exec_wrapper_mode()? {
-        return Ok(());
-    }
-    arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
+    arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         let args = AppServerArgs::parse();
         let managed_config_path = managed_config_path_from_debug_env();
         let loader_overrides = LoaderOverrides {
@@ -34,13 +42,15 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
         let transport = args.listen;
+        let session_source = args.session_source;
 
         run_main_with_transport(
-            codex_linux_sandbox_exe,
+            arg0_paths,
             CliConfigOverrides::default(),
             loader_overrides,
-            false,
+            /*default_analytics_enabled*/ false,
             transport,
+            session_source,
         )
         .await?;
         Ok(())

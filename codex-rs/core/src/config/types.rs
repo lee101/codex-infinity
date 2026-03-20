@@ -5,8 +5,10 @@
 
 use crate::config_loader::RequirementSource;
 pub use codex_protocol::config_types::AltScreenMode;
+pub use codex_protocol::config_types::ApprovalsReviewer;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
+pub use codex_protocol::config_types::ServiceTier;
 pub use codex_protocol::config_types::WebSearchMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
@@ -26,7 +28,8 @@ pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 16;
 pub const DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS: i64 = 30;
 pub const DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS: i64 = 6;
-pub const DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_GLOBAL: usize = 1_024;
+pub const DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION: usize = 256;
+pub const DEFAULT_MEMORIES_MAX_UNUSED_DAYS: i64 = 30;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +42,9 @@ pub enum WindowsSandboxModeToml {
 #[schemars(deny_unknown_fields)]
 pub struct WindowsToml {
     pub sandbox: Option<WindowsSandboxModeToml>,
+    /// Defaults to `true`. Set to `false` to launch the final sandboxed child
+    /// process on `Winsta0\\Default` instead of a private desktop.
+    pub sandbox_private_desktop: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +104,10 @@ pub struct McpServerConfig {
     /// Optional OAuth scopes to request during MCP login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+
+    /// Optional OAuth resource parameter to include during MCP login (RFC 8707).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_resource: Option<String>,
 }
 
 // Raw MCP config shape used for deserialization and JSON Schema generation.
@@ -142,6 +152,8 @@ pub(crate) struct RawMcpServerConfig {
     pub disabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub oauth_resource: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for McpServerConfig {
@@ -165,6 +177,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
         let enabled_tools = raw.enabled_tools.clone();
         let disabled_tools = raw.disabled_tools.clone();
         let scopes = raw.scopes.clone();
+        let oauth_resource = raw.oauth_resource.clone();
 
         fn throw_if_set<E, T>(transport: &str, field: &str, value: Option<&T>) -> Result<(), E>
         where
@@ -188,6 +201,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
             throw_if_set("stdio", "bearer_token", raw.bearer_token.as_ref())?;
             throw_if_set("stdio", "http_headers", raw.http_headers.as_ref())?;
             throw_if_set("stdio", "env_http_headers", raw.env_http_headers.as_ref())?;
+            throw_if_set("stdio", "oauth_resource", raw.oauth_resource.as_ref())?;
             McpServerTransportConfig::Stdio {
                 command,
                 args: raw.args.clone().unwrap_or_default(),
@@ -221,6 +235,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
             enabled_tools,
             disabled_tools,
             scopes,
+            oauth_resource,
         })
     }
 }
@@ -357,12 +372,42 @@ pub struct FeedbackConfigToml {
     pub enabled: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSuggestDiscoverableType {
+    Connector,
+    Plugin,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ToolSuggestDiscoverable {
+    #[serde(rename = "type")]
+    pub kind: ToolSuggestDiscoverableType,
+    pub id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ToolSuggestConfig {
+    #[serde(default)]
+    pub discoverables: Vec<ToolSuggestDiscoverable>,
+}
+
 /// Memories settings loaded from config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MemoriesToml {
+    /// When `true`, web searches and MCP tool calls mark the thread `memory_mode` as `"polluted"`.
+    pub no_memories_if_mcp_or_web_search: Option<bool>,
+    /// When `false`, newly created threads are stored with `memory_mode = "disabled"` in the state DB.
+    pub generate_memories: Option<bool>,
+    /// When `false`, skip injecting memory usage instructions into developer prompts.
+    pub use_memories: Option<bool>,
     /// Maximum number of recent raw memories retained for global consolidation.
-    pub max_raw_memories_for_global: Option<usize>,
+    pub max_raw_memories_for_consolidation: Option<usize>,
+    /// Maximum number of days since a memory was last used before it becomes ineligible for phase 2 selection.
+    pub max_unused_days: Option<i64>,
     /// Maximum age of the threads used for memories.
     pub max_rollout_age_days: Option<i64>,
     /// Maximum number of rollout candidates processed per pass.
@@ -370,31 +415,39 @@ pub struct MemoriesToml {
     /// Minimum idle time between last thread activity and memory creation (hours). > 12h recommended.
     pub min_rollout_idle_hours: Option<i64>,
     /// Model used for thread summarisation.
-    pub phase_1_model: Option<String>,
+    pub extract_model: Option<String>,
     /// Model used for memory consolidation.
-    pub phase_2_model: Option<String>,
+    pub consolidation_model: Option<String>,
 }
 
 /// Effective memories settings after defaults are applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoriesConfig {
-    pub max_raw_memories_for_global: usize,
+    pub no_memories_if_mcp_or_web_search: bool,
+    pub generate_memories: bool,
+    pub use_memories: bool,
+    pub max_raw_memories_for_consolidation: usize,
+    pub max_unused_days: i64,
     pub max_rollout_age_days: i64,
     pub max_rollouts_per_startup: usize,
     pub min_rollout_idle_hours: i64,
-    pub phase_1_model: Option<String>,
-    pub phase_2_model: Option<String>,
+    pub extract_model: Option<String>,
+    pub consolidation_model: Option<String>,
 }
 
 impl Default for MemoriesConfig {
     fn default() -> Self {
         Self {
-            max_raw_memories_for_global: DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_GLOBAL,
+            no_memories_if_mcp_or_web_search: false,
+            generate_memories: true,
+            use_memories: true,
+            max_raw_memories_for_consolidation: DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION,
+            max_unused_days: DEFAULT_MEMORIES_MAX_UNUSED_DAYS,
             max_rollout_age_days: DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS,
             max_rollouts_per_startup: DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP,
             min_rollout_idle_hours: DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS,
-            phase_1_model: None,
-            phase_2_model: None,
+            extract_model: None,
+            consolidation_model: None,
         }
     }
 }
@@ -403,10 +456,19 @@ impl From<MemoriesToml> for MemoriesConfig {
     fn from(toml: MemoriesToml) -> Self {
         let defaults = Self::default();
         Self {
-            max_raw_memories_for_global: toml
-                .max_raw_memories_for_global
-                .unwrap_or(defaults.max_raw_memories_for_global)
+            no_memories_if_mcp_or_web_search: toml
+                .no_memories_if_mcp_or_web_search
+                .unwrap_or(defaults.no_memories_if_mcp_or_web_search),
+            generate_memories: toml.generate_memories.unwrap_or(defaults.generate_memories),
+            use_memories: toml.use_memories.unwrap_or(defaults.use_memories),
+            max_raw_memories_for_consolidation: toml
+                .max_raw_memories_for_consolidation
+                .unwrap_or(defaults.max_raw_memories_for_consolidation)
                 .min(4096),
+            max_unused_days: toml
+                .max_unused_days
+                .unwrap_or(defaults.max_unused_days)
+                .clamp(0, 365),
             max_rollout_age_days: toml
                 .max_rollout_age_days
                 .unwrap_or(defaults.max_rollout_age_days)
@@ -419,8 +481,8 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .min_rollout_idle_hours
                 .unwrap_or(defaults.min_rollout_idle_hours)
                 .clamp(1, 48),
-            phase_1_model: toml.phase_1_model,
-            phase_2_model: toml.phase_2_model,
+            extract_model: toml.extract_model,
+            consolidation_model: toml.consolidation_model,
         }
     }
 }
@@ -639,6 +701,14 @@ impl fmt::Display for NotificationMethod {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ModelAvailabilityNuxConfig {
+    /// Number of times a startup availability NUX has been shown per model slug.
+    #[serde(default, flatten)]
+    pub shown_count: HashMap<String, u32>,
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -688,6 +758,10 @@ pub struct Tui {
     /// Use `/theme` in the TUI or see `$CODEX_HOME/themes` for custom themes.
     #[serde(default)]
     pub theme: Option<String>,
+
+    /// Startup tooltip availability NUX state persisted by the TUI.
+    #[serde(default)]
+    pub model_availability_nux: ModelAvailabilityNuxConfig,
 }
 
 const fn default_true() -> bool {
@@ -727,11 +801,34 @@ pub struct SkillConfig {
     pub enabled: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PluginConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct SkillsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled: Option<BundledSkillsConfig>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<SkillConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct BundledSkillsConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for BundledSkillsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
@@ -869,290 +966,5 @@ impl Default for ShellEnvironmentPolicy {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn deserialize_stdio_command_server_config() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-        "#,
-        )
-        .expect("should deserialize command config");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::Stdio {
-                command: "echo".to_string(),
-                args: vec![],
-                env: None,
-                env_vars: Vec::new(),
-                cwd: None,
-            }
-        );
-        assert!(cfg.enabled);
-        assert!(!cfg.required);
-        assert!(cfg.enabled_tools.is_none());
-        assert!(cfg.disabled_tools.is_none());
-    }
-
-    #[test]
-    fn deserialize_stdio_command_server_config_with_args() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            args = ["hello", "world"]
-        "#,
-        )
-        .expect("should deserialize command config");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::Stdio {
-                command: "echo".to_string(),
-                args: vec!["hello".to_string(), "world".to_string()],
-                env: None,
-                env_vars: Vec::new(),
-                cwd: None,
-            }
-        );
-        assert!(cfg.enabled);
-    }
-
-    #[test]
-    fn deserialize_stdio_command_server_config_with_arg_with_args_and_env() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            args = ["hello", "world"]
-            env = { "FOO" = "BAR" }
-        "#,
-        )
-        .expect("should deserialize command config");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::Stdio {
-                command: "echo".to_string(),
-                args: vec!["hello".to_string(), "world".to_string()],
-                env: Some(HashMap::from([("FOO".to_string(), "BAR".to_string())])),
-                env_vars: Vec::new(),
-                cwd: None,
-            }
-        );
-        assert!(cfg.enabled);
-    }
-
-    #[test]
-    fn deserialize_stdio_command_server_config_with_env_vars() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            env_vars = ["FOO", "BAR"]
-        "#,
-        )
-        .expect("should deserialize command config with env_vars");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::Stdio {
-                command: "echo".to_string(),
-                args: vec![],
-                env: None,
-                env_vars: vec!["FOO".to_string(), "BAR".to_string()],
-                cwd: None,
-            }
-        );
-    }
-
-    #[test]
-    fn deserialize_stdio_command_server_config_with_cwd() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            cwd = "/tmp"
-        "#,
-        )
-        .expect("should deserialize command config with cwd");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::Stdio {
-                command: "echo".to_string(),
-                args: vec![],
-                env: None,
-                env_vars: Vec::new(),
-                cwd: Some(PathBuf::from("/tmp")),
-            }
-        );
-    }
-
-    #[test]
-    fn deserialize_disabled_server_config() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            enabled = false
-        "#,
-        )
-        .expect("should deserialize disabled server config");
-
-        assert!(!cfg.enabled);
-        assert!(!cfg.required);
-    }
-
-    #[test]
-    fn deserialize_required_server_config() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            required = true
-        "#,
-        )
-        .expect("should deserialize required server config");
-
-        assert!(cfg.required);
-    }
-
-    #[test]
-    fn deserialize_streamable_http_server_config() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            url = "https://example.com/mcp"
-        "#,
-        )
-        .expect("should deserialize http config");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::StreamableHttp {
-                url: "https://example.com/mcp".to_string(),
-                bearer_token_env_var: None,
-                http_headers: None,
-                env_http_headers: None,
-            }
-        );
-        assert!(cfg.enabled);
-    }
-
-    #[test]
-    fn deserialize_streamable_http_server_config_with_env_var() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            url = "https://example.com/mcp"
-            bearer_token_env_var = "GITHUB_TOKEN"
-        "#,
-        )
-        .expect("should deserialize http config");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::StreamableHttp {
-                url: "https://example.com/mcp".to_string(),
-                bearer_token_env_var: Some("GITHUB_TOKEN".to_string()),
-                http_headers: None,
-                env_http_headers: None,
-            }
-        );
-        assert!(cfg.enabled);
-    }
-
-    #[test]
-    fn deserialize_streamable_http_server_config_with_headers() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            url = "https://example.com/mcp"
-            http_headers = { "X-Foo" = "bar" }
-            env_http_headers = { "X-Token" = "TOKEN_ENV" }
-        "#,
-        )
-        .expect("should deserialize http config with headers");
-
-        assert_eq!(
-            cfg.transport,
-            McpServerTransportConfig::StreamableHttp {
-                url: "https://example.com/mcp".to_string(),
-                bearer_token_env_var: None,
-                http_headers: Some(HashMap::from([("X-Foo".to_string(), "bar".to_string())])),
-                env_http_headers: Some(HashMap::from([(
-                    "X-Token".to_string(),
-                    "TOKEN_ENV".to_string()
-                )])),
-            }
-        );
-    }
-
-    #[test]
-    fn deserialize_server_config_with_tool_filters() {
-        let cfg: McpServerConfig = toml::from_str(
-            r#"
-            command = "echo"
-            enabled_tools = ["allowed"]
-            disabled_tools = ["blocked"]
-        "#,
-        )
-        .expect("should deserialize tool filters");
-
-        assert_eq!(cfg.enabled_tools, Some(vec!["allowed".to_string()]));
-        assert_eq!(cfg.disabled_tools, Some(vec!["blocked".to_string()]));
-    }
-
-    #[test]
-    fn deserialize_rejects_command_and_url() {
-        toml::from_str::<McpServerConfig>(
-            r#"
-            command = "echo"
-            url = "https://example.com"
-        "#,
-        )
-        .expect_err("should reject command+url");
-    }
-
-    #[test]
-    fn deserialize_rejects_env_for_http_transport() {
-        toml::from_str::<McpServerConfig>(
-            r#"
-            url = "https://example.com"
-            env = { "FOO" = "BAR" }
-        "#,
-        )
-        .expect_err("should reject env for http transport");
-    }
-
-    #[test]
-    fn deserialize_rejects_headers_for_stdio() {
-        toml::from_str::<McpServerConfig>(
-            r#"
-            command = "echo"
-            http_headers = { "X-Foo" = "bar" }
-        "#,
-        )
-        .expect_err("should reject http_headers for stdio transport");
-
-        toml::from_str::<McpServerConfig>(
-            r#"
-            command = "echo"
-            env_http_headers = { "X-Foo" = "BAR_ENV" }
-        "#,
-        )
-        .expect_err("should reject env_http_headers for stdio transport");
-    }
-
-    #[test]
-    fn deserialize_rejects_inline_bearer_token_field() {
-        let err = toml::from_str::<McpServerConfig>(
-            r#"
-            url = "https://example.com"
-            bearer_token = "secret"
-        "#,
-        )
-        .expect_err("should reject bearer_token field");
-
-        assert!(
-            err.to_string().contains("bearer_token is not supported"),
-            "unexpected error: {err}"
-        );
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;

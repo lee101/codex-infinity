@@ -13,6 +13,17 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 
+const TUI_NOTIFY_CLIENT: &str = "codex-tui";
+
+async fn initialize_app_server_client_name(thread: &CodexThread) {
+    if let Err(err) = thread
+        .set_app_server_client_name(Some(TUI_NOTIFY_CLIENT.to_string()))
+        .await
+    {
+        tracing::error!("failed to set app server client name: {err}");
+    }
+}
+
 /// Spawn the agent bootstrapper and op forwarding loop, returning the
 /// `UnboundedSender<Op>` used by the UI to submit operations.
 pub(crate) fn spawn_agent(
@@ -35,13 +46,14 @@ pub(crate) fn spawn_agent(
                 tracing::error!("{message}");
                 app_event_tx_clone.send(AppEvent::CodexEvent(Event {
                     id: "".to_string(),
-                    msg: EventMsg::Error(err.to_error_event(None)),
+                    msg: EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
                 }));
                 app_event_tx_clone.send(AppEvent::FatalExitRequest(message));
                 tracing::error!("failed to initialize codex: {err}");
                 return;
             }
         };
+        initialize_app_server_client_name(thread.as_ref()).await;
 
         // Forward the captured `SessionConfigured` event so it can be rendered in the UI.
         let ev = codex_protocol::protocol::Event {
@@ -87,6 +99,8 @@ pub(crate) fn spawn_agent_from_existing(
 
     let app_event_tx_clone = app_event_tx;
     tokio::spawn(async move {
+        initialize_app_server_client_name(thread.as_ref()).await;
+
         // Forward the captured `SessionConfigured` event so it can be rendered in the UI.
         let ev = codex_protocol::protocol::Event {
             id: "".to_string(),
@@ -123,6 +137,7 @@ pub(crate) fn spawn_op_forwarder(thread: std::sync::Arc<CodexThread>) -> Unbound
     let (codex_op_tx, mut codex_op_rx) = unbounded_channel::<Op>();
 
     tokio::spawn(async move {
+        initialize_app_server_client_name(thread.as_ref()).await;
         while let Some(op) = codex_op_rx.recv().await {
             if let Err(e) = thread.submit(op).await {
                 tracing::error!("failed to submit op: {e}");

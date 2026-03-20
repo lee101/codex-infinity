@@ -4,10 +4,11 @@ use crate::ModelProviderInfo;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+#[cfg(test)]
+use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
-use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -23,7 +24,6 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
 use tracing::error;
@@ -49,43 +49,6 @@ pub(crate) enum InitialContextInjection {
 
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
     provider.is_openai()
-}
-
-fn is_model_switch_developer_message(item: &ResponseItem) -> bool {
-    match item {
-        ResponseItem::Message { role, content, .. } if role == "developer" => {
-            matches!(
-                content.as_slice(),
-                [ContentItem::InputText { text }] if text.starts_with("<model_switch>\n")
-            )
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn extract_trailing_model_switch_update_for_compaction_request(
-    history: &mut ContextManager,
-) -> Option<ResponseItem> {
-    let history_items = history.raw_items();
-    let last_user_turn_boundary_index = history_items
-        .iter()
-        .rposition(crate::context_manager::is_user_turn_boundary);
-    let model_switch_index = history_items
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, item)| {
-            let is_trailing = last_user_turn_boundary_index.is_none_or(|boundary| i > boundary);
-            if is_trailing && is_model_switch_developer_message(item) {
-                Some(i)
-            } else {
-                None
-            }
-        })?;
-    let mut replacement = history_items.to_vec();
-    let model_switch_item = replacement.remove(model_switch_index);
-    history.replace(replacement);
-    Some(model_switch_item)
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
@@ -136,10 +99,6 @@ async fn run_compact_task_inner(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
-    // Keep compaction prompts in-distribution: if a model-switch update was injected at the
-    // tail of history (between turns), exclude it from the compaction request payload.
-    let stripped_model_switch_item =
-        extract_trailing_model_switch_update_for_compaction_request(&mut history);
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.truncation_policy,
@@ -150,7 +109,8 @@ async fn run_compact_task_inner(
     let max_retries = turn_context.provider.stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
-    // Reuse one client session so turn-scoped state (sticky routing, websocket append tracking)
+    // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
+    // request tracking)
     // survives retries within this compact turn.
 
     loop {
@@ -203,7 +163,7 @@ async fn run_compact_task_inner(
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
-                let event = EventMsg::Error(e.to_error_event(None));
+                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;
                 return Err(e);
             }
@@ -220,7 +180,7 @@ async fn run_compact_task_inner(
                     tokio::time::sleep(delay).await;
                     continue;
                 } else {
-                    let event = EventMsg::Error(e.to_error_event(None));
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                     sess.send_event(&turn_context, event).await;
                     return Err(e);
                 }
@@ -244,11 +204,6 @@ async fn run_compact_task_inner(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
-    // Reattach the stripped model-switch update only after successful compaction so the model
-    // still sees the switch instructions on the next real sampling request.
-    if let Some(model_switch_item) = stripped_model_switch_item {
-        new_history.push(model_switch_item);
-    }
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
@@ -259,15 +214,13 @@ async fn run_compact_task_inner(
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
     };
-    sess.replace_history(new_history.clone(), reference_context_item)
+    let compacted_item = CompactedItem {
+        message: summary_text.clone(),
+        replacement_history: Some(new_history.clone()),
+    };
+    sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(&turn_context).await;
-
-    let rollout_item = RolloutItem::Compacted(CompactedItem {
-        message: summary_text.clone(),
-        replacement_history: Some(new_history),
-    });
-    sess.persist_rollout_items(&[rollout_item]).await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;
@@ -447,9 +400,10 @@ async fn drain_to_completed(
         .stream(
             prompt,
             &turn_context.model_info,
-            &turn_context.otel_manager,
+            &turn_context.session_telemetry,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
+            turn_context.config.service_tier,
             turn_metadata_header,
         )
         .await?;
@@ -484,624 +438,5 @@ async fn drain_to_completed(
 }
 
 #[cfg(test)]
-mod tests {
-
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    async fn process_compacted_history_with_test_session(
-        compacted_history: Vec<ResponseItem>,
-    ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
-        let (session, turn_context) = crate::codex::make_session_and_context().await;
-        let initial_context = session.build_initial_context(&turn_context).await;
-        let refreshed = crate::compact_remote::process_compacted_history(
-            &session,
-            &turn_context,
-            compacted_history,
-            InitialContextInjection::BeforeLastUserMessage,
-        )
-        .await;
-        (refreshed, initial_context)
-    }
-
-    #[test]
-    fn content_items_to_text_joins_non_empty_segments() {
-        let items = vec![
-            ContentItem::InputText {
-                text: "hello".to_string(),
-            },
-            ContentItem::OutputText {
-                text: String::new(),
-            },
-            ContentItem::OutputText {
-                text: "world".to_string(),
-            },
-        ];
-
-        let joined = content_items_to_text(&items);
-
-        assert_eq!(Some("hello\nworld".to_string()), joined);
-    }
-
-    #[test]
-    fn content_items_to_text_ignores_image_only_content() {
-        let items = vec![ContentItem::InputImage {
-            image_url: "file://image.png".to_string(),
-        }];
-
-        let joined = content_items_to_text(&items);
-
-        assert_eq!(None, joined);
-    }
-
-    #[test]
-    fn extract_trailing_model_switch_update_for_compaction_request_removes_trailing_item() {
-        let mut history = ContextManager::new();
-        history.replace(vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "USER_MESSAGE".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "ASSISTANT_REPLY".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "<model_switch>\nNEW_MODEL_INSTRUCTIONS".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ]);
-
-        let model_switch_item =
-            extract_trailing_model_switch_update_for_compaction_request(&mut history);
-
-        assert_eq!(history.raw_items().len(), 2);
-        assert!(model_switch_item.is_some());
-        assert!(
-            history
-                .raw_items()
-                .iter()
-                .all(|item| !is_model_switch_developer_message(item))
-        );
-    }
-
-    #[test]
-    fn extract_trailing_model_switch_update_for_compaction_request_keeps_historical_item() {
-        let mut history = ContextManager::new();
-        history.replace(vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "FIRST_USER_MESSAGE".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "<model_switch>\nOLDER_MODEL_INSTRUCTIONS".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "ASSISTANT_REPLY".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "SECOND_USER_MESSAGE".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ]);
-
-        let model_switch_item =
-            extract_trailing_model_switch_update_for_compaction_request(&mut history);
-
-        assert_eq!(history.raw_items().len(), 4);
-        assert!(model_switch_item.is_none());
-        assert!(
-            history
-                .raw_items()
-                .iter()
-                .any(is_model_switch_developer_message)
-        );
-    }
-
-    #[test]
-    fn collect_user_messages_extracts_user_text_only() {
-        let items = vec![
-            ResponseItem::Message {
-                id: Some("assistant".to_string()),
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "ignored".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: Some("user".to_string()),
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "first".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Other,
-        ];
-
-        let collected = collect_user_messages(&items);
-
-        assert_eq!(vec!["first".to_string()], collected);
-    }
-
-    #[test]
-    fn collect_user_messages_filters_session_prefix_entries() {
-        let items = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: r#"# AGENTS.md instructions for project
-
-<INSTRUCTIONS>
-do things
-</INSTRUCTIONS>"#
-                        .to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "real user message".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-
-        let collected = collect_user_messages(&items);
-
-        assert_eq!(vec!["real user message".to_string()], collected);
-    }
-
-    #[test]
-    fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
-        // Use a small truncation limit so the test remains fast while still validating
-        // that oversized user content is truncated.
-        let max_tokens = 16;
-        let big = "word ".repeat(200);
-        let history = super::build_compacted_history_with_limit(
-            Vec::new(),
-            std::slice::from_ref(&big),
-            "SUMMARY",
-            max_tokens,
-        );
-        assert_eq!(history.len(), 2);
-
-        let truncated_message = &history[0];
-        let summary_message = &history[1];
-
-        let truncated_text = match truncated_message {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                content_items_to_text(content).unwrap_or_default()
-            }
-            other => panic!("unexpected item in history: {other:?}"),
-        };
-
-        assert!(
-            truncated_text.contains("tokens truncated"),
-            "expected truncation marker in truncated user message"
-        );
-        assert!(
-            !truncated_text.contains(&big),
-            "truncated user message should not include the full oversized user text"
-        );
-
-        let summary_text = match summary_message {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                content_items_to_text(content).unwrap_or_default()
-            }
-            other => panic!("unexpected item in history: {other:?}"),
-        };
-        assert_eq!(summary_text, "SUMMARY");
-    }
-
-    #[test]
-    fn build_token_limited_compacted_history_appends_summary_message() {
-        let initial_context: Vec<ResponseItem> = Vec::new();
-        let user_messages = vec!["first user message".to_string()];
-        let summary_text = "summary text";
-
-        let history = build_compacted_history(initial_context, &user_messages, summary_text);
-        assert!(
-            !history.is_empty(),
-            "expected compacted history to include summary"
-        );
-
-        let last = history.last().expect("history should have a summary entry");
-        let summary = match last {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                content_items_to_text(content).unwrap_or_default()
-            }
-            other => panic!("expected summary message, found {other:?}"),
-        };
-        assert_eq!(summary, summary_text);
-    }
-
-    #[tokio::test]
-    async fn process_compacted_history_replaces_developer_messages() {
-        let compacted_history = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "stale permissions".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "summary".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "stale personality".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-        let (refreshed, mut expected) =
-            process_compacted_history_with_test_session(compacted_history).await;
-        expected.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "summary".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        });
-        assert_eq!(refreshed, expected);
-    }
-
-    #[tokio::test]
-    async fn process_compacted_history_reinjects_full_initial_context() {
-        let compacted_history = vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "summary".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }];
-        let (refreshed, mut expected) =
-            process_compacted_history_with_test_session(compacted_history).await;
-        expected.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "summary".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        });
-        assert_eq!(refreshed, expected);
-    }
-
-    #[tokio::test]
-    async fn process_compacted_history_drops_non_user_content_messages() {
-        let compacted_history = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: r#"# AGENTS.md instructions for /repo
-
-<INSTRUCTIONS>
-keep me updated
-</INSTRUCTIONS>"#
-                        .to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: r#"<environment_context>
-  <cwd>/repo</cwd>
-  <shell>zsh</shell>
-</environment_context>"#
-                        .to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: r#"<turn_aborted>
-  <turn_id>turn-1</turn_id>
-  <reason>interrupted</reason>
-</turn_aborted>"#
-                        .to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "summary".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "stale developer instructions".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-        let (refreshed, mut expected) =
-            process_compacted_history_with_test_session(compacted_history).await;
-        expected.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "summary".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        });
-        assert_eq!(refreshed, expected);
-    }
-
-    #[tokio::test]
-    async fn process_compacted_history_inserts_context_before_last_real_user_message_only() {
-        let compacted_history = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "older user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("{SUMMARY_PREFIX}\nsummary text"),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "latest user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-
-        let (refreshed, initial_context) =
-            process_compacted_history_with_test_session(compacted_history).await;
-        let mut expected = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "older user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("{SUMMARY_PREFIX}\nsummary text"),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-        expected.extend(initial_context);
-        expected.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "latest user".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        });
-        assert_eq!(refreshed, expected);
-    }
-
-    #[test]
-    fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
-        let compacted_history = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "older user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "latest user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("{SUMMARY_PREFIX}\nsummary text"),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-        let initial_context = vec![ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "fresh permissions".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }];
-
-        let refreshed = insert_initial_context_before_last_real_user_or_summary(
-            compacted_history,
-            initial_context,
-        );
-        let expected = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "older user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "fresh permissions".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "latest user".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("{SUMMARY_PREFIX}\nsummary text"),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-        ];
-        assert_eq!(refreshed, expected);
-    }
-
-    #[test]
-    fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
-        let compacted_history = vec![ResponseItem::Compaction {
-            encrypted_content: "encrypted".to_string(),
-        }];
-        let initial_context = vec![ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "fresh permissions".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }];
-
-        let refreshed = insert_initial_context_before_last_real_user_or_summary(
-            compacted_history,
-            initial_context,
-        );
-        let expected = vec![
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "fresh permissions".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Compaction {
-                encrypted_content: "encrypted".to_string(),
-            },
-        ];
-        assert_eq!(refreshed, expected);
-    }
-}
+#[path = "compact_tests.rs"]
+mod tests;

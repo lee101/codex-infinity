@@ -129,6 +129,10 @@ pub struct Cli {
     #[arg(long = "color", value_enum, default_value_t = Color::Auto)]
     pub color: Color,
 
+    /// Force cursor-based progress updates in exec mode.
+    #[arg(long = "progress-cursor", default_value_t = false)]
+    pub progress_cursor: bool,
+
     /// Print events to stdout as JSONL.
     #[arg(
         long = "json",
@@ -143,7 +147,12 @@ pub struct Cli {
     pub include_plan_tool: bool,
 
     /// Specifies file where the last message from the agent should be written.
-    #[arg(long = "output-last-message", short = 'o', value_name = "FILE")]
+    #[arg(
+        long = "output-last-message",
+        short = 'o',
+        value_name = "FILE",
+        global = true
+    )]
     pub last_message_file: Option<PathBuf>,
 
     /// Initial instructions for the agent. If not provided as an argument (or
@@ -215,7 +224,7 @@ pub struct ResumeArgs {
 impl From<ResumeArgsRaw> for ResumeArgs {
     fn from(raw: ResumeArgsRaw) -> Self {
         // When --last is used without an explicit prompt, treat the positional as the prompt
-        // (clap can’t express this conditional positional meaning cleanly).
+        // (clap can't express this conditional positional meaning cleanly).
         let (session_id, prompt) = if raw.last && raw.prompt.is_none() {
             (None, raw.session_id)
         } else {
@@ -329,5 +338,28 @@ mod tests {
             }
         });
         assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
+    }
+
+    #[test]
+    fn resume_accepts_output_last_message_flag_after_subcommand() {
+        const PROMPT: &str = "echo resume-with-output-file";
+        let cli = Cli::parse_from([
+            "codex-exec",
+            "resume",
+            "session-123",
+            "-o",
+            "/tmp/resume-output.md",
+            PROMPT,
+        ]);
+
+        assert_eq!(
+            cli.last_message_file,
+            Some(PathBuf::from("/tmp/resume-output.md"))
+        );
+        let Some(Command::Resume(args)) = cli.command else {
+            panic!("expected resume command");
+        };
+        assert_eq!(args.session_id.as_deref(), Some("session-123"));
+        assert_eq!(args.prompt.as_deref(), Some(PROMPT));
     }
 }

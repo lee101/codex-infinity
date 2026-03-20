@@ -1,8 +1,12 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
+use codex_utils_stream_parser::strip_citations;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
@@ -10,17 +14,138 @@ use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::function_tool::FunctionCallError;
+use crate::memories::citations::get_thread_id_from_citations;
+use crate::memories::citations::parse_memory_citation;
 use crate::parse_turn_item;
-use crate::proposed_plan_parser::strip_proposed_plan_blocks;
+use crate::state_db;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
+use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
 use tracing::debug;
 use tracing::instrument;
+
+fn strip_hidden_assistant_markup(text: &str, plan_mode: bool) -> String {
+    let (without_citations, _) = strip_citations(text);
+    if plan_mode {
+        strip_proposed_plan_blocks(&without_citations)
+    } else {
+        without_citations
+    }
+}
+
+fn strip_hidden_assistant_markup_and_parse_memory_citation(
+    text: &str,
+    plan_mode: bool,
+) -> (
+    String,
+    Option<codex_protocol::memory_citation::MemoryCitation>,
+) {
+    let (without_citations, citations) = strip_citations(text);
+    let visible_text = if plan_mode {
+        strip_proposed_plan_blocks(&without_citations)
+    } else {
+        without_citations
+    };
+    (visible_text, parse_memory_citation(citations))
+}
+
+pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option<String> {
+    if let ResponseItem::Message { role, content, .. } = item
+        && role == "assistant"
+    {
+        let combined = content
+            .iter()
+            .filter_map(|ci| match ci {
+                codex_protocol::models::ContentItem::OutputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        return Some(combined);
+    }
+    None
+}
+
+async fn save_image_generation_result(call_id: &str, result: &str) -> Result<PathBuf> {
+    let bytes = BASE64_STANDARD
+        .decode(result.trim().as_bytes())
+        .map_err(|err| {
+            CodexErr::InvalidRequest(format!("invalid image generation payload: {err}"))
+        })?;
+    let mut file_stem: String = call_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if file_stem.is_empty() {
+        file_stem = "generated_image".to_string();
+    }
+    let path = std::env::temp_dir().join(format!("{file_stem}.png"));
+    tokio::fs::write(&path, bytes).await?;
+    Ok(path)
+}
+
+/// Persist a completed model response item and record any cited memory usage.
+pub(crate) async fn record_completed_response_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) {
+    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
+        .await;
+    maybe_mark_thread_memory_mode_polluted_from_web_search(sess, turn_context, item).await;
+    record_stage1_output_usage_for_completed_item(turn_context, item).await;
+}
+
+async fn maybe_mark_thread_memory_mode_polluted_from_web_search(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) {
+    if !turn_context
+        .config
+        .memories
+        .no_memories_if_mcp_or_web_search
+        || !matches!(item, ResponseItem::WebSearchCall { .. })
+    {
+        return;
+    }
+    state_db::mark_thread_memory_mode_polluted(
+        sess.services.state_db.as_deref(),
+        sess.conversation_id,
+        "record_completed_response_item",
+    )
+    .await;
+}
+
+async fn record_stage1_output_usage_for_completed_item(
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) {
+    let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
+        return;
+    };
+
+    let (_, citations) = strip_citations(&raw_text);
+    let thread_ids = get_thread_id_from_citations(citations);
+    if thread_ids.is_empty() {
+        return;
+    }
+
+    if let Some(db) = state_db::get_state_db(turn_context.config.as_ref()).await {
+        let _ = db.record_stage1_output_usage(&thread_ids).await;
+    }
+}
 
 /// Handle a completed output item from the model stream, recording it and
 /// queuing any tool execution futures. This records items immediately so
@@ -62,8 +187,7 @@ pub(crate) async fn handle_output_item_done(
                 payload_preview
             );
 
-            ctx.sess
-                .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
+            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
@@ -78,10 +202,24 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
-            if let Some(turn_item) = handle_non_tool_response_item(&item, plan_mode).await {
+            if let Some(turn_item) = handle_non_tool_response_item(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                plan_mode,
+            )
+            .await
+            {
                 if previously_active_item.is_none() {
+                    let mut started_item = turn_item.clone();
+                    if let TurnItem::ImageGeneration(item) = &mut started_item {
+                        item.status = "in_progress".to_string();
+                        item.revised_prompt = None;
+                        item.result.clear();
+                        item.saved_path = None;
+                    }
                     ctx.sess
-                        .emit_turn_item_started(&ctx.turn_context, &turn_item)
+                        .emit_turn_item_started(&ctx.turn_context, &started_item)
                         .await;
                 }
 
@@ -89,9 +227,7 @@ pub(crate) async fn handle_output_item_done(
                     .emit_turn_item_completed(&ctx.turn_context, turn_item)
                     .await;
             }
-
-            ctx.sess
-                .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
+            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
             let last_agent_message = last_assistant_message_from_item(&item, plan_mode);
 
@@ -101,7 +237,7 @@ pub(crate) async fn handle_output_item_done(
         Err(FunctionCallError::MissingLocalShellCallId) => {
             let msg = "LocalShellCall without call_id or id";
             ctx.turn_context
-                .otel_manager
+                .session_telemetry
                 .log_tool_failed("local_shell", msg);
             tracing::error!(msg);
 
@@ -112,8 +248,7 @@ pub(crate) async fn handle_output_item_done(
                     ..Default::default()
                 },
             };
-            ctx.sess
-                .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
+            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
             if let Some(response_item) = response_input_to_response_item(&response) {
                 ctx.sess
@@ -135,8 +270,7 @@ pub(crate) async fn handle_output_item_done(
                     ..Default::default()
                 },
             };
-            ctx.sess
-                .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
+            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
             if let Some(response_item) = response_input_to_response_item(&response) {
                 ctx.sess
@@ -159,6 +293,8 @@ pub(crate) async fn handle_output_item_done(
 }
 
 pub(crate) async fn handle_non_tool_response_item(
+    sess: &Session,
+    turn_context: &TurnContext,
     item: &ResponseItem,
     plan_mode: bool,
 ) -> Option<TurnItem> {
@@ -167,9 +303,10 @@ pub(crate) async fn handle_non_tool_response_item(
     match item {
         ResponseItem::Message { .. }
         | ResponseItem::Reasoning { .. }
-        | ResponseItem::WebSearchCall { .. } => {
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => {
             let mut turn_item = parse_turn_item(item)?;
-            if plan_mode && let TurnItem::AgentMessage(agent_message) = &mut turn_item {
+            if let TurnItem::AgentMessage(agent_message) = &mut turn_item {
                 let combined = agent_message
                     .content
                     .iter()
@@ -177,13 +314,44 @@ pub(crate) async fn handle_non_tool_response_item(
                         codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
                     })
                     .collect::<String>();
-                let stripped = strip_proposed_plan_blocks(&combined);
+                let (stripped, memory_citation) =
+                    strip_hidden_assistant_markup_and_parse_memory_citation(&combined, plan_mode);
                 agent_message.content =
                     vec![codex_protocol::items::AgentMessageContent::Text { text: stripped }];
+                agent_message.memory_citation = memory_citation;
+            }
+            if let TurnItem::ImageGeneration(image_item) = &mut turn_item {
+                match save_image_generation_result(&image_item.id, &image_item.result).await {
+                    Ok(path) => {
+                        image_item.saved_path = Some(path.to_string_lossy().into_owned());
+                        let image_output_dir = std::env::temp_dir();
+                        let message: ResponseItem = DeveloperInstructions::new(format!(
+                            "Generated images are saved to {} as {} by default.",
+                            image_output_dir.display(),
+                            image_output_dir.join("<image_id>.png").display(),
+                        ))
+                        .into();
+                        sess.record_conversation_items(
+                            turn_context,
+                            std::slice::from_ref(&message),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        let output_dir = std::env::temp_dir();
+                        tracing::warn!(
+                            call_id = %image_item.id,
+                            output_dir = %output_dir.display(),
+                            "failed to save generated image: {err}"
+                        );
+                    }
+                }
             }
             Some(turn_item)
         }
-        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+        ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. } => {
             debug!("unexpected tool output from stream");
             None
         }
@@ -195,25 +363,15 @@ pub(crate) fn last_assistant_message_from_item(
     item: &ResponseItem,
     plan_mode: bool,
 ) -> Option<String> {
-    if let ResponseItem::Message { role, content, .. } = item
-        && role == "assistant"
-    {
-        let combined = content
-            .iter()
-            .filter_map(|ci| match ci {
-                codex_protocol::models::ContentItem::OutputText { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
+    if let Some(combined) = raw_assistant_output_text_from_item(item) {
         if combined.is_empty() {
             return None;
         }
-        return if plan_mode {
-            let stripped = strip_proposed_plan_blocks(&combined);
-            (!stripped.trim().is_empty()).then_some(stripped)
-        } else {
-            Some(combined)
-        };
+        let stripped = strip_hidden_assistant_markup(&combined, plan_mode);
+        if stripped.trim().is_empty() {
+            return None;
+        }
+        return Some(stripped);
     }
     None
 }
@@ -226,25 +384,37 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
                 output: output.clone(),
             })
         }
-        ResponseInputItem::CustomToolCallOutput { call_id, output } => {
-            Some(ResponseItem::CustomToolCallOutput {
-                call_id: call_id.clone(),
-                output: output.clone(),
-            })
-        }
-        ResponseInputItem::McpToolCallOutput { call_id, result } => {
-            let output = match result {
-                Ok(call_tool_result) => FunctionCallOutputPayload::from(call_tool_result),
-                Err(err) => FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(err.clone()),
-                    success: Some(false),
-                },
-            };
+        ResponseInputItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => Some(ResponseItem::CustomToolCallOutput {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            output: output.clone(),
+        }),
+        ResponseInputItem::McpToolCallOutput { call_id, output } => {
+            let output = output.as_function_call_output_payload();
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),
                 output,
             })
         }
+        ResponseInputItem::ToolSearchOutput {
+            call_id,
+            status,
+            execution,
+            tools,
+        } => Some(ResponseItem::ToolSearchOutput {
+            call_id: Some(call_id.clone()),
+            status: status.clone(),
+            execution: execution.clone(),
+            tools: tools.clone(),
+        }),
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "stream_events_utils_tests.rs"]
+mod tests;

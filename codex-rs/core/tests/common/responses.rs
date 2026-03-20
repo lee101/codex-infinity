@@ -12,6 +12,7 @@ use futures::SinkExt;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -141,6 +142,32 @@ impl ResponsesRequest {
             .collect()
     }
 
+    /// Returns `input_text` spans grouped by `message` input for the provided role.
+    pub fn message_input_text_groups(&self, role: &str) -> Vec<Vec<String>> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .map(|content| {
+                content
+                    .into_iter()
+                    .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+                    .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn has_message_with_input_texts(
+        &self,
+        role: &str,
+        predicate: impl Fn(&[String]) -> bool,
+    ) -> bool {
+        self.message_input_text_groups(role)
+            .iter()
+            .any(|texts| predicate(texts))
+    }
+
     /// Returns all `input_image` `image_url` spans from `message` inputs for the provided role.
     pub fn message_input_image_urls(&self, role: &str) -> Vec<String> {
         self.inputs_of_type("message")
@@ -178,6 +205,10 @@ impl ResponsesRequest {
 
     pub fn custom_tool_call_output(&self, call_id: &str) -> Value {
         self.call_output(call_id, "custom_tool_call_output")
+    }
+
+    pub fn tool_search_output(&self, call_id: &str) -> Value {
+        self.call_output(call_id, "tool_search_output")
     }
 
     pub fn call_output(&self, call_id: &str, call_type: &str) -> Value {
@@ -237,7 +268,7 @@ impl ResponsesRequest {
             .cloned()
             .unwrap_or(Value::Null);
         match output {
-            Value::String(text) => Some((Some(text), None)),
+            Value::String(_) | Value::Array(_) => Some((output_value_to_text(&output), None)),
             Value::Object(obj) => Some((
                 obj.get("content")
                     .and_then(Value::as_str)
@@ -269,6 +300,87 @@ impl ResponsesRequest {
     }
 }
 
+pub(crate) fn output_value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => match items.as_slice() {
+            [item] if item.get("type").and_then(Value::as_str) == Some("input_text") => {
+                item.get("text").and_then(Value::as_str).map(str::to_string)
+            }
+            [_] | [] | [_, _, ..] => None,
+        },
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) | Value::Null => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use wiremock::http::HeaderMap;
+    use wiremock::http::Method;
+
+    fn request_with_input(input: Value) -> ResponsesRequest {
+        ResponsesRequest(wiremock::Request {
+            url: "http://localhost/v1/responses"
+                .parse()
+                .expect("valid request url"),
+            method: Method::POST,
+            headers: HeaderMap::new(),
+            body: serde_json::to_vec(&serde_json::json!({ "input": input }))
+                .expect("serialize request body"),
+        })
+    }
+
+    #[test]
+    fn call_output_content_and_success_returns_only_single_text_content_item() {
+        let single_text = request_with_input(serde_json::json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [{ "type": "input_text", "text": "hello" }]
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-2",
+                "output": [{ "type": "input_text", "text": "world" }]
+            }
+        ]));
+        assert_eq!(
+            single_text.function_call_output_content_and_success("call-1"),
+            Some((Some("hello".to_string()), None))
+        );
+        assert_eq!(
+            single_text.custom_tool_call_output_content_and_success("call-2"),
+            Some((Some("world".to_string()), None))
+        );
+
+        let mixed_content = request_with_input(serde_json::json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call-3",
+                "output": [
+                    { "type": "input_text", "text": "hello" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" }
+                ]
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-4",
+                "output": [{ "type": "input_image", "image_url": "data:image/png;base64,abc" }]
+            }
+        ]));
+        assert_eq!(
+            mixed_content.function_call_output_content_and_success("call-3"),
+            Some((None, None))
+        );
+        assert_eq!(
+            mixed_content.custom_tool_call_output_content_and_success("call-4"),
+            Some((None, None))
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebSocketRequest {
     body: Value,
@@ -282,10 +394,15 @@ impl WebSocketRequest {
 
 #[derive(Debug, Clone)]
 pub struct WebSocketHandshake {
+    uri: String,
     headers: Vec<(String, String)>,
 }
 
 impl WebSocketHandshake {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
     pub fn header(&self, name: &str) -> Option<String> {
         self.headers
             .iter()
@@ -300,15 +417,21 @@ pub struct WebSocketConnectionConfig {
     pub response_headers: Vec<(String, String)>,
     /// Optional delay inserted before accepting the websocket handshake.
     ///
-    /// Tests use this to force startup preconnect into an in-flight state so first-turn adoption
-    /// paths can be exercised deterministically.
+    /// Tests use this to force websocket setup into an in-flight state so first-turn warmup paths
+    /// can be exercised deterministically.
     pub accept_delay: Option<Duration>,
+    /// Whether the server should send a websocket close frame after all scripted responses.
+    ///
+    /// Tests can disable this to simulate a peer that surfaces a terminal event but never
+    /// completes the close handshake.
+    pub close_after_requests: bool,
 }
 
 pub struct WebSocketTestServer {
     uri: String,
     connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
+    request_log_updated: Arc<Notify>,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -330,6 +453,26 @@ impl WebSocketTestServer {
         connections.first().cloned().unwrap_or_default()
     }
 
+    pub async fn wait_for_request(
+        &self,
+        connection_index: usize,
+        request_index: usize,
+    ) -> WebSocketRequest {
+        loop {
+            if let Some(request) = self
+                .connections
+                .lock()
+                .unwrap()
+                .get(connection_index)
+                .and_then(|connection| connection.get(request_index))
+                .cloned()
+            {
+                return request;
+            }
+            self.request_log_updated.notified().await;
+        }
+    }
+
     pub fn handshakes(&self) -> Vec<WebSocketHandshake> {
         self.handshakes.lock().unwrap().clone()
     }
@@ -337,7 +480,7 @@ impl WebSocketTestServer {
     /// Waits until at least `expected` websocket handshakes have been observed or timeout elapses.
     ///
     /// Uses a short bounded polling interval so tests can deterministically wait for background
-    /// preconnect activity without busy-spinning.
+    /// websocket activity without busy-spinning.
     pub async fn wait_for_handshakes(&self, expected: usize, timeout: Duration) -> bool {
         if self.handshakes.lock().unwrap().len() >= expected {
             return true;
@@ -441,25 +584,6 @@ pub fn sse_completed(id: &str) -> String {
 pub fn ev_completed(id: &str) -> Value {
     serde_json::json!({
         "type": "response.completed",
-        "response": {
-            "id": id,
-            "usage": {"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}
-        }
-    })
-}
-
-pub fn ev_done() -> Value {
-    serde_json::json!({
-        "type": "response.done",
-        "response": {
-            "usage": {"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}
-        }
-    })
-}
-
-pub fn ev_done_with_id(id: &str) -> Value {
-    serde_json::json!({
-        "type": "response.done",
         "response": {
             "id": id,
             "usage": {"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}
@@ -624,6 +748,24 @@ pub fn ev_web_search_call_done(id: &str, status: &str, query: &str) -> Value {
     })
 }
 
+pub fn ev_image_generation_call(
+    id: &str,
+    status: &str,
+    revised_prompt: &str,
+    result: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "image_generation_call",
+            "id": id,
+            "status": status,
+            "revised_prompt": revised_prompt,
+            "result": result,
+        }
+    })
+}
+
 pub fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",
@@ -632,6 +774,18 @@ pub fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value {
             "call_id": call_id,
             "name": name,
             "arguments": arguments
+        }
+    })
+}
+
+pub fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "tool_search_call",
+            "call_id": call_id,
+            "execution": "client",
+            "arguments": arguments,
         }
     })
 }
@@ -1035,6 +1189,7 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
             requests,
             response_headers: Vec::new(),
             accept_delay: None,
+            close_after_requests: true,
         })
         .collect();
     start_websocket_server_with_headers(connections).await
@@ -1043,6 +1198,7 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
 pub async fn start_websocket_server_with_headers(
     connections: Vec<WebSocketConnectionConfig>,
 ) -> WebSocketTestServer {
+    let start = std::time::Instant::now();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind websocket server");
@@ -1050,8 +1206,10 @@ pub async fn start_websocket_server_with_headers(
     let uri = format!("ws://{addr}");
     let connections_log = Arc::new(Mutex::new(Vec::new()));
     let handshakes_log = Arc::new(Mutex::new(Vec::new()));
+    let request_log_updated = Arc::new(Notify::new());
     let requests = Arc::clone(&connections_log);
     let handshakes = Arc::clone(&handshakes_log);
+    let request_log = Arc::clone(&request_log_updated);
     let connections = Arc::new(Mutex::new(VecDeque::from(connections)));
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
@@ -1091,10 +1249,10 @@ pub async fn start_websocket_server_with_headers(
                             .map(|value| (name.as_str().to_string(), value.to_string()))
                     })
                     .collect();
-                handshake_log
-                    .lock()
-                    .unwrap()
-                    .push(WebSocketHandshake { headers });
+                handshake_log.lock().unwrap().push(WebSocketHandshake {
+                    uri: req.uri().to_string(),
+                    headers,
+                });
 
                 let headers_mut = response.headers_mut();
                 for (name, value) in &response_headers {
@@ -1125,6 +1283,7 @@ pub async fn start_websocket_server_with_headers(
                 log.push(Vec::new());
                 log.len() - 1
             };
+            let close_after_requests = connection.close_after_requests;
             for request_events in connection.requests {
                 let Some(Ok(message)) = ws_stream.next().await else {
                     break;
@@ -1133,9 +1292,51 @@ pub async fn start_websocket_server_with_headers(
                     let mut log = requests.lock().unwrap();
                     if let Some(connection_log) = log.get_mut(connection_index) {
                         connection_log.push(WebSocketRequest { body });
+                        let request_index = connection_log.len() - 1;
+                        let request = &connection_log[request_index];
+                        let request_body = request.body_json();
+                        eprintln!(
+                            "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
+                            start.elapsed().as_millis(),
+                            connection_index,
+                            request_index,
+                            request_body.get("type").and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("role"))
+                                .and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("content"))
+                                .and_then(Value::as_array)
+                                .and_then(|content| content.first())
+                                .and_then(|content| content.get("text"))
+                                .and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("content"))
+                                .and_then(Value::as_array)
+                                .and_then(|content| content.first())
+                                .and_then(|content| content.get("data"))
+                                .and_then(Value::as_str),
+                        );
                     }
+                    request_log.notify_waiters();
                 }
 
+                eprintln!(
+                    "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
+                    start.elapsed().as_millis(),
+                    connection_index,
+                    request_events.len(),
+                    request_events
+                        .iter()
+                        .map(|event| event.get("type").and_then(Value::as_str))
+                        .collect::<Vec<_>>(),
+                    request_events
+                        .iter()
+                        .find_map(|event| event.get("delta").and_then(Value::as_str)),
+                );
                 for event in &request_events {
                     let Ok(payload) = serde_json::to_string(event) else {
                         continue;
@@ -1146,7 +1347,12 @@ pub async fn start_websocket_server_with_headers(
                 }
             }
 
-            let _ = ws_stream.close(None).await;
+            if close_after_requests {
+                let _ = ws_stream.close(None).await;
+            } else {
+                let _ = shutdown_rx.await;
+                return;
+            }
 
             if connections.lock().unwrap().is_empty() {
                 return;
@@ -1158,6 +1364,7 @@ pub async fn start_websocket_server_with_headers(
         uri,
         connections: connections_log,
         handshakes: handshakes_log,
+        request_log_updated,
         shutdown: shutdown_tx,
         task,
     }
@@ -1293,11 +1500,13 @@ pub async fn mount_response_sequence(
 /// Validate invariants on the request body sent to `/v1/responses`.
 ///
 /// - No `function_call_output`/`custom_tool_call_output` with missing/empty `call_id`.
+/// - `tool_search_output` must have a `call_id` unless it is a server-executed legacy item.
 /// - Every `function_call_output` must match a prior `function_call` or
 ///   `local_shell_call` with the same `call_id` in the same `input`.
 /// - Every `custom_tool_call_output` must match a prior `custom_tool_call`.
-/// - Additionally, enforce symmetry: every `function_call`/`custom_tool_call`
-///   in the `input` must have a matching output entry.
+/// - Every `tool_search_output` must match a prior `tool_search_call`.
+/// - Additionally, enforce symmetry: every `function_call`/`custom_tool_call`/
+///   `tool_search_call` in the `input` must have a matching output entry.
 fn validate_request_body_invariants(request: &wiremock::Request) {
     // Skip GET requests (e.g., /models)
     if request.method != "POST" || !request.url.path().ends_with("/responses") {
@@ -1347,7 +1556,24 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
             .collect()
     }
 
+    fn gather_tool_search_output_ids(items: &[Value]) -> HashSet<String> {
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
+            .filter_map(|item| {
+                if let Some(id) = get_call_id(item) {
+                    return Some(id.to_string());
+                }
+                if item.get("execution").and_then(Value::as_str) == Some("server") {
+                    return None;
+                }
+                panic!("orphan tool_search_output with empty call_id should be dropped");
+            })
+            .collect()
+    }
+
     let function_calls = gather_ids(items, "function_call");
+    let tool_search_calls = gather_ids(items, "tool_search_call");
     let custom_tool_calls = gather_ids(items, "custom_tool_call");
     let local_shell_calls = gather_ids(items, "local_shell_call");
     let function_call_outputs = gather_output_ids(
@@ -1355,6 +1581,7 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         "function_call_output",
         "orphan function_call_output with empty call_id should be dropped",
     );
+    let tool_search_outputs = gather_tool_search_output_ids(items);
     let custom_tool_call_outputs = gather_output_ids(
         items,
         "custom_tool_call_output",
@@ -1373,6 +1600,12 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
             "custom_tool_call_output without matching call in input: {cid}",
         );
     }
+    for cid in &tool_search_outputs {
+        assert!(
+            tool_search_calls.contains(cid),
+            "tool_search_output without matching call in input: {cid}",
+        );
+    }
 
     for cid in &function_calls {
         assert!(
@@ -1384,6 +1617,12 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         assert!(
             custom_tool_call_outputs.contains(cid),
             "Custom tool call output is missing for call id: {cid}",
+        );
+    }
+    for cid in &tool_search_calls {
+        assert!(
+            tool_search_outputs.contains(cid),
+            "Tool search output is missing for call id: {cid}",
         );
     }
 }

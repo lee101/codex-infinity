@@ -39,11 +39,18 @@ use unicode_width::UnicodeWidthStr;
 
 const PAGE_SIZE: usize = 25;
 const LOAD_NEAR_THRESHOLD: usize = 5;
+
+#[derive(Debug, Clone)]
+pub struct SessionTarget {
+    pub path: PathBuf,
+    pub thread_id: ThreadId,
+}
+
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
-    Resume(PathBuf),
-    Fork(PathBuf),
+    Resume(SessionTarget),
+    Fork(SessionTarget),
     Exit,
 }
 
@@ -68,10 +75,11 @@ impl SessionPickerAction {
         }
     }
 
-    fn selection(self, path: PathBuf) -> SessionSelection {
+    fn selection(self, path: PathBuf, thread_id: ThreadId) -> SessionSelection {
+        let target_session = SessionTarget { path, thread_id };
         match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(path),
-            SessionPickerAction::Fork => SessionSelection::Fork(path),
+            SessionPickerAction::Resume => SessionSelection::Resume(target_session),
+            SessionPickerAction::Fork => SessionSelection::Fork(target_session),
         }
     }
 }
@@ -156,9 +164,10 @@ async fn run_session_picker(
                 PAGE_SIZE,
                 request.cursor.as_ref(),
                 request.sort_key,
-                INTERACTIVE_SESSION_SOURCES,
+                INTERACTIVE_SESSION_SOURCES.as_slice(),
                 Some(provider_filter.as_slice()),
                 request.default_provider.as_str(),
+                /*search_term*/ None,
             )
             .await;
             let _ = tx.send(BackgroundEvent::PageLoaded {
@@ -265,6 +274,7 @@ struct PickerState {
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
     thread_name_cache: HashMap<ThreadId, Option<String>>,
+    inline_error: Option<String>,
 }
 
 struct PaginationState {
@@ -380,8 +390,9 @@ impl PickerState {
             show_all,
             filter_cwd,
             action,
-            sort_key: ThreadSortKey::CreatedAt,
+            sort_key: ThreadSortKey::UpdatedAt,
             thread_name_cache: HashMap::new(),
+            inline_error: None,
         }
     }
 
@@ -390,6 +401,7 @@ impl PickerState {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
+        self.inline_error = None;
         match key.code {
             KeyCode::Esc => return Ok(Some(SessionSelection::StartFresh)),
             KeyCode::Char('c')
@@ -401,7 +413,25 @@ impl PickerState {
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    return Ok(Some(self.action.selection(row.path.clone())));
+                    let path = row.path.clone();
+                    let thread_id = match row.thread_id {
+                        Some(thread_id) => Some(thread_id),
+                        None => {
+                            crate::resolve_session_thread_id(
+                                path.as_path(),
+                                /*id_str_if_uuid*/ None,
+                            )
+                            .await
+                        }
+                    };
+                    if let Some(thread_id) = thread_id {
+                        return Ok(Some(self.action.selection(path, thread_id)));
+                    }
+                    self.inline_error = Some(format!(
+                        "Failed to read session metadata from {}",
+                        path.display()
+                    ));
+                    self.request_frame();
                 }
             }
             KeyCode::Up => {
@@ -865,12 +895,7 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         frame.render_widget_ref(header_line, header);
 
         // Search line
-        let q = if state.query.is_empty() {
-            "Type to search".dim().to_string()
-        } else {
-            format!("Search: {}", state.query)
-        };
-        frame.render_widget_ref(Line::from(q), search);
+        frame.render_widget_ref(search_line(state), search);
 
         let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
 
@@ -901,6 +926,16 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         .into();
         frame.render_widget_ref(hint_line, hint);
     })
+}
+
+fn search_line(state: &PickerState) -> Line<'_> {
+    if let Some(error) = state.inline_error.as_deref() {
+        return Line::from(error.red());
+    }
+    if state.query.is_empty() {
+        return Line::from("Type to search".dim());
+    }
+    Line::from(format!("Search: {}", state.query))
 }
 
 fn render_list(
@@ -1226,14 +1261,14 @@ fn calculate_column_metrics(rows: &[Row], include_cwd: bool) -> ColumnMetrics {
         let created = format_created_label(row);
         let updated = format_updated_label(row);
         let branch_raw = row.git_branch.clone().unwrap_or_default();
-        let branch = right_elide(&branch_raw, 24);
+        let branch = right_elide(&branch_raw, /*max*/ 24);
         let cwd = if include_cwd {
             let cwd_raw = row
                 .cwd
                 .as_ref()
                 .map(|p| display_path_for(p, std::path::Path::new("/")))
                 .unwrap_or_default();
-            right_elide(&cwd_raw, 24)
+            right_elide(&cwd_raw, /*max*/ 24)
         } else {
             String::new()
         };
@@ -1604,6 +1639,42 @@ mod tests {
 
         let snapshot = terminal.backend().to_string();
         assert_snapshot!("resume_picker_table", snapshot);
+    }
+
+    #[test]
+    fn resume_search_error_snapshot() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        state.inline_error = Some(String::from(
+            "Failed to read session metadata from /tmp/missing.jsonl",
+        ));
+
+        let width: u16 = 80;
+        let height: u16 = 1;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+
+        {
+            let mut frame = terminal.get_frame();
+            let line = search_line(&state);
+            frame.render_widget_ref(line, frame.area());
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_search_error", snapshot);
     }
 
     // TODO(jif) fix
@@ -2043,7 +2114,7 @@ mod tests {
         {
             let guard = recorded_requests.lock().unwrap();
             assert_eq!(guard.len(), 1);
-            assert_eq!(guard[0].sort_key, ThreadSortKey::CreatedAt);
+            assert_eq!(guard[0].sort_key, ThreadSortKey::UpdatedAt);
         }
 
         state
@@ -2053,7 +2124,7 @@ mod tests {
 
         let guard = recorded_requests.lock().unwrap();
         assert_eq!(guard.len(), 2);
-        assert_eq!(guard[1].sort_key, ThreadSortKey::UpdatedAt);
+        assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
     }
 
     #[tokio::test]
@@ -2099,6 +2170,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.selected, 5);
+    }
+
+    #[tokio::test]
+    async fn enter_on_row_without_resolvable_thread_id_shows_inline_error() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+
+        let row = Row {
+            path: PathBuf::from("/tmp/missing.jsonl"),
+            preview: String::from("missing metadata"),
+            thread_id: None,
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: None,
+            git_branch: None,
+        };
+        state.all_rows = vec![row.clone()];
+        state.filtered_rows = vec![row];
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("enter should not abort the picker");
+
+        assert!(selection.is_none());
+        assert_eq!(
+            state.inline_error,
+            Some(String::from(
+                "Failed to read session metadata from /tmp/missing.jsonl"
+            ))
+        );
     }
 
     #[tokio::test]

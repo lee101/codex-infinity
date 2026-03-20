@@ -10,6 +10,8 @@ use std::sync::Arc;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelsResponse;
+use once_cell::sync::Lazy;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -18,9 +20,18 @@ use crate::ThreadManager;
 use crate::config::Config;
 use crate::models_manager::collaboration_mode_presets;
 use crate::models_manager::manager::ModelsManager;
-use crate::models_manager::model_presets;
 use crate::thread_manager;
 use crate::unified_exec;
+
+static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
+    let file_contents = include_str!("../models.json");
+    let mut response: ModelsResponse = serde_json::from_str(file_contents)
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+    response.models.sort_by(|a, b| a.priority.cmp(&b.priority));
+    let mut presets: Vec<ModelPreset> = response.models.into_iter().map(Into::into).collect();
+    ModelPreset::mark_default_by_picker_visibility(&mut presets);
+    presets
+});
 
 pub fn set_thread_manager_test_mode(enabled: bool) {
     thread_manager::set_thread_manager_test_mode_for_tests(enabled);
@@ -53,6 +64,33 @@ pub fn thread_manager_with_models_provider_and_home(
     ThreadManager::with_models_provider_and_home_for_tests(auth, provider, codex_home)
 }
 
+pub async fn start_thread_with_user_shell_override(
+    thread_manager: &ThreadManager,
+    config: Config,
+    user_shell_override: crate::shell::Shell,
+) -> crate::error::Result<crate::NewThread> {
+    thread_manager
+        .start_thread_with_user_shell_override_for_tests(config, user_shell_override)
+        .await
+}
+
+pub async fn resume_thread_from_rollout_with_user_shell_override(
+    thread_manager: &ThreadManager,
+    config: Config,
+    rollout_path: PathBuf,
+    auth_manager: Arc<AuthManager>,
+    user_shell_override: crate::shell::Shell,
+) -> crate::error::Result<crate::NewThread> {
+    thread_manager
+        .resume_thread_from_rollout_with_user_shell_override_for_tests(
+            config,
+            rollout_path,
+            auth_manager,
+            user_shell_override,
+        )
+        .await
+}
+
 pub fn models_manager_with_provider(
     codex_home: PathBuf,
     auth_manager: Arc<AuthManager>,
@@ -70,9 +108,11 @@ pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
 }
 
 pub fn all_model_presets() -> &'static Vec<ModelPreset> {
-    &model_presets::PRESETS
+    &TEST_MODEL_PRESETS
 }
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
-    collaboration_mode_presets::builtin_collaboration_mode_presets()
+    collaboration_mode_presets::builtin_collaboration_mode_presets(
+        collaboration_mode_presets::CollaborationModesConfig::default(),
+    )
 }

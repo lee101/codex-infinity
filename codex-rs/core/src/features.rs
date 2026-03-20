@@ -5,6 +5,8 @@
 //! booleans through multiple types, call sites consult a single `Features`
 //! container attached to `Config`.
 
+use crate::auth::AuthManager;
+use crate::auth::CodexAuth;
 use crate::config::Config;
 use crate::config::ConfigToml;
 use crate::config::profile::ConfigProfile;
@@ -12,7 +14,7 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::WarningEvent;
 use codex_config::CONFIG_TOML_FILE;
-use codex_otel::OtelManager;
+use codex_otel::SessionTelemetry;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -62,6 +64,9 @@ impl Stage {
 
     pub fn experimental_announcement(self) -> Option<&'static str> {
         match self {
+            Stage::Experimental {
+                announcement: "", ..
+            } => None,
             Stage::Experimental { announcement, .. } => Some(announcement),
             _ => None,
         }
@@ -80,6 +85,10 @@ pub enum Feature {
     // Experimental
     /// Enable JavaScript REPL tools backed by a persistent Node kernel.
     JsRepl,
+    /// Enable a minimal JavaScript mode backed by Node's built-in vm runtime.
+    CodeMode,
+    /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
+    CodeModeOnly,
     /// Only expose js_repl tools directly to the model.
     JsReplToolsOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -88,6 +97,12 @@ pub enum Feature {
     ShellZshFork,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
+    /// Allow exec tools to request additional permissions while staying sandboxed.
+    ExecPermissionApprovals,
+    /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
+    CodexHooks,
+    /// Expose the built-in request_permissions tool.
+    RequestPermissionsTool,
     /// Allow the model to request web searches that fetch live content.
     WebSearchRequest,
     /// Allow the model to request web searches that fetch cached content.
@@ -95,8 +110,12 @@ pub enum Feature {
     WebSearchCached,
     /// Legacy search-tool feature flag kept for backward compatibility.
     SearchTool,
-    /// Use the bubblewrap-based Linux sandbox pipeline.
+    /// Removed legacy Linux bubblewrap opt-in flag retained as a no-op so old
+    /// wrappers and config can still parse it.
     UseLinuxSandboxBwrap,
+    /// Use the legacy Landlock Linux sandbox fallback instead of the default
+    /// bubblewrap pipeline.
+    UseLegacyLandlock,
     /// Allow the model to request approval and propose exec rules.
     RequestRule,
     /// Enable Windows sandbox (restricted token) on Windows.
@@ -117,33 +136,57 @@ pub enum Feature {
     MemoryTool,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
+    /// Allow the model to request `detail: "original"` image outputs on supported models.
+    ImageDetailOriginal,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
-    /// Allow the agent to use the plan tool to communicate progress.
-    PlanTool,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
     Collab,
+    /// Enable CSV-backed agent job tools.
+    SpawnCsv,
     /// Enable apps.
     Apps,
-    /// Route apps MCP calls through the configured gateway.
-    AppsMcpGateway,
+    /// Enable discoverable tool suggestions for apps.
+    ToolSuggest,
+    /// Enable plugins.
+    Plugins,
+    /// Allow the model to invoke the built-in image generation tool.
+    ImageGeneration,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
     /// Prompt for missing skill env var dependencies.
     SkillEnvVarDependencyPrompt,
     /// Steer feature flag - when enabled, Enter submits immediately instead of queuing.
+    /// Kept for config backward compatibility; behavior is always steer-enabled.
     Steer,
+    /// Allow request_user_input in Default collaboration mode.
+    DefaultModeRequestUserInput,
+    /// Enable automatic review for approval prompts.
+    GuardianApproval,
     /// Enable collaboration modes (Plan, Default).
+    /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
     CollaborationModes,
+    /// Route MCP tool approval prompts through the MCP elicitation request path.
+    ToolCallMcpElicitation,
     /// Enable personality selection in the TUI.
     Personality,
+    /// Enable native artifact tools.
+    Artifact,
+    /// Enable Fast mode selection in the TUI and request layer.
+    FastMode,
+    /// Enable voice transcription in the TUI composer.
+    VoiceTranscription,
+    /// Enable experimental realtime voice conversation mode in the TUI.
+    RealtimeConversation,
+    /// Route interactive startup to the app-server-backed TUI implementation.
+    TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
-    /// Use the Responses API WebSocket transport for OpenAI by default.
+    /// Legacy rollout flag for Responses API WebSocket transport experiments.
     ResponsesWebsockets,
-    /// Enable Responses API websocket v2 mode.
+    /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
 }
 
@@ -193,10 +236,17 @@ impl FeatureOverrides {
     fn apply(self, features: &mut Features) {
         LegacyFeatureToggles {
             include_apply_patch_tool: self.include_apply_patch_tool,
-            tools_web_search: self.web_search_request,
             ..Default::default()
         }
         .apply(features);
+        if let Some(enabled) = self.web_search_request {
+            if enabled {
+                features.enable(Feature::WebSearchRequest);
+            } else {
+                features.disable(Feature::WebSearchRequest);
+            }
+            features.record_legacy_usage("web_search_request", Feature::WebSearchRequest);
+        }
     }
 }
 
@@ -219,6 +269,31 @@ impl Features {
         self.enabled.contains(&f)
     }
 
+    pub async fn apps_enabled(&self, auth_manager: Option<&AuthManager>) -> bool {
+        if !self.enabled(Feature::Apps) {
+            return false;
+        }
+
+        let auth = match auth_manager {
+            Some(auth_manager) => auth_manager.auth().await,
+            None => None,
+        };
+        self.apps_enabled_for_auth(auth.as_ref())
+    }
+
+    pub fn apps_enabled_cached(&self, auth_manager: Option<&AuthManager>) -> bool {
+        let auth = auth_manager.and_then(AuthManager::auth_cached);
+        self.apps_enabled_for_auth(auth.as_ref())
+    }
+
+    pub(crate) fn apps_enabled_for_auth(&self, auth: Option<&CodexAuth>) -> bool {
+        self.enabled(Feature::Apps) && auth.is_some_and(CodexAuth::is_chatgpt_auth)
+    }
+
+    pub fn use_legacy_landlock(&self) -> bool {
+        self.enabled(Feature::UseLegacyLandlock)
+    }
+
     pub fn enable(&mut self, f: Feature) -> &mut Self {
         self.enabled.insert(f);
         self
@@ -227,6 +302,14 @@ impl Features {
     pub fn disable(&mut self, f: Feature) -> &mut Self {
         self.enabled.remove(&f);
         self
+    }
+
+    pub fn set_enabled(&mut self, f: Feature, enabled: bool) -> &mut Self {
+        if enabled {
+            self.enable(f)
+        } else {
+            self.disable(f)
+        }
     }
 
     pub fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature) {
@@ -250,7 +333,7 @@ impl Features {
         self.legacy_usages.iter()
     }
 
-    pub fn emit_metrics(&self, otel: &OtelManager) {
+    pub fn emit_metrics(&self, otel: &SessionTelemetry) {
         for feature in FEATURES {
             if matches!(feature.stage, Stage::Removed) {
                 continue;
@@ -258,7 +341,7 @@ impl Features {
             if self.enabled(feature.id) != feature.default_enabled {
                 otel.counter(
                     "codex.feature.state",
-                    1,
+                    /*inc*/ 1,
                     &[
                         ("feature", feature.key),
                         ("value", &self.enabled(feature.id).to_string()),
@@ -314,7 +397,6 @@ impl Features {
         let base_legacy = LegacyFeatureToggles {
             experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-            tools_web_search: cfg.tools.as_ref().and_then(|t| t.web_search),
             ..Default::default()
         };
         base_legacy.apply(&mut features);
@@ -327,9 +409,8 @@ impl Features {
             include_apply_patch_tool: config_profile.include_apply_patch_tool,
             experimental_use_freeform_apply_patch: config_profile
                 .experimental_use_freeform_apply_patch,
+
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
-            tools_web_search: config_profile.tools_web_search,
-            ..Default::default()
         };
         profile_legacy.apply(&mut features);
         if let Some(profile_features) = config_profile.features.as_ref() {
@@ -337,16 +418,26 @@ impl Features {
         }
 
         overrides.apply(&mut features);
-        if features.enabled(Feature::JsReplToolsOnly) && !features.enabled(Feature::JsRepl) {
-            tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
-            features.disable(Feature::JsReplToolsOnly);
-        }
+        features.normalize_dependencies();
 
         features
     }
 
     pub fn enabled_features(&self) -> Vec<Feature> {
         self.enabled.iter().copied().collect()
+    }
+
+    pub(crate) fn normalize_dependencies(&mut self) {
+        if self.enabled(Feature::SpawnCsv) && !self.enabled(Feature::Collab) {
+            self.enable(Feature::Collab);
+        }
+        if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
+            self.enable(Feature::CodeMode);
+        }
+        if self.enabled(Feature::JsReplToolsOnly) && !self.enabled(Feature::JsRepl) {
+            tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
+            self.disable(Feature::JsReplToolsOnly);
+        }
     }
 }
 
@@ -356,7 +447,6 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
         Feature::WebSearchRequest | Feature::WebSearchCached => {
             let label = match alias {
                 "web_search" => "[features].web_search",
-                "tools.web_search" => "[tools].web_search",
                 "features.web_search_request" | "web_search_request" => {
                     "[features].web_search_request"
                 }
@@ -370,7 +460,12 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
             (summary, Some(web_search_details().to_string()))
         }
         _ => {
-            let summary = format!("`{alias}` is deprecated. Use `[features].{canonical}` instead.");
+            let label = if alias.contains('.') || alias.starts_with('[') {
+                alias.to_string()
+            } else {
+                format!("[features].{alias}")
+            };
+            let summary = format!("`{label}` is deprecated. Use `[features].{canonical}` instead.");
             let details = if alias == canonical {
                 None
             } else {
@@ -388,13 +483,20 @@ fn web_search_details() -> &'static str {
 }
 
 /// Keys accepted in `[features]` tables.
-fn feature_for_key(key: &str) -> Option<Feature> {
+pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
     for spec in FEATURES {
         if spec.key == key {
             return Some(spec.id);
         }
     }
     legacy::feature_for_key(key)
+}
+
+pub(crate) fn canonical_feature_for_key(key: &str) -> Option<Feature> {
+    FEATURES
+        .iter()
+        .find(|spec| spec.key == key)
+        .map(|spec| spec.id)
 }
 
 /// Returns `true` if the provided string matches a known feature toggle key.
@@ -427,12 +529,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::PlanTool,
-        key: "plan_tool",
-        stage: Stage::Stable,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ShellTool,
         key: "shell_tool",
         stage: Stage::Stable,
@@ -459,6 +555,22 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::JsRepl,
         key: "js_repl",
+        stage: Stage::Experimental {
+            name: "JavaScript REPL",
+            menu_description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities. Requires Node >= v22.22.0 installed.",
+            announcement: "NEW: JavaScript REPL is now available in /experimental. Enable it, then start a new chat or restart Codex to use it.",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodeMode,
+        key: "code_mode",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodeModeOnly,
+        key: "code_mode_only",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -502,12 +614,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Removed,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::MemoryTool,
-        key: "memory_tool",
+        key: "memories",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -518,22 +630,45 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ImageDetailOriginal,
+        key: "image_detail_original",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ApplyPatchFreeform,
         key: "apply_patch_freeform",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ExecPermissionApprovals,
+        key: "exec_permission_approvals",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodexHooks,
+        key: "codex_hooks",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RequestPermissionsTool,
+        key: "request_permissions_tool",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::UseLinuxSandboxBwrap,
         key: "use_linux_sandbox_bwrap",
-        #[cfg(target_os = "linux")]
-        stage: Stage::Experimental {
-            name: "Bubblewrap sandbox",
-            menu_description: "Try the new linux sandbox based on bubblewrap.",
-            announcement: "NEW: Linux bubblewrap sandbox offers stronger filesystem and network controls than Landlock alone, including keeping .git and .codex read-only inside writable workspaces. Enable it in /experimental and restart Codex to try it.",
-        },
-        #[cfg(not(target_os = "linux"))]
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UseLegacyLandlock,
+        key: "use_legacy_landlock",
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
@@ -581,11 +716,13 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Collab,
         key: "multi_agent",
-        stage: Stage::Experimental {
-            name: "Multi-agents",
-            menu_description: "Ask Codex to spawn multiple agents to parallelize the work and win in efficiency.",
-            announcement: "NEW: Multi-agents can now be spawned by Codex. Enable in /experimental and restart Codex!",
-        },
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::SpawnCsv,
+        key: "enable_fanout",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -599,8 +736,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::AppsMcpGateway,
-        key: "apps_mcp_gateway",
+        id: Feature::ToolSuggest,
+        key: "tool_suggest",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Plugins,
+        key: "plugins",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ImageGeneration,
+        key: "image_generation",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -619,14 +768,36 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Steer,
         key: "steer",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::DefaultModeRequestUserInput,
+        key: "default_mode_request_user_input",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianApproval,
+        key: "guardian_approval",
+        stage: Stage::Experimental {
+            name: "Guardian Approvals",
+            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), route eligible approval requests to a carefully-prompted security reviewer subagent rather than blocking the agent on your input. This can consume significantly more tokens because it runs a subagent on every approval request.",
+            announcement: "",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,
         key: "collaboration_modes",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ToolCallMcpElicitation,
+        key: "tool_call_mcp_elicitation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Personality,
@@ -635,9 +806,47 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::Artifact,
+        key: "artifact",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::FastMode,
+        key: "fast_mode",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::VoiceTranscription,
+        key: "voice_transcription",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RealtimeConversation,
+        key: "realtime_conversation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::TuiAppServer,
+        key: "tui_app_server",
+        stage: Stage::Experimental {
+            name: "App-server TUI",
+            menu_description: "Use the app-server-backed TUI implementation.",
+            announcement: "",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::PreventIdleSleep,
         key: "prevent_idle_sleep",
-        stage: if cfg!(target_os = "macos") {
+        stage: if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             Stage::Experimental {
                 name: "Prevent sleep while running",
                 menu_description: "Keep your computer awake while Codex is running a thread.",
@@ -651,13 +860,13 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ResponsesWebsockets,
         key: "responses_websockets",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
 ];
@@ -714,62 +923,5 @@ pub fn maybe_push_unstable_features_warning(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn under_development_features_are_disabled_by_default() {
-        for spec in FEATURES {
-            if matches!(spec.stage, Stage::UnderDevelopment) {
-                assert_eq!(
-                    spec.default_enabled, false,
-                    "feature `{}` is under development and must be disabled by default",
-                    spec.key
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn default_enabled_features_are_stable() {
-        for spec in FEATURES {
-            if spec.default_enabled {
-                assert_eq!(
-                    spec.stage,
-                    Stage::Stable,
-                    "feature `{}` is enabled by default but is not stable ({:?})",
-                    spec.key,
-                    spec.stage
-                );
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn use_linux_sandbox_bwrap_is_experimental_on_linux() {
-        assert!(matches!(
-            Feature::UseLinuxSandboxBwrap.stage(),
-            Stage::Experimental { .. }
-        ));
-        assert_eq!(Feature::UseLinuxSandboxBwrap.default_enabled(), false);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn use_linux_sandbox_bwrap_is_under_development_off_linux() {
-        assert_eq!(
-            Feature::UseLinuxSandboxBwrap.stage(),
-            Stage::UnderDevelopment
-        );
-        assert_eq!(Feature::UseLinuxSandboxBwrap.default_enabled(), false);
-    }
-
-    #[test]
-    fn collab_is_legacy_alias_for_multi_agent() {
-        assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
-        assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
-    }
-}
+#[path = "features_tests.rs"]
+mod tests;

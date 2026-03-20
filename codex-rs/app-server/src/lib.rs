@@ -1,5 +1,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::config::Config;
@@ -12,7 +13,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -39,33 +39,45 @@ use codex_core::check_execpolicy_for_warnings;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::TextRange as CoreTextRange;
 use codex_feedback::CodexFeedback;
+use codex_protocol::protocol::SessionSource;
+use codex_state::log_db;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
+use tracing::Level;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod app_server_tracing;
 mod bespoke_event_handling;
 mod codex_message_processor;
+mod command_exec;
 mod config_api;
 mod dynamic_tools;
 mod error_code;
+mod external_agent_config_api;
 mod filters;
+mod fs_api;
 mod fuzzy_file_search;
+pub mod in_process;
 mod message_processor;
 mod models;
 mod outgoing_message;
+mod server_request_error;
 mod thread_state;
 mod thread_status;
 mod transport;
 
+pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
+pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
@@ -92,12 +104,100 @@ enum OutboundControlEvent {
     Opened {
         connection_id: ConnectionId,
         writer: mpsc::Sender<crate::outgoing_message::OutgoingMessage>,
+        // Allow codex/event/* notifications to be emitted.
+        allow_legacy_notifications: bool,
         disconnect_sender: Option<CancellationToken>,
         initialized: Arc<AtomicBool>,
+        experimental_api_enabled: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     },
     /// Remove state for a closed/disconnected connection.
     Closed { connection_id: ConnectionId },
+    /// Disconnect all connection-oriented clients during graceful restart.
+    DisconnectAll,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    requested: bool,
+    forced: bool,
+    last_logged_running_turn_count: Option<usize>,
+}
+
+enum ShutdownAction {
+    Noop,
+    Finish,
+}
+
+async fn shutdown_signal() -> IoResult<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::SignalKind;
+        use tokio::signal::unix::signal;
+
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            ctrl_c_result = tokio::signal::ctrl_c() => ctrl_c_result,
+            _ = term.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+impl ShutdownState {
+    fn requested(&self) -> bool {
+        self.requested
+    }
+
+    fn forced(&self) -> bool {
+        self.forced
+    }
+
+    fn on_signal(&mut self, connection_count: usize, running_turn_count: usize) {
+        if self.requested {
+            self.forced = true;
+            return;
+        }
+
+        self.requested = true;
+        self.last_logged_running_turn_count = None;
+        info!(
+            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, requests still accepted until no assistant turns are running)",
+            connection_count, running_turn_count,
+        );
+    }
+
+    fn update(&mut self, running_turn_count: usize, connection_count: usize) -> ShutdownAction {
+        if !self.requested {
+            return ShutdownAction::Noop;
+        }
+
+        if self.forced || running_turn_count == 0 {
+            if self.forced {
+                info!(
+                    "received second shutdown signal; forcing restart with {running_turn_count} running assistant turn(s) and {connection_count} connection(s)"
+                );
+            } else {
+                info!(
+                    "shutdown signal restart: no assistant turns running; stopping acceptor and disconnecting {connection_count} connection(s)"
+                );
+            }
+            return ShutdownAction::Finish;
+        }
+
+        if self.last_logged_running_turn_count != Some(running_turn_count) {
+            info!(
+                "shutdown signal restart: waiting for {running_turn_count} running assistant turn(s) to finish"
+            );
+            self.last_logged_running_turn_count = Some(running_turn_count);
+        }
+
+        ShutdownAction::Noop
+    }
 }
 
 fn config_warning_from_error(
@@ -166,10 +266,10 @@ fn app_text_range(range: &CoreTextRange) -> AppTextRange {
 fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> {
     let mut disabled_folders = Vec::new();
 
-    for layer in config
-        .config_layer_stack
-        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
-    {
+    for layer in config.config_layer_stack.get_layers(
+        ConfigLayerStackOrdering::LowestPrecedenceFirst,
+        /*include_disabled*/ true,
+    ) {
         if !matches!(layer.name, ConfigLayerSource::Project { .. })
             || layer.disabled_reason.is_none()
         {
@@ -225,27 +325,29 @@ fn log_format_from_env() -> LogFormat {
 }
 
 pub async fn run_main(
-    codex_linux_sandbox_exe: Option<PathBuf>,
+    arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
     loader_overrides: LoaderOverrides,
     default_analytics_enabled: bool,
 ) -> IoResult<()> {
     run_main_with_transport(
-        codex_linux_sandbox_exe,
+        arg0_paths,
         cli_config_overrides,
         loader_overrides,
         default_analytics_enabled,
         AppServerTransport::Stdio,
+        SessionSource::VSCode,
     )
     .await
 }
 
 pub async fn run_main_with_transport(
-    codex_linux_sandbox_exe: Option<PathBuf>,
+    arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
     loader_overrides: LoaderOverrides,
     default_analytics_enabled: bool,
     transport: AppServerTransport,
+    session_source: SessionSource,
 ) -> IoResult<()> {
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
@@ -253,20 +355,37 @@ pub async fn run_main_with_transport(
     let (outbound_control_tx, mut outbound_control_rx) =
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
+    enum TransportRuntime {
+        Stdio,
+        WebSocket {
+            accept_handle: JoinHandle<()>,
+            shutdown_token: CancellationToken,
+        },
+    }
+
     let mut stdio_handles = Vec::<JoinHandle<()>>::new();
-    let mut websocket_accept_handle = None;
-    match transport {
+    let transport_runtime = match transport {
         AppServerTransport::Stdio => {
             start_stdio_connection(transport_event_tx.clone(), &mut stdio_handles).await?;
+            TransportRuntime::Stdio
         }
         AppServerTransport::WebSocket { bind_address } => {
-            websocket_accept_handle =
-                Some(start_websocket_acceptor(bind_address, transport_event_tx.clone()).await?);
+            let shutdown_token = CancellationToken::new();
+            let accept_handle = start_websocket_acceptor(
+                bind_address,
+                transport_event_tx.clone(),
+                shutdown_token.clone(),
+            )
+            .await?;
+            TransportRuntime::WebSocket {
+                accept_handle,
+                shutdown_token,
+            }
         }
-    }
-    let single_client_mode = matches!(transport, AppServerTransport::Stdio);
+    };
+    let single_client_mode = matches!(&transport_runtime, TransportRuntime::Stdio);
     let shutdown_when_no_connections = single_client_mode;
-
+    let graceful_signal_restart_enabled = !single_client_mode;
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
     let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
@@ -301,7 +420,7 @@ pub async fn run_main_with_transport(
 
             let auth_manager = AuthManager::shared(
                 config.codex_home.clone(),
-                false,
+                /*enable_codex_api_key_env*/ false,
                 config.cli_auth_credentials_store_mode,
             );
             cloud_requirements_loader(
@@ -352,13 +471,29 @@ pub async fn run_main_with_transport(
     if let Some(warning) = project_config_warning(&config) {
         config_warnings.push(warning);
     }
+    for warning in &config.startup_warnings {
+        config_warnings.push(ConfigWarningNotification {
+            summary: warning.clone(),
+            details: None,
+            path: None,
+            range: None,
+        });
+    }
+    if let Some(warning) = codex_core::config::missing_system_bwrap_warning() {
+        config_warnings.push(ConfigWarningNotification {
+            summary: warning,
+            details: None,
+            path: None,
+            range: None,
+        });
+    }
 
     let feedback = CodexFeedback::new();
 
     let otel = codex_core::otel_init::build_provider(
         &config,
         env!("CARGO_PKG_VERSION"),
-        Some("codex_app_server"),
+        Some("codex-app-server"),
         default_analytics_enabled,
     )
     .map_err(|e| {
@@ -387,13 +522,23 @@ pub async fn run_main_with_transport(
 
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
+    let log_db = codex_state::StateRuntime::init(
+        config.sqlite_home.clone(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .ok()
+    .map(log_db::start);
+    let log_db_layer = log_db
+        .clone()
+        .map(|layer| layer.with_filter(Targets::new().with_default(Level::TRACE)));
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
-
     let _ = tracing_subscriber::registry()
         .with(stderr_fmt)
         .with(feedback_layer)
         .with(feedback_metadata_layer)
+        .with(log_db_layer)
         .with(otel_logger_layer)
         .with(otel_tracing_layer)
         .try_init();
@@ -417,8 +562,10 @@ pub async fn run_main_with_transport(
                             OutboundControlEvent::Opened {
                                 connection_id,
                                 writer,
+                                allow_legacy_notifications,
                                 disconnect_sender,
                                 initialized,
+                                experimental_api_enabled,
                                 opted_out_notification_methods,
                             } => {
                                 outbound_connections.insert(
@@ -426,13 +573,25 @@ pub async fn run_main_with_transport(
                                     OutboundConnectionState::new(
                                         writer,
                                         initialized,
+                                        experimental_api_enabled,
                                         opted_out_notification_methods,
+                                        allow_legacy_notifications,
                                         disconnect_sender,
                                     ),
                                 );
                             }
                             OutboundControlEvent::Closed { connection_id } => {
                                 outbound_connections.remove(&connection_id);
+                            }
+                            OutboundControlEvent::DisconnectAll => {
+                                info!(
+                                    "disconnecting {} outbound websocket connection(s) for graceful restart",
+                                    outbound_connections.len()
+                                );
+                                for connection_state in outbound_connections.values() {
+                                    connection_state.request_disconnect();
+                                }
+                                outbound_connections.clear();
                             }
                         }
                     }
@@ -454,21 +613,60 @@ pub async fn run_main_with_transport(
         let loader_overrides = loader_overrides_for_config_api;
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
-            codex_linux_sandbox_exe,
+            arg0_paths,
             config: Arc::new(config),
-            single_client_mode,
             cli_overrides,
             loader_overrides,
             cloud_requirements: cloud_requirements.clone(),
+            auth_manager: None,
+            thread_manager: None,
             feedback: feedback.clone(),
+            log_db,
             config_warnings,
+            session_source,
+            enable_codex_api_key_env: false,
         });
         let mut thread_created_rx = processor.thread_created_receiver();
+        let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+        let websocket_accept_shutdown = match &transport_runtime {
+            TransportRuntime::WebSocket { shutdown_token, .. } => Some(shutdown_token.clone()),
+            TransportRuntime::Stdio => None,
+        };
         async move {
             let mut listen_for_threads = true;
+            let mut shutdown_state = ShutdownState::default();
             loop {
+                let running_turn_count = {
+                    let running_turn_count = running_turn_count_rx.borrow();
+                    *running_turn_count
+                };
+                if matches!(
+                    shutdown_state.update(running_turn_count, connections.len()),
+                    ShutdownAction::Finish
+                ) {
+                    if let Some(shutdown_token) = &websocket_accept_shutdown {
+                        shutdown_token.cancel();
+                    }
+                    let _ = outbound_control_tx
+                        .send(OutboundControlEvent::DisconnectAll)
+                        .await;
+                    break;
+                }
+
                 tokio::select! {
+                    shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                        if let Err(err) = shutdown_signal_result {
+                            warn!("failed to listen for shutdown signal during graceful restart drain: {err}");
+                        }
+                        let running_turn_count = *running_turn_count_rx.borrow();
+                        shutdown_state.on_signal(connections.len(), running_turn_count);
+                    }
+                    changed = running_turn_count_rx.changed(), if graceful_signal_restart_enabled && shutdown_state.requested() => {
+                        if changed.is_err() {
+                            warn!("running-turn watcher closed during graceful restart drain");
+                        }
+                    }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
                             break;
@@ -477,17 +675,24 @@ pub async fn run_main_with_transport(
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 writer,
+                                allow_legacy_notifications,
                                 disconnect_sender,
                             } => {
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
+                                let outbound_experimental_api_enabled =
+                                    Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods =
                                     Arc::new(RwLock::new(HashSet::new()));
                                 if outbound_control_tx
                                     .send(OutboundControlEvent::Opened {
                                         connection_id,
                                         writer,
+                                        allow_legacy_notifications,
                                         disconnect_sender,
                                         initialized: Arc::clone(&outbound_initialized),
+                                        experimental_api_enabled: Arc::clone(
+                                            &outbound_experimental_api_enabled,
+                                        ),
                                         opted_out_notification_methods: Arc::clone(
                                             &outbound_opted_out_notification_methods,
                                         ),
@@ -501,6 +706,7 @@ pub async fn run_main_with_transport(
                                     connection_id,
                                     ConnectionState::new(
                                         outbound_initialized,
+                                        outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,
                                     ),
                                 );
@@ -533,8 +739,8 @@ pub async fn run_main_with_transport(
                                             .process_request(
                                                 connection_id,
                                                 request,
+                                                transport,
                                                 &mut connection_state.session,
-                                                &connection_state.outbound_initialized,
                                             )
                                             .await;
                                         if let Ok(mut opted_out_notification_methods) = connection_state
@@ -550,8 +756,22 @@ pub async fn run_main_with_transport(
                                                 "failed to update outbound opted-out notifications"
                                             );
                                         }
+                                        connection_state
+                                            .outbound_experimental_api_enabled
+                                            .store(
+                                                connection_state.session.experimental_api_enabled,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
                                         if !was_initialized && connection_state.session.initialized {
-                                            processor.send_initialize_notifications().await;
+                                            processor
+                                                .send_initialize_notifications_to_connection(
+                                                    connection_id,
+                                                )
+                                                .await;
+                                            processor.connection_initialized(connection_id).await;
+                                            connection_state
+                                                .outbound_initialized
+                                                .store(true, std::sync::atomic::Ordering::Release);
                                         }
                                     }
                                     JSONRPCMessage::Response(response) => {
@@ -610,6 +830,10 @@ pub async fn run_main_with_transport(
                 }
             }
 
+            if !shutdown_state.forced() {
+                processor.drain_background_tasks().await;
+                processor.shutdown_threads().await;
+            }
             info!("processor task exited (channel closed)");
         }
     });
@@ -619,12 +843,21 @@ pub async fn run_main_with_transport(
     let _ = processor_handle.await;
     let _ = outbound_handle.await;
 
-    if let Some(handle) = websocket_accept_handle {
-        handle.abort();
+    if let TransportRuntime::WebSocket {
+        accept_handle,
+        shutdown_token,
+    } = transport_runtime
+    {
+        shutdown_token.cancel();
+        let _ = accept_handle.await;
     }
 
     for handle in stdio_handles {
         let _ = handle.await;
+    }
+
+    if let Some(otel) = otel {
+        otel.shutdown();
     }
 
     Ok(())

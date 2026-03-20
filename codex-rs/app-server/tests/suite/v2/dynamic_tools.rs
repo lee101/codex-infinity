@@ -7,10 +7,15 @@ use app_test_support::to_response;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
+use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::DynamicToolSpec;
+use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -56,6 +61,7 @@ async fn thread_start_injects_dynamic_tools_into_model_requests() -> Result<()> 
         name: "demo_tool".to_string(),
         description: "Demo dynamic tool".to_string(),
         input_schema: input_schema.clone(),
+        defer_loading: false,
     };
 
     // Thread start injects dynamic tools into the thread's tool registry.
@@ -113,6 +119,78 @@ async fn thread_start_injects_dynamic_tools_into_model_requests() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn thread_start_keeps_hidden_dynamic_tools_out_of_model_requests() -> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let dynamic_tool = DynamicToolSpec {
+        name: "hidden_tool".to_string(),
+        description: "Hidden dynamic tool".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" }
+            },
+            "required": ["city"],
+            "additionalProperties": false,
+        }),
+        defer_loading: true,
+    };
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            dynamic_tools: Some(vec![dynamic_tool.clone()]),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![V2UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let bodies = responses_bodies(&server).await?;
+    assert!(
+        bodies
+            .iter()
+            .all(|body| find_tool(body, &dynamic_tool.name).is_none()),
+        "hidden dynamic tool should not be sent to the model"
+    );
+
+    Ok(())
+}
+
 /// Exercises the full dynamic tool call path (server request, client response, model output).
 #[tokio::test]
 async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Result<()> {
@@ -149,6 +227,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
             "required": ["city"],
             "additionalProperties": false,
         }),
+        defer_loading: false,
     };
 
     let thread_req = mcp
@@ -163,11 +242,12 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let thread_id = thread.id.clone();
 
     // Start a turn so the tool call is emitted.
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
+            thread_id: thread_id.clone(),
             input: vec![V2UserInput::Text {
                 text: "Run the tool".to_string(),
                 text_elements: Vec::new(),
@@ -181,6 +261,30 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     )
     .await??;
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let turn_id = turn.id.clone();
+
+    let started = wait_for_dynamic_tool_started(&mut mcp, call_id).await?;
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(started.turn_id, turn_id.clone());
+    let ThreadItem::DynamicToolCall {
+        id,
+        tool,
+        arguments,
+        status,
+        content_items,
+        success,
+        duration_ms,
+    } = started.item
+    else {
+        panic!("expected dynamic tool call item");
+    };
+    assert_eq!(id, call_id);
+    assert_eq!(tool, tool_name);
+    assert_eq!(arguments, tool_args);
+    assert_eq!(status, DynamicToolCallStatus::InProgress);
+    assert_eq!(content_items, None);
+    assert_eq!(success, None);
+    assert_eq!(duration_ms, None);
 
     // Read the tool call request from the app server.
     let request = timeout(
@@ -194,8 +298,8 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     };
 
     let expected = DynamicToolCallParams {
-        thread_id: thread.id,
-        turn_id: turn.id,
+        thread_id: thread_id.clone(),
+        turn_id: turn_id.clone(),
         call_id: call_id.to_string(),
         tool: tool_name.to_string(),
         arguments: tool_args.clone(),
@@ -212,6 +316,34 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     mcp.send_response(request_id, serde_json::to_value(response)?)
         .await?;
 
+    let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
+    assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(completed.turn_id, turn_id);
+    let ThreadItem::DynamicToolCall {
+        id,
+        tool,
+        arguments,
+        status,
+        content_items,
+        success,
+        duration_ms,
+    } = completed.item
+    else {
+        panic!("expected dynamic tool call item");
+    };
+    assert_eq!(id, call_id);
+    assert_eq!(tool, tool_name);
+    assert_eq!(arguments, tool_args);
+    assert_eq!(status, DynamicToolCallStatus::Completed);
+    assert_eq!(
+        content_items,
+        Some(vec![DynamicToolCallOutputContentItem::InputText {
+            text: "dynamic-ok".to_string(),
+        }])
+    );
+    assert_eq!(success, Some(true));
+    assert!(duration_ms.is_some());
+
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -223,11 +355,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         .iter()
         .find_map(|body| function_call_output_payload(body, call_id))
         .context("expected function_call_output in follow-up request")?;
-    let expected_payload = FunctionCallOutputPayload::from_content_items(vec![
-        FunctionCallOutputContentItem::InputText {
-            text: "dynamic-ok".to_string(),
-        },
-    ]);
+    let expected_payload = FunctionCallOutputPayload::from_text("dynamic-ok".to_string());
     assert_eq!(payload, expected_payload);
 
     Ok(())
@@ -268,6 +396,7 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
             "required": ["city"],
             "additionalProperties": false,
         }),
+        defer_loading: false,
     };
 
     let thread_req = mcp
@@ -282,10 +411,11 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let thread_id = thread.id.clone();
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
+            thread_id: thread_id.clone(),
             input: vec![V2UserInput::Text {
                 text: "Run the tool".to_string(),
                 text_elements: Vec::new(),
@@ -299,6 +429,11 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
     )
     .await??;
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let turn_id = turn.id.clone();
+
+    let started = wait_for_dynamic_tool_started(&mut mcp, call_id).await?;
+    assert_eq!(started.thread_id, thread_id.clone());
+    assert_eq!(started.turn_id, turn_id.clone());
 
     let request = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -311,8 +446,8 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
     };
 
     let expected = DynamicToolCallParams {
-        thread_id: thread.id,
-        turn_id: turn.id,
+        thread_id,
+        turn_id: turn_id.clone(),
         call_id: call_id.to_string(),
         tool: tool_name.to_string(),
         arguments: tool_args,
@@ -335,7 +470,10 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
                 FunctionCallOutputContentItem::InputText { text }
             }
             DynamicToolCallOutputContentItem::InputImage { image_url } => {
-                FunctionCallOutputContentItem::InputImage { image_url }
+                FunctionCallOutputContentItem::InputImage {
+                    image_url,
+                    detail: None,
+                }
             }
         })
         .collect::<Vec<FunctionCallOutputContentItem>>();
@@ -345,6 +483,32 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
     };
     mcp.send_response(request_id, serde_json::to_value(response)?)
         .await?;
+
+    let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
+    assert_eq!(completed.thread_id, expected.thread_id.clone());
+    assert_eq!(completed.turn_id, turn_id);
+    let ThreadItem::DynamicToolCall {
+        status,
+        content_items: completed_content_items,
+        success,
+        ..
+    } = completed.item
+    else {
+        panic!("expected dynamic tool call item");
+    };
+    assert_eq!(status, DynamicToolCallStatus::Completed);
+    assert_eq!(
+        completed_content_items,
+        Some(vec![
+            DynamicToolCallOutputContentItem::InputText {
+                text: "dynamic-ok".to_string(),
+            },
+            DynamicToolCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+            },
+        ])
+    );
+    assert_eq!(success, Some(true));
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -430,6 +594,46 @@ fn function_call_output_raw_output(body: &Value, call_id: &str) -> Option<Value>
         })
         .and_then(|item| item.get("output"))
         .cloned()
+}
+
+async fn wait_for_dynamic_tool_started(
+    mcp: &mut McpProcess,
+    call_id: &str,
+) -> Result<ItemStartedNotification> {
+    loop {
+        let notification: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("item/started"),
+        )
+        .await??;
+        let Some(params) = notification.params else {
+            continue;
+        };
+        let started: ItemStartedNotification = serde_json::from_value(params)?;
+        if matches!(&started.item, ThreadItem::DynamicToolCall { id, .. } if id == call_id) {
+            return Ok(started);
+        }
+    }
+}
+
+async fn wait_for_dynamic_tool_completed(
+    mcp: &mut McpProcess,
+    call_id: &str,
+) -> Result<ItemCompletedNotification> {
+    loop {
+        let notification: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("item/completed"),
+        )
+        .await??;
+        let Some(params) = notification.params else {
+            continue;
+        };
+        let completed: ItemCompletedNotification = serde_json::from_value(params)?;
+        if matches!(&completed.item, ThreadItem::DynamicToolCall { id, .. } if id == call_id) {
+            return Ok(completed);
+        }
+    }
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {

@@ -6,17 +6,20 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use futures::SinkExt;
 use futures::StreamExt;
+use reqwest::StatusCode;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Stdio;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::Duration;
@@ -26,11 +29,15 @@ use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
 async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()> {
@@ -38,8 +45,7 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
-    let bind_addr = reserve_local_addr()?;
-    let mut process = spawn_websocket_server(codex_home.path(), bind_addr).await?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
 
     let mut ws1 = connect_websocket(bind_addr).await?;
     let mut ws2 = connect_websocket(bind_addr).await?;
@@ -78,12 +84,88 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
     Ok(())
 }
 
-async fn spawn_websocket_server(codex_home: &Path, bind_addr: SocketAddr) -> Result<Child> {
+#[tokio::test]
+async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let client = reqwest::Client::new();
+
+    let readyz = http_get(&client, bind_addr, "/readyz").await?;
+    assert_eq!(readyz.status(), StatusCode::OK);
+
+    let healthz = http_get(&client, bind_addr, "/healthz").await?;
+    assert_eq!(healthz.status(), StatusCode::OK);
+
+    let mut ws = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws, 1, "ws_health_client").await?;
+    let init = read_response_for_id(&mut ws, 1).await?;
+    assert_eq!(init.id, RequestId::Integer(1));
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_transport_rejects_requests_with_origin_header() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let client = reqwest::Client::new();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let healthz = loop {
+        match client
+            .get(format!("http://{bind_addr}/healthz"))
+            .header(ORIGIN.as_str(), "https://example.com")
+            .send()
+            .await
+            .with_context(|| format!("failed to GET http://{bind_addr}/healthz with Origin header"))
+        {
+            Ok(response) => break response,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    bail!("failed to GET http://{bind_addr}/healthz with Origin header: {err}");
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert_eq!(healthz.status(), StatusCode::FORBIDDEN);
+
+    let url = format!("ws://{bind_addr}");
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert(ORIGIN, HeaderValue::from_static("https://example.com"));
+    match connect_async(request).await {
+        Err(WebSocketError::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        Ok(_) => bail!("expected websocket handshake with Origin header to be rejected"),
+        Err(err) => bail!("expected HTTP rejection for Origin header, got {err}"),
+    }
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+pub(super) async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, SocketAddr)> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
     cmd.arg("--listen")
-        .arg(format!("ws://{bind_addr}"))
+        .arg("ws://127.0.0.1:0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -94,26 +176,60 @@ async fn spawn_websocket_server(codex_home: &Path, bind_addr: SocketAddr) -> Res
         .spawn()
         .context("failed to spawn websocket app-server process")?;
 
-    if let Some(stderr) = process.stderr.take() {
-        let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = stderr_reader.next_line().await {
-                eprintln!("[websocket app-server stderr] {line}");
+    let stderr = process
+        .stderr
+        .take()
+        .context("failed to capture websocket app-server stderr")?;
+    let mut stderr_reader = BufReader::new(stderr).lines();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let bind_addr = loop {
+        let line = timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            stderr_reader.next_line(),
+        )
+        .await
+        .context("timed out waiting for websocket app-server to report bound websocket address")?
+        .context("failed to read websocket app-server stderr")?
+        .context("websocket app-server exited before reporting bound websocket address")?;
+        eprintln!("[websocket app-server stderr] {line}");
+
+        let stripped_line = {
+            let mut stripped = String::with_capacity(line.len());
+            let mut chars = line.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{1b}' && matches!(chars.peek(), Some(&'[')) {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                stripped.push(ch);
             }
-        });
-    }
+            stripped
+        };
 
-    Ok(process)
+        if let Some(bind_addr) = stripped_line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("ws://"))
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        {
+            break bind_addr;
+        }
+    };
+
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            eprintln!("[websocket app-server stderr] {line}");
+        }
+    });
+
+    Ok((process, bind_addr))
 }
 
-fn reserve_local_addr() -> Result<SocketAddr> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-    Ok(addr)
-}
-
-async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
+pub(super) async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
     let url = format!("ws://{bind_addr}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -129,7 +245,35 @@ async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
     }
 }
 
-async fn send_initialize_request(stream: &mut WsClient, id: i64, client_name: &str) -> Result<()> {
+async fn http_get(
+    client: &reqwest::Client,
+    bind_addr: SocketAddr,
+    path: &str,
+) -> Result<reqwest::Response> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client
+            .get(format!("http://{bind_addr}{path}"))
+            .send()
+            .await
+            .with_context(|| format!("failed to GET http://{bind_addr}{path}"))
+        {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    bail!("failed to GET http://{bind_addr}{path}: {err}");
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+pub(super) async fn send_initialize_request(
+    stream: &mut WsClient,
+    id: i64,
+    client_name: &str,
+) -> Result<()> {
     let params = InitializeParams {
         client_info: ClientInfo {
             name: client_name.to_string(),
@@ -157,7 +301,7 @@ async fn send_config_read_request(stream: &mut WsClient, id: i64) -> Result<()> 
     .await
 }
 
-async fn send_request(
+pub(super) async fn send_request(
     stream: &mut WsClient,
     method: &str,
     id: i64,
@@ -167,6 +311,7 @@ async fn send_request(
         id: RequestId::Integer(id),
         method: method.to_string(),
         params,
+        trace: None,
     });
     send_jsonrpc(stream, message).await
 }
@@ -179,7 +324,10 @@ async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<
         .context("failed to send websocket frame")
 }
 
-async fn read_response_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCResponse> {
+pub(super) async fn read_response_for_id(
+    stream: &mut WsClient,
+    id: i64,
+) -> Result<JSONRPCResponse> {
     let target_id = RequestId::Integer(id);
     loop {
         let message = read_jsonrpc_message(stream).await?;
@@ -189,6 +337,56 @@ async fn read_response_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCR
             return Ok(response);
         }
     }
+}
+
+pub(super) async fn read_notification_for_method(
+    stream: &mut WsClient,
+    method: &str,
+) -> Result<JSONRPCNotification> {
+    loop {
+        let message = read_jsonrpc_message(stream).await?;
+        if let JSONRPCMessage::Notification(notification) = message
+            && notification.method == method
+        {
+            return Ok(notification);
+        }
+    }
+}
+
+pub(super) async fn read_response_and_notification_for_method(
+    stream: &mut WsClient,
+    id: i64,
+    method: &str,
+) -> Result<(JSONRPCResponse, JSONRPCNotification)> {
+    let target_id = RequestId::Integer(id);
+    let mut response = None;
+    let mut notification = None;
+
+    while response.is_none() || notification.is_none() {
+        let message = read_jsonrpc_message(stream).await?;
+        match message {
+            JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
+                response = Some(candidate);
+            }
+            JSONRPCMessage::Notification(candidate) if candidate.method == method => {
+                if notification.replace(candidate).is_some() {
+                    bail!(
+                        "received duplicate notification for method `{method}` before completing paired read"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(response) = response else {
+        bail!("response must be set before returning");
+    };
+    let Some(notification) = notification else {
+        bail!("notification must be set before returning");
+    };
+
+    Ok((response, notification))
 }
 
 async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCError> {
@@ -203,7 +401,7 @@ async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCErro
     }
 }
 
-async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
+pub(super) async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
     loop {
         let frame = timeout(DEFAULT_READ_TIMEOUT, stream.next())
             .await
@@ -226,7 +424,7 @@ async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
     }
 }
 
-async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<()> {
+pub(super) async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<()> {
     match timeout(wait_for, stream.next()).await {
         Ok(Some(Ok(frame))) => bail!("unexpected frame while waiting for silence: {frame:?}"),
         Ok(Some(Err(err))) => bail!("unexpected websocket read error: {err}"),
@@ -235,7 +433,7 @@ async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<
     }
 }
 
-fn create_config_toml(
+pub(super) fn create_config_toml(
     codex_home: &Path,
     server_uri: &str,
     approval_policy: &str,

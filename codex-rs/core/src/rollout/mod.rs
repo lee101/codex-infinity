@@ -1,11 +1,19 @@
 //! Rollout module: persistence and discovery of session rollout files.
 
+use std::sync::LazyLock;
+
 use codex_protocol::protocol::SessionSource;
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
-pub const INTERACTIVE_SESSION_SOURCES: &[SessionSource] =
-    &[SessionSource::Cli, SessionSource::VSCode];
+pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
+    vec![
+        SessionSource::Cli,
+        SessionSource::VSCode,
+        SessionSource::Custom("atlas".to_string()),
+        SessionSource::Custom("chatgpt".to_string()),
+    ]
+});
 
 pub(crate) mod error;
 pub mod list;
@@ -24,6 +32,7 @@ pub use list::find_thread_path_by_id_str as find_conversation_path_by_id_str;
 pub use list::rollout_date_parts;
 pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
+pub use session_index::append_thread_name;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_path_by_name_str;
 

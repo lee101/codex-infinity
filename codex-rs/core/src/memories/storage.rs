@@ -13,21 +13,21 @@ use crate::memories::rollout_summaries_dir;
 pub(super) async fn rebuild_raw_memories_file_from_memories(
     root: &Path,
     memories: &[Stage1Output],
-    max_raw_memories_for_global: usize,
+    max_raw_memories_for_consolidation: usize,
 ) -> std::io::Result<()> {
     ensure_layout(root).await?;
-    rebuild_raw_memories_file(root, memories, max_raw_memories_for_global).await
+    rebuild_raw_memories_file(root, memories, max_raw_memories_for_consolidation).await
 }
 
 /// Syncs canonical rollout summary files from DB-backed stage-1 output rows.
 pub(super) async fn sync_rollout_summaries_from_memories(
     root: &Path,
     memories: &[Stage1Output],
-    max_raw_memories_for_global: usize,
+    max_raw_memories_for_consolidation: usize,
 ) -> std::io::Result<()> {
     ensure_layout(root).await?;
 
-    let retained = retained_memories(memories, max_raw_memories_for_global);
+    let retained = retained_memories(memories, max_raw_memories_for_consolidation);
     let keep = retained
         .iter()
         .map(rollout_summary_file_stem)
@@ -62,9 +62,9 @@ pub(super) async fn sync_rollout_summaries_from_memories(
 async fn rebuild_raw_memories_file(
     root: &Path,
     memories: &[Stage1Output],
-    max_raw_memories_for_global: usize,
+    max_raw_memories_for_consolidation: usize,
 ) -> std::io::Result<()> {
-    let retained = retained_memories(memories, max_raw_memories_for_global);
+    let retained = retained_memories(memories, max_raw_memories_for_consolidation);
     let mut body = String::from("# Raw Memories\n\n");
 
     if retained.is_empty() {
@@ -82,6 +82,8 @@ async fn rebuild_raw_memories_file(
         )
         .map_err(raw_memories_format_error)?;
         writeln!(body, "cwd: {}", memory.cwd.display()).map_err(raw_memories_format_error)?;
+        writeln!(body, "rollout_path: {}", memory.rollout_path.display())
+            .map_err(raw_memories_format_error)?;
         let rollout_summary_file = format!("{}.md", rollout_summary_file_stem(memory));
         writeln!(body, "rollout_summary_file: {rollout_summary_file}")
             .map_err(raw_memories_format_error)?;
@@ -138,7 +140,12 @@ async fn write_rollout_summary_for_thread(
         memory.source_updated_at.to_rfc3339()
     )
     .map_err(rollout_summary_format_error)?;
+    writeln!(body, "rollout_path: {}", memory.rollout_path.display())
+        .map_err(rollout_summary_format_error)?;
     writeln!(body, "cwd: {}", memory.cwd.display()).map_err(rollout_summary_format_error)?;
+    if let Some(git_branch) = memory.git_branch.as_deref() {
+        writeln!(body, "git_branch: {git_branch}").map_err(rollout_summary_format_error)?;
+    }
     writeln!(body).map_err(rollout_summary_format_error)?;
     body.push_str(&memory.rollout_summary);
     body.push('\n');
@@ -148,9 +155,9 @@ async fn write_rollout_summary_for_thread(
 
 fn retained_memories(
     memories: &[Stage1Output],
-    max_raw_memories_for_global: usize,
+    max_raw_memories_for_consolidation: usize,
 ) -> &[Stage1Output] {
-    &memories[..memories.len().min(max_raw_memories_for_global)]
+    &memories[..memories.len().min(max_raw_memories_for_consolidation)]
 }
 
 fn raw_memories_format_error(err: std::fmt::Error) -> std::io::Error {
@@ -249,73 +256,5 @@ pub(super) fn rollout_summary_file_stem_from_parts(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::rollout_summary_file_stem;
-    use super::rollout_summary_file_stem_from_parts;
-    use chrono::TimeZone;
-    use chrono::Utc;
-    use codex_protocol::ThreadId;
-    use codex_state::Stage1Output;
-    use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
-    const FIXED_PREFIX: &str = "2025-02-11T15-35-19-jqmb";
-
-    fn stage1_output_with_slug(thread_id: ThreadId, rollout_slug: Option<&str>) -> Stage1Output {
-        Stage1Output {
-            thread_id,
-            source_updated_at: Utc.timestamp_opt(123, 0).single().expect("timestamp"),
-            raw_memory: "raw memory".to_string(),
-            rollout_summary: "summary".to_string(),
-            rollout_slug: rollout_slug.map(ToString::to_string),
-            cwd: PathBuf::from("/tmp/workspace"),
-            generated_at: Utc.timestamp_opt(124, 0).single().expect("timestamp"),
-        }
-    }
-
-    fn fixed_thread_id() -> ThreadId {
-        ThreadId::try_from("0194f5a6-89ab-7cde-8123-456789abcdef").expect("valid thread id")
-    }
-
-    #[test]
-    fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_missing() {
-        let thread_id = fixed_thread_id();
-        let memory = stage1_output_with_slug(thread_id, None);
-
-        assert_eq!(rollout_summary_file_stem(&memory), FIXED_PREFIX);
-        assert_eq!(
-            rollout_summary_file_stem_from_parts(
-                memory.thread_id,
-                memory.source_updated_at,
-                memory.rollout_slug.as_deref(),
-            ),
-            FIXED_PREFIX
-        );
-    }
-
-    #[test]
-    fn rollout_summary_file_stem_sanitizes_and_truncates_slug() {
-        let thread_id = fixed_thread_id();
-        let memory = stage1_output_with_slug(
-            thread_id,
-            Some("Unsafe Slug/With Spaces & Symbols + EXTRA_LONG_12345_67890_ABCDE_fghij_klmno"),
-        );
-
-        let stem = rollout_summary_file_stem(&memory);
-        let slug = stem
-            .strip_prefix(&format!("{FIXED_PREFIX}-"))
-            .expect("slug suffix should be present");
-        assert_eq!(slug.len(), 60);
-        assert_eq!(
-            slug,
-            "unsafe_slug_with_spaces___symbols___extra_long_12345_67890_a"
-        );
-    }
-
-    #[test]
-    fn rollout_summary_file_stem_uses_uuid_timestamp_and_hash_when_slug_is_empty() {
-        let thread_id = fixed_thread_id();
-        let memory = stage1_output_with_slug(thread_id, Some(""));
-
-        assert_eq!(rollout_summary_file_stem(&memory), FIXED_PREFIX);
-    }
-}
+#[path = "storage_tests.rs"]
+mod tests;

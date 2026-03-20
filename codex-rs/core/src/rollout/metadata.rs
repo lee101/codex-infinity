@@ -2,11 +2,11 @@ use crate::config::Config;
 use crate::rollout;
 use crate::rollout::list::parse_timestamp_uuid_from_filename;
 use crate::rollout::recorder::RolloutRecorder;
+use crate::state_db::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
-use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
@@ -95,7 +95,6 @@ pub(crate) fn builder_from_items(
 pub(crate) async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
-    otel: Option<&OtelManager>,
 ) -> anyhow::Result<ExtractionOutcome> {
     let (items, _thread_id, parse_errors) =
         RolloutRecorder::load_rollout_items(rollout_path).await?;
@@ -118,27 +117,24 @@ pub(crate) async fn extract_metadata_from_rollout(
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
     }
-    if parse_errors > 0
-        && let Some(otel) = otel
-    {
-        otel.counter(
-            DB_ERROR_METRIC,
-            parse_errors as i64,
-            &[("stage", "extract_metadata_from_rollout")],
-        );
-    }
     Ok(ExtractionOutcome {
         metadata,
+        memory_mode: items.iter().rev().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::EventMsg(_) => None,
+        }),
         parse_errors,
     })
 }
 
-pub(crate) async fn backfill_sessions(
-    runtime: &codex_state::StateRuntime,
-    config: &Config,
-    otel: Option<&OtelManager>,
-) {
-    let timer = otel.and_then(|otel| otel.start_timer(DB_METRIC_BACKFILL_DURATION_MS, &[]).ok());
+pub(crate) async fn backfill_sessions(runtime: &codex_state::StateRuntime, config: &Config) {
+    let metric_client = codex_otel::metrics::global();
+    let timer = metric_client
+        .as_ref()
+        .and_then(|otel| otel.start_timer(DB_METRIC_BACKFILL_DURATION_MS, &[]).ok());
     let backfill_state = match runtime.get_backfill_state().await {
         Ok(state) => state,
         Err(err) => {
@@ -146,9 +142,6 @@ pub(crate) async fn backfill_sessions(
                 "failed to read backfill state at {}: {err}",
                 config.codex_home.display()
             );
-            if let Some(otel) = otel {
-                otel.counter(DB_ERROR_METRIC, 1, &[("stage", "backfill_state_read")]);
-            }
             BackfillState::default()
         }
     };
@@ -162,13 +155,6 @@ pub(crate) async fn backfill_sessions(
                 "failed to claim backfill worker at {}: {err}",
                 config.codex_home.display()
             );
-            if let Some(otel) = otel {
-                otel.counter(
-                    DB_ERROR_METRIC,
-                    1,
-                    &[("stage", "backfill_state_claim_running")],
-                );
-            }
             return;
         }
     };
@@ -186,13 +172,6 @@ pub(crate) async fn backfill_sessions(
                 "failed to read claimed backfill state at {}: {err}",
                 config.codex_home.display()
             );
-            if let Some(otel) = otel {
-                otel.counter(
-                    DB_ERROR_METRIC,
-                    1,
-                    &[("stage", "backfill_state_read_claimed")],
-                );
-            }
             BackfillState {
                 status: BackfillStatus::Running,
                 ..Default::default()
@@ -205,13 +184,6 @@ pub(crate) async fn backfill_sessions(
                 "failed to mark backfill running at {}: {err}",
                 config.codex_home.display()
             );
-            if let Some(otel) = otel {
-                otel.counter(
-                    DB_ERROR_METRIC,
-                    1,
-                    &[("stage", "backfill_state_mark_running")],
-                );
-            }
         } else {
             backfill_state.status = BackfillStatus::Running;
         }
@@ -254,24 +226,25 @@ pub(crate) async fn backfill_sessions(
     for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            match extract_metadata_from_rollout(
-                &rollout.path,
-                config.model_provider_id.as_str(),
-                otel,
-            )
-            .await
+            match extract_metadata_from_rollout(&rollout.path, config.model_provider_id.as_str())
+                .await
             {
                 Ok(outcome) => {
                     if outcome.parse_errors > 0
-                        && let Some(otel) = otel
+                        && let Some(ref metric_client) = metric_client
                     {
-                        otel.counter(
+                        let _ = metric_client.counter(
                             DB_ERROR_METRIC,
                             outcome.parse_errors as i64,
                             &[("stage", "backfill_sessions")],
                         );
                     }
                     let mut metadata = outcome.metadata;
+                    metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
+                    let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
+                    if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
+                        metadata.prefer_existing_git_info(&existing_metadata);
+                    }
                     if rollout.archived && metadata.archived_at.is_none() {
                         let fallback_archived_at = metadata.updated_at;
                         metadata.archived_at = file_modified_time_utc(&rollout.path)
@@ -282,6 +255,17 @@ pub(crate) async fn backfill_sessions(
                         stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
                     } else {
+                        if let Err(err) = runtime
+                            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+                            .await
+                        {
+                            stats.failed = stats.failed.saturating_add(1);
+                            warn!(
+                                "failed to restore memory mode for {}: {err}",
+                                rollout.path.display()
+                            );
+                            continue;
+                        }
                         stats.upserted = stats.upserted.saturating_add(1);
                         if let Ok(meta_line) =
                             rollout::list::read_session_meta_line(&rollout.path).await
@@ -293,13 +277,6 @@ pub(crate) async fn backfill_sessions(
                                 )
                                 .await
                             {
-                                if let Some(otel) = otel {
-                                    otel.counter(
-                                        DB_ERROR_METRIC,
-                                        1,
-                                        &[("stage", "backfill_dynamic_tools")],
-                                    );
-                                }
                                 warn!(
                                     "failed to backfill dynamic tools {}: {err}",
                                     rollout.path.display()
@@ -332,13 +309,6 @@ pub(crate) async fn backfill_sessions(
                     "failed to checkpoint backfill at {}: {err}",
                     config.codex_home.display()
                 );
-                if let Some(otel) = otel {
-                    otel.counter(
-                        DB_ERROR_METRIC,
-                        1,
-                        &[("stage", "backfill_state_checkpoint")],
-                    );
-                }
             } else {
                 last_watermark = Some(last_entry.watermark.clone());
             }
@@ -352,26 +322,19 @@ pub(crate) async fn backfill_sessions(
             "failed to mark backfill complete at {}: {err}",
             config.codex_home.display()
         );
-        if let Some(otel) = otel {
-            otel.counter(
-                DB_ERROR_METRIC,
-                1,
-                &[("stage", "backfill_state_mark_complete")],
-            );
-        }
     }
 
     info!(
         "state db backfill scanned={}, upserted={}, failed={}",
         stats.scanned, stats.upserted, stats.failed
     );
-    if let Some(otel) = otel {
-        otel.counter(
+    if let Some(metric_client) = metric_client {
+        let _ = metric_client.counter(
             DB_METRIC_BACKFILL,
             stats.upserted as i64,
             &[("status", "upserted")],
         );
-        otel.counter(
+        let _ = metric_client.counter(
             DB_METRIC_BACKFILL,
             stats.failed as i64,
             &[("status", "failed")],
@@ -474,213 +437,5 @@ async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::DateTime;
-    use chrono::NaiveDateTime;
-    use chrono::Timelike;
-    use chrono::Utc;
-    use codex_protocol::ThreadId;
-    use codex_protocol::protocol::CompactedItem;
-    use codex_protocol::protocol::RolloutItem;
-    use codex_protocol::protocol::RolloutLine;
-    use codex_protocol::protocol::SessionMeta;
-    use codex_protocol::protocol::SessionMetaLine;
-    use codex_protocol::protocol::SessionSource;
-    use codex_state::BackfillStatus;
-    use codex_state::ThreadMetadataBuilder;
-    use pretty_assertions::assert_eq;
-    use std::fs::File;
-    use std::io::Write;
-    use std::path::Path;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn extract_metadata_from_rollout_uses_session_meta() {
-        let dir = tempdir().expect("tempdir");
-        let uuid = Uuid::new_v4();
-        let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
-        let path = dir
-            .path()
-            .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
-
-        let session_meta = SessionMeta {
-            id,
-            forked_from_id: None,
-            timestamp: "2026-01-27T12:34:56Z".to_string(),
-            cwd: dir.path().to_path_buf(),
-            originator: "cli".to_string(),
-            cli_version: "0.0.0".to_string(),
-            source: SessionSource::default(),
-            agent_nickname: None,
-            agent_role: None,
-            model_provider: Some("openai".to_string()),
-            base_instructions: None,
-            dynamic_tools: None,
-        };
-        let session_meta_line = SessionMetaLine {
-            meta: session_meta,
-            git: None,
-        };
-        let rollout_line = RolloutLine {
-            timestamp: "2026-01-27T12:34:56Z".to_string(),
-            item: RolloutItem::SessionMeta(session_meta_line.clone()),
-        };
-        let json = serde_json::to_string(&rollout_line).expect("rollout json");
-        let mut file = File::create(&path).expect("create rollout");
-        writeln!(file, "{json}").expect("write rollout");
-
-        let outcome = extract_metadata_from_rollout(&path, "openai", None)
-            .await
-            .expect("extract");
-
-        let builder =
-            builder_from_session_meta(&session_meta_line, path.as_path()).expect("builder");
-        let mut expected = builder.build("openai");
-        apply_rollout_item(&mut expected, &rollout_line.item, "openai");
-        expected.updated_at = file_modified_time_utc(&path).await.expect("mtime");
-
-        assert_eq!(outcome.metadata, expected);
-        assert_eq!(outcome.parse_errors, 0);
-    }
-
-    #[test]
-    fn builder_from_items_falls_back_to_filename() {
-        let dir = tempdir().expect("tempdir");
-        let uuid = Uuid::new_v4();
-        let path = dir
-            .path()
-            .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
-        let items = vec![RolloutItem::Compacted(CompactedItem {
-            message: "noop".to_string(),
-            replacement_history: None,
-        })];
-
-        let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
-        let naive = NaiveDateTime::parse_from_str("2026-01-27T12-34-56", "%Y-%m-%dT%H-%M-%S")
-            .expect("timestamp");
-        let created_at = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
-            .with_nanosecond(0)
-            .expect("nanosecond");
-        let expected = ThreadMetadataBuilder::new(
-            ThreadId::from_string(&uuid.to_string()).expect("thread id"),
-            path,
-            created_at,
-            SessionSource::default(),
-        );
-
-        assert_eq!(builder, expected);
-    }
-
-    #[tokio::test]
-    async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
-        let dir = tempdir().expect("tempdir");
-        let codex_home = dir.path().to_path_buf();
-        let first_uuid = Uuid::new_v4();
-        let second_uuid = Uuid::new_v4();
-        let first_path = write_rollout_in_sessions(
-            codex_home.as_path(),
-            "2026-01-27T12-34-56",
-            "2026-01-27T12:34:56Z",
-            first_uuid,
-        );
-        let second_path = write_rollout_in_sessions(
-            codex_home.as_path(),
-            "2026-01-27T12-35-56",
-            "2026-01-27T12:35:56Z",
-            second_uuid,
-        );
-
-        let runtime =
-            codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
-                .await
-                .expect("initialize runtime");
-        let first_watermark =
-            backfill_watermark_for_path(codex_home.as_path(), first_path.as_path());
-        runtime.mark_backfill_running().await.expect("mark running");
-        runtime
-            .checkpoint_backfill(first_watermark.as_str())
-            .await
-            .expect("checkpoint first watermark");
-        tokio::time::sleep(std::time::Duration::from_secs(
-            (BACKFILL_LEASE_SECONDS + 1) as u64,
-        ))
-        .await;
-
-        let mut config = crate::config::test_config();
-        config.codex_home = codex_home.clone();
-        config.model_provider_id = "test-provider".to_string();
-        backfill_sessions(runtime.as_ref(), &config, None).await;
-
-        let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
-        let second_id = ThreadId::from_string(&second_uuid.to_string()).expect("second thread id");
-        assert_eq!(
-            runtime
-                .get_thread(first_id)
-                .await
-                .expect("get first thread"),
-            None
-        );
-        assert!(
-            runtime
-                .get_thread(second_id)
-                .await
-                .expect("get second thread")
-                .is_some()
-        );
-
-        let state = runtime
-            .get_backfill_state()
-            .await
-            .expect("get backfill state");
-        assert_eq!(state.status, BackfillStatus::Complete);
-        assert_eq!(
-            state.last_watermark,
-            Some(backfill_watermark_for_path(
-                codex_home.as_path(),
-                second_path.as_path()
-            ))
-        );
-        assert!(state.last_success_at.is_some());
-    }
-
-    fn write_rollout_in_sessions(
-        codex_home: &Path,
-        filename_ts: &str,
-        event_ts: &str,
-        thread_uuid: Uuid,
-    ) -> PathBuf {
-        let id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
-        let sessions_dir = codex_home.join("sessions");
-        std::fs::create_dir_all(sessions_dir.as_path()).expect("create sessions dir");
-        let path = sessions_dir.join(format!("rollout-{filename_ts}-{thread_uuid}.jsonl"));
-        let session_meta = SessionMeta {
-            id,
-            forked_from_id: None,
-            timestamp: event_ts.to_string(),
-            cwd: codex_home.to_path_buf(),
-            originator: "cli".to_string(),
-            cli_version: "0.0.0".to_string(),
-            source: SessionSource::default(),
-            agent_nickname: None,
-            agent_role: None,
-            model_provider: Some("test-provider".to_string()),
-            base_instructions: None,
-            dynamic_tools: None,
-        };
-        let session_meta_line = SessionMetaLine {
-            meta: session_meta,
-            git: None,
-        };
-        let rollout_line = RolloutLine {
-            timestamp: event_ts.to_string(),
-            item: RolloutItem::SessionMeta(session_meta_line),
-        };
-        let json = serde_json::to_string(&rollout_line).expect("serialize rollout");
-        let mut file = File::create(&path).expect("create rollout");
-        writeln!(file, "{json}").expect("write rollout");
-        path
-    }
-}
+#[path = "metadata_tests.rs"]
+mod tests;

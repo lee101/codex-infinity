@@ -13,7 +13,8 @@ use tracing::warn;
 
 use super::auth::McpOAuthLoginSupport;
 use super::auth::oauth_login_support;
-use super::effective_mcp_servers;
+use super::auth::resolve_oauth_scopes;
+use super::auth::should_retry_without_scopes;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
@@ -149,7 +150,10 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
-    let installed = config.mcp_servers.get().clone();
+    let installed = sess
+        .services
+        .mcp_manager
+        .configured_servers(config.as_ref());
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -178,7 +182,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     }
 
     let codex_home = config.codex_home.clone();
-    let installed = config.mcp_servers.get().clone();
+    let installed = sess.services.mcp_manager.configured_servers(config);
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -234,26 +238,62 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         )
         .await;
 
-        if let Err(err) = perform_oauth_login(
+        let resolved_scopes = resolve_oauth_scopes(
+            /*explicit_scopes*/ None,
+            server_config.scopes.clone(),
+            oauth_config.discovered_scopes.clone(),
+        );
+        let first_attempt = perform_oauth_login(
             &name,
             &oauth_config.url,
             config.mcp_oauth_credentials_store_mode,
-            oauth_config.http_headers,
-            oauth_config.env_http_headers,
-            &[],
+            oauth_config.http_headers.clone(),
+            oauth_config.env_http_headers.clone(),
+            &resolved_scopes.scopes,
+            server_config.oauth_resource.as_deref(),
             config.mcp_oauth_callback_port,
             config.mcp_oauth_callback_url.as_deref(),
         )
-        .await
-        {
-            warn!("failed to login to MCP dependency {name}: {err}");
+        .await;
+
+        if let Err(err) = first_attempt {
+            if should_retry_without_scopes(&resolved_scopes, &err) {
+                sess.notify_background_event(
+                    turn_context,
+                    format!(
+                        "Retrying MCP {name} authentication without scopes after provider rejection."
+                    ),
+                )
+                .await;
+
+                if let Err(err) = perform_oauth_login(
+                    &name,
+                    &oauth_config.url,
+                    config.mcp_oauth_credentials_store_mode,
+                    oauth_config.http_headers,
+                    oauth_config.env_http_headers,
+                    &[],
+                    server_config.oauth_resource.as_deref(),
+                    config.mcp_oauth_callback_port,
+                    config.mcp_oauth_callback_url.as_deref(),
+                )
+                .await
+                {
+                    warn!("failed to login to MCP dependency {name}: {err}");
+                }
+            } else {
+                warn!("failed to login to MCP dependency {name}: {err}");
+            }
         }
     }
 
     // Refresh from the effective merged MCP map (global + repo + managed) and
     // overlay the updated global servers so we don't drop repo-scoped servers.
     let auth = sess.services.auth_manager.auth().await;
-    let mut refresh_servers = effective_mcp_servers(config, auth.as_ref());
+    let mut refresh_servers = sess
+        .services
+        .mcp_manager
+        .effective_servers(config, auth.as_ref());
     for (name, server_config) in &servers {
         refresh_servers
             .entry(name.clone())
@@ -387,6 +427,7 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         });
     }
 
@@ -411,6 +452,7 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         });
     }
 
@@ -418,109 +460,5 @@ fn mcp_dependency_to_server_config(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::skills::model::SkillDependencies;
-    use codex_protocol::protocol::SkillScope;
-    use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
-
-    fn skill_with_tools(tools: Vec<SkillToolDependency>) -> SkillMetadata {
-        SkillMetadata {
-            name: "skill".to_string(),
-            description: "skill".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: Some(SkillDependencies { tools }),
-            policy: None,
-            permissions: None,
-            path: PathBuf::from("skill"),
-            scope: SkillScope::User,
-        }
-    }
-
-    #[test]
-    fn collect_missing_respects_canonical_installed_key() {
-        let url = "https://example.com/mcp".to_string();
-        let skills = vec![skill_with_tools(vec![SkillToolDependency {
-            r#type: "mcp".to_string(),
-            value: "github".to_string(),
-            description: None,
-            transport: Some("streamable_http".to_string()),
-            command: None,
-            url: Some(url.clone()),
-        }])];
-        let installed = HashMap::from([(
-            "alias".to_string(),
-            McpServerConfig {
-                transport: McpServerTransportConfig::StreamableHttp {
-                    url,
-                    bearer_token_env_var: None,
-                    http_headers: None,
-                    env_http_headers: None,
-                },
-                enabled: true,
-                required: false,
-                disabled_reason: None,
-                startup_timeout_sec: None,
-                tool_timeout_sec: None,
-                enabled_tools: None,
-                disabled_tools: None,
-                scopes: None,
-            },
-        )]);
-
-        assert_eq!(
-            collect_missing_mcp_dependencies(&skills, &installed),
-            HashMap::new()
-        );
-    }
-
-    #[test]
-    fn collect_missing_dedupes_by_canonical_key_but_preserves_original_name() {
-        let url = "https://example.com/one".to_string();
-        let skills = vec![skill_with_tools(vec![
-            SkillToolDependency {
-                r#type: "mcp".to_string(),
-                value: "alias-one".to_string(),
-                description: None,
-                transport: Some("streamable_http".to_string()),
-                command: None,
-                url: Some(url.clone()),
-            },
-            SkillToolDependency {
-                r#type: "mcp".to_string(),
-                value: "alias-two".to_string(),
-                description: None,
-                transport: Some("streamable_http".to_string()),
-                command: None,
-                url: Some(url.clone()),
-            },
-        ])];
-
-        let expected = HashMap::from([(
-            "alias-one".to_string(),
-            McpServerConfig {
-                transport: McpServerTransportConfig::StreamableHttp {
-                    url,
-                    bearer_token_env_var: None,
-                    http_headers: None,
-                    env_http_headers: None,
-                },
-                enabled: true,
-                required: false,
-                disabled_reason: None,
-                startup_timeout_sec: None,
-                tool_timeout_sec: None,
-                enabled_tools: None,
-                disabled_tools: None,
-                scopes: None,
-            },
-        )]);
-
-        assert_eq!(
-            collect_missing_mcp_dependencies(&skills, &HashMap::new()),
-            expected
-        );
-    }
-}
+#[path = "skill_dependencies_tests.rs"]
+mod tests;

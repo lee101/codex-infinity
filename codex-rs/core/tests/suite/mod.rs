@@ -56,6 +56,7 @@ pub static CODEX_ALIASES_TEMP_DIR: TestCodexAliasesGuard = unsafe {
 
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
+mod agent_jobs;
 mod agent_websocket;
 mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
@@ -64,6 +65,7 @@ mod auth_refresh;
 mod cli_stream;
 mod client;
 mod client_websockets;
+mod code_mode;
 mod codex_delegate;
 mod collaboration_instructions;
 mod compact;
@@ -75,16 +77,19 @@ mod exec_policy;
 mod fork_thread;
 mod grep_files;
 mod hierarchical_agents;
+#[cfg(not(target_os = "windows"))]
+mod hooks;
 mod image_rollout;
 mod items;
+mod js_repl;
 mod json_result;
 mod list_dir;
 mod live_cli;
 mod live_reload;
+mod memories;
 mod model_info_overrides;
 mod model_overrides;
 mod model_switching;
-mod model_tools;
 mod model_visible_layout;
 mod models_cache_ttl;
 mod models_etag_responses;
@@ -93,12 +98,17 @@ mod pending_input;
 mod permissions_messages;
 mod personality;
 mod personality_migration;
+mod plugins;
 mod prompt_caching;
 mod quota_exceeded;
 mod read_file;
 mod realtime_conversation;
 mod remote_models;
 mod request_compression;
+#[cfg(not(target_os = "windows"))]
+mod request_permissions;
+#[cfg(not(target_os = "windows"))]
+mod request_permissions_tool;
 mod request_user_input;
 mod resume;
 mod resume_warning;
@@ -111,7 +121,9 @@ mod seatbelt;
 mod shell_command;
 mod shell_serialization;
 mod shell_snapshot;
+mod skill_approval;
 mod skills;
+mod spawn_agent_description;
 mod sqlite_state;
 mod stream_error_allows_next_turn;
 mod stream_no_completed;
