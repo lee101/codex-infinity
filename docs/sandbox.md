@@ -6,9 +6,9 @@ For more information, see [the official documentation](https://developers.openai
 
 ### Approval policies
 
-Codex starts conservatively. Until you explicitly tell it a working directory is trusted, the CLI defaults to **read-only**. Codex can inspect files and answer questions, but every edit or command requires approval.
+The interactive TUI trusts the current working directory automatically on first launch and persists that decision in `config.toml`. That gives new sessions the **Agent** preset by default, which allows writes inside the workspace. Codex only interrupts you when it needs to leave the workspace or rerun something outside the sandbox. Note that the workspace includes the working directory plus temporary directories like `/tmp`. Use `/status` to confirm the exact writable roots.
 
-When you mark a working directory as trusted (for example via the onboarding prompt or `/approvals` -> "Trust this directory"), Codex upgrades the default preset to **Agent**, which allows writes inside the workspace. Codex only interrupts you when it needs to leave the workspace or rerun something outside the sandbox. Note that the workspace includes the working directory plus temporary directories like `/tmp`. Use `/status` to confirm the exact writable roots.
+If you explicitly mark a working directory as untrusted, Codex falls back to conservative approvals and ignores project-local `.codex/config.toml` until you trust the project again.
 
 If you want maximum guardrails for a trusted repo, switch back to Read Only from the `/approvals` picker. If you truly need hands-off automation, use `Full Access`--but be deliberate, because that skips both the sandbox and approvals.
 

@@ -30,12 +30,14 @@ use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
+use codex_core::config::set_project_trust_level;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::format_exec_policy_error_with_source;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
@@ -43,6 +45,7 @@ use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
@@ -965,8 +968,31 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let should_show_trust_screen_flag = !remote_mode && should_show_trust_screen(&initial_config);
+    let mut initial_config = initial_config;
     let mut trust_decision_was_made = false;
+    if !remote_mode && initial_config.active_project.trust_level.is_none() {
+        let target = resolve_root_git_project_for_trust(&initial_config.cwd)
+            .unwrap_or_else(|| initial_config.cwd.clone());
+        match set_project_trust_level(&initial_config.codex_home, &target, TrustLevel::Trusted) {
+            Ok(()) => {
+                trust_decision_was_made = true;
+                initial_config = load_config_or_exit(
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    cloud_requirements.clone(),
+                )
+                .await;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to auto-trust {} during startup: {err}",
+                    target.display()
+                );
+            }
+        }
+    }
+
+    let should_show_trust_screen_flag = !remote_mode && should_show_trust_screen(&initial_config);
     let needs_onboarding_app_server =
         should_show_trust_screen_flag || initial_config.model_provider.requires_openai_auth;
     let mut onboarding_app_server = if needs_onboarding_app_server {
@@ -1028,7 +1054,7 @@ async fn run_ratatui_app(
                 exit_reason: ExitReason::UserRequested,
             });
         }
-        trust_decision_was_made = onboarding_result.directory_trust_decision.is_some();
+        trust_decision_was_made |= onboarding_result.directory_trust_decision.is_some();
         // If this onboarding run included the login step, always refresh cloud requirements and
         // rebuild config. This avoids missing newly available cloud requirements due to login
         // status detection edge cases.
@@ -1258,12 +1284,34 @@ async fn run_ratatui_app(
                 cli_kv_overrides.clone(),
                 overrides.clone(),
                 cloud_requirements.clone(),
-                fallback_cwd,
+                fallback_cwd.clone(),
             )
             .await
         }
         _ => config,
     };
+    if !remote_mode && config.active_project.trust_level.is_none() {
+        let target =
+            resolve_root_git_project_for_trust(&config.cwd).unwrap_or_else(|| config.cwd.clone());
+        match set_project_trust_level(&config.codex_home, &target, TrustLevel::Trusted) {
+            Ok(()) => {
+                trust_decision_was_made = true;
+                config = load_config_or_exit_with_fallback_cwd(
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    cloud_requirements.clone(),
+                    fallback_cwd,
+                )
+                .await;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to auto-trust {} after resolving the session cwd: {err}",
+                    target.display()
+                );
+            }
+        }
+    }
 
     // Configure syntax highlighting theme from the final config — onboarding
     // and resume/fork can both reload config with a different tui_theme, so

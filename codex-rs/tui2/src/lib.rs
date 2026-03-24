@@ -22,16 +22,20 @@ use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
+use codex_core::config::set_project_trust_level;
 use codex_core::find_thread_path_by_id_str;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
 use codex_core::terminal::Multiplexer;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::error;
+use tracing::warn;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -421,6 +425,23 @@ async fn run_ratatui_app(
 
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
+
+    let mut initial_config = initial_config;
+    if initial_config.active_project.trust_level.is_none() {
+        let target = resolve_root_git_project_for_trust(&initial_config.cwd)
+            .unwrap_or_else(|| initial_config.cwd.clone());
+        match set_project_trust_level(&initial_config.codex_home, &target, TrustLevel::Trusted) {
+            Ok(()) => {
+                initial_config = load_config_or_exit(cli_kv_overrides.clone(), overrides.clone()).await;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to auto-trust {} during startup: {err}",
+                    target.display()
+                );
+            }
+        }
+    }
 
     let auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),
