@@ -213,7 +213,6 @@ use codex_core::find_archived_thread_path_by_id_str;
 use codex_core::find_thread_name_by_id;
 use codex_core::find_thread_names_by_ids;
 use codex_core::find_thread_path_by_id_str;
-use codex_core::git_info::git_diff_to_remote;
 use codex_core::mcp::auth::discover_supported_scopes;
 use codex_core::mcp::auth::resolve_oauth_scopes;
 use codex_core::mcp::collect_mcp_snapshot;
@@ -243,6 +242,7 @@ use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::Stage;
 use codex_feedback::CodexFeedback;
+use codex_git_utils::git_diff_to_remote;
 use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
 use codex_login::auth::login_with_chatgpt_auth_tokens;
@@ -407,6 +407,13 @@ struct ListenerTaskContext {
 enum EnsureConversationListenerResult {
     Attached,
     ConnectionClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshTokenRequestOutcome {
+    NotAttemptedOrSucceeded,
+    FailedTransiently,
+    FailedPermanently,
 }
 
 pub(crate) struct CodexMessageProcessorArgs {
@@ -886,7 +893,9 @@ impl CodexMessageProcessor {
             | ClientRequest::FsGetMetadata { .. }
             | ClientRequest::FsReadDirectory { .. }
             | ClientRequest::FsRemove { .. }
-            | ClientRequest::FsCopy { .. } => {
+            | ClientRequest::FsCopy { .. }
+            | ClientRequest::FsWatch { .. }
+            | ClientRequest::FsUnwatch { .. } => {
                 warn!("Filesystem request reached CodexMessageProcessor unexpectedly");
             }
             ClientRequest::ConfigRequirementsRead { .. } => {
@@ -1338,13 +1347,19 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn refresh_token_if_requested(&self, do_refresh: bool) {
+    async fn refresh_token_if_requested(&self, do_refresh: bool) -> RefreshTokenRequestOutcome {
         if self.auth_manager.is_external_auth_active() {
-            return;
+            return RefreshTokenRequestOutcome::NotAttemptedOrSucceeded;
         }
         if do_refresh && let Err(err) = self.auth_manager.refresh_token().await {
-            tracing::warn!("failed to refresh token while getting account: {err}");
+            let failed_reason = err.failed_reason();
+            if failed_reason.is_none() {
+                tracing::warn!("failed to refresh token while getting account: {err}");
+                return RefreshTokenRequestOutcome::FailedTransiently;
+            }
+            return RefreshTokenRequestOutcome::FailedPermanently;
         }
+        RefreshTokenRequestOutcome::NotAttemptedOrSucceeded
     }
 
     async fn get_auth_status(&self, request_id: ConnectionRequestId, params: GetAuthStatusParams) {
@@ -1367,18 +1382,25 @@ impl CodexMessageProcessor {
         } else {
             match self.auth_manager.auth().await {
                 Some(auth) => {
+                    let permanent_refresh_failure =
+                        self.auth_manager.refresh_failure_for_auth(&auth).is_some();
                     let auth_mode = auth.api_auth_mode();
-                    let (reported_auth_method, token_opt) = match auth.get_token() {
-                        Ok(token) if !token.is_empty() => {
-                            let tok = if include_token { Some(token) } else { None };
-                            (Some(auth_mode), tok)
-                        }
-                        Ok(_) => (None, None),
-                        Err(err) => {
-                            tracing::warn!("failed to get token for auth status: {err}");
-                            (None, None)
-                        }
-                    };
+                    let (reported_auth_method, token_opt) =
+                        if include_token && permanent_refresh_failure {
+                            (Some(auth_mode), None)
+                        } else {
+                            match auth.get_token() {
+                                Ok(token) if !token.is_empty() => {
+                                    let tok = if include_token { Some(token) } else { None };
+                                    (Some(auth_mode), tok)
+                                }
+                                Ok(_) => (None, None),
+                                Err(err) => {
+                                    tracing::warn!("failed to get token for auth status: {err}");
+                                    (None, None)
+                                }
+                            }
+                        };
                     GetAuthStatusResponse {
                         auth_method: reported_auth_method,
                         auth_token: token_opt,
@@ -1908,6 +1930,13 @@ impl CodexMessageProcessor {
             .is_err()
         {
             warn!("timed out waiting for background tasks to shut down; proceeding");
+        }
+    }
+
+    pub(crate) async fn cancel_active_login(&self) {
+        let mut guard = self.active_login.lock().await;
+        if let Some(active_login) = guard.take() {
+            drop(active_login);
         }
     }
 
@@ -5523,11 +5552,18 @@ impl CodexMessageProcessor {
 
         let config_for_marketplace_listing = config.clone();
         let plugins_manager_for_marketplace_listing = plugins_manager.clone();
-        let data = match tokio::task::spawn_blocking(move || {
-            let marketplaces = plugins_manager_for_marketplace_listing
+        let (data, marketplace_load_errors) = match tokio::task::spawn_blocking(move || {
+            let outcome = plugins_manager_for_marketplace_listing
                 .list_marketplaces_for_config(&config_for_marketplace_listing, &roots)?;
-            Ok::<Vec<PluginMarketplaceEntry>, MarketplaceError>(
-                marketplaces
+            Ok::<
+                (
+                    Vec<PluginMarketplaceEntry>,
+                    Vec<codex_app_server_protocol::MarketplaceLoadErrorInfo>,
+                ),
+                MarketplaceError,
+            >((
+                outcome
+                    .marketplaces
                     .into_iter()
                     .map(|marketplace| PluginMarketplaceEntry {
                         name: marketplace.name,
@@ -5551,11 +5587,19 @@ impl CodexMessageProcessor {
                             .collect(),
                     })
                     .collect(),
-            )
+                outcome
+                    .errors
+                    .into_iter()
+                    .map(|err| codex_app_server_protocol::MarketplaceLoadErrorInfo {
+                        marketplace_path: err.path,
+                        message: err.message,
+                    })
+                    .collect(),
+            ))
         })
         .await
         {
-            Ok(Ok(data)) => data,
+            Ok(Ok(outcome)) => outcome,
             Ok(Err(err)) => {
                 self.send_marketplace_error(request_id, err, "list marketplace plugins")
                     .await;
@@ -5597,6 +5641,7 @@ impl CodexMessageProcessor {
                 request_id,
                 PluginListResponse {
                     marketplaces: data,
+                    marketplace_load_errors,
                     remote_sync_error,
                     featured_plugin_ids,
                 },
@@ -8188,7 +8233,7 @@ fn extract_conversation_summary(
 
 fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     ConversationGitInfo {
-        sha: git_info.commit_hash.clone(),
+        sha: git_info.commit_hash.as_ref().map(|sha| sha.0.clone()),
         branch: git_info.branch.clone(),
         origin_url: git_info.repository_url.clone(),
     }
@@ -8871,6 +8916,7 @@ mod tests {
                     request_id: sent_request_id,
                     ..
                 }),
+            ..
         } = request_message
         else {
             panic!("expected tool request to be sent to the subscribed connection");

@@ -24,20 +24,23 @@ use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::SandboxPolicy;
-use crate::sandboxing::CommandSpec;
+use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
-use crate::sandboxing::SandboxManager;
 use crate::sandboxing::SandboxPermissions;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
 use crate::text_encoding::bytes_to_string_smart;
-use crate::tools::sandboxing::SandboxablePreference;
 use codex_network_proxy::NetworkProxy;
 #[cfg(any(target_os = "windows", test))]
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_sandboxing::SandboxCommand;
+use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxTransformRequest;
+use codex_sandboxing::SandboxType;
+use codex_sandboxing::SandboxablePreference;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::process_group::kill_child_process_group;
 
@@ -178,31 +181,6 @@ impl ExecCapturePolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SandboxType {
-    None,
-
-    /// Only available on macOS.
-    MacosSeatbelt,
-
-    /// Only available on Linux.
-    LinuxSeccomp,
-
-    /// Only available on Windows.
-    WindowsRestrictedToken,
-}
-
-impl SandboxType {
-    pub(crate) fn as_metric_tag(self) -> &'static str {
-        match self {
-            SandboxType::None => "none",
-            SandboxType::MacosSeatbelt => "seatbelt",
-            SandboxType::LinuxSeccomp => "seccomp",
-            SandboxType::WindowsRestrictedToken => "windows_sandbox",
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct StdoutStream {
     pub sub_id: String,
@@ -263,10 +241,10 @@ pub fn build_exec_request(
         expiration,
         capture_policy,
         network,
-        sandbox_permissions,
+        sandbox_permissions: _,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
-        justification,
+        justification: _,
         arg0: _,
     } = params;
     if let Some(network) = network.as_ref() {
@@ -279,22 +257,21 @@ pub fn build_exec_request(
         ))
     })?;
 
-    let spec = CommandSpec {
+    let manager = SandboxManager::new();
+    let command = SandboxCommand {
         program: program.clone(),
         args: args.to_vec(),
         cwd,
         env,
+        additional_permissions: None,
+    };
+    let options = ExecOptions {
         expiration,
         capture_policy,
-        sandbox_permissions,
-        additional_permissions: None,
-        justification,
     };
-
-    let manager = SandboxManager::new();
     let exec_req = manager
-        .transform(crate::sandboxing::SandboxTransformRequest {
-            spec,
+        .transform(SandboxTransformRequest {
+            command,
             policy: sandbox_policy,
             file_system_policy: file_system_sandbox_policy,
             network_policy: network_sandbox_policy,
@@ -309,6 +286,7 @@ pub fn build_exec_request(
             windows_sandbox_level,
             windows_sandbox_private_desktop,
         })
+        .map(|request| ExecRequest::from_sandbox_exec_request(request, options))
         .map_err(CodexErr::from)?;
     Ok(exec_req)
 }
@@ -329,11 +307,9 @@ pub(crate) async fn execute_exec_request(
         sandbox,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
-        sandbox_permissions,
         sandbox_policy: _sandbox_policy_from_env,
         file_system_sandbox_policy,
         network_sandbox_policy,
-        justification,
         arg0,
     } = exec_request;
     let _ = _sandbox_policy_from_env;
@@ -345,10 +321,10 @@ pub(crate) async fn execute_exec_request(
         capture_policy,
         env,
         network: network.clone(),
-        sandbox_permissions,
+        sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
-        justification,
+        justification: None,
         arg0,
     };
 
@@ -620,7 +596,7 @@ fn finalize_exec_result(
 
 pub(crate) mod errors {
     use super::CodexErr;
-    use crate::sandboxing::SandboxTransformError;
+    use codex_sandboxing::SandboxTransformError;
 
     impl From<SandboxTransformError> for CodexErr {
         fn from(err: SandboxTransformError) -> Self {
