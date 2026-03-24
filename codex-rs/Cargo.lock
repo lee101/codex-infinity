@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "codex-sandboxing"
-version = "0.0.0"
+version = "0.56.0"
 dependencies = [
  "codex-network-proxy",
  "codex-protocol",
