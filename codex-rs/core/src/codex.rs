@@ -1570,7 +1570,7 @@ impl Session {
         })?;
         let rollout_path = rollout_recorder
             .as_ref()
-            .map(|rec| rec.rollout_path.clone());
+            .map(|rec| rec.rollout_path().to_path_buf());
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -2213,15 +2213,6 @@ impl Session {
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
-                }
-
-                // Append the current session's initial context after the reconstructed history.
-                let initial_context = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &initial_context)
-                    .await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
                 }
 
                 // Forked threads should remain file-backed immediately after startup.

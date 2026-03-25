@@ -8,6 +8,7 @@ use crate::bottom_pane::ColumnWidthMode;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::history_cell;
+use crate::onboarding::mark_url_hyperlink;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::shimmer::shimmer_spans;
@@ -24,10 +25,12 @@ use codex_features::Feature;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::prelude::Widget;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
+use ratatui::widgets::Wrap;
 
 const PLUGINS_SELECTION_VIEW_ID: &str = "plugins-selection";
 const LOADING_ANIMATION_DELAY: Duration = Duration::from_secs(1);
@@ -90,6 +93,29 @@ impl Renderable for DelayedLoadingHeader {
 
     fn desired_height(&self, _width: u16) -> u16 {
         2 + u16::from(self.note.is_some())
+    }
+}
+
+const APPS_HELP_ARTICLE_URL: &str = "https://help.openai.com/en/articles/11487775-apps-in-chatgpt";
+
+struct PluginDisclosureLine {
+    line: Line<'static>,
+}
+
+impl Renderable for PluginDisclosureLine {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(self.line.clone())
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+        mark_url_hyperlink(buf, area, APPS_HELP_ARTICLE_URL);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        Paragraph::new(self.line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 }
 
@@ -394,13 +420,6 @@ impl ChatWidget {
         } else {
             "Not installed yet."
         };
-        let description = app
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Plugins".bold()));
         header.push(Line::from(
@@ -411,12 +430,7 @@ impl ChatWidget {
         ));
         header.push(Line::from(status_label.dim()));
 
-        let mut items = vec![SelectionItem {
-            name: app.name.clone(),
-            description,
-            is_disabled: true,
-            ..Default::default()
-        }];
+        let mut items = Vec::new();
 
         if let Some(install_url) = app.install_url.clone() {
             let install_label = if is_installed {
@@ -812,13 +826,37 @@ impl ChatWidget {
     ) -> SelectionViewParams {
         let marketplace_label = plugin.marketplace_name.clone();
         let display_name = plugin_display_name(&plugin.summary);
-        let status_label = plugin_status_label(&plugin.summary);
+        let detail_status_label = if plugin.summary.installed {
+            if plugin.summary.enabled {
+                "Installed"
+            } else {
+                "Installed · Disabled"
+            }
+        } else {
+            match plugin.summary.install_policy {
+                PluginInstallPolicy::NotAvailable => "Not installable",
+                PluginInstallPolicy::Available => "Can be installed",
+                PluginInstallPolicy::InstalledByDefault => "Available by default",
+            }
+        };
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Plugins".bold()));
         header.push(Line::from(
-            format!("{display_name} · {marketplace_label}").bold(),
+            format!("{display_name} · {detail_status_label} · {marketplace_label}").bold(),
         ));
-        header.push(Line::from(status_label.dim()));
+        if !plugin.summary.installed {
+            header.push(PluginDisclosureLine {
+                line: Line::from(vec![
+                    "Data shared with this app is subject to the app's ".into(),
+                    "terms of service".bold(),
+                    " and ".into(),
+                    "privacy policy".bold(),
+                    ". ".into(),
+                    "Learn more".cyan().underlined(),
+                    ".".into(),
+                ]),
+            });
+        }
         if let Some(description) = plugin_detail_description(plugin) {
             header.push(Line::from(description.dim()));
         }

@@ -11,6 +11,7 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::StdoutStream;
+use crate::exec::WindowsRestrictedTokenFilesystemOverlay;
 use crate::exec::execute_exec_request;
 #[cfg(target_os = "macos")]
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
@@ -46,10 +47,46 @@ pub struct ExecRequest {
     pub sandbox_policy: SandboxPolicy,
     pub file_system_sandbox_policy: FileSystemSandboxPolicy,
     pub network_sandbox_policy: NetworkSandboxPolicy,
+    pub(crate) windows_restricted_token_filesystem_overlay:
+        Option<WindowsRestrictedTokenFilesystemOverlay>,
     pub arg0: Option<String>,
 }
 
 impl ExecRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        command: Vec<String>,
+        cwd: PathBuf,
+        env: HashMap<String, String>,
+        network: Option<NetworkProxy>,
+        expiration: ExecExpiration,
+        capture_policy: ExecCapturePolicy,
+        sandbox: SandboxType,
+        windows_sandbox_level: WindowsSandboxLevel,
+        windows_sandbox_private_desktop: bool,
+        sandbox_policy: SandboxPolicy,
+        file_system_sandbox_policy: FileSystemSandboxPolicy,
+        network_sandbox_policy: NetworkSandboxPolicy,
+        arg0: Option<String>,
+    ) -> Self {
+        Self {
+            command,
+            cwd,
+            env,
+            network,
+            expiration,
+            capture_policy,
+            sandbox,
+            windows_sandbox_level,
+            windows_sandbox_private_desktop,
+            sandbox_policy,
+            file_system_sandbox_policy,
+            network_sandbox_policy,
+            windows_restricted_token_filesystem_overlay: None,
+            arg0,
+        }
+    }
+
     pub(crate) fn from_sandbox_exec_request(
         request: SandboxExecRequest,
         options: ExecOptions,
@@ -94,6 +131,7 @@ impl ExecRequest {
             sandbox_policy,
             file_system_sandbox_policy,
             network_sandbox_policy,
+            windows_restricted_token_filesystem_overlay: None,
             arg0,
         }
     }

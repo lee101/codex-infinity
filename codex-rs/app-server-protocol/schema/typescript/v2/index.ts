@@ -81,6 +81,8 @@ export type { DynamicToolSpec } from "./DynamicToolSpec";
 export type { ErrorNotification } from "./ErrorNotification";
 export type { ExecPolicyAmendment } from "./ExecPolicyAmendment";
 export type { ExperimentalFeature } from "./ExperimentalFeature";
+export type { ExperimentalFeatureEnablementSetParams } from "./ExperimentalFeatureEnablementSetParams";
+export type { ExperimentalFeatureEnablementSetResponse } from "./ExperimentalFeatureEnablementSetResponse";
 export type { ExperimentalFeatureListParams } from "./ExperimentalFeatureListParams";
 export type { ExperimentalFeatureListResponse } from "./ExperimentalFeatureListResponse";
 export type { ExperimentalFeatureStage } from "./ExperimentalFeatureStage";

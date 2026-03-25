@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::sync::atomic::Ordering;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
+use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
@@ -29,6 +31,7 @@ use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
+use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::FsCopyParams;
@@ -225,6 +228,8 @@ impl MessageProcessor {
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
 
+        let cli_overrides = Arc::new(RwLock::new(cli_overrides));
+        let runtime_feature_enablement = Arc::new(RwLock::new(BTreeMap::new()));
         let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
             auth_manager: auth_manager.clone(),
@@ -233,6 +238,7 @@ impl MessageProcessor {
             arg0_paths,
             config: Arc::clone(&config),
             cli_overrides: cli_overrides.clone(),
+            runtime_feature_enablement: runtime_feature_enablement.clone(),
             cloud_requirements: cloud_requirements.clone(),
             feedback,
             log_db,
@@ -245,6 +251,7 @@ impl MessageProcessor {
         let config_api = ConfigApi::new(
             config.codex_home.clone(),
             cli_overrides,
+            runtime_feature_enablement,
             loader_overrides,
             cloud_requirements,
             thread_manager,
@@ -590,8 +597,21 @@ impl MessageProcessor {
                 }
 
                 let user_agent = get_codex_user_agent();
+                let codex_home = match self.config.codex_home.clone().try_into() {
+                    Ok(codex_home) => codex_home,
+                    Err(err) => {
+                        let error = JSONRPCErrorError {
+                            code: INTERNAL_ERROR_CODE,
+                            message: format!("Invalid CODEX_HOME: {err}"),
+                            data: None,
+                        };
+                        self.outgoing.send_error(connection_request_id, error).await;
+                        return;
+                    }
+                };
                 let response = InitializeResponse {
                     user_agent,
+                    codex_home,
                     platform_family: std::env::consts::FAMILY.to_string(),
                     platform_os: std::env::consts::OS.to_string(),
                 };
@@ -678,6 +698,16 @@ impl MessageProcessor {
             }
             ClientRequest::ConfigBatchWrite { request_id, params } => {
                 self.handle_config_batch_write(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::ExperimentalFeatureEnablementSet { request_id, params } => {
+                self.handle_experimental_feature_enablement_set(
                     ConnectionRequestId {
                         connection_id,
                         request_id,
@@ -834,7 +864,30 @@ impl MessageProcessor {
         request_id: ConnectionRequestId,
         params: ConfigBatchWriteParams,
     ) {
-        match self.config_api.batch_write(params).await {
+        self.handle_config_mutation_result(request_id, self.config_api.batch_write(params).await)
+            .await;
+    }
+
+    async fn handle_experimental_feature_enablement_set(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ExperimentalFeatureEnablementSetParams,
+    ) {
+        self.handle_config_mutation_result(
+            request_id,
+            self.config_api
+                .set_experimental_feature_enablement(params)
+                .await,
+        )
+        .await;
+    }
+
+    async fn handle_config_mutation_result<T: serde::Serialize>(
+        &self,
+        request_id: ConnectionRequestId,
+        result: std::result::Result<T, JSONRPCErrorError>,
+    ) {
+        match result {
             Ok(response) => {
                 self.codex_message_processor.clear_plugin_related_caches();
                 self.codex_message_processor
