@@ -363,6 +363,46 @@ pub fn read_codex_api_key_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
+
+/// Read the Anthropic API key from the environment variable `ANTHROPIC_API_KEY`.
+pub fn read_anthropic_api_key_from_env() -> Option<String> {
+    env::var(ANTHROPIC_API_KEY_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read the Claude Code OAuth access token from `~/.claude/.credentials.json`.
+///
+/// Claude Code stores OAuth credentials (from `claude.ai` login) in this file.
+/// The access token can be used as an `ANTHROPIC_API_KEY` bearer token for
+/// Anthropic API calls when a proper Anthropic provider is configured.
+pub fn read_claude_code_credentials() -> Option<String> {
+    let home = env::var("HOME").ok().map(PathBuf::from)?;
+    let creds_path = home.join(".claude").join(".credentials.json");
+    let content = std::fs::read_to_string(creds_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json["claudeAiOauth"]["accessToken"]
+        .as_str()
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+}
+
+/// If `ANTHROPIC_API_KEY` is not set in the environment, attempt to load the
+/// Claude Code OAuth token from `~/.claude/.credentials.json` and set it.
+///
+/// Call this early in the process lifecycle so downstream provider lookups see it.
+pub fn bootstrap_anthropic_api_key_from_claude_credentials() {
+    if read_anthropic_api_key_from_env().is_some() {
+        return;
+    }
+    if let Some(token) = read_claude_code_credentials() {
+        // SAFETY: single-threaded startup context.
+        unsafe { env::set_var(ANTHROPIC_API_KEY_ENV_VAR, token) };
+    }
+}
+
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
 pub fn logout(
