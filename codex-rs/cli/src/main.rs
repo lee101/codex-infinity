@@ -21,6 +21,7 @@ use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
 use codex_execpolicy::ExecPolicyCheckCommand;
+use codex_login::bootstrap_anthropic_api_key_from_claude_credentials;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
@@ -588,6 +589,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    // If ANTHROPIC_API_KEY is not set, auto-load from Claude Code credentials
+    // (~/.claude/.credentials.json) so Anthropic-configured providers work.
+    bootstrap_anthropic_api_key_from_claude_credentials();
+
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
