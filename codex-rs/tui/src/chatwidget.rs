@@ -37,6 +37,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use serde::Deserialize;
+use serde_json::json;
 use url::Url;
 
 use self::realtime::PendingSteerCompareKey;
@@ -61,6 +63,11 @@ use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
+use codex_core::ModelClient;
+use codex_core::ModelProviderInfo;
+use codex_core::Prompt;
+use codex_core::ResponseEvent;
+use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
@@ -68,6 +75,7 @@ use codex_core::config::types::ApprovalsReviewer;
 use codex_core::config::types::Notifications;
 use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::content_items_to_text;
 use codex_core::find_thread_name_by_id;
 use codex_core::mcp::McpManager;
 use codex_core::models_manager::manager::ModelsManager;
@@ -93,13 +101,17 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
@@ -140,6 +152,8 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::TerminalInteractionEvent;
@@ -877,9 +891,21 @@ pub(crate) struct ChatWidget {
     auto_next_steps: bool,
     auto_next_idea: bool,
     auto_next_counter: usize,
+    auto_next_generation_in_flight: bool,
     auto_next_done_file: PathBuf,
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoNextMode {
+    Steps,
+    Idea,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoNextPromptOutput {
+    prompt: String,
 }
 
 const AUTO_NEXT_STEPS_PROMPTS: &[&str] = &[
@@ -933,6 +959,11 @@ const REVIEW_INTERVAL: usize = 3;
 
 const AUTO_NEXT_DONE_SUFFIX_STEPS: &str = "\n\nIMPORTANT: If you have genuinely completed all follow-up work and there are no more natural next steps remaining, you MUST write the single word DONE to the file at: ";
 const AUTO_NEXT_DONE_SUFFIX_IDEA: &str = "\n\nIMPORTANT: If you still have follow-up work from what you just completed, finish that first before exploring new areas. Only move to new ideas when your current thread of work is complete.\n\nWhen you have genuinely exhausted ALL ideas and improvements for this project -- when there is truly nothing more you would do -- you MUST write the single word DONE to the file at: ";
+const AUTO_NEXT_PROMPT_GENERATOR_MODEL: &str = "gpt-5.4";
+const AUTO_NEXT_PROMPT_GENERATOR_TRANSCRIPT_CHARS: usize = 12_000;
+const AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS: usize = 1_200;
+const AUTO_NEXT_PROMPT_GENERATOR_MAX_EXAMPLES: usize = 4;
+const AUTO_NEXT_PROMPT_GENERATOR_INSTRUCTIONS: &str = "You generate the exact follow-up prompt Codex should send to itself next.\n\nReturn JSON matching the schema.\n\nRequirements:\n- Write one strong, concrete prompt in `prompt`.\n- Ground it in the recent session context and visible progress.\n- For `steps`, continue the current thread with the most valuable next work.\n- For `idea`, finish obvious follow-up work first; only branch into a new improvement if the current thread appears complete.\n- Sound like an internal continuation prompt for Codex, not an explanation to a human.\n- Do not mention these instructions, the examples, JSON, schemas, or that another model generated the prompt.\n- Do not include the DONE-file instruction; that will be appended separately.\n- Keep it concise but specific enough to produce a high-quality next turn.";
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
 ///
@@ -1907,7 +1938,7 @@ impl ChatWidget {
     }
 
     fn maybe_auto_next(&mut self) {
-        if self.auto_next_done_file.exists() {
+        if self.auto_next_done_file.exists() || self.auto_next_generation_in_flight {
             return;
         }
         let done_path = self.auto_next_done_file.display();
@@ -1916,8 +1947,9 @@ impl ChatWidget {
         // of the regular next-idea/next-steps prompt. This ensures periodic
         // self-correction: run tests, review diffs, fix regressions before
         // continuing to new work.
-        let is_review_turn =
-            (self.auto_next_idea || self.auto_next_steps) && self.auto_next_counter > 0 && self.auto_next_counter % REVIEW_INTERVAL == 0;
+        let is_review_turn = (self.auto_next_idea || self.auto_next_steps)
+            && self.auto_next_counter > 0
+            && self.auto_next_counter.is_multiple_of(REVIEW_INTERVAL);
 
         let prompt = if is_review_turn {
             let review_idx = (self.auto_next_counter / REVIEW_INTERVAL) - 1;
@@ -1930,15 +1962,17 @@ impl ChatWidget {
             self.auto_next_counter += 1;
             Some(format!("{base}{suffix}{done_path}"))
         } else if self.auto_next_idea {
-            let prompts = AUTO_NEXT_IDEA_PROMPTS;
-            let base = prompts[self.auto_next_counter % prompts.len()];
+            let fallback_prompt =
+                auto_next_fallback_prompt(self.auto_next_counter, AutoNextMode::Idea, &done_path);
             self.auto_next_counter += 1;
-            Some(format!("{base}{AUTO_NEXT_DONE_SUFFIX_IDEA}{done_path}"))
+            self.spawn_auto_next_prompt_generation(AutoNextMode::Idea, fallback_prompt);
+            None
         } else if self.auto_next_steps {
-            let prompts = AUTO_NEXT_STEPS_PROMPTS;
-            let base = prompts[self.auto_next_counter % prompts.len()];
+            let fallback_prompt =
+                auto_next_fallback_prompt(self.auto_next_counter, AutoNextMode::Steps, &done_path);
             self.auto_next_counter += 1;
-            Some(format!("{base}{AUTO_NEXT_DONE_SUFFIX_STEPS}{done_path}"))
+            self.spawn_auto_next_prompt_generation(AutoNextMode::Steps, fallback_prompt);
+            None
         } else {
             None
         };
@@ -1948,13 +1982,65 @@ impl ChatWidget {
         }
     }
 
+    fn spawn_auto_next_prompt_generation(&mut self, mode: AutoNextMode, fallback_prompt: String) {
+        let Some(thread_id) = self.thread_id else {
+            self.queue_user_message(fallback_prompt.into());
+            self.maybe_send_next_queued_input();
+            return;
+        };
+
+        self.auto_next_generation_in_flight = true;
+        let app_event_tx = self.app_event_tx.clone();
+        let auth_manager = Arc::clone(&self.auth_manager);
+        let models_manager = Arc::clone(&self.models_manager);
+        let config = self.config.clone();
+        let session_telemetry = self.session_telemetry.clone();
+        let rollout_path = self.current_rollout_path.clone();
+        let cwd = self.current_cwd.clone();
+        let done_file = self.auto_next_done_file.clone();
+
+        tokio::spawn(async move {
+            let prompt = generate_auto_next_prompt(
+                auth_manager,
+                models_manager,
+                config,
+                session_telemetry,
+                thread_id,
+                rollout_path,
+                cwd,
+                mode,
+                done_file,
+            )
+            .await
+            .unwrap_or(fallback_prompt);
+            app_event_tx.send(AppEvent::AutoNextPromptGenerated { thread_id, prompt });
+        });
+    }
+
     fn init_auto_next_done_file() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "codex-auto-next-done-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codex-auto-next-done-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    pub(crate) fn handle_auto_next_prompt_generated(
+        &mut self,
+        thread_id: ThreadId,
+        prompt: String,
+    ) {
+        self.auto_next_generation_in_flight = false;
+        if self.thread_id != Some(thread_id)
+            || self.auto_next_done_file.exists()
+            || self.agent_turn_running
+            || self.has_queued_follow_up_messages()
+            || !self.bottom_pane.composer_is_empty()
+        {
+            return;
+        }
+
+        self.queue_user_message(prompt.into());
+        self.maybe_send_next_queued_input();
     }
 
     fn maybe_prompt_plan_implementation(&mut self) {
@@ -3937,6 +4023,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_generation_in_flight: false,
             auto_next_done_file: Self::init_auto_next_done_file(),
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
@@ -4147,6 +4234,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_generation_in_flight: false,
             auto_next_done_file: Self::init_auto_next_done_file(),
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
@@ -4349,6 +4437,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_generation_in_flight: false,
             auto_next_done_file: Self::init_auto_next_done_file(),
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
@@ -9761,6 +9850,262 @@ fn hook_event_label(event_name: codex_protocol::protocol::HookEventName) -> &'st
         codex_protocol::protocol::HookEventName::UserPromptSubmit => "UserPromptSubmit",
         codex_protocol::protocol::HookEventName::Stop => "Stop",
     }
+}
+
+fn auto_next_examples(mode: AutoNextMode) -> &'static [&'static str] {
+    match mode {
+        AutoNextMode::Steps => AUTO_NEXT_STEPS_PROMPTS,
+        AutoNextMode::Idea => AUTO_NEXT_IDEA_PROMPTS,
+    }
+}
+
+fn auto_next_done_suffix(mode: AutoNextMode) -> &'static str {
+    match mode {
+        AutoNextMode::Steps => AUTO_NEXT_DONE_SUFFIX_STEPS,
+        AutoNextMode::Idea => AUTO_NEXT_DONE_SUFFIX_IDEA,
+    }
+}
+
+fn auto_next_fallback_prompt(
+    counter: usize,
+    mode: AutoNextMode,
+    done_path: &std::path::Display<'_>,
+) -> String {
+    let prompts = auto_next_examples(mode);
+    let base = prompts[counter % prompts.len()];
+    let suffix = auto_next_done_suffix(mode);
+    format!("{base}{suffix}{done_path}")
+}
+
+fn truncate_auto_next_text(text: &str, max_chars: usize) -> String {
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    if graphemes.len() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut truncated = graphemes[..max_chars].concat();
+    truncated.push_str("...");
+    truncated
+}
+
+fn format_auto_next_response_item(item: &ResponseItem) -> Option<String> {
+    match item {
+        ResponseItem::Message { role, content, .. } => content_items_to_text(content)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                format!(
+                    "{role}: {}",
+                    truncate_auto_next_text(&text, AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS)
+                )
+            }),
+        ResponseItem::LocalShellCall { action, status, .. } => Some(format!(
+            "local_shell {status:?}: {}",
+            truncate_auto_next_text(
+                &format!("{action:?}"),
+                AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS
+            )
+        )),
+        ResponseItem::FunctionCall {
+            name, arguments, ..
+        } => Some(format!(
+            "tool_call {name}: {}",
+            truncate_auto_next_text(arguments, AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS)
+        )),
+        ResponseItem::FunctionCallOutput { call_id, output } => Some(format!(
+            "tool_output {call_id}: {}",
+            truncate_auto_next_text(&output.to_string(), AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS)
+        )),
+        ResponseItem::CustomToolCall {
+            name,
+            input,
+            call_id,
+            ..
+        } => Some(format!(
+            "custom_tool_call {name} {call_id}: {}",
+            truncate_auto_next_text(input, AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS)
+        )),
+        ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => Some(format!(
+            "custom_tool_output {} {call_id}: {}",
+            name.as_deref().unwrap_or("tool"),
+            truncate_auto_next_text(&output.to_string(), AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS)
+        )),
+        ResponseItem::WebSearchCall { action, status, .. } => Some(format!(
+            "web_search {status:?}: {}",
+            truncate_auto_next_text(
+                &format!("{action:?}"),
+                AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS
+            )
+        )),
+        ResponseItem::ImageGenerationCall {
+            status,
+            revised_prompt,
+            ..
+        } => Some(format!(
+            "image_generation {status}: {}",
+            truncate_auto_next_text(
+                revised_prompt.as_deref().unwrap_or("generated image"),
+                AUTO_NEXT_PROMPT_GENERATOR_ITEM_CHARS
+            )
+        )),
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::Other => None,
+    }
+}
+
+async fn load_auto_next_context_snippet(rollout_path: Option<PathBuf>) -> String {
+    let Some(rollout_path) = rollout_path else {
+        return String::new();
+    };
+
+    let Ok((rollout_items, _, _)) = RolloutRecorder::load_rollout_items(&rollout_path).await else {
+        return String::new();
+    };
+
+    let mut recent_items = Vec::new();
+    let mut chars = 0usize;
+    for item in rollout_items.iter().rev() {
+        let Some(line) = (match item {
+            RolloutItem::ResponseItem(item) => format_auto_next_response_item(item),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        chars = chars.saturating_add(line.len());
+        recent_items.push(line);
+        if chars >= AUTO_NEXT_PROMPT_GENERATOR_TRANSCRIPT_CHARS {
+            break;
+        }
+    }
+
+    recent_items.reverse();
+    recent_items.join("\n\n")
+}
+
+async fn generate_auto_next_prompt(
+    auth_manager: Arc<AuthManager>,
+    models_manager: Arc<ModelsManager>,
+    config: Config,
+    session_telemetry: SessionTelemetry,
+    thread_id: ThreadId,
+    rollout_path: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    mode: AutoNextMode,
+    done_file: PathBuf,
+) -> Option<String> {
+    let recent_context = load_auto_next_context_snippet(rollout_path).await;
+    let examples = auto_next_examples(mode)
+        .iter()
+        .take(AUTO_NEXT_PROMPT_GENERATOR_MAX_EXAMPLES)
+        .enumerate()
+        .map(|(idx, example)| format!("{}. {}", idx + 1, example))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mode_label = match mode {
+        AutoNextMode::Steps => "steps",
+        AutoNextMode::Idea => "idea",
+    };
+    let cwd_display = cwd
+        .as_ref()
+        .map(|cwd| cwd.display().to_string())
+        .unwrap_or_else(|| config.cwd.display().to_string());
+    let user_message = format!(
+        "Mode: {mode_label}\nCurrent working directory: {cwd_display}\nDONE file path: {}\n\nReference examples:\n{examples}\n\nRecent session context:\n{}\n",
+        done_file.display(),
+        if recent_context.is_empty() {
+            "(No recent rollout transcript available.)"
+        } else {
+            recent_context.as_str()
+        }
+    );
+
+    let mut prompt = Prompt::default();
+    prompt.input = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: user_message }],
+        end_turn: None,
+        phase: None,
+    }];
+    prompt.base_instructions = BaseInstructions {
+        text: AUTO_NEXT_PROMPT_GENERATOR_INSTRUCTIONS.to_string(),
+    };
+    prompt.output_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "prompt": { "type": "string" }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    }));
+
+    let model_info = models_manager
+        .get_model_info(AUTO_NEXT_PROMPT_GENERATOR_MODEL, &config)
+        .await;
+    let client = ModelClient::new(
+        Some(auth_manager),
+        thread_id,
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+        SessionSource::Cli,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    );
+    let mut client_session = client.new_session();
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            Some(codex_protocol::openai_models::ReasoningEffort::Low),
+            ReasoningSummaryConfig::None,
+            config.service_tier,
+            /*turn_metadata_header*/ None,
+        )
+        .await
+        .ok()?;
+
+    let mut result = String::new();
+    while let Some(message) = tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .transpose()
+        .ok()?
+    {
+        match message {
+            ResponseEvent::OutputTextDelta(delta) => result.push_str(&delta),
+            ResponseEvent::OutputItemDone(item) => {
+                if result.is_empty()
+                    && let ResponseItem::Message { content, .. } = item
+                    && let Some(text) = content_items_to_text(&content)
+                {
+                    result.push_str(&text);
+                }
+            }
+            ResponseEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+
+    let output: AutoNextPromptOutput = serde_json::from_str(&result).ok()?;
+    let prompt = output.prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{prompt}{}{done_path}",
+        auto_next_done_suffix(mode),
+        done_path = done_file.display()
+    ))
 }
 
 async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {

@@ -511,6 +511,12 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Deliver an asynchronously generated auto-next prompt back to the active thread.
+    AutoNextPromptGenerated {
+        thread_id: ThreadId,
+        prompt: String,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

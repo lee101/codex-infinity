@@ -2098,6 +2098,7 @@ async fn make_chatwidget_manual(
         auto_next_steps: false,
         auto_next_idea: false,
         auto_next_counter: 0,
+        auto_next_generation_in_flight: false,
         auto_next_done_file: ChatWidget::init_auto_next_done_file(),
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
@@ -12458,6 +12459,46 @@ async fn chatwidget_tall() {
     })
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
+}
+
+#[tokio::test]
+async fn auto_next_generated_prompt_submits_for_active_thread() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.auto_next_generation_in_flight = true;
+
+    chat.handle_auto_next_prompt_generated(thread_id, "Continue with targeted follow-up.".into());
+
+    assert!(!chat.auto_next_generation_in_flight);
+    assert!(chat.queued_user_messages.is_empty());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "Continue with targeted follow-up.".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected auto-next submit op, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn auto_next_generated_prompt_skips_when_follow_up_is_already_queued() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.bottom_pane.set_task_running(true);
+    chat.auto_next_generation_in_flight = true;
+    chat.queue_user_message("existing follow-up".into());
+
+    chat.handle_auto_next_prompt_generated(thread_id, "new auto-next prompt".into());
+
+    assert!(!chat.auto_next_generation_in_flight);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.queued_user_messages[0].text, "existing follow-up");
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]
