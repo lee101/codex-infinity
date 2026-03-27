@@ -54,11 +54,12 @@ async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
 
-fn text_input(text: &str) -> Vec<UserInput> {
+fn text_input(text: &str) -> Op {
     vec![UserInput::Text {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
+    .into()
 }
 
 struct AgentControlHarness {
@@ -75,6 +76,9 @@ impl AgentControlHarness {
             CodexAuth::from_api_key("dummy"),
             config.model_provider.clone(),
             config.codex_home.clone(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+                /*exec_server_url*/ None,
+            )),
         );
         let control = manager.agent_control();
         Self {
@@ -214,7 +218,8 @@ async fn send_input_errors_when_manager_dropped() {
             vec![UserInput::Text {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
-            }],
+            }]
+            .into(),
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -318,7 +323,8 @@ async fn send_input_errors_when_thread_missing() {
             vec![UserInput::Text {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
-            }],
+            }]
+            .into(),
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -384,7 +390,8 @@ async fn send_input_submits_user_message() {
             vec![UserInput::Text {
                 text: "hello from tests".to_string(),
                 text_elements: Vec::new(),
-            }],
+            }]
+            .into(),
         )
         .await
         .expect("send_input should succeed");
@@ -811,6 +818,9 @@ async fn spawn_agent_respects_max_threads_limit() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
 
@@ -854,6 +864,9 @@ async fn spawn_agent_releases_slot_after_shutdown() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
 
@@ -888,6 +901,9 @@ async fn spawn_agent_limit_shared_across_clones() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
     let cloned = control.clone();
@@ -924,6 +940,9 @@ async fn resume_agent_respects_max_threads_limit() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
 
@@ -971,6 +990,9 @@ async fn resume_agent_releases_slot_after_resume_failure() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
 
@@ -1361,6 +1383,9 @@ async fn resume_thread_subagent_restores_stored_nickname_and_role() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.clone(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
     );
     let control = manager.agent_control();
     let harness = AgentControlHarness {

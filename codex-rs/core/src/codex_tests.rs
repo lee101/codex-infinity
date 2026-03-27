@@ -5,6 +5,8 @@ use crate::config::test_config;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigLayerStackOrdering;
 use crate::config_loader::NetworkConstraints;
+use crate::config_loader::NetworkDomainPermissionToml;
+use crate::config_loader::NetworkDomainPermissionsToml;
 use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
 use crate::exec::ExecCapturePolicy;
@@ -80,6 +82,7 @@ use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::W3cTraceContext;
+use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
@@ -470,8 +473,8 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
 
     let current_cfg = started_proxy.proxy().current_cfg().await?;
     assert_eq!(
-        current_cfg.network.allowed_domains,
-        vec!["example.com".to_string()]
+        current_cfg.network.allowed_domains(),
+        Some(vec!["example.com".to_string()])
     );
     Ok(())
 }
@@ -482,7 +485,12 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
         Some(NetworkConstraints {
-            allowed_domains: Some(vec!["managed.example.com".to_string()]),
+            domains: Some(NetworkDomainPermissionsToml {
+                entries: std::collections::BTreeMap::from([(
+                    "managed.example.com".to_string(),
+                    NetworkDomainPermissionToml::Allow,
+                )]),
+            }),
             managed_allowed_domains_only: Some(true),
             ..Default::default()
         }),
@@ -509,8 +517,8 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
 
     let current_cfg = started_proxy.proxy().current_cfg().await?;
     assert_eq!(
-        current_cfg.network.allowed_domains,
-        vec!["managed.example.com".to_string()]
+        current_cfg.network.allowed_domains(),
+        Some(vec!["managed.example.com".to_string()])
     );
     Ok(())
 }
@@ -1161,35 +1169,10 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    // The parent rollout writer drains asynchronously after turn completion.
-    // Wait until the persisted JSONL includes the source user turn before forking from it.
-    let mut source_history_persisted = false;
-    for _ in 0..100 {
-        let history = RolloutRecorder::get_rollout_history(&rollout_path).await;
-        source_history_persisted = history.ok().is_some_and(|history| {
-            history.get_rollout_items().into_iter().any(|item| {
-                matches!(
-                        item,
-                        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                            if role == "user"
-                                && content.iter().any(|content_item| {
-                                    matches!(
-                                        content_item,
-                                        ContentItem::InputText { text } if text == "fork seed"
-                                    )
-                                })
-                )
-            })
-        });
-        if source_history_persisted {
-            break;
-        }
-        sleep(StdDuration::from_millis(10)).await;
-    }
-    assert!(
-        source_history_persisted,
-        "source rollout should contain the completed pre-fork user turn before forking"
-    );
+    // Forking reads the persisted rollout JSONL, so force the completed source turn to disk
+    // before snapshotting from it.
+    initial.codex.ensure_rollout_materialized().await;
+    initial.codex.flush_rollout().await;
 
     let mut fork_config = initial.config.clone();
     fork_config.permissions.approval_policy =
@@ -1266,7 +1249,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         trace_id: turn_context.trace_id.clone(),
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd.to_path_buf(),
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
@@ -2282,10 +2265,9 @@ async fn session_configuration_apply_preserves_split_file_system_policy_on_cwd_o
     let original_cwd = project_root.join("subdir");
     let docs_dir = original_cwd.join("docs");
     std::fs::create_dir_all(&docs_dir).expect("create docs dir");
-    let docs_dir =
-        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&docs_dir).expect("docs");
+    let docs_dir = docs_dir.abs();
 
-    session_configuration.cwd = original_cwd;
+    session_configuration.cwd = original_cwd.abs();
     session_configuration.sandbox_policy =
         codex_config::Constrained::allow_any(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
@@ -2341,7 +2323,10 @@ async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
     let parent_outcome = session
         .services
         .skills_manager
-        .skills_for_cwd(&parent_config.cwd, &parent_config, true)
+        .skills_for_cwd(
+            &crate::skills_load_input_from_config(&parent_config, Vec::new()),
+            true,
+        )
         .await;
     let parent_skill = parent_outcome
         .skills
@@ -2407,10 +2392,9 @@ async fn session_configuration_apply_rederives_legacy_file_system_policy_on_cwd_
     let original_cwd = project_root.join("subdir");
     let docs_dir = original_cwd.join("docs");
     std::fs::create_dir_all(&docs_dir).expect("create docs dir");
-    let docs_dir =
-        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&docs_dir).expect("docs");
+    let docs_dir = docs_dir.abs();
 
-    session_configuration.cwd = original_cwd;
+    session_configuration.cwd = original_cwd.abs();
     session_configuration.sandbox_policy =
         codex_config::Constrained::allow_any(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
@@ -2442,6 +2426,36 @@ async fn session_configuration_apply_rederives_legacy_file_system_policy_on_cwd_
             &project_root,
         )
     );
+}
+
+#[tokio::test]
+async fn session_update_settings_keeps_runtime_cwds_absolute() {
+    let (session, turn_context) = make_session_and_context().await;
+    let updated_cwd = turn_context
+        .cwd
+        .join("project")
+        .expect("resolve project dir");
+    std::fs::create_dir_all(updated_cwd.as_path()).expect("create project dir");
+
+    session
+        .update_settings(SessionSettingsUpdate {
+            cwd: Some(PathBuf::from("project")),
+            ..Default::default()
+        })
+        .await
+        .expect("cwd update should succeed");
+
+    let session_cwd = {
+        let state = session.state.lock().await;
+        state.session_configuration.cwd.clone()
+    };
+    let config = session.get_config().await;
+    let next_turn = session.new_default_turn().await;
+
+    assert_eq!(session_cwd, updated_cwd);
+    assert_eq!(config.cwd, turn_context.cwd);
+    assert_eq!(next_turn.cwd, updated_cwd);
+    assert_eq!(next_turn.config.cwd, updated_cwd);
 }
 
 #[tokio::test]
@@ -2508,11 +2522,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
-    let skills_manager = Arc::new(SkillsManager::new(
-        config.codex_home.clone(),
-        Arc::clone(&plugins_manager),
-        true,
-    ));
+    let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone(), true));
     let result = Session::new(
         session_configuration,
         Arc::clone(&config),
@@ -2523,6 +2533,9 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         agent_status_tx,
         InitialHistory::New,
         SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2613,14 +2626,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let state = SessionState::new(session_configuration.clone());
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
-    let skills_manager = Arc::new(SkillsManager::new(
-        config.codex_home.clone(),
-        Arc::clone(&plugins_manager),
-        true,
-    ));
+    let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone(), true));
     let network_approval = Arc::new(NetworkApprovalService::default());
     let environment = Arc::new(
-        codex_exec_server::Environment::create(None)
+        codex_exec_server::Environment::create(/*exec_server_url*/ None)
             .await
             .expect("create environment"),
     );
@@ -2639,8 +2648,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
         analytics_events_client: AnalyticsEventsClient::new(
-            Arc::clone(&config),
             Arc::clone(&auth_manager),
+            config.chatgpt_base_url.trim_end_matches('/').to_string(),
+            config.analytics_enabled,
         ),
         hooks: Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
@@ -2655,7 +2665,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
-        execve_session_approvals: RwLock::new(HashMap::new()),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2684,7 +2693,13 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         config.js_repl_node_module_dirs.clone(),
     ));
 
-    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&per_turn_config));
+    let plugin_outcome = services
+        .plugins_manager
+        .plugins_for_config(&per_turn_config);
+    let effective_skill_roots = plugin_outcome.effective_skill_roots();
+    let skills_input =
+        crate::skills_load_input_from_config(&per_turn_config, effective_skill_roots);
+    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&skills_input));
     let turn_context = Session::make_turn_context(
         conversation_id,
         Some(Arc::clone(&auth_manager)),
@@ -3058,7 +3073,7 @@ async fn user_turn_updates_approvals_reviewer() {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: Some(crate::config::types::ApprovalsReviewer::GuardianSubagent),
             sandbox_policy: config.permissions.sandbox_policy.get().clone(),
@@ -3448,14 +3463,10 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let state = SessionState::new(session_configuration.clone());
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
-    let skills_manager = Arc::new(SkillsManager::new(
-        config.codex_home.clone(),
-        Arc::clone(&plugins_manager),
-        true,
-    ));
+    let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone(), true));
     let network_approval = Arc::new(NetworkApprovalService::default());
     let environment = Arc::new(
-        codex_exec_server::Environment::create(None)
+        codex_exec_server::Environment::create(/*exec_server_url*/ None)
             .await
             .expect("create environment"),
     );
@@ -3474,8 +3485,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
         analytics_events_client: AnalyticsEventsClient::new(
-            Arc::clone(&config),
             Arc::clone(&auth_manager),
+            config.chatgpt_base_url.trim_end_matches('/').to_string(),
+            config.analytics_enabled,
         ),
         hooks: Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
@@ -3490,7 +3502,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
-        execve_session_approvals: RwLock::new(HashMap::new()),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -3519,7 +3530,13 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         config.js_repl_node_module_dirs.clone(),
     ));
 
-    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&per_turn_config));
+    let plugin_outcome = services
+        .plugins_manager
+        .plugins_for_config(&per_turn_config);
+    let effective_skill_roots = plugin_outcome.effective_skill_roots();
+    let skills_input =
+        crate::skills_load_input_from_config(&per_turn_config, effective_skill_roots);
+    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&skills_input));
     let turn_context = Arc::new(Session::make_turn_context(
         conversation_id,
         Some(Arc::clone(&auth_manager)),
@@ -3677,8 +3694,18 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
     let mut requirements = config.config_layer_stack.requirements().clone();
     requirements.network = Some(Sourced::new(
         NetworkConstraints {
-            allowed_domains: Some(vec!["api.example.com".to_string()]),
-            denied_domains: Some(vec!["blocked.example.com".to_string()]),
+            domains: Some(NetworkDomainPermissionsToml {
+                entries: std::collections::BTreeMap::from([
+                    (
+                        "api.example.com".to_string(),
+                        NetworkDomainPermissionToml::Allow,
+                    ),
+                    (
+                        "blocked.example.com".to_string(),
+                        NetworkDomainPermissionToml::Deny,
+                    ),
+                ]),
+            }),
             ..Default::default()
         },
         RequirementSource::CloudRequirements,
@@ -5060,7 +5087,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
                 "echo hi".to_string(),
             ]
         },
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd.to_path_buf(),
         expiration: timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         env: HashMap::new(),
