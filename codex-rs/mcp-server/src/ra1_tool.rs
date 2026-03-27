@@ -1,9 +1,11 @@
 //! RA1 Art Generator tool - generates AI images via netwrck.com API.
 
-use rmcp::model::{CallToolResult, Tool};
-use schemars::r#gen::SchemaSettings;
+use rmcp::model::CallToolResult;
+use rmcp::model::Tool;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::r#gen::SchemaSettings;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map as JsonObject;
 use std::env;
 use std::sync::Arc;
@@ -94,7 +96,9 @@ pub async fn handle_ra1_art_generator(
     let api_key = match env::var(NETWRCK_API_KEY_ENV) {
         Ok(key) => key,
         Err(_) => {
-            return error_result(format!("{NETWRCK_API_KEY_ENV} environment variable not set"));
+            return error_result(format!(
+                "{NETWRCK_API_KEY_ENV} environment variable not set"
+            ));
         }
     };
 
@@ -106,9 +110,7 @@ pub async fn handle_ra1_art_generator(
             }
         },
         None => {
-            return error_result(
-                "Missing arguments; the `prompt` field is required.".to_string(),
-            );
+            return error_result("Missing arguments; the `prompt` field is required.".to_string());
         }
     };
 
@@ -159,9 +161,7 @@ pub async fn handle_ra1_art_generator(
             structured_content: None,
             meta: None,
         },
-        Err(e) => error_result(format!(
-            "Failed to parse API response: {e}\nRaw: {body}"
-        )),
+        Err(e) => error_result(format!("Failed to parse API response: {e}\nRaw: {body}")),
     }
 }
 

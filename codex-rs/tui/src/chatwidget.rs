@@ -324,8 +324,6 @@ use self::realtime::RealtimeConversationUiState;
 use self::realtime::RenderedUserMessageEvent;
 mod status_surfaces;
 use self::status_surfaces::CachedProjectRootName;
-#[cfg(test)]
-use self::status_surfaces::TERMINAL_TITLE_SPINNER_INTERVAL;
 use self::status_surfaces::TerminalTitleStatusKind;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
@@ -875,8 +873,6 @@ pub(crate) struct ChatWidget {
     // Original terminal-title config captured when opening the setup UI so live preview can be
     // rolled back on cancel.
     terminal_title_setup_original_items: Option<Option<Vec<String>>>,
-    // Baseline instant used to animate spinner-prefixed title statuses.
-    terminal_title_animation_origin: Instant,
     // Cached project root display name for the current cwd; avoids walking parent directories on
     // frequent title/status refreshes.
     status_line_project_root_name_cache: Option<CachedProjectRootName>,
@@ -4019,7 +4015,6 @@ impl ChatWidget {
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
             terminal_title_setup_original_items: None,
-            terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
             status_line_branch: None,
             status_line_branch_cwd: None,
@@ -4230,7 +4225,6 @@ impl ChatWidget {
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
             terminal_title_setup_original_items: None,
-            terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
             status_line_branch: None,
             status_line_branch_cwd: None,
@@ -4433,7 +4427,6 @@ impl ChatWidget {
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
             terminal_title_setup_original_items: None,
-            terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
             status_line_branch: None,
             status_line_branch_cwd: None,

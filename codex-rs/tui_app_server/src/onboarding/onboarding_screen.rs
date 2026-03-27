@@ -113,7 +113,6 @@ impl OnboardingScreen {
                     app_server_request_handle,
                     forced_chatgpt_workspace_id,
                     forced_login_method,
-                    animations_enabled: config.animations,
                 }));
             } else {
                 tracing::warn!("skipping onboarding login step without app-server request handle");

@@ -2086,7 +2086,6 @@ async fn make_chatwidget_manual(
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         last_terminal_title: None,
         terminal_title_setup_original_items: None,
-        terminal_title_animation_origin: Instant::now(),
         status_line_project_root_name_cache: None,
         status_line_branch: None,
         status_line_branch_cwd: None,
@@ -6682,14 +6681,13 @@ async fn undo_completed_clears_terminal_title_undo_state() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.config.animations = true;
     chat.config.tui_terminal_title = Some(vec!["spinner".to_string(), "status".to_string()]);
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
 
     chat.handle_codex_event(Event {
         id: "turn-undo".to_string(),
         msg: EventMsg::UndoStarted(UndoStartedEvent { message: None }),
     });
 
-    assert_eq!(chat.last_terminal_title, Some("⠋ Undoing".to_string()));
+    assert_eq!(chat.last_terminal_title, Some("Undoing".to_string()));
 
     chat.handle_codex_event(Event {
         id: "turn-undo".to_string(),
@@ -6711,14 +6709,13 @@ async fn undo_started_refreshes_default_spinner_project_title() {
         .last_terminal_title
         .clone()
         .expect("default title should include a project name");
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
 
     chat.handle_codex_event(Event {
         id: "turn-undo".to_string(),
         msg: EventMsg::UndoStarted(UndoStartedEvent { message: None }),
     });
 
-    assert_eq!(chat.last_terminal_title, Some(format!("⠋ {project}")));
+    assert_eq!(chat.last_terminal_title, Some(project));
 }
 
 /// The commit picker shows only commit subjects (no timestamps).
@@ -11619,7 +11616,7 @@ async fn terminal_title_can_render_app_name_item() {
 }
 
 #[tokio::test]
-async fn default_terminal_title_refreshes_when_spinner_state_changes() {
+async fn default_terminal_title_refreshes_when_task_state_changes() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.config.animations = true;
 
@@ -11658,34 +11655,22 @@ async fn default_terminal_title_refreshes_when_spinner_state_changes() {
     chat.last_terminal_title = Some(project.clone());
     chat.bottom_pane.set_task_running(true);
     chat.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
-
     chat.refresh_terminal_title();
 
-    assert_eq!(chat.last_terminal_title, Some(format!("⠋ {project}")));
+    assert_eq!(chat.last_terminal_title, Some(project));
 }
 
 #[tokio::test]
-async fn terminal_title_spinner_item_renders_when_animations_enabled() {
+async fn terminal_title_spinner_item_renders_nothing() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.bottom_pane.set_task_running(true);
     chat.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-    chat.terminal_title_animation_origin = Instant::now();
 
-    assert_eq!(
-        chat.terminal_title_spinner_text_at(chat.terminal_title_animation_origin),
-        Some("⠋".to_string())
-    );
-    assert_eq!(
-        chat.terminal_title_spinner_text_at(
-            chat.terminal_title_animation_origin + TERMINAL_TITLE_SPINNER_INTERVAL,
-        ),
-        Some("⠙".to_string())
-    );
+    assert_eq!(chat.terminal_title_spinner_text_at(Instant::now()), None);
 }
 
 #[tokio::test]
-async fn terminal_title_uses_spaces_around_spinner_item() {
+async fn terminal_title_omits_spinner_item_spacing_when_spinner_is_disabled() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.config.animations = true;
     chat.config.tui_terminal_title = Some(vec![
@@ -11697,7 +11682,6 @@ async fn terminal_title_uses_spaces_around_spinner_item() {
     chat.thread_name = Some("Investigate flaky test".to_string());
     chat.bottom_pane.set_task_running(true);
     chat.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
 
     chat.refresh_terminal_title();
 
@@ -11705,28 +11689,26 @@ async fn terminal_title_uses_spaces_around_spinner_item() {
         .last_terminal_title
         .clone()
         .expect("expected terminal title");
-    assert!(title.contains(" ⠋ Working | "));
-    assert!(!title.contains("| ⠋"));
-    assert!(!title.contains("⠋ |"));
+    assert!(title.contains(" Working | Investigate flaky test"));
+    assert!(!title.contains("⠋"));
 }
 
 #[tokio::test]
-async fn terminal_title_shows_spinner_and_undoing_without_task_running() {
+async fn terminal_title_shows_undoing_without_spinner_when_task_is_not_running() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.config.animations = true;
     chat.config.tui_terminal_title = Some(vec!["spinner".to_string(), "status".to_string()]);
     chat.terminal_title_status_kind = TerminalTitleStatusKind::Undoing;
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
 
     assert!(!chat.bottom_pane.is_task_running());
 
     chat.refresh_terminal_title();
 
-    assert_eq!(chat.last_terminal_title, Some("⠋ Undoing".to_string()));
+    assert_eq!(chat.last_terminal_title, Some("Undoing".to_string()));
 }
 
 #[tokio::test]
-async fn terminal_title_reschedules_spinner_when_title_text_is_unchanged() {
+async fn terminal_title_does_not_reschedule_spinner_when_title_text_is_unchanged() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     let (frame_requester, mut frame_schedule_rx) = FrameRequester::test_observable();
     chat.frame_requester = frame_requester;
@@ -11734,12 +11716,11 @@ async fn terminal_title_reschedules_spinner_when_title_text_is_unchanged() {
     chat.config.tui_terminal_title = Some(vec!["spinner".to_string()]);
     chat.bottom_pane.set_task_running(true);
     chat.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(1);
-    chat.last_terminal_title = Some("⠋".to_string());
+    chat.last_terminal_title = Some(String::new());
 
     chat.refresh_terminal_title();
 
-    assert!(frame_schedule_rx.try_recv().is_ok());
+    assert!(frame_schedule_rx.try_recv().is_err());
 }
 
 #[tokio::test]

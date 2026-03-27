@@ -21,7 +21,6 @@ use tokio::sync::Notify;
 
 use crate::local_chatgpt_auth::LocalChatgptAuth;
 use crate::local_chatgpt_auth::load_local_chatgpt_auth;
-use crate::shimmer::shimmer_spans;
 use crate::tui::FrameRequester;
 
 use super::AuthModeWidget;
@@ -123,7 +122,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
 }
 
 pub(super) fn render_device_code_login(
-    widget: &AuthModeWidget,
+    _widget: &AuthModeWidget,
     area: Rect,
     buf: &mut Buffer,
     state: &ContinueWithDeviceCodeState,
@@ -135,15 +134,7 @@ pub(super) fn render_device_code_login(
     };
 
     let mut spans = vec!["  ".into()];
-    if widget.animations_enabled {
-        // Schedule a follow-up frame to keep the shimmer animation going.
-        widget
-            .request_frame
-            .schedule_frame_in(std::time::Duration::from_millis(100));
-        spans.extend(shimmer_spans(banner));
-    } else {
-        spans.push(banner.into());
-    }
+    spans.push(banner.into());
 
     let mut lines = vec![spans.into(), "".into()];
 

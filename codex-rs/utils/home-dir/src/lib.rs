@@ -42,13 +42,17 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Pat
             if !metadata.is_dir() {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("CODEX_HOME/CODEX_INFINITY_HOME points to {val:?}, but that path is not a directory"),
+                    format!(
+                        "CODEX_HOME/CODEX_INFINITY_HOME points to {val:?}, but that path is not a directory"
+                    ),
                 ))
             } else {
                 path.canonicalize().map_err(|err| {
                     std::io::Error::new(
                         err.kind(),
-                        format!("failed to canonicalize CODEX_HOME/CODEX_INFINITY_HOME {val:?}: {err}"),
+                        format!(
+                            "failed to canonicalize CODEX_HOME/CODEX_INFINITY_HOME {val:?}: {err}"
+                        ),
                     )
                 })
             }
@@ -206,7 +210,10 @@ mod tests {
         super::auto_migrate(&legacy, &new).unwrap();
 
         assert!(new.join("config.toml").is_file());
-        assert_eq!(fs::read_to_string(new.join("config.toml")).unwrap(), "test = true");
+        assert_eq!(
+            fs::read_to_string(new.join("config.toml")).unwrap(),
+            "test = true"
+        );
 
         #[cfg(unix)]
         {

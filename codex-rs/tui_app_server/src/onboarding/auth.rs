@@ -40,7 +40,6 @@ use uuid::Uuid;
 use crate::LoginStatus;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
-use crate::shimmer::shimmer_spans;
 use crate::tui::FrameRequester;
 
 /// Marks buffer cells that have cyan+underlined style as an OSC 8 hyperlink.
@@ -187,7 +186,6 @@ pub(crate) struct AuthModeWidget {
     pub app_server_request_handle: AppServerRequestHandle,
     pub forced_chatgpt_workspace_id: Option<String>,
     pub forced_login_method: Option<ForcedLoginMethod>,
-    pub animations_enabled: bool,
 }
 
 impl AuthModeWidget {
@@ -415,14 +413,7 @@ impl AuthModeWidget {
 
     fn render_continue_in_browser(&self, area: Rect, buf: &mut Buffer) {
         let mut spans = vec!["  ".into()];
-        if self.animations_enabled {
-            // Schedule a follow-up frame to keep the shimmer animation going.
-            self.request_frame
-                .schedule_frame_in(std::time::Duration::from_millis(100));
-            spans.extend(shimmer_spans("Finish signing in via your browser"));
-        } else {
-            spans.push("Finish signing in via your browser".into());
-        }
+        spans.push("Finish signing in via your browser".into());
         let mut lines = vec![spans.into(), "".into()];
 
         let sign_in_state = self.sign_in_state.read().unwrap();
@@ -949,7 +940,6 @@ mod tests {
             app_server_request_handle: AppServerRequestHandle::InProcess(client.request_handle()),
             forced_chatgpt_workspace_id: None,
             forced_login_method: Some(ForcedLoginMethod::Chatgpt),
-            animations_enabled: true,
         };
         (widget, codex_home)
     }

@@ -6,9 +6,6 @@
 use super::*;
 
 pub(super) const DEFAULT_TERMINAL_TITLE_ITEMS: [&str; 2] = ["spinner", "project"];
-pub(super) const TERMINAL_TITLE_SPINNER_FRAMES: [&str; 10] =
-    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-pub(super) const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Compact runtime states that can be rendered into the terminal title.
@@ -200,10 +197,7 @@ impl ChatWidget {
         let should_animate_spinner =
             self.should_animate_terminal_title_spinner_with_selections(selections);
         if self.last_terminal_title == title {
-            if should_animate_spinner {
-                self.frame_requester
-                    .schedule_frame_in(TERMINAL_TITLE_SPINNER_INTERVAL);
-            }
+            let _ = should_animate_spinner;
             return;
         }
         match title {
@@ -225,11 +219,6 @@ impl ChatWidget {
                     tracing::debug!(error = %err, "failed to clear terminal title");
                 }
             }
-        }
-
-        if should_animate_spinner {
-            self.frame_requester
-                .schedule_frame_in(TERMINAL_TITLE_SPINNER_INTERVAL);
         }
     }
 
@@ -585,53 +574,19 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn terminal_title_spinner_text_at(&self, now: Instant) -> Option<String> {
-        if !self.config.animations {
-            return None;
-        }
-
-        if !self.terminal_title_has_active_progress() {
-            return None;
-        }
-
-        Some(self.terminal_title_spinner_frame_at(now).to_string())
-    }
-
-    fn terminal_title_spinner_frame_at(&self, now: Instant) -> &'static str {
-        let elapsed = now.saturating_duration_since(self.terminal_title_animation_origin);
-        let frame_index =
-            (elapsed.as_millis() / TERMINAL_TITLE_SPINNER_INTERVAL.as_millis()) as usize;
-        TERMINAL_TITLE_SPINNER_FRAMES[frame_index % TERMINAL_TITLE_SPINNER_FRAMES.len()]
-    }
-
-    fn terminal_title_uses_spinner(&self) -> bool {
-        self.config
-            .tui_terminal_title
-            .as_ref()
-            .is_none_or(|items| items.iter().any(|item| item == "spinner"))
-    }
-
-    fn terminal_title_has_active_progress(&self) -> bool {
-        self.mcp_startup_status.is_some()
-            || self.bottom_pane.is_task_running()
-            || self.terminal_title_status_kind == TerminalTitleStatusKind::Undoing
+    pub(super) fn terminal_title_spinner_text_at(&self, _now: Instant) -> Option<String> {
+        None
     }
 
     pub(super) fn should_animate_terminal_title_spinner(&self) -> bool {
-        self.config.animations
-            && self.terminal_title_uses_spinner()
-            && self.terminal_title_has_active_progress()
+        false
     }
 
     fn should_animate_terminal_title_spinner_with_selections(
         &self,
-        selections: &StatusSurfaceSelections,
+        _selections: &StatusSurfaceSelections,
     ) -> bool {
-        self.config.animations
-            && selections
-                .terminal_title_items
-                .contains(&TerminalTitleItem::Spinner)
-            && self.terminal_title_has_active_progress()
+        false
     }
 
     /// Formats the last `update_plan` progress snapshot for terminal-title display.

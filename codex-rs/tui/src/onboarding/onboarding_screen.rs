@@ -109,7 +109,6 @@ impl OnboardingScreen {
                 auth_manager,
                 forced_chatgpt_workspace_id,
                 forced_login_method,
-                animations_enabled: config.animations,
             }))
         }
         #[cfg(target_os = "windows")]

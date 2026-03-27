@@ -32,11 +32,11 @@ use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
-use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
@@ -653,7 +653,7 @@ async fn run_ratatui_app(
     let mut trust_decision_was_made = false;
     if initial_config.active_project.trust_level.is_none() {
         let target = resolve_root_git_project_for_trust(&initial_config.cwd)
-            .unwrap_or_else(|| initial_config.cwd.clone());
+            .unwrap_or_else(|| initial_config.cwd.clone().to_path_buf());
         match set_project_trust_level(&initial_config.codex_home, &target, TrustLevel::Trusted) {
             Ok(()) => {
                 trust_decision_was_made = true;
@@ -1012,7 +1012,7 @@ async fn run_ratatui_app(
     };
     if config.active_project.trust_level.is_none() {
         let target =
-            resolve_root_git_project_for_trust(&config.cwd).unwrap_or_else(|| config.cwd.clone());
+            resolve_root_git_project_for_trust(&config.cwd).unwrap_or_else(|| config.cwd.clone().to_path_buf());
         match set_project_trust_level(&config.codex_home, &target, TrustLevel::Trusted) {
             Ok(()) => {
                 trust_decision_was_made = true;

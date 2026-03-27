@@ -29,8 +29,7 @@ use super::popup_consts::standard_popup_hint_line;
 use super::textarea::TextArea;
 use super::textarea::TextAreaState;
 
-const BASE_CLI_BUG_ISSUE_URL: &str =
-    "https://github.com/lee101/codex-infinity/issues/new";
+const BASE_CLI_BUG_ISSUE_URL: &str = "https://github.com/lee101/codex-infinity/issues/new";
 /// Internal routing link for employee feedback follow-ups. This must not be shown to external users.
 const CODEX_FEEDBACK_INTERNAL_URL: &str = "http://go/codex-feedback-internal";
 

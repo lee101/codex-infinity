@@ -521,7 +521,9 @@ impl HistoryCell for UpdateAvailableHistoryCell {
         } else {
             line![
                 "See ",
-                "https://github.com/lee101/codex-infinity".cyan().underlined(),
+                "https://github.com/lee101/codex-infinity"
+                    .cyan()
+                    .underlined(),
                 " for installation options."
             ]
         };

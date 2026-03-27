@@ -2856,7 +2856,7 @@ impl App {
                         .await?
                         {
                             crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
-                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone().to_path_buf(),
                             crate::ResolveCwdOutcome::Exit => {
                                 return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                             }
@@ -3033,7 +3033,7 @@ impl App {
                         .await?
                         {
                             crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
-                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone().to_path_buf(),
                             crate::ResolveCwdOutcome::Exit => {
                                 return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                             }
@@ -3076,7 +3076,7 @@ impl App {
                                 self.shutdown_current_thread().await;
                                 self.config = fork_config;
                                 tui.set_notification_method(self.config.tui_notification_method);
-                                self.file_search.update_search_dir(self.config.cwd.clone());
+                                self.file_search.update_search_dir(self.config.cwd.clone().to_path_buf());
                                 let init = self.chatwidget_init_for_forked_or_resumed_thread(
                                     tui,
                                     self.config.clone(),

@@ -25,7 +25,6 @@ use crate::exec_cell::spinner;
 use crate::key_hint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
-use crate::shimmer::shimmer_spans;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
 use crate::wrapping::RtOptions;
@@ -33,6 +32,7 @@ use crate::wrapping::word_wrap_lines;
 
 pub(crate) const STATUS_DETAILS_DEFAULT_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
+const STATUS_ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusDetailsCapitalization {
@@ -55,7 +55,6 @@ pub(crate) struct StatusIndicatorWidget {
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
-    animations_enabled: bool,
 }
 
 // Format elapsed seconds into a compact human-friendly form used by the status line.
@@ -79,7 +78,7 @@ impl StatusIndicatorWidget {
     pub(crate) fn new(
         app_event_tx: AppEventSender,
         frame_requester: FrameRequester,
-        animations_enabled: bool,
+        _animations_enabled: bool,
     ) -> Self {
         Self {
             header: String::from("Working"),
@@ -93,7 +92,6 @@ impl StatusIndicatorWidget {
 
             app_event_tx,
             frame_requester,
-            animations_enabled,
         }
     }
 
@@ -192,6 +190,11 @@ impl StatusIndicatorWidget {
         self.elapsed_duration_at(now).as_secs()
     }
 
+    fn displayed_elapsed_seconds_at(&self, now: Instant) -> u64 {
+        let elapsed_seconds = self.elapsed_seconds_at(now);
+        elapsed_seconds - elapsed_seconds % STATUS_ELAPSED_REFRESH_INTERVAL.as_secs()
+    }
+
     pub fn elapsed_seconds(&self) -> u64 {
         self.elapsed_seconds_at(Instant::now())
     }
@@ -239,21 +242,27 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        if self.animations_enabled {
-            // Schedule next animation frame.
+        if !self.is_paused {
+            let elapsed_duration = self.elapsed_duration_at(Instant::now());
+            let elapsed_millis = elapsed_duration.as_millis();
+            let refresh_millis = STATUS_ELAPSED_REFRESH_INTERVAL.as_millis();
+            let remainder_millis = elapsed_millis % refresh_millis;
+            let delay_millis = if remainder_millis == 0 {
+                refresh_millis
+            } else {
+                refresh_millis - remainder_millis
+            };
+            let delay_millis_u64 = u64::try_from(delay_millis).unwrap_or(u64::MAX);
             self.frame_requester
-                .schedule_frame_in(Duration::from_millis(32));
+                .schedule_frame_in(Duration::from_millis(delay_millis_u64));
         }
         let now = Instant::now();
-        let elapsed_duration = self.elapsed_duration_at(now);
-        let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
+        let pretty_elapsed = fmt_elapsed_compact(self.displayed_elapsed_seconds_at(now));
 
         let mut spans = Vec::with_capacity(5);
-        spans.push(spinner(Some(self.last_resume_at), self.animations_enabled));
+        spans.push(spinner(Some(self.last_resume_at), false));
         spans.push(" ".into());
-        if self.animations_enabled {
-            spans.extend(shimmer_spans(&self.header));
-        } else if !self.header.is_empty() {
+        if !self.header.is_empty() {
             spans.push(self.header.clone().into());
         }
         spans.push(" ".into());
@@ -389,6 +398,31 @@ mod tests {
         widget.resume_timer_at(baseline + Duration::from_secs(10));
         let after_resume = widget.elapsed_seconds_at(baseline + Duration::from_secs(13));
         assert_eq!(after_resume, before_pause + 3);
+    }
+
+    #[test]
+    fn displayed_elapsed_rounds_down_to_ten_seconds() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget =
+            StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
+
+        let baseline = Instant::now();
+        widget.last_resume_at = baseline;
+
+        assert_eq!(widget.displayed_elapsed_seconds_at(baseline), 0);
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(9)),
+            0
+        );
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(10)),
+            10
+        );
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(19)),
+            10
+        );
     }
 
     #[test]
