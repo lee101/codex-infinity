@@ -148,8 +148,6 @@ impl SlashCommand {
             | SlashCommand::Model
             | SlashCommand::Fast
             | SlashCommand::Personality
-            | SlashCommand::Approvals
-            | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
@@ -180,6 +178,7 @@ impl SlashCommand {
             SlashCommand::Settings => true,
             SlashCommand::Collab => true,
             SlashCommand::Agent | SlashCommand::MultiAgents => true,
+            SlashCommand::Approvals | SlashCommand::Permissions => true,
             SlashCommand::Statusline => false,
             SlashCommand::Theme => false,
             SlashCommand::Title => false,

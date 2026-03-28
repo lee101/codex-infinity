@@ -1,6 +1,6 @@
 ---
-source: tui/src/status/tests.rs
-assertion_line: 704
+source: tui_app_server/src/status/tests.rs
+assertion_line: 891
 expression: sanitized
 ---
 /status
@@ -16,7 +16,9 @@ expression: sanitized
 │  Permissions:      Custom (read-only, on-request)                     │
 │  Agents.md:        <none>                                             │
 │                                                                       │
-│  Token usage:      750 total  (500 input + 250 output)                │
-│  Context window:   100% left (750 used / 272K)                        │
-│  Limits:           data not available yet                             │
+│  Token usage:      1.9K total  (1K input + 900 output)                │
+│  Context window:   100% left (2.25K used / 272K)                      │
+│  5h limit:         [██████░░░░░░░░░░░░░░] 28% left (resets 03:14)     │
+│  Weekly limit:     [████████████░░░░░░░░] 60% left (resets 03:34)     │
+│  Warning:          limits may be stale - start new turn to refresh.   │
 ╰───────────────────────────────────────────────────────────────────────╯

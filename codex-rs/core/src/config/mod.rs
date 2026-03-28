@@ -211,6 +211,8 @@ pub struct Permissions {
     pub windows_sandbox_mode: Option<WindowsSandboxModeToml>,
     /// Whether the final Windows sandboxed child should run on a private desktop.
     pub windows_sandbox_private_desktop: bool,
+    /// When true, disable command timeouts for shell/exec tools (yolo2+).
+    pub disable_command_timeouts: bool,
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -1816,6 +1818,8 @@ pub struct ConfigOverrides {
     pub ephemeral: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
+    /// When true, disable command timeouts for shell/exec tools (yolo2+).
+    pub disable_command_timeouts: bool,
 }
 
 fn validate_reserved_model_provider_ids(
@@ -2033,6 +2037,7 @@ impl Config {
             tools_web_search_request: override_tools_web_search_request,
             ephemeral,
             additional_writable_roots,
+            disable_command_timeouts,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -2582,6 +2587,7 @@ impl Config {
                 shell_environment_policy,
                 windows_sandbox_mode,
                 windows_sandbox_private_desktop,
+                disable_command_timeouts: overrides.disable_command_timeouts,
             },
             approvals_reviewer,
             enforce_residency: enforce_residency.value,

@@ -1,6 +1,6 @@
 ---
-source: tui/src/chatwidget/tests.rs
-assertion_line: 8725
+source: tui_app_server/src/chatwidget/tests.rs
+assertion_line: 9276
 expression: popup
 ---
   Select Model and Effort

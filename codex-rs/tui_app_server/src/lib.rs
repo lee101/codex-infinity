@@ -636,12 +636,17 @@ pub async fn run_main(
             auth_token: remote_auth_token.clone(),
         })
         .unwrap_or(AppServerTarget::Embedded);
+    let effective_yolo = cli.dangerously_bypass_approvals_and_sandbox
+        || cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
             Some(AskForApproval::OnRequest),
         )
-    } else if cli.dangerously_bypass_approvals_and_sandbox {
+    } else if effective_yolo {
         (
             Some(SandboxMode::DangerFullAccess),
             Some(AskForApproval::Never),
@@ -652,6 +657,25 @@ pub async fn run_main(
             cli.approval_policy.map(Into::into),
         )
     };
+
+    let effective_disable_timeouts = cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+    let effective_disable_env_wrapping =
+        cli.dangerously_disable_environment_wrapping || cli.dangerously_passthrough_stdio;
+
+    if effective_disable_env_wrapping {
+        for ov in [
+            "shell_environment_policy.inherit=\"all\"",
+            "shell_environment_policy.ignore_default_excludes=true",
+            "shell_environment_policy.experimental_use_profile=true",
+            "allow_login_shell=true",
+        ] {
+            cli.config_overrides
+                .raw_overrides
+                .push(ov.to_string());
+        }
+    }
 
     // Map the legacy --search flag to the canonical web_search mode.
     if cli.web_search {
@@ -785,6 +809,7 @@ pub async fn run_main(
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
+        disable_command_timeouts: effective_disable_timeouts,
         ..Default::default()
     };
 

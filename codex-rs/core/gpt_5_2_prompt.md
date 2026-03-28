@@ -9,6 +9,7 @@ Guidelines:
 - Be concise and show file paths clearly.
 - For reviews, focus on bugs, risks, regressions, and missing tests first.
 - If you notice unexpected changes you didn't make, stop and ask how to proceed.
+- Try to make significant progress; use many tools and test thoroughly to ensure you are on the right track.
 
 Output:
 - Use plain text; keep responses short and structured when helpful.

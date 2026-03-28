@@ -1,23 +1,22 @@
 ---
 source: tui/src/status/tests.rs
-assertion_line: 829
+assertion_line: 830
 expression: sanitized
 ---
 /status
 
-╭──────────────────────────────────────────────────────────────────────────────╮
-│  >_ OpenAI Codex (v0.56.0)                                                   │
-│                                                                              │
-│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                │
-│ information on rate limits and credits                                       │
-│                                                                              │
-│  Model:            gpt-5.1-codex-max (reasoning none, summaries auto)        │
-│  Model provider:   Google Gemini (via OpenRouter) - https://openrouter.ai/ap │
-│  Directory: [[workspace]]                                                    │
-│  Permissions:      Custom (read-only, on-request)                            │
-│  Agents.md:        <none>                                                    │
-│                                                                              │
-│  Token usage:      750 total  (500 input + 250 output)                       │
-│  Context window:   100% left (750 used / 272K)                               │
-│  Limits:           data not available yet                                    │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────╮
+│  >_ ∞ Codex Infinity (v1.0.0)                                         │
+│                                                                       │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date         │
+│ information on rate limits and credits                                │
+│                                                                       │
+│  Model:            gpt-5.1-codex-max (reasoning none, summaries auto) │
+│  Directory: [[workspace]]                                             │
+│  Permissions:      Custom (read-only, on-request)                     │
+│  Agents.md:        <none>                                             │
+│                                                                       │
+│  Token usage:      750 total  (500 input + 250 output)                │
+│  Context window:   100% left (750 used / 272K)                        │
+│  Limits:           data not available yet                             │
+╰───────────────────────────────────────────────────────────────────────╯

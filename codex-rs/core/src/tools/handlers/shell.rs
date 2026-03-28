@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crate::codex::TurnContext;
 use crate::exec::ExecCapturePolicy;
+use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
+use tokio_util::sync::CancellationToken;
 use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
@@ -94,10 +96,15 @@ impl ShellHandler {
         turn_context: &TurnContext,
         thread_id: ThreadId,
     ) -> ExecParams {
+        let expiration = if turn_context.config.permissions.disable_command_timeouts {
+            ExecExpiration::Cancellation(CancellationToken::new())
+        } else {
+            params.timeout_ms.into()
+        };
         ExecParams {
             command: params.command.clone(),
             cwd: turn_context.resolve_path(params.workdir.clone()),
-            expiration: params.timeout_ms.into(),
+            expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
             env: create_env(&turn_context.shell_environment_policy, Some(thread_id)),
             network: turn_context.network.clone(),
@@ -149,10 +156,15 @@ impl ShellCommandHandler {
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
         let command = Self::base_command(shell.as_ref(), &params.command, use_login_shell);
 
+        let expiration = if turn_context.config.permissions.disable_command_timeouts {
+            ExecExpiration::Cancellation(CancellationToken::new())
+        } else {
+            params.timeout_ms.into()
+        };
         Ok(ExecParams {
             command,
             cwd: turn_context.resolve_path(params.workdir.clone()),
-            expiration: params.timeout_ms.into(),
+            expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
             env: create_env(&turn_context.shell_environment_policy, Some(thread_id)),
             network: turn_context.network.clone(),

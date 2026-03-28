@@ -4390,6 +4390,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
                 windows_sandbox_mode: None,
                 windows_sandbox_private_desktop: true,
+                disable_command_timeouts: false,
             },
             approvals_reviewer: ApprovalsReviewer::User,
             enforce_residency: Constrained::allow_any(None),

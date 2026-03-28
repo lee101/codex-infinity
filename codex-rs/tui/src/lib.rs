@@ -297,6 +297,28 @@ pub async fn run_main(
         )
     };
 
+    // yolo2+ disables command timeouts.
+    let effective_disable_timeouts = cli.dangerously_disable_timeouts
+        || cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+
+    // yolo3+ forces full env passthrough and login shell for aliases.
+    let effective_disable_env_wrapping = cli.dangerously_disable_environment_wrapping
+        || cli.dangerously_passthrough_stdio;
+
+    if effective_disable_env_wrapping {
+        for ov in [
+            "shell_environment_policy.inherit=\"all\"",
+            "shell_environment_policy.ignore_default_excludes=true",
+            "shell_environment_policy.experimental_use_profile=true",
+            "allow_login_shell=true",
+        ] {
+            cli.config_overrides
+                .raw_overrides
+                .push(ov.to_string());
+        }
+    }
+
     // Map the legacy --search flag to the canonical web_search mode.
     if cli.web_search {
         cli.config_overrides
@@ -433,6 +455,7 @@ pub async fn run_main(
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
+        disable_command_timeouts: effective_disable_timeouts,
         ..Default::default()
     };
 

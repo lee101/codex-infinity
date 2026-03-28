@@ -176,6 +176,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         config_profile,
         full_auto,
         dangerously_bypass_approvals_and_sandbox,
+        dangerously_disable_timeouts,
+        dangerously_disable_environment_wrapping,
+        dangerously_passthrough_stdio,
         cwd,
         skip_git_repo_check,
         add_dir,
@@ -186,9 +189,30 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         sandbox_mode: sandbox_mode_cli_arg,
         prompt,
         output_schema: output_schema_path,
-        config_overrides,
+        mut config_overrides,
         ..
     } = cli;
+
+    let effective_yolo = dangerously_bypass_approvals_and_sandbox
+        || dangerously_disable_timeouts
+        || dangerously_disable_environment_wrapping
+        || dangerously_passthrough_stdio;
+    let effective_disable_timeouts = dangerously_disable_timeouts
+        || dangerously_disable_environment_wrapping
+        || dangerously_passthrough_stdio;
+    let effective_disable_env_wrapping =
+        dangerously_disable_environment_wrapping || dangerously_passthrough_stdio;
+
+    if effective_disable_env_wrapping {
+        for ov in [
+            "shell_environment_policy.inherit=\"all\"",
+            "shell_environment_policy.ignore_default_excludes=true",
+            "shell_environment_policy.experimental_use_profile=true",
+            "allow_login_shell=true",
+        ] {
+            config_overrides.raw_overrides.push(ov.to_string());
+        }
+    }
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -213,7 +237,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     let sandbox_mode = if full_auto {
         Some(SandboxMode::WorkspaceWrite)
-    } else if dangerously_bypass_approvals_and_sandbox {
+    } else if effective_yolo {
         Some(SandboxMode::DangerFullAccess)
     } else {
         sandbox_mode_cli_arg.map(Into::<SandboxMode>::into)
@@ -343,6 +367,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         additional_writable_roots: add_dir,
+        disable_command_timeouts: effective_disable_timeouts,
     };
 
     let config = ConfigBuilder::default()

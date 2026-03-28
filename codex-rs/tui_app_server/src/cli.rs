@@ -90,6 +90,30 @@ pub struct Cli {
     )]
     pub dangerously_bypass_approvals_and_sandbox: bool,
 
+    /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
+    #[arg(
+        long = "yolo2",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_disable_timeouts: bool,
+
+    /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
+    #[arg(
+        long = "yolo3",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_disable_environment_wrapping: bool,
+
+    /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
+    #[arg(
+        long = "yolo4",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    pub dangerously_passthrough_stdio: bool,
+
     /// Tell the agent to use the specified directory as its working root.
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     pub cwd: Option<PathBuf>,

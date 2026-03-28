@@ -1292,6 +1292,9 @@ fn into_app_server_tui_cli(cli: TuiCli) -> codex_tui_app_server::Cli {
         approval_policy: cli.approval_policy,
         full_auto: cli.full_auto,
         dangerously_bypass_approvals_and_sandbox: cli.dangerously_bypass_approvals_and_sandbox,
+        dangerously_disable_timeouts: cli.dangerously_disable_timeouts,
+        dangerously_disable_environment_wrapping: cli.dangerously_disable_environment_wrapping,
+        dangerously_passthrough_stdio: cli.dangerously_passthrough_stdio,
         cwd: cli.cwd,
         web_search: cli.web_search,
         add_dir: cli.add_dir,
@@ -1421,6 +1424,12 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if subcommand_cli.dangerously_disable_timeouts {
         interactive.dangerously_disable_timeouts = true;
+    }
+    if subcommand_cli.dangerously_disable_environment_wrapping {
+        interactive.dangerously_disable_environment_wrapping = true;
+    }
+    if subcommand_cli.dangerously_passthrough_stdio {
+        interactive.dangerously_passthrough_stdio = true;
     }
     if let Some(cwd) = subcommand_cli.cwd {
         interactive.cwd = Some(cwd);
