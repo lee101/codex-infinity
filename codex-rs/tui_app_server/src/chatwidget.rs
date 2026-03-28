@@ -449,6 +449,38 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
 }
 
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
+
+const AUTO_NEXT_STEPS_PROMPTS: &[&str] = &[
+    "Continue: you're the owner of this project. What are the natural next steps from what was just done? Do whatever you think matters most -- could be implementation, testing, cleanup, anything. Take initiative.",
+    "Continue: step back and look at what just happened. As the project owner, what would you do next? Maybe there's follow-up work, maybe something needs testing, maybe something else entirely catches your eye. Your call.",
+    "Continue: you have full ownership here. Review the recent work and decide what needs attention next -- could be edge cases, could be new functionality, could be a code review pass. Whatever you'd do if this were your project.",
+    "Continue: think like the maintainer of this project. What's the most valuable thing to do right now given what was just completed? Trust your judgment -- implement whatever you think is right and verify it works.",
+    "Continue: look at the current state of things with fresh eyes. What stands out as the next thing to tackle? You have the freedom to go in whatever direction makes sense -- build, fix, test, refactor, your call.",
+    "Continue: as project owner, assess where things stand after the last round. What would you prioritize next? Don't just follow a checklist -- think about what actually matters and do that.",
+    "Continue: take stock of what's been done and what's ahead. You own this -- pick the next move that creates the most value, whether that's hardening what exists, building something new, or something else entirely.",
+];
+
+const AUTO_NEXT_IDEA_PROMPTS: &[&str] = &[
+    "Continue: you own this project. Come up with the next improvement you'd make if you were sitting down to work on it. Could be anything -- a feature, a fix, a refactor, better tests. Whatever you think has the most impact. Go for it.",
+    "Continue: explore the codebase and see what jumps out at you. Maybe there are TODOs, FIXMEs, or rough spots that deserve attention. Maybe you spot something else entirely. Trust your instincts as project owner and act on what you find.",
+    "Continue: think about this project's performance. Are there bottlenecks, inefficiencies, or things that could be faster? If something stands out, optimize it. If not, whatever else catches your eye is fair game too.",
+    "Continue: put on your code reviewer hat. Read through the codebase looking for things you'd flag -- error handling gaps, unclear logic, potential bugs. Pick the most important thing you find and fix it.",
+    "Continue: think about test coverage. Are there important paths that aren't well tested? Or maybe the existing tests could be stronger? If testing is in good shape, go wherever else your instincts lead you.",
+    "Continue: consider the user experience of this project. What would make it nicer to use, easier to understand, or more delightful? Could be UX, DX, CLI ergonomics, anything user-facing. Or if something else feels more important, do that.",
+    "Continue: look for opportunities to simplify. Duplicated code, overly complex patterns, things that could be cleaner. But don't force it -- if the code is already clean, find something else that would benefit from your attention.",
+    "Continue: think about what would surprise and delight someone using this project. A nice polish, a clever feature, a thoughtful default. Or maybe there's something more fundamental that needs doing. You're the owner -- your call.",
+    "Continue: examine how this project handles failure cases. Network errors, bad input, resource exhaustion, unexpected state. If you find fragility, harden it. If it's solid, take your energy wherever it's most needed.",
+    "Continue: look at the project's interfaces and APIs. Are they consistent, intuitive, well-designed? If something could be better, improve it. Or if a completely different area calls to you, go there instead.",
+];
+
+const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
+    "PAUSE -- third-person review checkpoint. Step back from the work you've been doing and assess it as if you're a senior engineer reviewing someone else's work:\n\n1. Run `git diff` to see all uncommitted changes. Read through them critically.\n2. Run the project's test suite. If tests fail, fix them before doing anything else.\n3. Look at the diff from a third-person perspective: is the code correct? Are there untested paths? Any regressions introduced? Repeated patterns that should be extracted?\n4. If you've been making changes without running tests, run them now.\n5. Fix any issues you find before continuing to new work.\n\nBe honest -- if the recent work has quality problems, address them. If tests are missing for new code, write them. Only continue to new work after you're confident the codebase is in good shape.",
+    "PAUSE -- quality gate. Before continuing, do a self-review:\n\n1. Run `git diff --stat` to see what files changed and how much.\n2. Run tests. If any fail, that's your top priority.\n3. Review your recent changes as a code reviewer would: are there bugs? Missing error handling? Untested code paths? Code that doesn't match the project's conventions?\n4. Check if you've been repeating similar work or going in circles. If so, step back and reconsider your approach.\n5. If you wrote new functions or modules without tests, write tests now.\n\nDo not skip this review. Fix everything you find before moving on.",
+    "PAUSE -- testing and integration check. As a QA engineer looking at recent changes:\n\n1. Run the full test suite. Note any failures.\n2. Look at `git diff` -- for every new function or changed behavior, ask: is this tested? If not, add a test.\n3. Check for regressions: did any changes break existing functionality?\n4. Look for code you've written that duplicates existing utilities or patterns in the codebase.\n5. Verify any new code integrates properly with the rest of the system.\n\nFix all issues found. Quality comes before quantity -- untested code is a liability.",
+    "PAUSE -- architecture review. Take a high-level look at everything done so far:\n\n1. Run `git log --oneline` and `git diff --stat` to see the full picture of changes.\n2. Are the changes cohesive or scattered? If scattered, consider whether you're drifting from the main goal.\n3. Run tests. Fix failures.\n4. Look for: dead code introduced, imports added but not used, TODO comments left behind, debug prints left in.\n5. Check if your changes would make sense to another developer reading the code for the first time.\n\nClean up anything that doesn't meet a professional standard before continuing.",
+];
+
+const REVIEW_INTERVAL: usize = 3;
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 
@@ -560,6 +592,8 @@ pub(crate) struct ChatWidgetInit {
     // Shared latch so we only warn once about invalid terminal-title item IDs.
     pub(crate) terminal_title_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) session_telemetry: SessionTelemetry,
+    pub(crate) auto_next_steps: bool,
+    pub(crate) auto_next_idea: bool,
 }
 
 #[derive(Default)]
@@ -939,6 +973,9 @@ pub(crate) struct ChatWidget {
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
     last_non_retry_error: Option<(String, String)>,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
+    auto_next_counter: usize,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -2370,6 +2407,10 @@ impl ChatWidget {
         if !from_replay {
             self.saw_plan_item_this_turn = false;
         }
+        // If auto-next is enabled, queue the next prompt.
+        if !from_replay {
+            self.maybe_auto_next();
+        }
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
@@ -2405,6 +2446,26 @@ impl ChatWidget {
         }
 
         self.open_plan_implementation_prompt();
+    }
+
+    fn maybe_auto_next(&mut self) {
+        if !self.auto_next_steps && !self.auto_next_idea {
+            return;
+        }
+        let is_review_turn = self.auto_next_counter > 0
+            && self.auto_next_counter % REVIEW_INTERVAL == 0;
+        let prompt = if is_review_turn {
+            let review_idx = (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
+            AUTO_NEXT_REVIEW_PROMPTS[review_idx].to_string()
+        } else if self.auto_next_idea {
+            let idx = self.auto_next_counter % AUTO_NEXT_IDEA_PROMPTS.len();
+            AUTO_NEXT_IDEA_PROMPTS[idx].to_string()
+        } else {
+            let idx = self.auto_next_counter % AUTO_NEXT_STEPS_PROMPTS.len();
+            AUTO_NEXT_STEPS_PROMPTS[idx].to_string()
+        };
+        self.auto_next_counter += 1;
+        self.queued_user_messages.push_back(UserMessage::from(prompt));
     }
 
     fn open_plan_implementation_prompt(&mut self) {
@@ -4471,6 +4532,8 @@ impl ChatWidget {
             status_line_invalid_items_warned,
             terminal_title_invalid_items_warned,
             session_telemetry,
+            auto_next_steps,
+            auto_next_idea,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
@@ -4615,6 +4678,9 @@ impl ChatWidget {
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
             last_non_retry_error: None,
+            auto_next_steps,
+            auto_next_idea,
+            auto_next_counter: 0,
         };
 
         widget.bottom_pane.set_voice_transcription_enabled(

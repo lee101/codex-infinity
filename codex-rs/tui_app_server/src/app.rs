@@ -967,6 +967,8 @@ pub(crate) struct App {
     feedback_audience: FeedbackAudience,
     remote_app_server_url: Option<String>,
     remote_app_server_auth_token: Option<String>,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -1062,6 +1064,8 @@ impl App {
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: self.terminal_title_invalid_items_warned.clone(),
             session_telemetry: self.session_telemetry.clone(),
+            auto_next_steps: self.auto_next_steps,
+            auto_next_idea: self.auto_next_idea,
         }
     }
 
@@ -3187,6 +3191,8 @@ impl App {
         should_prompt_windows_sandbox_nux_at_startup: bool,
         remote_app_server_url: Option<String>,
         remote_app_server_auth_token: Option<String>,
+        auto_next_steps: bool,
+        auto_next_idea: bool,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -3291,6 +3297,8 @@ impl App {
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 (ChatWidget::new_with_app_event(init), Some(started))
             }
@@ -3326,6 +3334,8 @@ impl App {
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 (ChatWidget::new_with_app_event(init), Some(resumed))
             }
@@ -3366,6 +3376,8 @@ impl App {
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
+                    auto_next_steps,
+                    auto_next_idea,
                 };
                 (ChatWidget::new_with_app_event(init), Some(forked))
             }
@@ -3407,6 +3419,8 @@ impl App {
             feedback_audience,
             remote_app_server_url,
             remote_app_server_auth_token,
+            auto_next_steps,
+            auto_next_idea,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),

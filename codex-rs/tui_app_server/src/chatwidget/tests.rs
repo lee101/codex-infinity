@@ -2015,6 +2015,8 @@ async fn helpers_are_available_and_do_not_panic() {
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
     let mut w = ChatWidget::new_with_app_event(init);
     // Basic construction sanity.
@@ -6953,6 +6955,8 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new_with_app_event(init);
@@ -6998,6 +7002,8 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         session_telemetry,
+        auto_next_steps: false,
+        auto_next_idea: false,
     };
 
     let chat = ChatWidget::new_with_app_event(init);

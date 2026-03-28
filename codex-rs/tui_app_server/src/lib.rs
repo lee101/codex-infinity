@@ -1417,6 +1417,8 @@ async fn run_ratatui_app(
         prompt,
         images,
         no_alt_screen,
+        auto_next_steps,
+        auto_next_idea,
         ..
     } = cli;
 
@@ -1456,6 +1458,8 @@ async fn run_ratatui_app(
         should_prompt_windows_sandbox_nux_at_startup,
         remote_url,
         remote_auth_token,
+        auto_next_steps,
+        auto_next_idea,
     )
     .await;
 
