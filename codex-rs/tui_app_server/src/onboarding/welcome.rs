@@ -83,8 +83,12 @@ mod tests {
 
     #[test]
     fn welcome_renders_animation_on_first_draw() {
-        let widget = WelcomeWidget::new(false, FrameRequester::test_dummy(), true);
-        let area = Rect::new(0, 0, 60, 37);
+        let widget = WelcomeWidget::new(
+            /*is_logged_in*/ false,
+            FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+        let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT);
         let mut buf = Buffer::empty(area);
         (&widget).render(area, &mut buf);
 
@@ -94,8 +98,12 @@ mod tests {
 
     #[test]
     fn welcome_skips_animation_below_height_breakpoint() {
-        let widget = WelcomeWidget::new(false, FrameRequester::test_dummy(), true);
-        let area = Rect::new(0, 0, 60, 36);
+        let widget = WelcomeWidget::new(
+            /*is_logged_in*/ false,
+            FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+        let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT - 1);
         let mut buf = Buffer::empty(area);
         (&widget).render(area, &mut buf);
 
@@ -105,7 +113,16 @@ mod tests {
 
     #[test]
     fn ctrl_dot_changes_animation_variant() {
-        let mut widget = WelcomeWidget::new(false, FrameRequester::test_dummy(), true);
+        let mut widget = WelcomeWidget {
+            is_logged_in: false,
+            animation: AsciiAnimation::with_variants(
+                FrameRequester::test_dummy(),
+                &VARIANTS,
+                /*variant_idx*/ 0,
+            ),
+            animations_enabled: true,
+            layout_area: Cell::new(None),
+        };
 
         widget.handle_key_event(KeyEvent::new(
             crossterm::event::KeyCode::Char('.'),

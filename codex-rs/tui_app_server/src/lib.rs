@@ -523,7 +523,10 @@ async fn lookup_session_target_by_name_with_app_server(
                 source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
                 archived: Some(false),
                 cwd: None,
-                search_term: Some(name.to_string()),
+                // Thread names are hydrated after `thread/list` resolves rollout metadata, so
+                // name-based resume must scan the filtered list client-side instead of relying on
+                // the backend search index.
+                search_term: None,
             })
             .await?;
         if let Some(thread) = response
@@ -551,7 +554,7 @@ async fn lookup_session_target_with_app_server(
                 warn!(
                     session = id_or_name,
                     %err,
-                    "Failed to parse session id during app-server TUI lookup"
+                    "Failed to parse session id during TUI lookup"
                 );
                 return Ok(None);
             }
@@ -565,7 +568,7 @@ async fn lookup_session_target_with_app_server(
                 warn!(
                     session = id_or_name,
                     %err,
-                    "thread/read failed during app-server TUI session lookup"
+                    "thread/read failed during TUI session lookup"
                 );
                 Ok(None)
             }
@@ -579,12 +582,14 @@ async fn lookup_latest_session_target_with_app_server(
     app_server: &mut AppServerSession,
     config: &Config,
     cwd_filter: Option<&Path>,
+    include_non_interactive: bool,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let response = app_server
         .thread_list(latest_session_lookup_params(
             app_server.is_remote(),
             config,
             cwd_filter,
+            include_non_interactive,
         ))
         .await?;
     Ok(response
@@ -597,6 +602,7 @@ fn latest_session_lookup_params(
     is_remote: bool,
     config: &Config,
     cwd_filter: Option<&Path>,
+    include_non_interactive: bool,
 ) -> ThreadListParams {
     ThreadListParams {
         cursor: None,
@@ -607,7 +613,8 @@ fn latest_session_lookup_params(
         } else {
             Some(vec![config.model_provider_id.clone()])
         },
-        source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: (!include_non_interactive)
+            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
         cwd: if is_remote {
             None
@@ -1212,6 +1219,7 @@ async fn run_ratatui_app(
             };
             match lookup_latest_session_target_with_app_server(
                 app_server, &config, /*cwd_filter*/ None,
+                /*include_non_interactive*/ false,
             )
             .await?
             {
@@ -1266,7 +1274,14 @@ async fn run_ratatui_app(
         let Some(app_server) = session_lookup_app_server.as_mut() else {
             unreachable!("session lookup app server should be initialized for --resume --last");
         };
-        match lookup_latest_session_target_with_app_server(app_server, &config, filter_cwd).await? {
+        match lookup_latest_session_target_with_app_server(
+            app_server,
+            &config,
+            filter_cwd,
+            cli.resume_include_non_interactive,
+        )
+        .await?
+        {
             Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
             None => resume_picker::SessionSelection::StartFresh,
         }
@@ -1278,6 +1293,7 @@ async fn run_ratatui_app(
             &mut tui,
             &config,
             cli.resume_show_all,
+            cli.resume_include_non_interactive,
             app_server,
         )
         .await?
@@ -1871,7 +1887,12 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(false, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(
+            /*is_remote*/ false,
+            &config,
+            Some(cwd.as_path()),
+            /*include_non_interactive*/ false,
+        );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
         assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
@@ -1885,7 +1906,12 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(true, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(
+            /*is_remote*/ true,
+            &config,
+            Some(cwd.as_path()),
+            /*include_non_interactive*/ false,
+        );
 
         assert_eq!(params.model_providers, None);
         assert_eq!(params.cwd, None);
@@ -1897,7 +1923,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
 
-        let cwd = read_session_cwd(&config, ThreadId::new(), None).await;
+        let cwd = read_session_cwd(&config, ThreadId::new(), /*path*/ None).await;
 
         assert_eq!(cwd, None);
         Ok(())
@@ -1909,7 +1935,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(false);
+        config.set_windows_sandbox_enabled(/*value*/ false);
 
         let should_show = should_show_trust_screen(&config);
         assert!(
@@ -1935,6 +1961,67 @@ mod tests {
             .await
             .expect("thread/start should succeed");
         assert!(!response.thread.id.is_empty());
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_session_target_by_name_ignores_backend_search_term_mismatch()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/01")
+            .join(format!("rollout-2025-02-01T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-01T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Cli,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Different rollout title".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        codex_core::append_thread_name(&config.codex_home, thread_id, "saved-session").await?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config).await?,
+            ));
+        let target =
+            lookup_session_target_by_name_with_app_server(&mut app_server, "saved-session").await?;
+        let target = target.expect("name lookup should find the saved thread");
+        assert_eq!(target.path, Some(rollout_path));
+        assert_eq!(target.thread_id, thread_id);
 
         app_server.shutdown().await?;
         Ok(())
@@ -1972,7 +2059,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(true);
+        config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {
@@ -2274,7 +2361,7 @@ trust_level = "untrusted"
         .await
         .map_err(std::io::Error::other)?;
         runtime
-            .mark_backfill_complete(None)
+            .mark_backfill_complete(/*last_watermark*/ None)
             .await
             .map_err(std::io::Error::other)?;
 

@@ -4289,7 +4289,7 @@ mod tests {
             }),
         };
 
-        let legacy_events = event.as_legacy_events(false);
+        let legacy_events = event.as_legacy_events(/*show_raw_agent_reasoning*/ false);
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::WebSearchBegin(event) => assert_eq!(event.call_id, "search-1"),
@@ -4305,7 +4305,11 @@ mod tests {
             item: TurnItem::UserMessage(UserMessageItem::new(&[])),
         };
 
-        assert!(event.as_legacy_events(false).is_empty());
+        assert!(
+            event
+                .as_legacy_events(/*show_raw_agent_reasoning*/ false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4322,7 +4326,7 @@ mod tests {
             }),
         };
 
-        let legacy_events = event.as_legacy_events(false);
+        let legacy_events = event.as_legacy_events(/*show_raw_agent_reasoning*/ false);
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::ImageGenerationBegin(event) => assert_eq!(event.call_id, "ig-1"),
@@ -4344,7 +4348,7 @@ mod tests {
             }),
         };
 
-        let legacy_events = event.as_legacy_events(false);
+        let legacy_events = event.as_legacy_events(/*show_raw_agent_reasoning*/ false);
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::ImageGenerationEnd(event) => {
@@ -4759,8 +4763,9 @@ mod tests {
             total_tokens: 10,
         });
 
-        let info = TokenUsageInfo::new_or_append(&initial, &last, None)
-            .expect("new_or_append should return info");
+        let info =
+            TokenUsageInfo::new_or_append(&initial, &last, /*model_context_window*/ None)
+                .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
     }

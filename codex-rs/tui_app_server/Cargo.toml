@@ -1,5 +1,5 @@
 [package]
-name = "codex-tui-app-server"
+name = "codex-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,10 @@ autobins = false
 [[bin]]
 name = "codex-tui-app-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "codex-tui"
+path = "src/bin/codex-tui.rs"
 
 [[bin]]
 name = "md-events-app-server"

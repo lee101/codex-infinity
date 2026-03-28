@@ -25,10 +25,10 @@ use codex_login::bootstrap_anthropic_api_key_from_claude_credentials;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
-use codex_tui::AppExitInfo;
-use codex_tui::Cli as TuiCli;
-use codex_tui::ExitReason;
-use codex_tui::update_action::UpdateAction;
+use codex_tui_app_server::AppExitInfo;
+use codex_tui_app_server::Cli as TuiCli;
+use codex_tui_app_server::ExitReason;
+use codex_tui_app_server::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
@@ -526,7 +526,7 @@ struct FeatureToggles {
 
 #[derive(Debug, Default, Parser, Clone)]
 struct InteractiveRemoteOptions {
-    /// Connect the app-server-backed TUI to a remote app server websocket endpoint.
+    /// Connect the TUI to a remote app server websocket endpoint.
     ///
     /// Accepted forms: `ws://host:port` or `wss://host:port`.
     #[arg(long = "remote", value_name = "ADDR")]
@@ -1231,7 +1231,6 @@ async fn run_interactive_tui(
         }
     }
 
-    let use_app_server_tui = codex_tui::should_use_app_server_tui(&interactive).await?;
     let normalized_remote = remote
         .as_deref()
         .map(codex_tui_app_server::normalize_remote_addr)
@@ -1242,96 +1241,19 @@ async fn run_interactive_tui(
             "`--remote-auth-token-env` requires `--remote`.",
         ));
     }
-    if normalized_remote.is_some() && !use_app_server_tui {
-        return Ok(AppExitInfo::fatal(
-            "`--remote` requires the `tui_app_server` feature flag to be enabled.",
-        ));
-    }
-    if use_app_server_tui {
-        let remote_auth_token = remote_auth_token_env
-            .as_deref()
-            .map(read_remote_auth_token_from_env_var)
-            .transpose()
-            .map_err(std::io::Error::other)?;
-        codex_tui_app_server::run_main(
-            into_app_server_tui_cli(interactive),
-            arg0_paths,
-            codex_core::config_loader::LoaderOverrides::default(),
-            normalized_remote,
-            remote_auth_token,
-        )
-        .await
-        .map(into_legacy_app_exit_info)
-    } else {
-        codex_tui::run_main(
-            interactive,
-            arg0_paths,
-            codex_core::config_loader::LoaderOverrides::default(),
-        )
-        .await
-    }
-}
-
-fn into_app_server_tui_cli(cli: TuiCli) -> codex_tui_app_server::Cli {
-    codex_tui_app_server::Cli {
-        prompt: cli.prompt,
-        images: cli.images,
-        resume_picker: cli.resume_picker,
-        resume_last: cli.resume_last,
-        resume_session_id: cli.resume_session_id,
-        resume_show_all: cli.resume_show_all,
-        fork_picker: cli.fork_picker,
-        fork_last: cli.fork_last,
-        fork_session_id: cli.fork_session_id,
-        fork_show_all: cli.fork_show_all,
-        model: cli.model,
-        oss: cli.oss,
-        oss_provider: cli.oss_provider,
-        config_profile: cli.config_profile,
-        sandbox_mode: cli.sandbox_mode,
-        approval_policy: cli.approval_policy,
-        full_auto: cli.full_auto,
-        dangerously_bypass_approvals_and_sandbox: cli.dangerously_bypass_approvals_and_sandbox,
-        dangerously_disable_timeouts: cli.dangerously_disable_timeouts,
-        dangerously_disable_environment_wrapping: cli.dangerously_disable_environment_wrapping,
-        dangerously_passthrough_stdio: cli.dangerously_passthrough_stdio,
-        cwd: cli.cwd,
-        web_search: cli.web_search,
-        add_dir: cli.add_dir,
-        no_alt_screen: cli.no_alt_screen,
-        config_overrides: cli.config_overrides,
-    }
-}
-
-fn into_legacy_update_action(
-    action: codex_tui_app_server::update_action::UpdateAction,
-) -> UpdateAction {
-    match action {
-        codex_tui_app_server::update_action::UpdateAction::NpmGlobalLatest => {
-            UpdateAction::NpmGlobalLatest
-        }
-        codex_tui_app_server::update_action::UpdateAction::BunGlobalLatest => {
-            UpdateAction::BunGlobalLatest
-        }
-        codex_tui_app_server::update_action::UpdateAction::BrewUpgrade => UpdateAction::BrewUpgrade,
-    }
-}
-
-fn into_legacy_exit_reason(reason: codex_tui_app_server::ExitReason) -> ExitReason {
-    match reason {
-        codex_tui_app_server::ExitReason::UserRequested => ExitReason::UserRequested,
-        codex_tui_app_server::ExitReason::Fatal(message) => ExitReason::Fatal(message),
-    }
-}
-
-fn into_legacy_app_exit_info(exit_info: codex_tui_app_server::AppExitInfo) -> AppExitInfo {
-    AppExitInfo {
-        token_usage: exit_info.token_usage,
-        thread_id: exit_info.thread_id,
-        thread_name: exit_info.thread_name,
-        update_action: exit_info.update_action.map(into_legacy_update_action),
-        exit_reason: into_legacy_exit_reason(exit_info.exit_reason),
-    }
+    let remote_auth_token = remote_auth_token_env
+        .as_deref()
+        .map(read_remote_auth_token_from_env_var)
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    codex_tui_app_server::run_main(
+        interactive,
+        arg0_paths,
+        codex_core::config_loader::LoaderOverrides::default(),
+        normalized_remote,
+        remote_auth_token,
+    )
+    .await
 }
 
 fn confirm(prompt: &str) -> std::io::Result<bool> {
@@ -1605,14 +1527,17 @@ mod tests {
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         };
-        let lines = format_exit_messages(exit_info, false);
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
         assert!(lines.is_empty());
     }
 
     #[test]
     fn format_exit_messages_includes_resume_hint_without_color() {
-        let exit_info = sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), None);
-        let lines = format_exit_messages(exit_info, false);
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            /*thread_name*/ None,
+        );
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
         assert_eq!(
             lines,
             vec![
@@ -1625,8 +1550,11 @@ mod tests {
 
     #[test]
     fn format_exit_messages_applies_color_when_enabled() {
-        let exit_info = sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), None);
-        let lines = format_exit_messages(exit_info, true);
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            /*thread_name*/ None,
+        );
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("\u{1b}[36m"));
     }
@@ -1637,7 +1565,7 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000"),
             Some("my-thread"),
         );
-        let lines = format_exit_messages(exit_info, false);
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
         assert_eq!(
             lines,
             vec![
@@ -1863,8 +1791,12 @@ mod tests {
 
     #[test]
     fn reject_remote_mode_for_non_interactive_subcommands() {
-        let err = reject_remote_mode_for_subcommand(Some("127.0.0.1:4500"), None, "exec")
-            .expect_err("non-interactive subcommands should reject --remote");
+        let err = reject_remote_mode_for_subcommand(
+            Some("127.0.0.1:4500"),
+            /*remote_auth_token_env*/ None,
+            "exec",
+        )
+        .expect_err("non-interactive subcommands should reject --remote");
         assert!(
             err.to_string()
                 .contains("only supported for interactive TUI commands")
@@ -1873,8 +1805,12 @@ mod tests {
 
     #[test]
     fn reject_remote_auth_token_env_for_non_interactive_subcommands() {
-        let err = reject_remote_mode_for_subcommand(None, Some("CODEX_REMOTE_AUTH_TOKEN"), "exec")
-            .expect_err("non-interactive subcommands should reject --remote-auth-token-env");
+        let err = reject_remote_mode_for_subcommand(
+            /*remote*/ None,
+            Some("CODEX_REMOTE_AUTH_TOKEN"),
+            "exec",
+        )
+        .expect_err("non-interactive subcommands should reject --remote-auth-token-env");
         assert!(
             err.to_string()
                 .contains("only supported for interactive TUI commands")
@@ -1888,7 +1824,7 @@ mod tests {
                 out_dir: PathBuf::from("/tmp/out"),
             });
         let err = reject_remote_mode_for_app_server_subcommand(
-            None,
+            /*remote*/ None,
             Some("CODEX_REMOTE_AUTH_TOKEN"),
             Some(&subcommand),
         )

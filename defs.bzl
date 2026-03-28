@@ -13,6 +13,18 @@ PLATFORMS = [
     "windows_arm64",
 ]
 
+# The Bazel-built windows-gnullvm binaries that pull in V8 need a larger PE
+# stack reserve than the default linker setting. Thread the flag through the
+# executable and test entry points so the final linked artifacts behave the same
+# in normal builds and under `bazel test`.
+WINDOWS_GNULLVM_RUSTC_STACK_FLAGS = select({
+    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": [
+        "-C",
+        "link-arg=-Wl,--stack,8388608",
+    ],
+    "//conditions:default": [],
+})
+
 def multiplatform_binaries(name, platforms = PLATFORMS):
     for platform in platforms:
         platform_data(
@@ -188,11 +200,14 @@ def codex_rust_crate(
             name = unit_test_binary,
             crate = name,
             deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
+            # Unit tests also compile to standalone Windows executables, so
+            # keep their stack reserve aligned with binaries and integration
+            # tests under gnullvm.
             # Bazel has emitted both `codex-rs/<crate>/...` and
             # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
             # prefix so the workspace-root launcher sees Cargo-like metadata
             # such as `tui/src/...`.
-            rustc_flags = rustc_flags_extra + [
+            rustc_flags = rustc_flags_extra + WINDOWS_GNULLVM_RUSTC_STACK_FLAGS + [
                 "--remap-path-prefix=../codex-rs=",
                 "--remap-path-prefix=codex-rs=",
             ],
@@ -224,7 +239,7 @@ def codex_rust_crate(
             crate_root = main,
             deps = all_crate_deps() + maybe_deps + deps_extra,
             edition = crate_edition,
-            rustc_flags = rustc_flags_extra,
+            rustc_flags = rustc_flags_extra + WINDOWS_GNULLVM_RUSTC_STACK_FLAGS,
             srcs = native.glob(["src/**/*.rs"]),
             visibility = ["//visibility:public"],
         )
@@ -252,7 +267,7 @@ def codex_rust_crate(
             # Bazel has emitted both `codex-rs/<crate>/...` and
             # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
             # prefix so Insta records Cargo-like metadata such as `core/tests/...`.
-            rustc_flags = rustc_flags_extra + [
+            rustc_flags = rustc_flags_extra + WINDOWS_GNULLVM_RUSTC_STACK_FLAGS + [
                 "--remap-path-prefix=../codex-rs=",
                 "--remap-path-prefix=codex-rs=",
             ],

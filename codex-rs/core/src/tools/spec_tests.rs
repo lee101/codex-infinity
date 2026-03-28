@@ -12,6 +12,7 @@ use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_tools::AdditionalProperties;
+use codex_tools::mcp_tool_to_deferred_responses_api_tool;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
@@ -64,28 +65,6 @@ fn search_capable_model_info() -> ModelInfo {
 }
 
 #[test]
-fn search_tool_deferred_tools_always_set_defer_loading_true() {
-    let tool = mcp_tool(
-        "lookup_order",
-        "Look up an order",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string"}
-            },
-            "required": ["order_id"],
-            "additionalProperties": false,
-        }),
-    );
-
-    let openai_tool =
-        mcp_tool_to_deferred_openai_tool("mcp__codex_apps__lookup_order".to_string(), tool)
-            .expect("convert deferred tool");
-
-    assert_eq!(openai_tool.defer_loading, Some(true));
-}
-
-#[test]
 fn deferred_responses_api_tool_serializes_with_defer_loading() {
     let tool = mcp_tool(
         "lookup_order",
@@ -101,7 +80,7 @@ fn deferred_responses_api_tool_serializes_with_defer_loading() {
     );
 
     let serialized = serde_json::to_value(ToolSpec::Function(
-        mcp_tool_to_deferred_openai_tool("mcp__codex_apps__lookup_order".to_string(), tool)
+        mcp_tool_to_deferred_responses_api_tool("mcp__codex_apps__lookup_order".to_string(), &tool)
             .expect("convert deferred tool"),
     ))
     .expect("serialize deferred tool");
@@ -241,22 +220,22 @@ fn model_info_from_models_json(slug: &str) -> ModelInfo {
 #[test]
 fn unified_exec_is_blocked_for_windows_sandboxed_policies_only() {
     assert!(!unified_exec_allowed_in_environment(
-        true,
+        /*is_windows*/ true,
         &SandboxPolicy::new_read_only_policy(),
         WindowsSandboxLevel::RestrictedToken,
     ));
     assert!(!unified_exec_allowed_in_environment(
-        true,
+        /*is_windows*/ true,
         &SandboxPolicy::new_workspace_write_policy(),
         WindowsSandboxLevel::RestrictedToken,
     ));
     assert!(unified_exec_allowed_in_environment(
-        true,
+        /*is_windows*/ true,
         &SandboxPolicy::DangerFullAccess,
         WindowsSandboxLevel::RestrictedToken,
     ));
     assert!(unified_exec_allowed_in_environment(
-        true,
+        /*is_windows*/ true,
         &SandboxPolicy::DangerFullAccess,
         WindowsSandboxLevel::Disabled,
     ));
@@ -301,7 +280,13 @@ fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     // Build actual map name -> spec
     use std::collections::BTreeMap;
@@ -322,7 +307,9 @@ fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
     // Build expected from the same helpers used by the builder.
     let mut expected: BTreeMap<String, ToolSpec> = BTreeMap::from([]);
     for spec in [
-        create_exec_command_tool(true, false),
+        create_exec_command_tool(
+            /*allow_login_shell*/ true, /*exec_permission_approvals_enabled*/ false,
+        ),
         create_write_stdin_tool(),
         PLAN_TOOL.clone(),
         create_request_user_input_tool(CollaborationModesConfig::default()),
@@ -397,7 +384,13 @@ fn test_build_specs_collab_tools_enabled() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(
         &tools,
         &["spawn_agent", "send_input", "wait_agent", "close_agent"],
@@ -423,7 +416,13 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(
         &tools,
         &[
@@ -575,7 +574,13 @@ fn test_build_specs_enable_fanout_enables_agent_jobs_and_collab_tools() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(
         &tools,
         &[
@@ -605,7 +610,13 @@ fn view_image_tool_omits_detail_without_original_detail_feature() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let view_image = find_tool(&tools, VIEW_IMAGE_TOOL_NAME);
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &view_image.spec else {
         panic!("view_image should be a function tool");
@@ -634,7 +645,13 @@ fn view_image_tool_includes_detail_with_original_detail_feature() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let view_image = find_tool(&tools, VIEW_IMAGE_TOOL_NAME);
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &view_image.spec else {
         panic!("view_image should be a function tool");
@@ -673,7 +690,13 @@ fn test_build_specs_agent_job_worker_tools_enabled() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(
         &tools,
         &[
@@ -704,7 +727,13 @@ fn request_user_input_description_reflects_default_mode_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let request_user_input_tool = find_tool(&tools, "request_user_input");
     assert_eq!(
         request_user_input_tool.spec,
@@ -722,7 +751,13 @@ fn request_user_input_description_reflects_default_mode_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let request_user_input_tool = find_tool(&tools, "request_user_input");
     assert_eq!(
         request_user_input_tool.spec,
@@ -747,7 +782,13 @@ fn request_permissions_requires_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_lacks_tool_name(&tools, "request_permissions");
 
     let mut features = Features::with_defaults();
@@ -762,7 +803,13 @@ fn request_permissions_requires_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let request_permissions_tool = find_tool(&tools, "request_permissions");
     assert_eq!(
         request_permissions_tool.spec,
@@ -786,7 +833,13 @@ fn request_permissions_tool_is_independent_from_additional_permissions() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert_lacks_tool_name(&tools, "request_permissions");
 }
@@ -807,7 +860,13 @@ fn get_memory_requires_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert!(
         !tools.iter().any(|t| t.spec.name() == "get_memory"),
         "get_memory should be disabled when memory_tool feature is off"
@@ -830,7 +889,13 @@ fn js_repl_requires_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert!(
         !tools.iter().any(|tool| tool.spec.name() == "js_repl"),
@@ -859,7 +924,13 @@ fn js_repl_enabled_adds_tools() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(&tools, &["js_repl", "js_repl_reset"]);
 }
 
@@ -885,7 +956,13 @@ fn image_generation_tools_require_feature_and_supported_model() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (default_tools, _) = build_specs(&default_tools_config, None, None, &[]).build();
+    let (default_tools, _) = build_specs(
+        &default_tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert!(
         !default_tools
             .iter()
@@ -902,7 +979,13 @@ fn image_generation_tools_require_feature_and_supported_model() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (supported_tools, _) = build_specs(&supported_tools_config, None, None, &[]).build();
+    let (supported_tools, _) = build_specs(
+        &supported_tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert_contains_tool_names(&supported_tools, &["image_generation"]);
     let image_generation_tool = find_tool(&supported_tools, "image_generation");
     assert_eq!(
@@ -922,7 +1005,13 @@ fn image_generation_tools_require_feature_and_supported_model() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     assert!(
         !tools
             .iter()
@@ -1013,7 +1102,13 @@ fn web_search_mode_cached_sets_external_web_access_false() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     let tool = find_tool(&tools, "web_search");
     assert_eq!(
@@ -1044,7 +1139,13 @@ fn web_search_mode_live_sets_external_web_access_true() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     let tool = find_tool(&tools, "web_search");
     assert_eq!(
@@ -1089,7 +1190,13 @@ fn web_search_config_is_forwarded_to_tool_spec() {
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     })
     .with_web_search_config(Some(web_search_config.clone()));
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     let tool = find_tool(&tools, "web_search");
     assert_eq!(
@@ -1126,7 +1233,13 @@ fn web_search_tool_type_text_and_image_sets_search_content_types() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     let tool = find_tool(&tools, "web_search");
     assert_eq!(
@@ -1161,7 +1274,13 @@ fn mcp_resource_tools_are_hidden_without_mcp_servers() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert!(
         !tools.iter().any(|tool| matches!(
@@ -1187,7 +1306,13 @@ fn mcp_resource_tools_are_included_when_mcp_servers_are_present() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        Some(HashMap::new()),
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert_contains_tool_names(
         &tools,
@@ -1427,7 +1552,13 @@ fn test_build_specs_default_shell_present() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        Some(HashMap::new()),
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     // Only check the shell variant and a couple of core tools.
     let mut subset = vec!["exec_command", "write_stdin", "update_plan"];
@@ -1517,7 +1648,13 @@ fn test_parallel_support_flags() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert!(find_tool(&tools, "exec_command").supports_parallel_tool_calls);
     assert!(!find_tool(&tools, "write_stdin").supports_parallel_tool_calls);
@@ -1539,7 +1676,13 @@ fn test_test_model_info_includes_sync_tool() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
 
     assert!(
         tools
@@ -1589,7 +1732,7 @@ fn test_build_specs_mcp_tools_converted() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -1674,7 +1817,7 @@ fn test_build_specs_mcp_tools_sorted_by_name() {
         ),
     ]);
 
-    let (tools, _) = build_specs(&tools_config, Some(tools_map), None, &[]).build();
+    let (tools, _) = build_specs(&tools_config, Some(tools_map), /*app_tools*/ None, &[]).build();
 
     // Only assert that the MCP tools themselves are sorted by fully-qualified name.
     let mcp_names: Vec<_> = tools
@@ -1848,7 +1991,13 @@ fn search_tool_requires_model_capability_and_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, app_tools.clone(), &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        app_tools.clone(),
+        &[],
+    )
+    .build();
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
 
     let available_models = Vec::new();
@@ -1861,7 +2010,13 @@ fn search_tool_requires_model_capability_and_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, app_tools.clone(), &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        app_tools.clone(),
+        &[],
+    )
+    .build();
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
 
     let mut features = Features::with_defaults();
@@ -1876,7 +2031,7 @@ fn search_tool_requires_model_capability_and_feature_flag() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs(&tools_config, None, app_tools, &[]).build();
+    let (tools, _) = build_specs(&tools_config, /*mcp_tools*/ None, app_tools, &[]).build();
     assert_contains_tool_names(&tools, &[TOOL_SEARCH_TOOL_NAME]);
 }
 
@@ -1900,8 +2055,8 @@ fn tool_suggest_is_not_registered_without_feature_flag() {
     });
     let (tools, _) = build_specs_with_discoverable_tools(
         &tools_config,
-        None,
-        None,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
         Some(vec![discoverable_connector(
             "connector_2128aebfecb84f64a069897515042a44",
             "Google Calendar",
@@ -1940,8 +2095,8 @@ fn tool_suggest_can_be_registered_without_search_tool() {
     });
     let (tools, _) = build_specs_with_discoverable_tools(
         &tools_config,
-        None,
-        None,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
         Some(vec![discoverable_connector(
             "connector_2128aebfecb84f64a069897515042a44",
             "Google Calendar",
@@ -1995,8 +2150,8 @@ fn tool_suggest_requires_apps_and_plugins_features() {
         });
         let (tools, _) = build_specs_with_discoverable_tools(
             &tools_config,
-            None,
-            None,
+            /*mcp_tools*/ None,
+            /*app_tools*/ None,
             discoverable_tools.clone(),
             &[],
         )
@@ -2028,7 +2183,13 @@ fn search_tool_description_handles_no_enabled_apps() {
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
-    let (tools, _) = build_specs(&tools_config, None, Some(HashMap::new()), &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        Some(HashMap::new()),
+        &[],
+    )
+    .build();
     let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
     let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
         panic!("expected tool_search tool");
@@ -2057,7 +2218,7 @@ fn search_tool_description_falls_back_to_connector_name_without_description() {
 
     let (tools, _) = build_specs(
         &tools_config,
-        None,
+        /*mcp_tools*/ None,
         Some(HashMap::from([(
             "mcp__codex_apps__calendar_create_event".to_string(),
             ToolInfo {
@@ -2106,7 +2267,7 @@ fn search_tool_registers_namespaced_app_tool_aliases() {
 
     let (_, registry) = build_specs(
         &tools_config,
-        None,
+        /*mcp_tools*/ None,
         Some(HashMap::from([
             (
                 "mcp__codex_apps__calendar_create_event".to_string(),
@@ -2149,8 +2310,8 @@ fn search_tool_registers_namespaced_app_tool_aliases() {
 
     let alias = tool_handler_key("_create_event", Some("mcp__codex_apps__calendar"));
 
-    assert!(registry.has_handler(TOOL_SEARCH_TOOL_NAME, None));
-    assert!(registry.has_handler(alias.as_str(), None));
+    assert!(registry.has_handler(TOOL_SEARCH_TOOL_NAME, /*namespace*/ None));
+    assert!(registry.has_handler(alias.as_str(), /*namespace*/ None));
 }
 
 #[test]
@@ -2195,8 +2356,8 @@ fn tool_suggest_description_lists_discoverable_tools() {
 
     let (tools, _) = build_specs_with_discoverable_tools(
         &tools_config,
-        None,
-        None,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
         Some(discoverable_tools),
         &[],
     )
@@ -2290,7 +2451,7 @@ fn test_mcp_tool_property_missing_type_defaults_to_string() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2348,7 +2509,7 @@ fn test_mcp_tool_integer_normalized_to_number() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2405,7 +2566,7 @@ fn test_mcp_tool_array_without_items_gets_default_string_items() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2466,7 +2627,7 @@ fn test_mcp_tool_anyof_defaults_to_string() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2494,7 +2655,7 @@ fn test_mcp_tool_anyof_defaults_to_string() {
 
 #[test]
 fn test_shell_tool() {
-    let tool = super::create_shell_tool(false);
+    let tool = super::create_shell_tool(/*exec_permission_approvals_enabled*/ false);
     let ToolSpec::Function(ResponsesApiTool {
         description, name, ..
     }) = &tool
@@ -2527,7 +2688,9 @@ Examples of valid command strings:
 
 #[test]
 fn test_exec_command_tool_windows_description_includes_shell_safety_guidance() {
-    let tool = super::create_exec_command_tool(true, false);
+    let tool = super::create_exec_command_tool(
+        /*allow_login_shell*/ true, /*exec_permission_approvals_enabled*/ false,
+    );
     let ToolSpec::Function(ResponsesApiTool {
         description, name, ..
     }) = &tool
@@ -2550,7 +2713,7 @@ fn test_exec_command_tool_windows_description_includes_shell_safety_guidance() {
 
 #[test]
 fn shell_tool_with_request_permission_includes_additional_permissions() {
-    let tool = super::create_shell_tool(true);
+    let tool = super::create_shell_tool(/*exec_permission_approvals_enabled*/ true);
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
         panic!("expected function tool");
     };
@@ -2630,7 +2793,9 @@ fn request_permissions_tool_includes_full_permission_schema() {
 
 #[test]
 fn test_shell_command_tool() {
-    let tool = super::create_shell_command_tool(true, false);
+    let tool = super::create_shell_command_tool(
+        /*allow_login_shell*/ true, /*exec_permission_approvals_enabled*/ false,
+    );
     let ToolSpec::Function(ResponsesApiTool {
         description, name, ..
     }) = &tool
@@ -2707,7 +2872,7 @@ fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2787,7 +2952,13 @@ fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let ToolSpec::Function(ResponsesApiTool { description, .. }) =
         &find_tool(&tools, "view_image").spec
     else {
@@ -2835,7 +3006,7 @@ fn code_mode_augments_mcp_tool_descriptions_with_namespaced_sample() {
                 }),
             ),
         )])),
-        None,
+        /*app_tools*/ None,
         &[],
     )
     .build();
@@ -2884,7 +3055,13 @@ fn code_mode_only_exec_description_includes_full_nested_tool_details() {
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let ToolSpec::Freeform(FreeformTool { description, .. }) = &find_tool(&tools, "exec").spec
     else {
         panic!("expected freeform tool");
@@ -2916,7 +3093,13 @@ fn code_mode_exec_description_omits_nested_tool_details_when_not_code_mode_only(
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
-    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
     let ToolSpec::Freeform(FreeformTool { description, .. }) = &find_tool(&tools, "exec").spec
     else {
         panic!("expected freeform tool");

@@ -5,14 +5,26 @@ shared across multiple crates and does not need to stay coupled to
 `codex-core`.
 
 Today this crate is intentionally small. It currently owns the shared tool
-schema primitives that no longer need to live in `core/src/tools/spec.rs`:
+schema and Responses API tool primitives that no longer need to live in
+`core/src/tools/spec.rs` or `core/src/client_common.rs`:
 
 - `JsonSchema`
 - `AdditionalProperties`
+- `ToolDefinition`
+- `ResponsesApiTool`
+- `FreeformTool`
+- `FreeformToolFormat`
+- `ToolSearchOutputTool`
+- `ResponsesApiNamespace`
+- `ResponsesApiNamespaceTool`
 - `parse_tool_input_schema()`
-- `ParsedMcpTool`
+- `parse_dynamic_tool()`
 - `parse_mcp_tool()`
 - `mcp_call_tool_result_output_schema()`
+- `tool_definition_to_responses_api_tool()`
+- `dynamic_tool_to_responses_api_tool()`
+- `mcp_tool_to_responses_api_tool()`
+- `mcp_tool_to_deferred_responses_api_tool()`
 
 That extraction is the first step in a longer migration. The goal is not to
 move all of `core/src/tools` into this crate in one shot. Instead, the plan is
