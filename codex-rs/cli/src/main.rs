@@ -25,10 +25,10 @@ use codex_login::bootstrap_anthropic_api_key_from_claude_credentials;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
-use codex_tui_app_server::AppExitInfo;
-use codex_tui_app_server::Cli as TuiCli;
-use codex_tui_app_server::ExitReason;
-use codex_tui_app_server::update_action::UpdateAction;
+use codex_tui::AppExitInfo;
+use codex_tui::Cli as TuiCli;
+use codex_tui::ExitReason;
+use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
@@ -1233,7 +1233,7 @@ async fn run_interactive_tui(
 
     let normalized_remote = remote
         .as_deref()
-        .map(codex_tui_app_server::normalize_remote_addr)
+        .map(codex_tui::normalize_remote_addr)
         .transpose()
         .map_err(std::io::Error::other)?;
     if remote_auth_token_env.is_some() && normalized_remote.is_none() {
@@ -1246,7 +1246,7 @@ async fn run_interactive_tui(
         .map(read_remote_auth_token_from_env_var)
         .transpose()
         .map_err(std::io::Error::other)?;
-    codex_tui_app_server::run_main(
+    codex_tui::run_main(
         interactive,
         arg0_paths,
         codex_core::config_loader::LoaderOverrides::default(),
