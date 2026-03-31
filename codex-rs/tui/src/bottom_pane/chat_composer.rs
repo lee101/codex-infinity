@@ -641,6 +641,14 @@ impl ChatComposer {
         self.history.set_metadata(log_id, entry_count);
     }
 
+    pub(crate) fn set_history_cwd(&mut self, cwd: String) {
+        self.history.set_cwd(cwd);
+    }
+
+    pub(crate) fn set_history_cwd_offsets(&mut self, offsets: Vec<usize>) {
+        self.history.set_cwd_persistent_offsets(offsets);
+    }
+
     /// Integrate an asynchronous response to an on-demand history lookup.
     ///
     /// If the entry is present and the offset still matches the active history cursor, the
@@ -652,8 +660,9 @@ impl ChatComposer {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
+        cwd: Option<String>,
     ) -> bool {
-        let Some(entry) = self.history.on_entry_response(log_id, offset, entry) else {
+        let Some(entry) = self.history.on_entry_response_with_cwd(log_id, offset, entry, cwd) else {
             return false;
         };
         // Persistent ↑/↓ history is text-only (backwards-compatible and avoids persisting
@@ -982,6 +991,7 @@ impl ChatComposer {
             remote_image_urls,
             mention_bindings,
             pending_pastes,
+            cwd: None,
         });
         Some(previous)
     }
@@ -1006,6 +1016,7 @@ impl ChatComposer {
             remote_image_urls,
             mention_bindings,
             pending_pastes,
+            cwd: _,
         } = entry;
         self.set_remote_image_urls(remote_image_urls);
         self.set_text_content_with_mention_bindings(
@@ -2147,6 +2158,7 @@ impl ChatComposer {
                 remote_image_urls: self.remote_image_urls.clone(),
                 mention_bindings: original_mention_bindings,
                 pending_pastes: Vec::new(),
+                cwd: None,
             });
         }
         self.pending_pastes.clear();
@@ -2479,7 +2491,21 @@ impl ChatComposer {
         } else {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
+        // --- Reverse search mode (Ctrl+R) ---
+        if self.history.search_active {
+            return self.handle_search_key(key_event);
+        }
         match key_event {
+            // Ctrl+R: enter reverse search
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.history.start_search();
+                return (InputResult::None, true);
+            }
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -2575,6 +2601,79 @@ impl ChatComposer {
     /// - For non-plain keys, flush via `flush_before_modified_input()` before applying the key;
     ///   otherwise `clear_window_after_non_char()` can leave buffered text waiting without a
     ///   timestamp to time out against.
+    fn handle_search_key(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        match key_event {
+            // Ctrl+R again: next match
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if let Some(entry) = self.history.search_next() {
+                    self.apply_history_entry(entry);
+                }
+                (InputResult::None, true)
+            }
+            // Enter: accept current match
+            KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if let Some(entry) = self.history.accept_search() {
+                    self.apply_history_entry(entry);
+                }
+                (InputResult::None, true)
+            }
+            // Escape / Ctrl+C / Ctrl+G: cancel search
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c') | KeyCode::Char('g'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.history.cancel_search();
+                (InputResult::None, true)
+            }
+            // Backspace: remove last char from search query
+            KeyEvent {
+                code: KeyCode::Backspace,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.history.search_query_pop();
+                if let Some(entry) = self.history.current_search_match() {
+                    self.apply_history_entry(entry);
+                }
+                (InputResult::None, true)
+            }
+            // Printable chars: append to search query
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.history.search_query_push(ch);
+                if let Some(entry) = self.history.current_search_match() {
+                    self.apply_history_entry(entry);
+                }
+                (InputResult::None, true)
+            }
+            // Anything else exits search and passes through
+            _ => {
+                self.history.cancel_search();
+                (InputResult::None, true)
+            }
+        }
+    }
+
     fn handle_input_basic(&mut self, input: KeyEvent) -> (InputResult, bool) {
         // Ignore key releases here to avoid treating them as additional input
         // (e.g., appending the same character twice via paste-burst logic).
@@ -3700,7 +3799,13 @@ impl ChatComposer {
         } else {
             StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
         }
-        if self.textarea.text().is_empty() {
+        if self.history.search_active {
+            if !textarea_rect.is_empty() {
+                let search_line = Span::from(self.history.search_prompt()).yellow();
+                Line::from(vec![search_line])
+                    .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
+            }
+        } else if self.textarea.text().is_empty() {
             let text = if self.input_enabled {
                 self.placeholder_text.as_str().to_string()
             } else {

@@ -307,6 +307,10 @@ impl ModelInfo {
         config_limit
     }
 
+    pub fn background_compact_token_limit(&self) -> Option<i64> {
+        self.context_window.map(|cw| (cw * 3) / 4)
+    }
+
     pub fn supports_personality(&self) -> bool {
         self.model_messages
             .as_ref()

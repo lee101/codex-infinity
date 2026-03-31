@@ -475,6 +475,7 @@ const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
 ];
 
 const REVIEW_INTERVAL: usize = 3;
+const ORIGINAL_TASK_REMINDER_INTERVAL: usize = 7;
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 
@@ -980,6 +981,7 @@ pub(crate) struct ChatWidget {
     auto_next_steps: bool,
     auto_next_idea: bool,
     auto_next_counter: usize,
+    original_human_prompt: Option<String>,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -1972,6 +1974,17 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_protocol::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
+        let cwd_str = event.cwd.to_string_lossy().to_string();
+        self.bottom_pane.set_history_cwd(cwd_str.clone());
+        {
+            let config = self.config.clone();
+            let tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                let (_, _, cwd_offsets) =
+                    codex_core::message_history::history_metadata_with_cwd(&config, &cwd_str).await;
+                tx.send(AppEvent::HistoryCwdIndex { cwd_offsets });
+            });
+        }
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
@@ -2458,12 +2471,19 @@ impl ChatWidget {
         }
         let is_review_turn = self.auto_next_counter > 0
             && self.auto_next_counter % REVIEW_INTERVAL == 0;
-        let prompt = if is_review_turn {
+        let mut prompt = if is_review_turn {
             let review_idx = (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
             AUTO_NEXT_REVIEW_PROMPTS[review_idx].to_string()
         } else {
             self.generate_contextual_auto_next_prompt()
         };
+        if self.auto_next_counter > 0
+            && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
+        {
+            if let Some(ref original) = self.original_human_prompt {
+                prompt.push_str(&format!("\n\nReminder of original task: {original}"));
+            }
+        }
         self.auto_next_counter += 1;
         self.queued_user_messages.push_back(UserMessage::from(prompt));
     }
@@ -4079,8 +4099,9 @@ impl ChatWidget {
             log_id,
             entry,
         } = event;
+        let cwd = entry.as_ref().and_then(|e| e.cwd.clone());
         self.bottom_pane
-            .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
+            .on_history_entry_response(log_id, offset, entry.map(|e| e.text), cwd);
     }
 
     fn on_shutdown_complete(&mut self) {
@@ -4888,6 +4909,7 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            original_human_prompt: None,
         };
 
         widget
@@ -5733,6 +5755,9 @@ impl ChatWidget {
             self.queued_user_messages.push_front(user_message);
             self.refresh_pending_input_preview();
             return;
+        }
+        if (self.auto_next_steps || self.auto_next_idea) && self.original_human_prompt.is_none() {
+            self.original_human_prompt = Some(user_message.text.clone());
         }
         let UserMessage {
             text,
@@ -7439,6 +7464,10 @@ impl ChatWidget {
 
     pub(crate) fn on_diff_complete(&mut self) {
         self.request_redraw();
+    }
+
+    pub(crate) fn on_history_cwd_index(&mut self, cwd_offsets: Vec<usize>) {
+        self.bottom_pane.set_history_cwd_offsets(cwd_offsets);
     }
 
     pub(crate) fn add_status_output(&mut self) {

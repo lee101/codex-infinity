@@ -21,12 +21,15 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
+use tokio::task::JoinHandle;
 use tracing::error;
+use tracing::warn;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
@@ -45,6 +48,253 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage,
     DoNotInject,
+}
+
+pub(crate) struct BackgroundCompactionResult {
+    pub compacted_items: Vec<ResponseItem>,
+    pub reference_context_item: Option<TurnContextItem>,
+    pub compacted_item: CompactedItem,
+}
+
+pub(crate) struct BackgroundCompactionHandle {
+    task: JoinHandle<CodexResult<BackgroundCompactionResult>>,
+    snapshot_items_len: usize,
+}
+
+impl BackgroundCompactionHandle {
+    pub fn new(
+        task: JoinHandle<CodexResult<BackgroundCompactionResult>>,
+        snapshot_items_len: usize,
+    ) -> Self {
+        Self {
+            task,
+            snapshot_items_len,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub fn snapshot_items_len(&self) -> usize {
+        self.snapshot_items_len
+    }
+
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    pub async fn take_result(self) -> Option<BackgroundCompactionResult> {
+        match self.task.await {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(e)) => {
+                warn!("background compaction failed: {e:#}");
+                None
+            }
+            Err(e) => {
+                warn!("background compaction task panicked: {e}");
+                None
+            }
+        }
+    }
+}
+
+pub(crate) async fn start_background_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) {
+    if sess.has_background_compaction().await {
+        return;
+    }
+
+    let snapshot_len = sess.history_items_len().await;
+    let sess_clone = Arc::clone(sess);
+    let tc_clone = Arc::clone(turn_context);
+
+    let task = tokio::spawn(async move {
+        run_background_compact_task(sess_clone, tc_clone).await
+    });
+
+    let handle = BackgroundCompactionHandle::new(task, snapshot_len);
+    sess.set_background_compaction(handle).await;
+}
+
+async fn run_background_compact_task(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+) -> CodexResult<BackgroundCompactionResult> {
+    if should_use_remote_compact_task(&turn_context.provider) {
+        crate::compact_remote::run_background_remote_compact(
+            sess,
+            turn_context,
+        )
+        .await
+    } else {
+        run_background_local_compact(sess, turn_context).await
+    }
+}
+
+async fn run_background_local_compact(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+) -> CodexResult<BackgroundCompactionResult> {
+    let prompt = turn_context.compact_prompt().to_string();
+    let input = vec![UserInput::Text {
+        text: prompt,
+        text_elements: Vec::new(),
+    }];
+    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+
+    let mut history = sess.clone_history().await;
+    history.record_items(
+        &[initial_input_for_turn.into()],
+        turn_context.truncation_policy,
+    );
+
+    let mut truncated_count = 0usize;
+    let max_retries = turn_context.provider.stream_max_retries();
+    let mut retries = 0;
+    let mut client_session = sess.services.model_client.new_session();
+
+    loop {
+        let turn_input = history
+            .clone()
+            .for_prompt(&turn_context.model_info.input_modalities);
+        let turn_input_len = turn_input.len();
+        let prompt = Prompt {
+            input: turn_input,
+            base_instructions: sess.get_base_instructions().await,
+            personality: turn_context.personality,
+            ..Default::default()
+        };
+        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+        let attempt_result = drain_to_completed(
+            &sess,
+            turn_context.as_ref(),
+            &mut client_session,
+            turn_metadata_header.as_deref(),
+            &prompt,
+        )
+        .await;
+
+        match attempt_result {
+            Ok(()) => {
+                if truncated_count > 0 {
+                    sess.notify_background_event(
+                        turn_context.as_ref(),
+                        format!(
+                            "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
+                        ),
+                    )
+                    .await;
+                }
+                break;
+            }
+            Err(CodexErr::Interrupted) => {
+                return Err(CodexErr::Interrupted);
+            }
+            Err(e @ CodexErr::ContextWindowExceeded) => {
+                if turn_input_len > 1 {
+                    error!(
+                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
+                    );
+                    history.remove_first_item();
+                    truncated_count += 1;
+                    retries = 0;
+                    continue;
+                }
+                return Err(e);
+            }
+            Err(e) => {
+                if retries < max_retries {
+                    retries += 1;
+                    let delay = backoff(retries);
+                    sess.notify_stream_error(
+                        turn_context.as_ref(),
+                        format!("Reconnecting... {retries}/{max_retries}"),
+                        e,
+                    )
+                    .await;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    let history_snapshot = sess.clone_history().await;
+    let history_items = history_snapshot.raw_items();
+    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    let user_messages = collect_user_messages(history_items);
+
+    let new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+
+    let ghost_snapshots: Vec<ResponseItem> = history_items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
+    let mut compacted_items = new_history;
+    compacted_items.extend(ghost_snapshots);
+
+    let compacted_item = CompactedItem {
+        message: summary_text,
+        replacement_history: Some(compacted_items.clone()),
+    };
+
+    Ok(BackgroundCompactionResult {
+        compacted_items,
+        reference_context_item: None,
+        compacted_item,
+    })
+}
+
+pub(crate) async fn try_apply_background_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> bool {
+    let Some(handle) = sess.take_finished_background_compaction().await else {
+        return false;
+    };
+    let snapshot_len = handle.snapshot_items_len();
+    let current_len = sess.history_items_len().await;
+
+    // Stale if history was rolled back/truncated since snapshot
+    if snapshot_len > current_len {
+        warn!("discarding stale background compaction (snapshot_len={snapshot_len} > current={current_len})");
+        // Drop handle without awaiting to abort
+        handle.abort();
+        return false;
+    }
+
+    let Some(result) = handle.take_result().await else {
+        return false;
+    };
+
+    let new_items_since_snapshot = sess.history_items_since(snapshot_len).await;
+
+    let mut merged = result.compacted_items;
+    merged.extend(new_items_since_snapshot);
+
+    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    sess.emit_turn_item_started(turn_context, &compaction_item)
+        .await;
+
+    sess.replace_compacted_history(merged, result.reference_context_item, result.compacted_item)
+        .await;
+    sess.recompute_token_usage(turn_context).await;
+
+    sess.emit_turn_item_completed(turn_context, compaction_item)
+        .await;
+    let warning = EventMsg::Warning(WarningEvent {
+        message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+    });
+    sess.send_event(turn_context, warning).await;
+
+    true
 }
 
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {

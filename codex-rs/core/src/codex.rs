@@ -22,6 +22,8 @@ use crate::compact;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
+use crate::compact::start_background_compaction;
+use crate::compact::try_apply_background_compaction;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
@@ -819,6 +821,7 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
+    background_compaction: Mutex<Option<crate::compact::BackgroundCompactionHandle>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1933,6 +1936,7 @@ impl Session {
             services,
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
+            background_compaction: Mutex::new(None),
         });
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
@@ -3727,6 +3731,55 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn history_items_len(&self) -> usize {
+        let state = self.state.lock().await;
+        state.history.raw_items().len()
+    }
+
+    pub(crate) async fn history_items_since(&self, from: usize) -> Vec<ResponseItem> {
+        let state = self.state.lock().await;
+        let items = state.history.raw_items();
+        if from < items.len() {
+            items[from..].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) async fn set_background_compaction(
+        &self,
+        handle: crate::compact::BackgroundCompactionHandle,
+    ) {
+        let mut guard = self.background_compaction.lock().await;
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
+        *guard = Some(handle);
+    }
+
+    pub(crate) async fn take_finished_background_compaction(
+        &self,
+    ) -> Option<crate::compact::BackgroundCompactionHandle> {
+        let mut guard = self.background_compaction.lock().await;
+        if guard.as_ref().is_some_and(|h| h.is_finished()) {
+            guard.take()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn cancel_background_compaction(&self) {
+        let mut guard = self.background_compaction.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+
+    pub(crate) async fn has_background_compaction(&self) -> bool {
+        let guard = self.background_compaction.lock().await;
+        guard.is_some()
+    }
+
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
         let state = self.state.lock().await;
         state.reference_context_item()
@@ -4935,8 +4988,9 @@ mod handlers {
     pub async fn add_to_history(sess: &Arc<Session>, config: &Arc<Config>, text: String) {
         let id = sess.conversation_id;
         let config = Arc::clone(config);
+        let cwd = Some(config.cwd.to_string_lossy().to_string());
         tokio::spawn(async move {
-            if let Err(e) = crate::message_history::append_entry(&text, &id, &config).await {
+            if let Err(e) = crate::message_history::append_entry_with_cwd(&text, &id, &config, cwd).await {
                 warn!("failed to append to message history: {e}");
             }
         });
@@ -4970,6 +5024,7 @@ mod handlers {
                             conversation_id: e.session_id,
                             ts: e.ts,
                             text: e.text,
+                            cwd: e.cwd,
                         }),
                     },
                 ),
@@ -5977,6 +6032,14 @@ pub(crate) async fn run_turn(
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
+                    // Try background compaction result first
+                    if try_apply_background_compaction(&sess, &turn_context).await {
+                        let rechecked = sess.get_total_token_usage().await;
+                        if rechecked < auto_compact_limit {
+                            continue;
+                        }
+                    }
+                    sess.cancel_background_compaction().await;
                     if run_auto_compact(
                         &sess,
                         &turn_context,
@@ -5988,6 +6051,17 @@ pub(crate) async fn run_turn(
                         return None;
                     }
                     continue;
+                }
+
+                // Proactively start background compaction if nearing the limit
+                if !token_limit_reached {
+                    let bg_limit = turn_context
+                        .model_info
+                        .background_compact_token_limit()
+                        .unwrap_or(i64::MAX);
+                    if total_usage_tokens >= bg_limit {
+                        start_background_compaction(&sess, &turn_context).await;
+                    }
                 }
 
                 if !needs_follow_up {
@@ -6155,15 +6229,40 @@ async fn run_pre_sampling_compact(
         total_usage_tokens_before_compaction,
     )
     .await?;
+
+    // Try applying completed background compaction first
+    if try_apply_background_compaction(sess, turn_context).await {
+        let rechecked = sess.get_total_token_usage().await;
+        let auto_compact_limit = turn_context
+            .model_info
+            .auto_compact_token_limit()
+            .unwrap_or(i64::MAX);
+        if rechecked < auto_compact_limit {
+            return Ok(());
+        }
+    }
+
     let total_usage_tokens = sess.get_total_token_usage().await;
     let auto_compact_limit = turn_context
         .model_info
         .auto_compact_token_limit()
         .unwrap_or(i64::MAX);
-    // Compact if the total usage tokens are greater than the auto compact limit
+
     if total_usage_tokens >= auto_compact_limit {
+        sess.cancel_background_compaction().await;
         run_auto_compact(sess, turn_context, InitialContextInjection::DoNotInject).await?;
+        return Ok(());
     }
+
+    // Proactively start background compaction at 75% threshold
+    let bg_limit = turn_context
+        .model_info
+        .background_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    if total_usage_tokens >= bg_limit {
+        start_background_compaction(sess, turn_context).await;
+    }
+
     Ok(())
 }
 

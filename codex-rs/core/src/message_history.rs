@@ -58,6 +58,8 @@ pub struct HistoryEntry {
     pub session_id: String,
     pub ts: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 fn history_filepath(config: &Config) -> PathBuf {
@@ -82,6 +84,10 @@ fn history_filepath(config: &Config) -> PathBuf {
 /// system clock is before the Unix epoch, or the exclusive lock cannot be
 /// acquired after [`MAX_RETRIES`] attempts.
 pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Config) -> Result<()> {
+    append_entry_with_cwd(text, conversation_id, config, None).await
+}
+
+pub async fn append_entry_with_cwd(text: &str, conversation_id: &ThreadId, config: &Config, cwd: Option<String>) -> Result<()> {
     match config.history.persistence {
         HistoryPersistence::SaveAll => {
             // Save everything: proceed.
@@ -111,6 +117,7 @@ pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Confi
         session_id: conversation_id.to_string(),
         ts,
         text: text.to_string(),
+        cwd,
     };
     let mut line = serde_json::to_string(&entry)
         .map_err(|e| std::io::Error::other(format!("failed to serialise history entry: {e}")))?;
@@ -261,6 +268,42 @@ fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {
 pub async fn history_metadata(config: &Config) -> (u64, usize) {
     let path = history_filepath(config);
     history_metadata_for_file(&path).await
+}
+
+/// Async metadata scan that also returns zero-based offsets whose `cwd` matches.
+pub async fn history_metadata_with_cwd(config: &Config, cwd: &str) -> (u64, usize, Vec<usize>) {
+    let path = history_filepath(config);
+    let log_id = match fs::metadata(&path).await {
+        Ok(metadata) => history_log_id(&metadata).unwrap_or(0),
+        Err(_) => return (0, 0, Vec::new()),
+    };
+
+    let cwd_owned = cwd.to_string();
+    let path_owned = path.clone();
+    let result = tokio::task::spawn_blocking(move || -> (usize, Vec<usize>) {
+        let file = match std::fs::File::open(&path_owned) {
+            Ok(f) => f,
+            Err(_) => return (0, Vec::new()),
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut count = 0usize;
+        let mut cwd_offsets = Vec::new();
+        for line_res in std::io::BufRead::lines(reader) {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(_) => { count += 1; continue; }
+            };
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                if entry.cwd.as_deref() == Some(cwd_owned.as_str()) {
+                    cwd_offsets.push(count);
+                }
+            }
+            count += 1;
+        }
+        (count, cwd_offsets)
+    }).await.unwrap_or((0, Vec::new()));
+
+    (log_id, result.0, result.1)
 }
 
 /// Look up a single history entry by file identity and zero-based offset.

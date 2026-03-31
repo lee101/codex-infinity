@@ -1043,6 +1043,14 @@ impl BottomPane {
         self.composer.set_history_metadata(log_id, entry_count);
     }
 
+    pub(crate) fn set_history_cwd(&mut self, cwd: String) {
+        self.composer.set_history_cwd(cwd);
+    }
+
+    pub(crate) fn set_history_cwd_offsets(&mut self, offsets: Vec<usize>) {
+        self.composer.set_history_cwd_offsets(offsets);
+    }
+
     pub(crate) fn flush_paste_burst_if_due(&mut self) -> bool {
         // Give the active view the first chance to flush paste-burst state so
         // overlays that reuse the composer behave consistently.
@@ -1068,10 +1076,11 @@ impl BottomPane {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
+        cwd: Option<String>,
     ) {
         let updated = self
             .composer
-            .on_history_entry_response(log_id, offset, entry);
+            .on_history_entry_response(log_id, offset, entry, cwd);
 
         if updated {
             self.composer.sync_popups();

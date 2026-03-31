@@ -2003,9 +2003,10 @@ impl App {
             AppCommandView::Other(Op::AddToHistory { text }) => {
                 let text = text.clone();
                 let config = self.chat_widget.config_ref().clone();
+                let cwd = Some(config.cwd.to_string_lossy().to_string());
                 tokio::spawn(async move {
                     if let Err(err) =
-                        message_history::append_entry(&text, &thread_id, &config).await
+                        message_history::append_entry_with_cwd(&text, &thread_id, &config, cwd).await
                     {
                         tracing::warn!(
                             thread_id = %thread_id,
@@ -2041,6 +2042,7 @@ impl App {
                                     conversation_id: entry.session_id,
                                     ts: entry.ts,
                                     text: entry.text,
+                                    cwd: entry.cwd,
                                 }
                             }),
                         },
@@ -4092,6 +4094,9 @@ impl App {
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
+            }
+            AppEvent::HistoryCwdIndex { cwd_offsets } => {
+                self.chat_widget.on_history_cwd_index(cwd_offsets);
             }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane

@@ -8,4 +8,6 @@ pub struct HistoryEntry {
     pub conversation_id: String,
     pub ts: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }

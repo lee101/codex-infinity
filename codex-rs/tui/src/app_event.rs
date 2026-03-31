@@ -150,6 +150,11 @@ pub(crate) enum AppEvent {
     /// Result of computing a `/diff` command.
     DiffResult(String),
 
+    /// CWD-filtered history offsets ready for the composer.
+    HistoryCwdIndex {
+        cwd_offsets: Vec<usize>,
+    },
+
     /// Open the app link view in the bottom pane.
     OpenAppLink {
         app_id: String,
