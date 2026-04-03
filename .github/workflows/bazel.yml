@@ -63,6 +63,12 @@ jobs:
         shell: bash
         run: ./scripts/check-module-bazel-lock.sh
 
+      - name: Set up Bazel execution logs
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/bazel-execution-logs"
+          echo "CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR=${RUNNER_TEMP}/bazel-execution-logs" >> "${GITHUB_ENV}"
+
       - name: bazel test //...
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -86,6 +92,15 @@ jobs:
             --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
             -- \
             "${bazel_targets[@]}"
+
+      - name: Upload Bazel execution logs
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: bazel-execution-logs-test-${{ matrix.target }}
+          path: ${{ runner.temp }}/bazel-execution-logs
+          if-no-files-found: ignore
 
       # Save bazel repository cache explicitly; make non-fatal so cache uploading
       # never fails the overall job. Only save when key wasn't hit.
@@ -126,6 +141,12 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - name: Set up Bazel execution logs
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/bazel-execution-logs"
+          echo "CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR=${RUNNER_TEMP}/bazel-execution-logs" >> "${GITHUB_ENV}"
+
       - name: bazel build --config=clippy //codex-rs/...
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -142,6 +163,15 @@ jobs:
             -- \
             //codex-rs/... \
             -//codex-rs/v8-poc:all
+
+      - name: Upload Bazel execution logs
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: bazel-execution-logs-clippy-${{ matrix.target }}
+          path: ${{ runner.temp }}/bazel-execution-logs
+          if-no-files-found: ignore
 
       # Save bazel repository cache explicitly; make non-fatal so cache uploading
       # never fails the overall job. Only save when key wasn't hit.

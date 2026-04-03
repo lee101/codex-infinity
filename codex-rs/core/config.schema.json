@@ -392,6 +392,9 @@
             "fast_mode": {
               "type": "boolean"
             },
+            "general_analytics": {
+              "type": "boolean"
+            },
             "guardian_approval": {
               "type": "boolean"
             },
@@ -842,9 +845,9 @@
         },
         "refresh_interval_ms": {
           "default": 300000,
-          "description": "Maximum age for the cached token before rerunning the command.",
+          "description": "Maximum age for the cached token before rerunning the command. Set to `0` to disable proactive refresh and only rerun after a 401 retry path.",
           "format": "uint64",
-          "minimum": 1.0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "timeout_ms": {
@@ -1316,6 +1319,7 @@
     },
     "RawMcpServerConfig": {
       "additionalProperties": false,
+      "description": "Raw MCP config shape used for deserialization and JSON Schema generation.\n\nKeep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively destructuring this struct so new TOML fields cannot be added here without updating the validation/mapping logic that produces [`McpServerConfig`].",
       "properties": {
         "args": {
           "default": null,
@@ -2086,6 +2090,9 @@
         "fast_mode": {
           "type": "boolean"
         },
+        "general_analytics": {
+          "type": "boolean"
+        },
         "guardian_approval": {
           "type": "boolean"
         },
@@ -2389,7 +2396,7 @@
           "$ref": "#/definitions/Notice"
         }
       ],
-      "description": "Collection of in-product notices (different from notifications) See [`crate::config::types::Notices`] for more details"
+      "description": "Collection of in-product notices (different from notifications) See [`codex_config::types::Notice`] for more details"
     },
     "notify": {
       "default": null,

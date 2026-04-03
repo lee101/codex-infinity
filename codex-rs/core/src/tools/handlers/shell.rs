@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
@@ -12,9 +11,7 @@ use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
-use crate::is_safe_command::is_known_safe_command;
 use crate::maybe_emit_implicit_skill_invocation;
-use crate::protocol::ExecCommandSource;
 use crate::shell::Shell;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -38,9 +35,11 @@ use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
-use crate::tools::spec::ShellCommandBackendConfig;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_shell_command::is_safe_command::is_known_safe_command;
+use codex_tools::ShellCommandBackendConfig;
 use tokio_util::sync::CancellationToken;
 
 pub struct ShellHandler;
@@ -190,7 +189,6 @@ impl From<ShellCommandBackendConfig> for ShellCommandHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ShellHandler {
     type Output = FunctionToolOutput;
 
@@ -291,7 +289,6 @@ impl ToolHandler for ShellHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ShellCommandHandler {
     type Output = FunctionToolOutput;
 

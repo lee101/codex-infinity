@@ -146,6 +146,12 @@ if [[ -n "${BAZEL_REPOSITORY_CACHE:-}" ]]; then
   post_config_bazel_args+=("--repository_cache=${BAZEL_REPOSITORY_CACHE}")
 fi
 
+if [[ -n "${CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR:-}" ]]; then
+  post_config_bazel_args+=(
+    "--execution_log_compact_file=${CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR}/execution-log-${bazel_args[0]}-${GITHUB_JOB:-local}-$$.zst"
+  )
+fi
+
 if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
   windows_action_env_vars=(
     INCLUDE
