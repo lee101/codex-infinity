@@ -102,8 +102,11 @@ use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
+use crate::model_provider_info::GEMINI_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
+use crate::model_provider_info::OPENROUTER_PROVIDER_ID;
 use crate::model_provider_info::WireApi;
+use crate::model_provider_info::infer_builtin_provider_id_for_model;
 use crate::provider_auth::auth_manager_for_provider;
 use crate::response_debug_context::extract_response_debug_context;
 use crate::response_debug_context::extract_response_debug_context_from_api_error;
@@ -151,8 +154,10 @@ struct ModelClientState {
 /// share the same auth/provider setup flow.
 struct CurrentClientSetup {
     auth: Option<CodexAuth>,
+    provider: ModelProviderInfo,
     api_provider: codex_api::Provider,
     api_auth: CoreAuthProvider,
+    auth_env_telemetry: AuthEnvTelemetry,
 }
 
 #[derive(Clone, Copy)]
@@ -320,9 +325,9 @@ impl ModelClient {
     pub(crate) fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
-        _model_info: &ModelInfo,
+        model_info: &ModelInfo,
     ) -> bool {
-        let websocket_enabled = self.responses_websocket_enabled();
+        let websocket_enabled = self.responses_websocket_enabled(model_info);
         let activated =
             websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
         if activated {
@@ -356,7 +361,7 @@ impl ModelClient {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
-        let client_setup = self.current_client_setup().await?;
+        let client_setup = self.current_client_setup(model_info).await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -366,7 +371,7 @@ impl ModelClient {
                 PendingUnauthorizedRetry::default(),
             ),
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
-            self.state.auth_env_telemetry.clone(),
+            client_setup.auth_env_telemetry.clone(),
         );
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
@@ -389,7 +394,7 @@ impl ModelClient {
         };
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let payload = ApiCompactionInput {
-            model: &model_info.slug,
+            model: client_setup.provider.effective_model_name(&model_info.slug),
             input: &input,
             instructions: &instructions,
             tools,
@@ -425,7 +430,7 @@ impl ModelClient {
             return Ok(Vec::new());
         }
 
-        let client_setup = self.current_client_setup().await?;
+        let client_setup = self.current_client_setup(model_info).await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -435,14 +440,17 @@ impl ModelClient {
                 PendingUnauthorizedRetry::default(),
             ),
             RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
-            self.state.auth_env_telemetry.clone(),
+            client_setup.auth_env_telemetry.clone(),
         );
         let client =
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
         let payload = ApiMemorySummarizeInput {
-            model: model_info.slug.clone(),
+            model: client_setup
+                .provider
+                .effective_model_name(&model_info.slug)
+                .to_string(),
             raw_memories,
             reasoning: effort.map(|effort| Reasoning {
                 effort: Some(effort),
@@ -514,8 +522,9 @@ impl ModelClient {
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
-    pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.supports_websockets
+    pub fn responses_websocket_enabled(&self, model_info: &ModelInfo) -> bool {
+        let provider = self.resolve_provider_for_model(model_info);
+        if !provider.supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
             || (*CODEX_RS_SSE_FIXTURE).is_some()
         {
@@ -529,20 +538,38 @@ impl ModelClient {
     ///
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
-    async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+    fn resolve_provider_for_model(&self, model_info: &ModelInfo) -> ModelProviderInfo {
+        if !self.state.provider.is_openai() {
+            return self.state.provider.clone();
+        }
+
+        match infer_builtin_provider_id_for_model(&model_info.slug) {
+            Some(GEMINI_PROVIDER_ID) => ModelProviderInfo::create_gemini_provider(),
+            Some(OPENROUTER_PROVIDER_ID) => ModelProviderInfo::create_openrouter_provider(),
+            Some(_) | None => self.state.provider.clone(),
+        }
+    }
+
+    async fn current_client_setup(&self, model_info: &ModelInfo) -> Result<CurrentClientSetup> {
         let auth = match self.state.auth_manager.as_ref() {
             Some(manager) => manager.auth().await,
             None => None,
         };
-        let api_provider = self
+        let provider = self.resolve_provider_for_model(model_info);
+        let api_provider = provider.to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+        let api_auth = auth_provider_from_auth(auth.clone(), &provider)?;
+        let codex_api_key_env_enabled = self
             .state
-            .provider
-            .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+            .auth_manager
+            .as_ref()
+            .is_some_and(|manager| manager.codex_api_key_env_enabled());
+        let auth_env_telemetry = collect_auth_env_telemetry(&provider, codex_api_key_env_enabled);
         Ok(CurrentClientSetup {
             auth,
+            provider,
             api_provider,
             api_auth,
+            auth_env_telemetry,
         })
     }
 
@@ -687,7 +714,8 @@ impl ModelClientSession {
 
     fn build_responses_request(
         &self,
-        provider: &codex_api::Provider,
+        api_provider: &codex_api::Provider,
+        model_provider: &ModelProviderInfo,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -732,14 +760,16 @@ impl ModelClientSession {
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
         let request = ResponsesApiRequest {
-            model: model_info.slug.clone(),
+            model: model_provider
+                .effective_model_name(&model_info.slug)
+                .to_string(),
             instructions: instructions.clone(),
             input,
             tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls,
             reasoning,
-            store: provider.is_azure_responses_endpoint(),
+            store: api_provider.is_azure_responses_endpoint(),
             stream: true,
             include,
             service_tier: match service_tier {
@@ -861,20 +891,24 @@ impl ModelClientSession {
     pub async fn preconnect_websocket(
         &mut self,
         session_telemetry: &SessionTelemetry,
-        _model_info: &ModelInfo,
+        model_info: &ModelInfo,
     ) -> std::result::Result<(), ApiError> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.client.responses_websocket_enabled(model_info) {
             return Ok(());
         }
         if self.websocket_session.connection.is_some() {
             return Ok(());
         }
 
-        let client_setup = self.client.current_client_setup().await.map_err(|err| {
-            ApiError::Stream(format!(
-                "failed to build websocket prewarm client setup: {err}"
-            ))
-        })?;
+        let client_setup = self
+            .client
+            .current_client_setup(model_info)
+            .await
+            .map_err(|err| {
+                ApiError::Stream(format!(
+                    "failed to build websocket prewarm client setup: {err}"
+                ))
+            })?;
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             &client_setup.api_auth,
@@ -1015,7 +1049,9 @@ impl ModelClientSession {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(
                 path,
-                self.client.state.provider.stream_idle_timeout(),
+                self.client
+                    .resolve_provider_for_model(model_info)
+                    .stream_idle_timeout(),
             )
             .map_err(map_api_error)?;
             let (stream, _last_request_rx) = map_response_stream(stream, session_telemetry.clone());
@@ -1028,7 +1064,7 @@ impl ModelClientSession {
             .map(super::auth::AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.client.current_client_setup(model_info).await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -1039,13 +1075,14 @@ impl ModelClientSession {
                 session_telemetry,
                 request_auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-                self.client.state.auth_env_telemetry.clone(),
+                client_setup.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
             let options = self.build_responses_options(turn_metadata_header, compression);
 
             let request = self.build_responses_request(
                 &client_setup.api_provider,
+                &client_setup.provider,
                 prompt,
                 model_info,
                 effort,
@@ -1117,7 +1154,7 @@ impl ModelClientSession {
             .map(super::auth::AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.client.current_client_setup(model_info).await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 &client_setup.api_auth,
@@ -1128,6 +1165,7 @@ impl ModelClientSession {
             let options = self.build_responses_options(turn_metadata_header, compression);
             let request = self.build_responses_request(
                 &client_setup.api_provider,
+                &client_setup.provider,
                 prompt,
                 model_info,
                 effort,
@@ -1245,7 +1283,7 @@ impl ModelClientSession {
         service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.client.responses_websocket_enabled(model_info) {
             return Ok(());
         }
         if self.websocket_session.last_request.is_some() {
@@ -1302,10 +1340,10 @@ impl ModelClientSession {
         service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
-        let wire_api = self.client.state.provider.wire_api;
+        let wire_api = self.client.resolve_provider_for_model(model_info).wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                if self.client.responses_websocket_enabled(model_info) {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(

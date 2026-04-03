@@ -111,9 +111,7 @@ pub(crate) async fn start_background_compaction(
     let sess_clone = Arc::clone(sess);
     let tc_clone = Arc::clone(turn_context);
 
-    let task = tokio::spawn(async move {
-        run_background_compact_task(sess_clone, tc_clone).await
-    });
+    let task = tokio::spawn(async move { run_background_compact_task(sess_clone, tc_clone).await });
 
     let handle = BackgroundCompactionHandle::new(task, snapshot_len);
     sess.set_background_compaction(handle).await;
@@ -124,11 +122,7 @@ async fn run_background_compact_task(
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<BackgroundCompactionResult> {
     if should_use_remote_compact_task(&turn_context.provider) {
-        crate::compact_remote::run_background_remote_compact(
-            sess,
-            turn_context,
-        )
-        .await
+        crate::compact_remote::run_background_remote_compact(sess, turn_context).await
     } else {
         run_background_local_compact(sess, turn_context).await
     }
@@ -264,7 +258,9 @@ pub(crate) async fn try_apply_background_compaction(
 
     // Stale if history was rolled back/truncated since snapshot
     if snapshot_len > current_len {
-        warn!("discarding stale background compaction (snapshot_len={snapshot_len} > current={current_len})");
+        warn!(
+            "discarding stale background compaction (snapshot_len={snapshot_len} > current={current_len})"
+        );
         // Drop handle without awaiting to abort
         handle.abort();
         return false;

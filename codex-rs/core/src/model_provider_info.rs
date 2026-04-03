@@ -31,6 +31,10 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
+const GEMINI_PROVIDER_NAME: &str = "Google Gemini";
+pub const GEMINI_PROVIDER_ID: &str = "gemini";
+const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
+pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -309,8 +313,58 @@ impl ModelProviderInfo {
         }
     }
 
+    pub fn create_gemini_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: GEMINI_PROVIDER_NAME.into(),
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
+            env_key: Some("GEMINI_API_KEY".into()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
+    pub fn create_openrouter_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: OPENROUTER_PROVIDER_NAME.into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            env_key: Some("OPENROUTER_API_KEY".into()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
+    }
+
+    pub fn effective_model_name<'a>(&self, slug: &'a str) -> &'a str {
+        if self.name == GEMINI_PROVIDER_NAME {
+            slug.strip_prefix("google/").unwrap_or(slug)
+        } else {
+            slug
+        }
     }
 
     pub(crate) fn has_command_auth(&self) -> bool {
@@ -331,12 +385,13 @@ pub fn built_in_model_providers(
     use ModelProviderInfo as P;
     let openai_provider = P::create_openai_provider(openai_base_url);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // Keep the bundled list intentionally small. These providers cover the
+    // built-in model catalog plus local OSS backends; users can still extend
+    // `model_providers` in config.toml for anything else.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
+        (OPENROUTER_PROVIDER_ID, P::create_openrouter_provider()),
+        (GEMINI_PROVIDER_ID, P::create_gemini_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -349,6 +404,25 @@ pub fn built_in_model_providers(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect()
+}
+
+fn non_empty_env_var(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
+    match model.split_once('/') {
+        Some(("google", _)) if non_empty_env_var("GEMINI_API_KEY") => Some(GEMINI_PROVIDER_ID),
+        Some(("google", _)) if non_empty_env_var("OPENROUTER_API_KEY") => {
+            Some(OPENROUTER_PROVIDER_ID)
+        }
+        Some(("anthropic" | "z-ai", _)) if non_empty_env_var("OPENROUTER_API_KEY") => {
+            Some(OPENROUTER_PROVIDER_ID)
+        }
+        _ => None,
+    }
 }
 
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {

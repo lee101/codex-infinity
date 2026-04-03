@@ -662,7 +662,10 @@ impl ChatComposer {
         entry: Option<String>,
         cwd: Option<String>,
     ) -> bool {
-        let Some(entry) = self.history.on_entry_response_with_cwd(log_id, offset, entry, cwd) else {
+        let Some(entry) = self
+            .history
+            .on_entry_response_with_cwd(log_id, offset, entry, cwd)
+        else {
             return false;
         };
         // Persistent ↑/↓ history is text-only (backwards-compatible and avoids persisting

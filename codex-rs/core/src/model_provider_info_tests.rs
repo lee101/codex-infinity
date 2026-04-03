@@ -2,8 +2,37 @@ use super::*;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use pretty_assertions::assert_eq;
+use std::ffi::OsString;
 use std::num::NonZeroU64;
 use tempfile::tempdir;
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
 
 #[test]
 fn test_deserialize_ollama_model_provider_toml() {
@@ -154,5 +183,51 @@ args = ["--format=text"]
             refresh_interval_ms: NonZeroU64::new(300_000).unwrap(),
             cwd: AbsolutePathBuf::resolve_path_against_base(".", base_dir.path()).unwrap(),
         })
+    );
+}
+
+#[test]
+fn gemini_provider_normalizes_google_prefix() {
+    let provider = ModelProviderInfo::create_gemini_provider();
+    assert_eq!(
+        provider.effective_model_name("google/gemini-3.1-pro-preview"),
+        "gemini-3.1-pro-preview"
+    );
+    assert_eq!(
+        provider.effective_model_name("gemini-3.1-pro-preview"),
+        "gemini-3.1-pro-preview"
+    );
+}
+
+#[test]
+fn infer_builtin_provider_prefers_env_backed_routes() {
+    let gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
+    let openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        None
+    );
+
+    drop(gemini_remove_guard);
+    let gemini_set_guard = EnvVarGuard::set("GEMINI_API_KEY", "gemini-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        Some(GEMINI_PROVIDER_ID)
+    );
+
+    drop(gemini_set_guard);
+    drop(openrouter_remove_guard);
+    let _openrouter_set_guard = EnvVarGuard::set("OPENROUTER_API_KEY", "openrouter-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        Some(OPENROUTER_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("anthropic/claude-opus-4.6"),
+        Some(OPENROUTER_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("z-ai/glm-5"),
+        Some(OPENROUTER_PROVIDER_ID)
     );
 }

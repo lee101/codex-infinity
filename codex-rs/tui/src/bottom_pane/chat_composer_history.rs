@@ -430,7 +430,11 @@ impl ChatComposerHistory {
         let matches_cursor = self.history_cursor == Some(offset as isize);
         let matches_cwd_cursor = self.nav_phase == NavPhase::CwdLocal
             && self.cwd_cursor.is_some()
-            && self.cwd_persistent_offsets.get(self.cwd_cursor.unwrap_or(usize::MAX)).copied() == Some(offset);
+            && self
+                .cwd_persistent_offsets
+                .get(self.cwd_cursor.unwrap_or(usize::MAX))
+                .copied()
+                == Some(offset);
 
         if matches_cursor || matches_cwd_cursor {
             self.last_history_text = Some(entry.text.clone());
@@ -502,7 +506,9 @@ impl ChatComposerHistory {
     pub fn search_prompt(&self) -> String {
         let match_info = match (self.search_match_cursor, self.search_matches.len()) {
             (Some(idx), total) if total > 0 => format!(" [{}/{}]", idx + 1, total),
-            _ if !self.search_query.is_empty() && self.search_matches.is_empty() => " [no match]".to_string(),
+            _ if !self.search_query.is_empty() && self.search_matches.is_empty() => {
+                " [no match]".to_string()
+            }
             _ => String::new(),
         };
         format!("(reverse-i-search){match_info}`{}'", self.search_query)
@@ -721,7 +727,10 @@ mod tests {
 
         // First Up: should get "another in a" (newest CWD match)
         let result = history.navigate_up(&tx);
-        assert_eq!(result.as_ref().map(|e| e.text.as_str()), Some("another in a"));
+        assert_eq!(
+            result.as_ref().map(|e| e.text.as_str()),
+            Some("another in a")
+        );
 
         // Second Up: should get "cmd in a" (older CWD match)
         let result = history.navigate_up(&tx);
@@ -729,7 +738,10 @@ mod tests {
 
         // Third Up: CWD exhausted, transitions to global, gets "another in a" (newest global)
         let result = history.navigate_up(&tx);
-        assert_eq!(result.as_ref().map(|e| e.text.as_str()), Some("another in a"));
+        assert_eq!(
+            result.as_ref().map(|e| e.text.as_str()),
+            Some("another in a")
+        );
     }
 
     #[test]

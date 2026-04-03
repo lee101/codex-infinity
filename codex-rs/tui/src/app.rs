@@ -1032,11 +1032,14 @@ fn active_turn_not_steerable_turn_error(error: &TypedRequestError) -> Option<App
     .then_some(turn_error)
 }
 
-fn active_turn_missing_steer_error(error: &TypedRequestError) -> bool {
-    let TypedRequestError::Server { source, .. } = error else {
+fn active_turn_stale_steer_error(error: &TypedRequestError) -> bool {
+    let TypedRequestError::Server { method, source } = error else {
         return false;
     };
-    source.message == "no active turn to steer"
+    method == "turn/steer"
+        && (source.message == "no active turn to steer"
+            || source.message.starts_with("expected active turn id `")
+                && source.message.contains("` but found `"))
 }
 
 impl App {
@@ -2006,7 +2009,8 @@ impl App {
                 let cwd = Some(config.cwd.to_string_lossy().to_string());
                 tokio::spawn(async move {
                     if let Err(err) =
-                        message_history::append_entry_with_cwd(&text, &thread_id, &config, cwd).await
+                        message_history::append_entry_with_cwd(&text, &thread_id, &config, cwd)
+                            .await
                     {
                         tracing::warn!(
                             thread_id = %thread_id,
@@ -2095,7 +2099,7 @@ impl App {
                                     self.chat_widget.add_error_message(turn_error.message);
                                 }
                                 return Ok(true);
-                            } else if active_turn_missing_steer_error(&error) {
+                            } else if active_turn_stale_steer_error(&error) {
                                 if let Some(channel) = self.thread_event_channels.get(&thread_id) {
                                     let mut store = channel.store.lock().await;
                                     store.clear_active_turn_id();
@@ -9326,7 +9330,7 @@ guardian_approval = true
     }
 
     #[test]
-    fn active_turn_missing_steer_error_detects_stale_turn_race() {
+    fn active_turn_stale_steer_error_detects_missing_turn_race() {
         let error = TypedRequestError::Server {
             method: "turn/steer".to_string(),
             source: JSONRPCErrorError {
@@ -9336,7 +9340,22 @@ guardian_approval = true
             },
         };
 
-        assert!(active_turn_missing_steer_error(&error));
+        assert!(active_turn_stale_steer_error(&error));
+        assert_eq!(active_turn_not_steerable_turn_error(&error), None);
+    }
+
+    #[test]
+    fn active_turn_stale_steer_error_detects_expected_turn_mismatch_race() {
+        let error = TypedRequestError::Server {
+            method: "turn/steer".to_string(),
+            source: JSONRPCErrorError {
+                code: -32602,
+                message: "expected active turn id `turn-a` but found `turn-b`".to_string(),
+                data: None,
+            },
+        };
+
+        assert!(active_turn_stale_steer_error(&error));
         assert_eq!(active_turn_not_steerable_turn_error(&error), None);
     }
 

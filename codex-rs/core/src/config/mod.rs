@@ -40,13 +40,16 @@ use crate::config_loader::ResidencyRequirement;
 use crate::config_loader::Sourced;
 use crate::config_loader::load_config_layers_state;
 use crate::memories::memory_root;
+use crate::model_provider_info::GEMINI_PROVIDER_ID;
 use crate::model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use crate::model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use crate::model_provider_info::OPENAI_PROVIDER_ID;
+use crate::model_provider_info::OPENROUTER_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
+use crate::model_provider_info::infer_builtin_provider_id_for_model;
 use crate::path_utils::normalize_for_native_workdir;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
@@ -149,8 +152,10 @@ const CODEX_INFINITE_DEFAULT_MODEL_ENV_VAR: &str = "CODEX_INFINITE_DEFAULT_MODEL
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const OPENAI_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 3] = [
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
     OPENAI_PROVIDER_ID,
+    OPENROUTER_PROVIDER_ID,
+    GEMINI_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
@@ -1975,6 +1980,23 @@ fn codex_infinite_default_model_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn resolve_model_provider_id(
+    explicit_model_provider: Option<String>,
+    profile_model_provider: Option<String>,
+    config_model_provider: Option<String>,
+    model: Option<&str>,
+) -> String {
+    explicit_model_provider
+        .or(profile_model_provider)
+        .or(config_model_provider)
+        .or_else(|| {
+            model
+                .and_then(infer_builtin_provider_id_for_model)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| OPENAI_PROVIDER_ID.to_string())
+}
+
 fn resolve_configured_model(
     model_override: Option<String>,
     profile_model: Option<String>,
@@ -2298,22 +2320,6 @@ impl Config {
             model_providers.entry(key).or_insert(provider);
         }
 
-        let model_provider_id = model_provider
-            .or(config_profile.model_provider)
-            .or(cfg.model_provider)
-            .unwrap_or_else(|| "openai".to_string());
-        let model_provider = model_providers
-            .get(&model_provider_id)
-            .ok_or_else(|| {
-                let message = if model_provider_id == LEGACY_OLLAMA_CHAT_PROVIDER_ID {
-                    OLLAMA_CHAT_PROVIDER_REMOVED_ERROR.to_string()
-                } else {
-                    format!("Model provider `{model_provider_id}` not found")
-                };
-                std::io::Error::new(std::io::ErrorKind::NotFound, message)
-            })?
-            .clone();
-
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
@@ -2411,6 +2417,23 @@ impl Config {
             cfg.model,
             codex_infinite_default_model_from_env(),
         );
+        let model_provider_id = resolve_model_provider_id(
+            model_provider,
+            config_profile.model_provider,
+            cfg.model_provider,
+            model.as_deref(),
+        );
+        let model_provider = model_providers
+            .get(&model_provider_id)
+            .ok_or_else(|| {
+                let message = if model_provider_id == LEGACY_OLLAMA_CHAT_PROVIDER_ID {
+                    OLLAMA_CHAT_PROVIDER_REMOVED_ERROR.to_string()
+                } else {
+                    format!("Model provider `{model_provider_id}` not found")
+                };
+                std::io::Error::new(std::io::ErrorKind::NotFound, message)
+            })?
+            .clone();
         let service_tier = service_tier_override
             .unwrap_or_else(|| config_profile.service_tier.or(cfg.service_tier));
         let service_tier = match service_tier {

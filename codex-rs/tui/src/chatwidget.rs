@@ -2469,10 +2469,11 @@ impl ChatWidget {
         if !self.auto_next_steps && !self.auto_next_idea {
             return;
         }
-        let is_review_turn = self.auto_next_counter > 0
-            && self.auto_next_counter % REVIEW_INTERVAL == 0;
+        let is_review_turn =
+            self.auto_next_counter > 0 && self.auto_next_counter % REVIEW_INTERVAL == 0;
         let mut prompt = if is_review_turn {
-            let review_idx = (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
+            let review_idx =
+                (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
             AUTO_NEXT_REVIEW_PROMPTS[review_idx].to_string()
         } else {
             self.generate_contextual_auto_next_prompt()
@@ -2485,7 +2486,8 @@ impl ChatWidget {
             }
         }
         self.auto_next_counter += 1;
-        self.queued_user_messages.push_back(UserMessage::from(prompt));
+        self.queued_user_messages
+            .push_back(UserMessage::from(prompt));
     }
 
     fn generate_contextual_auto_next_prompt(&self) -> String {
@@ -2497,22 +2499,19 @@ impl ChatWidget {
         let idx = self.auto_next_counter % templates.len();
         let base = templates[idx];
 
-        let context_snippet = self
-            .last_copyable_output
-            .as_deref()
-            .map(|s| {
-                let truncated: String = s.chars().take(800).collect();
-                if s.len() > 800 {
-                    format!("{truncated}...")
-                } else {
-                    truncated
-                }
-            });
+        let context_snippet = self.last_copyable_output.as_deref().map(|s| {
+            let truncated: String = s.chars().take(800).collect();
+            if s.len() > 800 {
+                format!("{truncated}...")
+            } else {
+                truncated
+            }
+        });
 
         match context_snippet {
-            Some(snippet) => format!(
-                "{base}\n\nFor reference, here's a summary of the last output:\n{snippet}"
-            ),
+            Some(snippet) => {
+                format!("{base}\n\nFor reference, here's a summary of the last output:\n{snippet}")
+            }
             None => base.to_string(),
         }
     }

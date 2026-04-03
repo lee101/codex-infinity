@@ -640,9 +640,7 @@ pub async fn run_main(
             "shell_environment_policy.experimental_use_profile=true",
             "allow_login_shell=true",
         ] {
-            cli.config_overrides
-                .raw_overrides
-                .push(ov.to_string());
+            cli.config_overrides.raw_overrides.push(ov.to_string());
         }
     }
 
@@ -1336,8 +1334,8 @@ async fn run_ratatui_app(
         _ => config,
     };
     if !remote_mode && config.active_project.trust_level.is_none() {
-        let target =
-            resolve_root_git_project_for_trust(&config.cwd).unwrap_or_else(|| config.cwd.clone().to_path_buf());
+        let target = resolve_root_git_project_for_trust(&config.cwd)
+            .unwrap_or_else(|| config.cwd.clone().to_path_buf());
         match set_project_trust_level(&config.codex_home, &target, TrustLevel::Trusted) {
             Ok(()) => {
                 trust_decision_was_made = true;

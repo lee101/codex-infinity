@@ -87,7 +87,12 @@ pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Confi
     append_entry_with_cwd(text, conversation_id, config, None).await
 }
 
-pub async fn append_entry_with_cwd(text: &str, conversation_id: &ThreadId, config: &Config, cwd: Option<String>) -> Result<()> {
+pub async fn append_entry_with_cwd(
+    text: &str,
+    conversation_id: &ThreadId,
+    config: &Config,
+    cwd: Option<String>,
+) -> Result<()> {
     match config.history.persistence {
         HistoryPersistence::SaveAll => {
             // Save everything: proceed.
@@ -291,7 +296,10 @@ pub async fn history_metadata_with_cwd(config: &Config, cwd: &str) -> (u64, usiz
         for line_res in std::io::BufRead::lines(reader) {
             let line = match line_res {
                 Ok(l) => l,
-                Err(_) => { count += 1; continue; }
+                Err(_) => {
+                    count += 1;
+                    continue;
+                }
             };
             if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
                 if entry.cwd.as_deref() == Some(cwd_owned.as_str()) {
@@ -301,7 +309,9 @@ pub async fn history_metadata_with_cwd(config: &Config, cwd: &str) -> (u64, usiz
             count += 1;
         }
         (count, cwd_offsets)
-    }).await.unwrap_or((0, Vec::new()));
+    })
+    .await
+    .unwrap_or((0, Vec::new()));
 
     (log_id, result.0, result.1)
 }

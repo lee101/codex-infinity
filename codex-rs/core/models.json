@@ -733,6 +733,118 @@
         "pro",
         "team"
       ]
+    },
+    {
+      "supports_reasoning_summaries": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "context_window": 400000,
+      "reasoning_summary_format": null,
+      "slug": "anthropic/claude-opus-4.6",
+      "display_name": "Claude Opus 4.6",
+      "description": "Anthropic flagship reasoning model via OpenRouter.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.0.1",
+      "supported_in_api": true,
+      "upgrade": null,
+      "priority": 14,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n# General\n\n- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)\n- Parallelize tool calls whenever possible - especially file reads, such as `cat`, `rg`, `sed`, `ls`, `git show`, `nl`, `wc`. Use `multi_tool_use.parallel` to parallelize tool calls and only this.\n\n## Editing constraints\n\n- Default to ASCII when editing or creating files. Only introduce non-ASCII or other Unicode characters when there is a clear justification and the file already uses them.\n- Try to use apply_patch for single file edits, but it is fine to explore other options to make the edit if it does not work well.\n- You may be in a dirty git worktree. NEVER revert existing changes you did not make unless explicitly requested.\n- Do not amend a commit unless explicitly requested to do so.\n- NEVER use destructive commands like `git reset --hard` or `git checkout --` unless specifically requested.\n- ALWAYS prefer using non-interactive git commands.\n",
+      "experimental_supported_tools": [],
+      "available_in_plans": [
+        "business",
+        "edu",
+        "education",
+        "enterprise",
+        "finserv",
+        "free",
+        "go",
+        "hc",
+        "plus",
+        "pro",
+        "team"
+      ]
+    },
+    {
+      "supports_reasoning_summaries": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "context_window": 202752,
+      "reasoning_summary_format": null,
+      "slug": "z-ai/glm-5",
+      "display_name": "GLM 5",
+      "description": "Z.ai flagship reasoning model via OpenRouter.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.0.1",
+      "supported_in_api": true,
+      "upgrade": null,
+      "priority": 15,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n# General\n\n- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)\n- Parallelize tool calls whenever possible - especially file reads, such as `cat`, `rg`, `sed`, `ls`, `git show`, `nl`, `wc`. Use `multi_tool_use.parallel` to parallelize tool calls and only this.\n\n## Editing constraints\n\n- Default to ASCII when editing or creating files. Only introduce non-ASCII or other Unicode characters when there is a clear justification and the file already uses them.\n- Try to use apply_patch for single file edits, but it is fine to explore other options to make the edit if it does not work well.\n- You may be in a dirty git worktree. NEVER revert existing changes you did not make unless explicitly requested.\n- Do not amend a commit unless explicitly requested to do so.\n- NEVER use destructive commands like `git reset --hard` or `git checkout --` unless specifically requested.\n- ALWAYS prefer using non-interactive git commands.\n",
+      "experimental_supported_tools": [],
+      "available_in_plans": [
+        "business",
+        "edu",
+        "education",
+        "enterprise",
+        "finserv",
+        "free",
+        "go",
+        "hc",
+        "plus",
+        "pro",
+        "team"
+      ]
     }
   ]
 }
