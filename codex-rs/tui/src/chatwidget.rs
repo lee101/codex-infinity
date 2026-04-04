@@ -803,7 +803,7 @@ pub(crate) struct ChatWidget {
     plan_stream_controller: Option<PlanStreamController>,
     // Latest completed user-visible Codex output that `/copy` should place on the clipboard.
     last_copyable_output: Option<String>,
-    // Final-answer agent message observed during the active turn. App-server turn completion
+    // Latest agent message observed during the active turn. App-server turn completion
     // notifications do not repeat this payload, so we promote it when the turn completes.
     pending_turn_copyable_output: Option<String>,
     running_commands: HashMap<String, RunningCommand>,
@@ -4138,10 +4138,7 @@ impl ChatWidget {
         self.finalize_completed_assistant_message(
             (!message.is_empty()).then_some(message.as_str()),
         );
-        if self.agent_turn_running
-            && !message.is_empty()
-            && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
-        {
+        if self.agent_turn_running && !message.is_empty() {
             self.pending_turn_copyable_output = Some(message.clone());
         }
         self.pending_status_indicator_restore = match item.phase {

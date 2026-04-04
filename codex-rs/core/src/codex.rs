@@ -334,6 +334,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -1533,6 +1534,17 @@ impl Session {
                 ),
             ),
         };
+        let window_generation = match &initial_history {
+            InitialHistory::Resumed(resumed_history) => u64::try_from(
+                resumed_history
+                    .history
+                    .iter()
+                    .filter(|item| matches!(item, RolloutItem::Compacted(_)))
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+            InitialHistory::New | InitialHistory::Forked(_) => 0,
+        };
         let state_builder = match &initial_history {
             InitialHistory::Resumed(resumed) => metadata::builder_from_items(
                 resumed.history.as_slice(),
@@ -1922,6 +1934,9 @@ impl Session {
             ),
             environment: environment_manager.current().await?,
         };
+        services
+            .model_client
+            .set_window_generation(window_generation);
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
             config.js_repl_node_module_dirs.clone(),
@@ -3517,6 +3532,7 @@ impl Session {
             self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
                 .await;
         }
+        self.services.model_client.advance_window_generation();
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -3582,22 +3598,24 @@ impl Session {
         {
             developer_sections.push(model_switch_message.into_text());
         }
-        developer_sections.push(
-            DeveloperInstructions::from_policy(
-                turn_context.sandbox_policy.get(),
-                turn_context.approval_policy.value(),
-                turn_context.config.approvals_reviewer,
-                self.services.exec_policy.current().as_ref(),
-                &turn_context.cwd,
-                turn_context
-                    .features
-                    .enabled(Feature::ExecPermissionApprovals),
-                turn_context
-                    .features
-                    .enabled(Feature::RequestPermissionsTool),
-            )
-            .into_text(),
-        );
+        if turn_context.config.include_permissions_instructions {
+            developer_sections.push(
+                DeveloperInstructions::from_policy(
+                    turn_context.sandbox_policy.get(),
+                    turn_context.approval_policy.value(),
+                    turn_context.config.approvals_reviewer,
+                    self.services.exec_policy.current().as_ref(),
+                    &turn_context.cwd,
+                    turn_context
+                        .features
+                        .enabled(Feature::ExecPermissionApprovals),
+                    turn_context
+                        .features
+                        .enabled(Feature::RequestPermissionsTool),
+                )
+                .into_text(),
+            );
+        }
         let separate_guardian_developer_message =
             crate::guardian::is_guardian_reviewer_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it
@@ -3647,7 +3665,7 @@ impl Session {
                 );
             }
         }
-        if turn_context.apps_enabled() {
+        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             let accessible_and_enabled_connectors =
                 connectors::list_accessible_and_enabled_connectors_from_manager(
@@ -3690,16 +3708,18 @@ impl Session {
                 .serialize_to_text(),
             );
         }
-        let subagents = self
-            .services
-            .agent_control
-            .format_environment_context_subagents(self.conversation_id)
-            .await;
-        contextual_user_sections.push(
-            EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
-                .with_subagents(subagents)
-                .serialize_to_xml(),
-        );
+        if turn_context.config.include_environment_context {
+            let subagents = self
+                .services
+                .agent_control
+                .format_environment_context_subagents(self.conversation_id)
+                .await;
+            contextual_user_sections.push(
+                EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
+                    .with_subagents(subagents)
+                    .serialize_to_xml(),
+            );
+        }
 
         let mut items = Vec::with_capacity(3);
         if let Some(developer_message) =
@@ -5785,16 +5805,20 @@ pub(crate) async fn run_turn(
 
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+    let mut prewarmed_client_session = prewarmed_client_session;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if run_pre_sampling_compact(&sess, &turn_context)
-        .await
-        .is_err()
-    {
-        error!("Failed to run pre-sampling compact");
-        return None;
+    let pre_sampling_compacted = match run_pre_sampling_compact(&sess, &turn_context).await {
+        Ok(pre_sampling_compacted) => pre_sampling_compacted,
+        Err(_) => {
+            error!("Failed to run pre-sampling compact");
+            return None;
+        }
+    };
+    if pre_sampling_compacted && let Some(mut client_session) = prewarmed_client_session.take() {
+        client_session.reset_websocket_session();
     }
 
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
@@ -6115,6 +6139,7 @@ pub(crate) async fn run_turn(
                     {
                         return None;
                     }
+                    client_session.reset_websocket_session();
                     continue;
                 }
 
@@ -6286,9 +6311,9 @@ pub(crate) async fn run_turn(
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
-    maybe_run_previous_model_inline_compact(
+    let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
         total_usage_tokens_before_compaction,
@@ -6303,7 +6328,7 @@ async fn run_pre_sampling_compact(
             .auto_compact_token_limit()
             .unwrap_or(i64::MAX);
         if rechecked < auto_compact_limit {
-            return Ok(());
+            return Ok(pre_sampling_compacted);
         }
     }
 
@@ -6316,7 +6341,7 @@ async fn run_pre_sampling_compact(
     if total_usage_tokens >= auto_compact_limit {
         sess.cancel_background_compaction().await;
         run_auto_compact(sess, turn_context, InitialContextInjection::DoNotInject).await?;
-        return Ok(());
+        pre_sampling_compacted = true;
     }
 
     // Proactively start background compaction at 75% threshold
@@ -6328,7 +6353,7 @@ async fn run_pre_sampling_compact(
         start_background_compaction(sess, turn_context).await;
     }
 
-    Ok(())
+    Ok(pre_sampling_compacted)
 }
 
 /// Runs pre-sampling compaction against the previous model when switching to a smaller
@@ -6586,6 +6611,7 @@ pub(crate) fn build_prompt(
         output_schema: turn_context.final_output_json_schema.clone(),
     }
 }
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -7525,6 +7551,25 @@ async fn try_run_sampling_request(
                     cancellation_token: cancellation_token.child_token(),
                 };
 
+                let preempt_for_mailbox_mail = match &item {
+                    ResponseItem::Message { role, phase, .. } => {
+                        role == "assistant" && matches!(phase, Some(MessagePhase::Commentary))
+                    }
+                    ResponseItem::Reasoning { .. } => true,
+                    ResponseItem::LocalShellCall { .. }
+                    | ResponseItem::FunctionCall { .. }
+                    | ResponseItem::ToolSearchCall { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCall { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::WebSearchCall { .. }
+                    | ResponseItem::ImageGenerationCall { .. }
+                    | ResponseItem::GhostSnapshot { .. }
+                    | ResponseItem::Compaction { .. }
+                    | ResponseItem::Other => false,
+                };
+
                 let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)
                     .instrument(handle_responses)
                     .await?;
@@ -7535,6 +7580,13 @@ async fn try_run_sampling_request(
                     last_agent_message = Some(agent_message);
                 }
                 needs_follow_up |= output_result.needs_follow_up;
+                // todo: remove before stabilizing multi-agent v2
+                if preempt_for_mailbox_mail && sess.mailbox_rx.lock().await.has_pending() {
+                    break Ok(SamplingRequestResult {
+                        needs_follow_up: true,
+                        last_agent_message,
+                    });
+                }
             }
             ResponseEvent::OutputItemAdded(item) => {
                 if let Some(turn_item) = handle_non_tool_response_item(

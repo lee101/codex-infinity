@@ -248,7 +248,8 @@ use codex_login::run_login_server;
 use codex_mcp::mcp::auth::discover_supported_scopes;
 use codex_mcp::mcp::auth::resolve_oauth_scopes;
 use codex_mcp::mcp::collect_mcp_snapshot;
-use codex_mcp::mcp::group_tools_by_server;
+use codex_mcp::mcp::effective_mcp_servers;
+use codex_mcp::mcp::qualified_mcp_tool_name_prefix;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
@@ -2214,14 +2215,28 @@ impl CodexMessageProcessor {
             }
         };
 
+        // The user may have requested WorkspaceWrite or DangerFullAccess via
+        // the command line, though in the process of deriving the Config, it
+        // could be downgraded to ReadOnly (perhaps there is no sandbox
+        // available on Windows or the enterprise config disallows it). The cwd
+        // should still be considered "trusted" in this case.
+        let requested_sandbox_trusts_project = matches!(
+            typesafe_overrides.sandbox_mode,
+            Some(
+                codex_protocol::config_types::SandboxMode::WorkspaceWrite
+                    | codex_protocol::config_types::SandboxMode::DangerFullAccess
+            )
+        );
+
         if requested_cwd.is_some()
             && !config.active_project.is_trusted()
-            && matches!(
-                config.permissions.sandbox_policy.get(),
-                codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                    | codex_protocol::protocol::SandboxPolicy::DangerFullAccess
-                    | codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. }
-            )
+            && (requested_sandbox_trusts_project
+                || matches!(
+                    config.permissions.sandbox_policy.get(),
+                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+                        | codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. }
+                ))
         {
             let trust_target = resolve_root_git_project_for_trust(config.cwd.as_path())
                 .unwrap_or_else(|| config.cwd.to_path_buf());
@@ -3349,6 +3364,13 @@ impl CodexMessageProcessor {
             cwd,
             search_term,
         } = params;
+        let cwd = match normalize_thread_list_cwd_filter(cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
 
         let requested_page_size = limit
             .map(|value| value as usize)
@@ -3367,7 +3389,7 @@ impl CodexMessageProcessor {
                     model_providers,
                     source_kinds,
                     archived: archived.unwrap_or(false),
-                    cwd: cwd.map(PathBuf::from),
+                    cwd,
                     search_term,
                 },
             )
@@ -5134,12 +5156,56 @@ impl CodexMessageProcessor {
         )
         .await;
 
-        let tools_by_server = group_tools_by_server(&snapshot.tools);
+        // Rebuild the tool list per original server name instead of using
+        // `group_tools_by_server()`: qualified tool names are sanitized for the
+        // Responses API, so a config key like `some-server` is encoded as the
+        // `mcp__some_server__` prefix. Matching with the original server name's
+        // sanitized prefix preserves `/mcp` output for hyphenated names.
+        let effective_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
+        let mut sanitized_prefix_counts = HashMap::<String, usize>::new();
+        for name in effective_servers.keys() {
+            let prefix = qualified_mcp_tool_name_prefix(name);
+            *sanitized_prefix_counts.entry(prefix).or_default() += 1;
+        }
+        let tools_by_server = effective_servers
+            .keys()
+            .map(|name| {
+                let prefix = qualified_mcp_tool_name_prefix(name);
+                // If multiple server names normalize to the same prefix, the
+                // qualified tool namespace is ambiguous (for example
+                // `some-server` and `some_server` both become
+                // `mcp__some_server__`). In that case, avoid attributing the
+                // same tools to multiple servers.
+                let tools = if sanitized_prefix_counts
+                    .get(&prefix)
+                    .copied()
+                    .unwrap_or_default()
+                    == 1
+                {
+                    snapshot
+                        .tools
+                        .iter()
+                        .filter_map(|(qualified_name, tool)| {
+                            qualified_name
+                                .strip_prefix(&prefix)
+                                .map(|tool_name| (tool_name.to_string(), tool.clone()))
+                        })
+                        .collect::<HashMap<_, _>>()
+                } else {
+                    HashMap::new()
+                };
+                (name.clone(), tools)
+            })
+            .collect::<HashMap<_, _>>();
 
         let mut server_names: Vec<String> = config
             .mcp_servers
             .keys()
             .cloned()
+            // Include built-in/plugin MCP servers that are present in the
+            // effective runtime config even when they are not user-declared in
+            // `config.mcp_servers`.
+            .chain(effective_servers.keys().cloned())
             .chain(snapshot.auth_statuses.keys().cloned())
             .chain(snapshot.resources.keys().cloned())
             .chain(snapshot.resource_templates.keys().cloned())
@@ -7659,6 +7725,57 @@ impl CodexMessageProcessor {
             Ok(conv) => conv.rollout_path(),
             Err(_) => None,
         }
+    }
+}
+
+fn normalize_thread_list_cwd_filter(
+    cwd: Option<String>,
+) -> Result<Option<PathBuf>, JSONRPCErrorError> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    AbsolutePathBuf::relative_to_current_dir(cwd.as_str())
+        .map(AbsolutePathBuf::into_path_buf)
+        .map(Some)
+        .map_err(|err| JSONRPCErrorError {
+            code: INVALID_PARAMS_ERROR_CODE,
+            message: format!("invalid thread/list cwd filter `{cwd}`: {err}"),
+            data: None,
+        })
+}
+
+#[cfg(test)]
+mod thread_list_cwd_filter_tests {
+    use super::normalize_thread_list_cwd_filter;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    #[test]
+    fn normalize_thread_list_cwd_filter_preserves_absolute_paths() {
+        let cwd = if cfg!(windows) {
+            String::from(r"C:\srv\repo-b")
+        } else {
+            String::from("/srv/repo-b")
+        };
+
+        assert_eq!(
+            normalize_thread_list_cwd_filter(Some(cwd.clone())).expect("cwd filter should parse"),
+            Some(PathBuf::from(cwd))
+        );
+    }
+
+    #[test]
+    fn normalize_thread_list_cwd_filter_resolves_relative_paths_against_server_cwd()
+    -> std::io::Result<()> {
+        let expected = AbsolutePathBuf::relative_to_current_dir("repo-b")?.to_path_buf();
+
+        assert_eq!(
+            normalize_thread_list_cwd_filter(Some(String::from("repo-b")))
+                .expect("cwd filter should parse"),
+            Some(expected)
+        );
+        Ok(())
     }
 }
 
