@@ -238,6 +238,21 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             needs_special_apply_patch_instructions: true,
             support_verbosity: true,
         )
+    } else if slug.starts_with("glm-5") || slug.starts_with("GLM-5") {
+        model_family!(
+            slug, "glm-5",
+            needs_special_apply_patch_instructions: true,
+        )
+    } else if slug.starts_with("glm-4") || slug.starts_with("GLM-4") {
+        model_family!(
+            slug, "glm-4",
+            needs_special_apply_patch_instructions: true,
+        )
+    } else if slug.contains("grok") {
+        model_family!(
+            slug, "grok",
+            needs_special_apply_patch_instructions: true,
+        )
     } else {
         None
     }
