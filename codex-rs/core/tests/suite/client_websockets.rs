@@ -10,11 +10,11 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_otel::current_span_w3c_trace_context;
-use codex_otel::metrics::MetricsClient;
-use codex_otel::metrics::MetricsConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ReasoningSummary;
@@ -1654,9 +1654,9 @@ fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
 
 fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &str) -> Prompt {
     let mut prompt = prompt_with_input(input);
-    prompt.base_instructions = BaseInstructions {
+    prompt.base_instructions = Some(BaseInstructions {
         text: instructions.to_string(),
-    };
+    });
     prompt
 }
 

@@ -95,13 +95,13 @@ use codex_chatgpt::connectors;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_core::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::find_thread_name_by_id;
 use codex_core::plugins::PluginsManager;
-use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -1971,7 +1971,7 @@ impl ChatWidget {
             let tx = self.app_event_tx.clone();
             tokio::spawn(async move {
                 let (_, _, cwd_offsets) =
-                    codex_core::message_history::history_metadata_with_cwd(&config, &cwd_str).await;
+                    codex_core::message_history_metadata_with_cwd(&config, &cwd_str).await;
                 tx.send(AppEvent::HistoryCwdIndex { cwd_offsets });
             });
         }
@@ -5995,6 +5995,9 @@ impl ChatWidget {
                 items,
                 status,
                 error,
+                started_at,
+                completed_at,
+                duration_ms,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
                 self.last_non_retry_error = None;
@@ -6015,6 +6018,9 @@ impl ChatWidget {
                             items: Vec::new(),
                             status,
                             error,
+                            started_at,
+                            completed_at,
+                            duration_ms,
                         },
                     },
                     Some(replay_kind),
@@ -7407,6 +7413,8 @@ impl ChatWidget {
             .values()
             .cloned()
             .collect();
+        let config = self.config.clone();
+        let frame_requester = self.frame_requester.clone();
         let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle(
             &self.config,
             self.status_account_display.as_ref(),
@@ -7421,8 +7429,21 @@ impl ChatWidget {
             self.model_display_name(),
             collaboration_mode,
             reasoning_effort_override,
+            "<none>".to_string(),
             refreshing_rate_limits,
         );
+        let agents_summary_handle = handle.clone();
+        tokio::spawn(async move {
+            let agents_summary = match crate::status::discover_agents_summary(&config).await {
+                Ok(summary) => summary,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to discover project docs for /status");
+                    "<none>".to_string()
+                }
+            };
+            agents_summary_handle.finish_agents_summary_discovery(agents_summary);
+            frame_requester.schedule_frame();
+        });
         if let Some(request_id) = request_id {
             self.refreshing_status_outputs.push((request_id, handle));
         }

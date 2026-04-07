@@ -36,6 +36,8 @@ impl WelcomeWidget {
     pub(crate) fn update_layout_area(&self, area: Rect) {
         let _ = area;
     }
+
+    pub(crate) fn set_animations_suppressed(&self, _suppressed: bool) {}
 }
 
 impl WidgetRef for &WelcomeWidget {
@@ -121,6 +123,7 @@ mod tests {
                 /*variant_idx*/ 0,
             ),
             animations_enabled: true,
+            animations_suppressed: Cell::new(false),
             layout_area: Cell::new(None),
         };
 

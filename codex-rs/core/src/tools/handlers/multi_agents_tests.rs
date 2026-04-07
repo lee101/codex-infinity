@@ -757,7 +757,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let err = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -769,7 +769,9 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
             })),
         ))
         .await
-        .expect_err("followup_task should reject the root target");
+    else {
+        panic!("followup_task should reject the root target");
+    };
 
     assert_eq!(
         err,
@@ -837,6 +839,8 @@ async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_messa
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: child_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
+                completed_at: None,
+                duration_ms: None,
             }),
         )
         .await;
@@ -1337,6 +1341,8 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: first_turn.sub_id.clone(),
                 last_agent_message: Some("first done".to_string()),
+                completed_at: None,
+                duration_ms: None,
             }),
         )
         .await;
@@ -1363,6 +1369,8 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: second_turn.sub_id.clone(),
                 last_agent_message: Some("second done".to_string()),
+                completed_at: None,
+                duration_ms: None,
             }),
         )
         .await;
@@ -1518,6 +1526,8 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(aborted_turn.sub_id.clone()),
                 reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
             }),
         )
         .await;
@@ -1546,7 +1556,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_includes_agent_id_key_when_named() {
+async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -1578,7 +1588,7 @@ async fn multi_agent_v2_spawn_includes_agent_id_key_when_named() {
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
 
-    assert_eq!(result["agent_id"], serde_json::Value::Null);
+    assert!(result.get("agent_id").is_none());
     assert_eq!(result["task_name"], "/root/test_process");
     assert!(result.get("nickname").is_some());
     assert_eq!(success, Some(true));
@@ -3201,9 +3211,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
 
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+    let config = build_agent_spawn_config(Some(&base_instructions), &turn).expect("spawn config");
     let mut expected = (*turn.config).clone();
-    expected.base_instructions = Some(base_instructions.text);
+    expected.base_instructions = Some(Some(base_instructions.text));
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.clone();
     expected.model_reasoning_effort = turn.reasoning_effort;
@@ -3239,7 +3249,7 @@ async fn build_agent_spawn_config_preserves_base_user_instructions() {
         text: "base".to_string(),
     };
 
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+    let config = build_agent_spawn_config(Some(&base_instructions), &turn).expect("spawn config");
 
     assert_eq!(config.user_instructions, base_config.user_instructions);
 }
@@ -3248,7 +3258,7 @@ async fn build_agent_spawn_config_preserves_base_user_instructions() {
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
-    base_config.base_instructions = Some("caller-base".to_string());
+    base_config.base_instructions = Some(Some("caller-base".to_string()));
     turn.config = Arc::new(base_config);
     turn.approval_policy
         .set(AskForApproval::OnRequest)
