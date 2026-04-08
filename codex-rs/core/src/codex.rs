@@ -26,6 +26,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
+use crate::installation_id::resolve_installation_id;
 use crate::parse_turn_item;
 use crate::path_utils::normalize_for_native_workdir;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -580,15 +581,11 @@ impl Codex {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
-        let base_instructions = match config.base_instructions.clone() {
-            Some(base_instructions) => base_instructions,
-            None => conversation_history
-                .get_base_instructions()
-                .map(|base_instructions| {
-                    base_instructions.map(|base_instructions| base_instructions.text)
-                })
-                .unwrap_or_else(|| Some(model_info.get_model_instructions(config.personality))),
-        };
+        let base_instructions = config
+            .base_instructions
+            .clone()
+            .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
 
         // Respect thread-start tools. When missing (resumed/forked threads), read from the db
         // first, then fall back to rollout-file tools.
@@ -820,6 +817,9 @@ pub(crate) struct Session {
     agent_status: watch::Sender<AgentStatus>,
     out_of_band_elicitation_paused: watch::Sender<bool>,
     state: Mutex<SessionState>,
+    /// Serializes rebuild/apply cycles for the running proxy; each cycle
+    /// rebuilds from the current SessionState while holding this lock.
+    managed_network_proxy_refresh_lock: Mutex<()>,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     features: ManagedFeatures,
@@ -967,6 +967,9 @@ impl TurnContext {
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_has_environment(self.tools_config.has_environment)
+        .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
+        .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
+        .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
         ));
@@ -1105,7 +1108,7 @@ pub(crate) struct SessionConfiguration {
     personality: Option<Personality>,
 
     /// Base instructions for the session.
-    base_instructions: Option<String>,
+    base_instructions: String,
 
     /// Compact prompt override.
     compact_prompt: Option<String>,
@@ -1333,6 +1336,48 @@ impl Session {
         Ok((network_proxy, session_network_proxy))
     }
 
+    async fn refresh_managed_network_proxy_for_current_sandbox_policy(&self) {
+        let Some(started_proxy) = self.services.network_proxy.as_ref() else {
+            return;
+        };
+        let _refresh_guard = self.managed_network_proxy_refresh_lock.lock().await;
+        let session_configuration = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+        let Some(spec) = session_configuration
+            .original_config_do_not_use
+            .permissions
+            .network
+            .as_ref()
+        else {
+            return;
+        };
+
+        let spec = match spec
+            .recompute_for_sandbox_policy(session_configuration.sandbox_policy.get())
+        {
+            Ok(spec) => spec,
+            Err(err) => {
+                warn!("failed to rebuild managed network proxy policy for sandbox change: {err}");
+                return;
+            }
+        };
+        let current_exec_policy = self.services.exec_policy.current();
+        let spec = match spec.with_exec_policy_network_rules(current_exec_policy.as_ref()) {
+            Ok(spec) => spec,
+            Err(err) => {
+                warn!(
+                    "failed to apply execpolicy network rules while refreshing managed network proxy: {err}"
+                );
+                spec
+            }
+        };
+        if let Err(err) = spec.apply_to_started_proxy(started_proxy).await {
+            warn!("failed to refresh managed network proxy for sandbox change: {err}");
+        }
+    }
+
     /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
     pub(crate) fn build_per_turn_config(session_configuration: &SessionConfiguration) -> Config {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
@@ -1449,6 +1494,9 @@ impl Session {
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
         .with_has_environment(environment.is_some())
+        .with_spawn_agent_usage_hint(per_turn_config.multi_agent_v2.usage_hint_enabled)
+        .with_spawn_agent_usage_hint_text(per_turn_config.multi_agent_v2.usage_hint_text.clone())
+        .with_hide_spawn_agent_metadata(per_turn_config.multi_agent_v2.hide_spawn_agent_metadata)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &per_turn_config.agent_roles,
         ));
@@ -1544,10 +1592,9 @@ impl Session {
                         conversation_id,
                         forked_from_id,
                         session_source,
-                        session_configuration
-                            .base_instructions
-                            .clone()
-                            .map(|text| BaseInstructions { text }),
+                        BaseInstructions {
+                            text: session_configuration.base_instructions.clone(),
+                        },
                         session_configuration.dynamic_tools.clone(),
                         if session_configuration.persist_extended_history {
                             EventPersistenceMode::Extended
@@ -1914,6 +1961,7 @@ impl Session {
             });
         }
 
+        let installation_id = resolve_installation_id(&config.codex_home).await?;
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
@@ -1957,6 +2005,7 @@ impl Session {
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
+                installation_id,
                 session_configuration.provider.clone(),
                 session_configuration.session_source.clone(),
                 config.model_verbosity,
@@ -1986,6 +2035,7 @@ impl Session {
             agent_status,
             out_of_band_elicitation_paused,
             state: Mutex::new(state),
+            managed_network_proxy_refresh_lock: Mutex::new(()),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
             conversation: Arc::new(RealtimeConversationManager::new()),
@@ -2110,9 +2160,8 @@ impl Session {
                 ));
             }
         }
-        if let Some(base_instructions) = session_configuration.base_instructions.clone() {
-            sess.schedule_startup_prewarm(base_instructions).await;
-        }
+        sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+            .await;
         let session_start_source = match &initial_history {
             InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -2214,13 +2263,11 @@ impl Session {
         state.history.estimate_token_count(turn_context)
     }
 
-    pub(crate) async fn get_base_instructions(&self) -> Option<BaseInstructions> {
+    pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
         let state = self.state.lock().await;
-        state
-            .session_configuration
-            .base_instructions
-            .clone()
-            .map(|text| BaseInstructions { text })
+        BaseInstructions {
+            text: state.session_configuration.base_instructions.clone(),
+        }
     }
 
     // Merges connector IDs into the session-level explicit connector selection.
@@ -2406,6 +2453,8 @@ impl Session {
         match state.session_configuration.apply(&updates) {
             Ok(updated) => {
                 let previous_cwd = state.session_configuration.cwd.clone();
+                let sandbox_policy_changed =
+                    state.session_configuration.sandbox_policy != updated.sandbox_policy;
                 let next_cwd = updated.cwd.clone();
                 let codex_home = updated.codex_home.clone();
                 let session_source = updated.session_source.clone();
@@ -2418,6 +2467,10 @@ impl Session {
                     &codex_home,
                     &session_source,
                 );
+                if sandbox_policy_changed {
+                    self.refresh_managed_network_proxy_for_current_sandbox_policy()
+                        .await;
+                }
 
                 Ok(())
             }
@@ -2504,6 +2557,8 @@ impl Session {
             .set_approval_policy(&session_configuration.approval_policy);
 
         if sandbox_policy_changed {
+            self.refresh_managed_network_proxy_for_current_sandbox_policy()
+                .await;
             let sandbox_state = SandboxState {
                 sandbox_policy: per_turn_config.permissions.sandbox_policy.get().clone(),
                 codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
@@ -2939,6 +2994,7 @@ impl Session {
         amendment: &NetworkPolicyAmendment,
         network_approval_context: &NetworkApprovalContext,
     ) -> anyhow::Result<()> {
+        let _refresh_guard = self.managed_network_proxy_refresh_lock.lock().await;
         let host =
             Self::validated_network_policy_amendment_host(amendment, network_approval_context)?;
         let codex_home = self
@@ -3624,11 +3680,7 @@ impl Session {
                 state.reference_context_item(),
                 state.previous_turn_settings(),
                 state.session_configuration.collaboration_mode.clone(),
-                state
-                    .session_configuration
-                    .base_instructions
-                    .clone()
-                    .unwrap_or_default(),
+                state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
             )
         };
@@ -3918,13 +3970,7 @@ impl Session {
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let history = self.clone_history().await;
-        let empty_base_instructions = BaseInstructions {
-            text: String::new(),
-        };
-        let base_instructions = self
-            .get_base_instructions()
-            .await
-            .unwrap_or(empty_base_instructions);
+        let base_instructions = self.get_base_instructions().await;
         let Some(estimated_total_tokens) =
             history.estimate_token_count_with_base_instructions(&base_instructions)
         else {
@@ -5693,6 +5739,9 @@ async fn spawn_review_thread(
     .with_web_search_config(/*web_search_config*/ None)
     .with_allow_login_shell(config.permissions.allow_login_shell)
     .with_has_environment(parent_turn_context.environment.is_some())
+    .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
+    .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
+    .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
     .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
         &config.agent_roles,
     ));
@@ -6665,7 +6714,7 @@ pub(crate) fn build_prompt(
     input: Vec<ResponseItem>,
     router: &ToolRouter,
     turn_context: &TurnContext,
-    base_instructions: Option<BaseInstructions>,
+    base_instructions: BaseInstructions,
 ) -> Prompt {
     let deferred_dynamic_tools = turn_context
         .dynamic_tools
@@ -6951,16 +7000,18 @@ pub(crate) async fn built_tools(
     } else {
         app_tools
     };
+    let mcp_tool_router_inputs =
+        has_mcp_servers.then(|| crate::tools::router::map_mcp_tool_infos(&mcp_tools));
 
     Ok(Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
         ToolRouterParams {
-            mcp_tools: has_mcp_servers.then(|| {
-                mcp_tools
-                    .into_iter()
-                    .map(|(name, tool)| (name, tool.tool))
-                    .collect()
-            }),
+            mcp_tools: mcp_tool_router_inputs
+                .as_ref()
+                .map(|inputs| inputs.mcp_tools.clone()),
+            tool_namespaces: mcp_tool_router_inputs
+                .as_ref()
+                .map(|inputs| inputs.tool_namespaces.clone()),
             app_tools,
             discoverable_tools,
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
@@ -7155,6 +7206,7 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         EventMsg::Error(_)
         | EventMsg::Warning(_)
         | EventMsg::RealtimeConversationStarted(_)
+        | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::ModelReroute(_)

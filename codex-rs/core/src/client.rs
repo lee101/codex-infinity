@@ -39,6 +39,8 @@ use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
 use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
 use codex_api::RawMemory as ApiRawMemory;
+use codex_api::RealtimeCallClient as ApiRealtimeCallClient;
+use codex_api::RealtimeSessionConfig;
 use codex_api::Reasoning;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
@@ -121,6 +123,7 @@ use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
@@ -145,6 +148,7 @@ struct ModelClientState {
     auth_manager: Option<Arc<AuthManager>>,
     conversation_id: ThreadId,
     window_generation: AtomicU64,
+    installation_id: String,
     provider: ModelProviderInfo,
     auth_env_telemetry: AuthEnvTelemetry,
     session_source: SessionSource,
@@ -268,6 +272,7 @@ impl ModelClient {
     pub fn new(
         auth_manager: Option<Arc<AuthManager>>,
         conversation_id: ThreadId,
+        installation_id: String,
         provider: ModelProviderInfo,
         session_source: SessionSource,
         model_verbosity: Option<VerbosityConfig>,
@@ -285,6 +290,7 @@ impl ModelClient {
                 auth_manager,
                 conversation_id,
                 window_generation: AtomicU64::new(0),
+                installation_id,
                 provider,
                 auth_env_telemetry,
                 session_source,
@@ -404,11 +410,7 @@ impl ModelClient {
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
-        let instructions = prompt
-            .base_instructions
-            .as_ref()
-            .map(|base_instructions| base_instructions.text.clone())
-            .unwrap_or_default();
+        let instructions = prompt.base_instructions.text.clone();
         let input = prompt.get_formatted_input();
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let reasoning = Self::build_reasoning(model_info, effort, summary);
@@ -434,13 +436,41 @@ impl ModelClient {
             text,
         };
 
-        let mut extra_headers = self.build_responses_identity_headers();
+        let mut extra_headers = ApiHeaderMap::new();
+        if let Ok(header_value) = HeaderValue::from_str(&self.state.installation_id) {
+            extra_headers.insert(X_CODEX_INSTALLATION_ID_HEADER, header_value);
+        }
+        extra_headers.extend(self.build_responses_identity_headers());
         extra_headers.extend(build_conversation_headers(Some(
             self.state.conversation_id.to_string(),
         )));
         client
             .compact_input(&payload, extra_headers)
             .await
+            .map_err(map_api_error)
+    }
+
+    pub async fn create_realtime_call(
+        &self,
+        sdp: String,
+        session_config: RealtimeSessionConfig,
+    ) -> Result<String> {
+        self.create_realtime_call_with_headers(sdp, session_config, ApiHeaderMap::new())
+            .await
+    }
+
+    pub async fn create_realtime_call_with_headers(
+        &self,
+        sdp: String,
+        session_config: RealtimeSessionConfig,
+        extra_headers: ApiHeaderMap,
+    ) -> Result<String> {
+        let client_setup = self.current_client_setup_default().await?;
+        let transport = ReqwestTransport::new(build_reqwest_client());
+        ApiRealtimeCallClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+            .create_with_session_and_headers(sdp, session_config, extra_headers)
+            .await
+            .map(|response| response.sdp)
             .map_err(map_api_error)
     }
 
@@ -523,6 +553,10 @@ impl ModelClient {
         turn_metadata_header: Option<&str>,
     ) -> HashMap<String, String> {
         let mut client_metadata = HashMap::new();
+        client_metadata.insert(
+            X_CODEX_INSTALLATION_ID_HEADER.to_string(),
+            self.state.installation_id.clone(),
+        );
         client_metadata.insert(
             X_CODEX_WINDOW_ID_HEADER.to_string(),
             self.current_window_id(),
@@ -612,6 +646,29 @@ impl ModelClient {
             Some(OPENROUTER_PROVIDER_ID) => ModelProviderInfo::create_openrouter_provider(),
             Some(_) | None => self.state.provider.clone(),
         }
+    }
+
+    async fn current_client_setup_default(&self) -> Result<CurrentClientSetup> {
+        let auth = match self.state.auth_manager.as_ref() {
+            Some(manager) => manager.auth().await,
+            None => None,
+        };
+        let provider = self.state.provider.clone();
+        let api_provider = provider.to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+        let api_auth = auth_provider_from_auth(auth.clone(), &provider)?;
+        let codex_api_key_env_enabled = self
+            .state
+            .auth_manager
+            .as_ref()
+            .is_some_and(|manager| manager.codex_api_key_env_enabled());
+        let auth_env_telemetry = collect_auth_env_telemetry(&provider, codex_api_key_env_enabled);
+        Ok(CurrentClientSetup {
+            auth,
+            provider,
+            api_provider,
+            api_auth,
+            auth_env_telemetry,
+        })
     }
 
     async fn current_client_setup(&self, model_info: &ModelInfo) -> Result<CurrentClientSetup> {
@@ -787,10 +844,7 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
     ) -> Result<ResponsesApiRequest> {
-        let instructions = prompt
-            .base_instructions
-            .as_ref()
-            .map(|base_instructions| base_instructions.text.clone());
+        let instructions = &prompt.base_instructions.text;
         let input = prompt.get_formatted_input();
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let default_reasoning_effort = model_info.default_reasoning_level;
@@ -831,7 +885,7 @@ impl ModelClientSession {
             model: model_provider
                 .effective_model_name(&model_info.slug)
                 .to_string(),
-            instructions,
+            instructions: instructions.clone(),
             input,
             tools,
             tool_choice: "auto".to_string(),
@@ -847,6 +901,10 @@ impl ModelClientSession {
             },
             prompt_cache_key,
             text,
+            client_metadata: Some(HashMap::from([(
+                X_CODEX_INSTALLATION_ID_HEADER.to_string(),
+                self.client.state.installation_id.clone(),
+            )])),
         };
         Ok(request)
     }

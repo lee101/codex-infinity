@@ -445,7 +445,7 @@ impl WidgetRef for Step {
 
 pub(crate) async fn run_onboarding_app(
     args: OnboardingScreenArgs,
-    mut app_server: Option<AppServerSession>,
+    mut app_server: Option<&mut AppServerSession>,
     tui: &mut Tui,
 ) -> Result<OnboardingResult> {
     use tokio_stream::StreamExt;
@@ -530,9 +530,6 @@ pub(crate) async fn run_onboarding_app(
                 }
             }
         }
-    }
-    if let Some(app_server) = app_server {
-        app_server.shutdown().await.ok();
     }
     Ok(OnboardingResult {
         directory_trust_decision: onboarding_screen.directory_trust_decision(),
