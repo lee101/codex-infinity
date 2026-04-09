@@ -5492,6 +5492,10 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
+            AppEvent::AutoNextPromptGenerated { thread_id, prompt } => {
+                self.chat_widget
+                    .handle_auto_next_prompt_generated(thread_id, prompt);
+            }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
             }

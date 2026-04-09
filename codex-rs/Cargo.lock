@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "codex-realtime-webrtc"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "libwebrtc",
  "thiserror 2.0.18",

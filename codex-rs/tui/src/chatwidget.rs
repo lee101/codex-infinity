@@ -476,6 +476,8 @@ const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
     "PAUSE -- architecture review. Take a high-level look at everything done so far:\n\n1. Run `git log --oneline` and `git diff --stat` to see the full picture of changes.\n2. Are the changes cohesive or scattered? If scattered, consider whether you're drifting from the main goal.\n3. Run tests. Fix failures.\n4. Look for: dead code introduced, imports added but not used, TODO comments left behind, debug prints left in.\n5. Check if your changes would make sense to another developer reading the code for the first time.\n\nClean up anything that doesn't meet a professional standard before continuing.",
 ];
 
+const AUTO_NEXT_DONE_SUFFIX_STEPS: &str = "\n\nIMPORTANT: If you have genuinely completed all follow-up work and there are no more natural next steps remaining, you MUST write the single word DONE to the file at: ";
+
 const REVIEW_INTERVAL: usize = 3;
 const ORIGINAL_TASK_REMINDER_INTERVAL: usize = 7;
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
@@ -983,6 +985,8 @@ pub(crate) struct ChatWidget {
     auto_next_steps: bool,
     auto_next_idea: bool,
     auto_next_counter: usize,
+    auto_next_generation_in_flight: bool,
+    auto_next_done_file: std::path::PathBuf,
     original_human_prompt: Option<String>,
 }
 
@@ -2452,15 +2456,44 @@ impl ChatWidget {
         if !self.auto_next_steps && !self.auto_next_idea {
             return;
         }
+        if self.auto_next_generation_in_flight {
+            return;
+        }
+        // DONE-file gate only applies to --auto-next-steps. When steps has run
+        // out of work, promote the session to --auto-next-idea (the outer
+        // infinite re-prompting layer) and clear the done file so the loop
+        // keeps exploring new ideas.
+        if self.auto_next_steps && self.auto_next_done_file.exists() {
+            let _ = std::fs::remove_file(&self.auto_next_done_file);
+            self.auto_next_steps = false;
+            self.auto_next_idea = true;
+            self.auto_next_counter = 0;
+        }
+
         let is_review_turn =
             self.auto_next_counter > 0 && self.auto_next_counter % REVIEW_INTERVAL == 0;
-        let mut prompt = if is_review_turn {
+        if is_review_turn {
             let review_idx =
                 (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
-            AUTO_NEXT_REVIEW_PROMPTS[review_idx].to_string()
+            let mut prompt = AUTO_NEXT_REVIEW_PROMPTS[review_idx].to_string();
+            self.append_original_task_reminder(&mut prompt);
+            self.auto_next_counter += 1;
+            self.queued_user_messages
+                .push_back(UserMessage::from(prompt));
+            return;
+        }
+
+        let mode = if self.auto_next_idea {
+            codex_core::auto_next_prompt::AutoNextMode::Idea
         } else {
-            self.generate_contextual_auto_next_prompt()
+            codex_core::auto_next_prompt::AutoNextMode::Steps
         };
+        let fallback = self.auto_next_fallback_prompt();
+        self.auto_next_counter += 1;
+        self.spawn_auto_next_prompt_generation(mode, fallback);
+    }
+
+    fn append_original_task_reminder(&self, prompt: &mut String) {
         if self.auto_next_counter > 0
             && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
         {
@@ -2468,35 +2501,100 @@ impl ChatWidget {
                 prompt.push_str(&format!("\n\nReminder of original task: {original}"));
             }
         }
-        self.auto_next_counter += 1;
-        self.queued_user_messages
-            .push_back(UserMessage::from(prompt));
     }
 
-    fn generate_contextual_auto_next_prompt(&self) -> String {
+    fn auto_next_fallback_prompt(&self) -> String {
         let templates = if self.auto_next_idea {
             AUTO_NEXT_IDEA_META_TEMPLATES
         } else {
             AUTO_NEXT_STEPS_META_TEMPLATES
         };
-        let idx = self.auto_next_counter % templates.len();
-        let base = templates[idx];
-
-        let context_snippet = self.last_copyable_output.as_deref().map(|s| {
-            let truncated: String = s.chars().take(800).collect();
-            if s.len() > 800 {
-                format!("{truncated}...")
-            } else {
-                truncated
-            }
-        });
-
-        match context_snippet {
-            Some(snippet) => {
-                format!("{base}\n\nFor reference, here's a summary of the last output:\n{snippet}")
-            }
-            None => base.to_string(),
+        let base = templates[self.auto_next_counter % templates.len()];
+        let mut prompt = base.to_string();
+        if self.auto_next_steps {
+            prompt.push_str(AUTO_NEXT_DONE_SUFFIX_STEPS);
+            prompt.push_str(&self.auto_next_done_file.display().to_string());
         }
+        self.append_original_task_reminder(&mut prompt);
+        prompt
+    }
+
+    fn spawn_auto_next_prompt_generation(
+        &mut self,
+        mode: codex_core::auto_next_prompt::AutoNextMode,
+        fallback_prompt: String,
+    ) {
+        let Some(thread_id) = self.thread_id else {
+            self.queued_user_messages
+                .push_back(UserMessage::from(fallback_prompt));
+            return;
+        };
+        self.auto_next_generation_in_flight = true;
+        let app_event_tx = self.app_event_tx.clone();
+        let config = self.config.clone();
+        let rollout_path = self.current_rollout_path.clone();
+        let examples: Vec<String> = if matches!(
+            mode,
+            codex_core::auto_next_prompt::AutoNextMode::Idea
+        ) {
+            AUTO_NEXT_IDEA_META_TEMPLATES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            AUTO_NEXT_STEPS_META_TEMPLATES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        let append_done_suffix = self.auto_next_steps;
+        let done_path = self
+            .auto_next_done_file
+            .display()
+            .to_string();
+        let reminder = if self.auto_next_counter > 0
+            && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
+        {
+            self.original_human_prompt.clone()
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            let generated =
+                codex_core::auto_next_prompt::generate_auto_next_prompt(
+                    config,
+                    rollout_path,
+                    mode,
+                    examples,
+                )
+                .await;
+            let mut prompt = match generated {
+                Some(p) => p,
+                None => fallback_prompt,
+            };
+            if append_done_suffix && !prompt.contains(AUTO_NEXT_DONE_SUFFIX_STEPS) {
+                prompt.push_str(AUTO_NEXT_DONE_SUFFIX_STEPS);
+                prompt.push_str(&done_path);
+            }
+            if let Some(original) = reminder {
+                prompt.push_str(&format!("\n\nReminder of original task: {original}"));
+            }
+            app_event_tx.send(AppEvent::AutoNextPromptGenerated { thread_id, prompt });
+        });
+    }
+
+    pub(crate) fn handle_auto_next_prompt_generated(
+        &mut self,
+        thread_id: codex_protocol::ThreadId,
+        prompt: String,
+    ) {
+        self.auto_next_generation_in_flight = false;
+        if self.thread_id != Some(thread_id) {
+            return;
+        }
+        self.queued_user_messages
+            .push_back(UserMessage::from(prompt));
+        self.maybe_send_next_queued_input();
     }
 
     fn open_plan_implementation_prompt(&mut self) {
@@ -4821,8 +4919,12 @@ impl ChatWidget {
             auto_next_steps,
             auto_next_idea,
             auto_next_counter: 0,
+            auto_next_generation_in_flight: false,
+            auto_next_done_file: std::env::temp_dir()
+                .join(format!("codex-auto-next-done-{}", std::process::id())),
             original_human_prompt: None,
         };
+        let _ = std::fs::remove_file(&widget.auto_next_done_file);
 
         widget
             .bottom_pane
