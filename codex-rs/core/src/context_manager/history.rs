@@ -34,6 +34,8 @@ use std::sync::LazyLock;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    /// Bumped whenever history is rewritten, such as compaction or rollback.
+    history_version: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -60,6 +62,7 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -124,6 +127,10 @@ impl ContextManager {
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
+    }
+
+    pub(crate) fn history_version(&self) -> u64 {
+        self.history_version
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
@@ -204,6 +211,7 @@ impl ContextManager {
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.history_version = self.history_version.saturating_add(1);
             true
         } else {
             false
@@ -212,6 +220,7 @@ impl ContextManager {
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
+        self.history_version = self.history_version.saturating_add(1);
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -237,6 +246,9 @@ impl ContextManager {
                         };
                         replaced = true;
                     }
+                }
+                if replaced {
+                    self.history_version = self.history_version.saturating_add(1);
                 }
                 replaced
             }
