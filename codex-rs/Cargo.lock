@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "codex-account"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "codex-backend-client",
