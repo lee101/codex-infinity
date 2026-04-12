@@ -79,6 +79,7 @@ use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::SandboxState;
+use codex_mcp::ToolInfo;
 use codex_mcp::codex_apps_tools_cache_key;
 #[cfg(test)]
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
@@ -4465,25 +4466,16 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn parse_mcp_tool_name(
+    pub(crate) async fn resolve_mcp_tool_info(
         &self,
         name: &str,
-        namespace: &Option<String>,
-    ) -> Option<(String, String)> {
-        let tool_name = if let Some(namespace) = namespace {
-            if name.starts_with(namespace.as_str()) {
-                name
-            } else {
-                &format!("{namespace}{name}")
-            }
-        } else {
-            name
-        };
+        namespace: Option<&str>,
+    ) -> Option<ToolInfo> {
         self.services
             .mcp_connection_manager
             .read()
             .await
-            .parse_tool_name(tool_name)
+            .resolve_tool_info(name, namespace)
             .await
     }
 
