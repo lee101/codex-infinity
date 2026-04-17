@@ -31,6 +31,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -617,16 +618,21 @@ impl PickerState {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
-        match key.code {
-            KeyCode::Esc => return Ok(Some(SessionSelection::StartFresh)),
-            KeyCode::Char('c')
-                if key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => return Ok(Some(SessionSelection::StartFresh)),
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Some(SessionSelection::Exit));
             }
-            KeyCode::Enter => {
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
                     let path = row.path.clone();
                     let thread_id = match row.thread_id {
@@ -656,14 +662,39 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            KeyCode::Up => {
+            KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{0010}'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } /* ^P */ => {
                 if self.selected > 0 {
                     self.selected -= 1;
                     self.ensure_selected_visible();
                 }
                 self.request_frame();
             }
-            KeyCode::Down => {
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{000e}'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } /* ^N */ => {
                 if self.selected + 1 < self.filtered_rows.len() {
                     self.selected += 1;
                     self.ensure_selected_visible();
@@ -671,7 +702,10 @@ impl PickerState {
                 self.maybe_load_more_for_scroll();
                 self.request_frame();
             }
-            KeyCode::PageUp => {
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => {
                 let step = self.view_rows.unwrap_or(10).max(1);
                 if self.selected > 0 {
                     self.selected = self.selected.saturating_sub(step);
@@ -679,7 +713,10 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            KeyCode::PageDown => {
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => {
                 if !self.filtered_rows.is_empty() {
                     let step = self.view_rows.unwrap_or(10).max(1);
                     let max_index = self.filtered_rows.len().saturating_sub(1);
@@ -689,21 +726,28 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            KeyCode::Tab => {
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
                 self.toggle_sort_key();
                 self.request_frame();
             }
-            KeyCode::Backspace => {
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
                 let mut new_query = self.query.clone();
                 new_query.pop();
                 self.set_query(new_query);
             }
-            KeyCode::Char(c) => {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } => {
                 // basic text input for search
-                if !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT)
                 {
                     let mut new_query = self.query.clone();
                     new_query.push(c);
@@ -1116,7 +1160,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
             .map(|dt| dt.with_timezone(&Utc)),
         updated_at: chrono::DateTime::from_timestamp(thread.updated_at, 0)
             .map(|dt| dt.with_timezone(&Utc)),
-        cwd: Some(thread.cwd),
+        cwd: Some(thread.cwd.to_path_buf()),
         git_branch: thread.git_info.and_then(|git_info| git_info.branch),
     })
 }
@@ -1640,6 +1684,8 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use codex_protocol::ThreadId;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
 
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
@@ -2676,7 +2722,7 @@ mod tests {
             updated_at: 2,
             status: codex_app_server_protocol::ThreadStatus::Idle,
             path: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             cli_version: String::from("0.0.0"),
             source: codex_app_server_protocol::SessionSource::Cli,
             agent_nickname: None,

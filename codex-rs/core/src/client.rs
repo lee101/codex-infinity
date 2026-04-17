@@ -32,12 +32,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_api::ApiError;
+use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::Compression;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
 use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
+use codex_api::Provider as ApiProvider;
 use codex_api::RawMemory as ApiRawMemory;
 use codex_api::RealtimeCallClient as ApiRealtimeCallClient;
 use codex_api::RealtimeSessionConfig as ApiRealtimeSessionConfig;
@@ -51,9 +53,11 @@ use codex_api::ResponsesOptions as ApiResponsesOptions;
 use codex_api::ResponsesWebsocketClient as ApiWebSocketResponsesClient;
 use codex_api::ResponsesWebsocketConnection as ApiWebSocketConnection;
 use codex_api::ResponsesWsRequest;
+use codex_api::SharedAuthProvider;
 use codex_api::SseTelemetry;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
+use codex_api::auth_header_telemetry;
 use codex_api::build_conversation_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
@@ -83,7 +87,6 @@ use futures::StreamExt;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
-use http::header::AUTHORIZATION;
 use reqwest::StatusCode;
 use std::time::Duration;
 use std::time::Instant;
@@ -100,18 +103,14 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
-use codex_model_provider_info::GEMINI_PROVIDER_ID;
-use codex_model_provider_info::OPENROUTER_PROVIDER_ID;
-use codex_model_provider_info::infer_builtin_provider_id_for_model;
 use crate::util::emit_feedback_auth_recovery_tags;
-use codex_api::CoreAuthProvider;
 use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
-use codex_login::api_bridge::auth_provider_from_auth;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_login::provider_auth::auth_manager_for_provider;
+use codex_model_provider::SharedModelProvider;
+use codex_model_provider::create_model_provider;
 #[cfg(test)]
 use codex_model_provider_info::DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS;
 use codex_model_provider_info::ModelProviderInfo;
@@ -146,11 +145,10 @@ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
 /// configuration is per turn and is passed explicitly to streaming/unary methods.
 #[derive(Debug)]
 struct ModelClientState {
-    auth_manager: Option<Arc<AuthManager>>,
     conversation_id: ThreadId,
     window_generation: AtomicU64,
     installation_id: String,
-    provider: ModelProviderInfo,
+    provider: SharedModelProvider,
     auth_env_telemetry: AuthEnvTelemetry,
     session_source: SessionSource,
     model_verbosity: Option<VerbosityConfig>,
@@ -167,10 +165,8 @@ struct ModelClientState {
 /// share the same auth/provider setup flow.
 struct CurrentClientSetup {
     auth: Option<CodexAuth>,
-    provider: ModelProviderInfo,
-    api_provider: codex_api::Provider,
-    api_auth: CoreAuthProvider,
-    auth_env_telemetry: AuthEnvTelemetry,
+    api_provider: ApiProvider,
+    api_auth: SharedAuthProvider,
 }
 
 #[derive(Clone, Copy)]
@@ -280,18 +276,9 @@ pub(crate) struct RealtimeWebrtcCallStart {
 /// API-key sessions send that API bearer. ChatGPT-auth sessions send their bearer plus account id;
 /// transceiver is responsible for accepting that same call-create identity on the direct
 /// `api.openai.com` sideband path.
-fn sideband_websocket_auth_headers(api_auth: &CoreAuthProvider) -> ApiHeaderMap {
+fn sideband_websocket_auth_headers(api_auth: &dyn AuthProvider) -> ApiHeaderMap {
     let mut headers = ApiHeaderMap::new();
-    if let Some(token) = api_auth.token.as_ref()
-        && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
-    {
-        headers.insert(AUTHORIZATION, value);
-    }
-    if let Some(account_id) = api_auth.account_id.as_ref()
-        && let Ok(value) = HeaderValue::from_str(account_id)
-    {
-        headers.insert("ChatGPT-Account-ID", value);
-    }
+    api_auth.add_auth_headers(&mut headers);
     headers
 }
 
@@ -305,25 +292,26 @@ impl ModelClient {
         auth_manager: Option<Arc<AuthManager>>,
         conversation_id: ThreadId,
         installation_id: String,
-        provider: ModelProviderInfo,
+        provider_info: ModelProviderInfo,
         session_source: SessionSource,
         model_verbosity: Option<VerbosityConfig>,
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
     ) -> Self {
-        let auth_manager = auth_manager_for_provider(auth_manager, &provider);
-        let codex_api_key_env_enabled = auth_manager
+        let model_provider = create_model_provider(provider_info, auth_manager);
+        let codex_api_key_env_enabled = model_provider
+            .auth_manager()
             .as_ref()
             .is_some_and(|manager| manager.codex_api_key_env_enabled());
-        let auth_env_telemetry = collect_auth_env_telemetry(&provider, codex_api_key_env_enabled);
+        let auth_env_telemetry =
+            collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         Self {
             state: Arc::new(ModelClientState {
-                auth_manager,
                 conversation_id,
                 window_generation: AtomicU64::new(0),
                 installation_id,
-                provider,
+                provider: model_provider,
                 auth_env_telemetry,
                 session_source,
                 model_verbosity,
@@ -349,7 +337,7 @@ impl ModelClient {
     }
 
     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
-        self.state.auth_manager.clone()
+        self.state.provider.auth_manager()
     }
 
     pub(crate) fn set_window_generation(&self, window_generation: u64) {
@@ -390,9 +378,9 @@ impl ModelClient {
     pub(crate) fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
-        model_info: &ModelInfo,
+        _model_info: &ModelInfo,
     ) -> bool {
-        let websocket_enabled = self.responses_websocket_enabled(model_info);
+        let websocket_enabled = self.responses_websocket_enabled();
         let activated =
             websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
         if activated {
@@ -426,17 +414,17 @@ impl ModelClient {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
-        let client_setup = self.current_client_setup(model_info).await?;
+        let client_setup = self.current_client_setup().await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
             AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                &client_setup.api_auth,
+                client_setup.api_auth.as_ref(),
                 PendingUnauthorizedRetry::default(),
             ),
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
-            client_setup.auth_env_telemetry.clone(),
+            self.state.auth_env_telemetry.clone(),
         );
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
@@ -459,7 +447,7 @@ impl ModelClient {
         };
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let payload = ApiCompactionInput {
-            model: client_setup.provider.effective_model_name(&model_info.slug),
+            model: self.state.provider.info().effective_model_name(&model_info.slug),
             input: &input,
             instructions: &instructions,
             tools,
@@ -490,9 +478,11 @@ impl ModelClient {
     ) -> Result<RealtimeWebrtcCallStart> {
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
-        let client_setup = self.current_client_setup_default().await?;
+        let client_setup = self.current_client_setup().await?;
         let mut sideband_headers = extra_headers.clone();
-        sideband_headers.extend(sideband_websocket_auth_headers(&client_setup.api_auth));
+        sideband_headers.extend(sideband_websocket_auth_headers(
+            client_setup.api_auth.as_ref(),
+        ));
         let transport = ReqwestTransport::new(build_reqwest_client());
         let response =
             ApiRealtimeCallClient::new(transport, client_setup.api_provider, client_setup.api_auth)
@@ -523,27 +513,24 @@ impl ModelClient {
             return Ok(Vec::new());
         }
 
-        let client_setup = self.current_client_setup(model_info).await?;
+        let client_setup = self.current_client_setup().await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
             AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                &client_setup.api_auth,
+                client_setup.api_auth.as_ref(),
                 PendingUnauthorizedRetry::default(),
             ),
             RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
-            client_setup.auth_env_telemetry.clone(),
+            self.state.auth_env_telemetry.clone(),
         );
         let client =
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
         let payload = ApiMemorySummarizeInput {
-            model: client_setup
-                .provider
-                .effective_model_name(&model_info.slug)
-                .to_string(),
+            model: model_info.slug.clone(),
             raw_memories,
             reasoning: effort.map(|effort| Reasoning {
                 effort: Some(effort),
@@ -652,9 +639,8 @@ impl ModelClient {
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
-    pub fn responses_websocket_enabled(&self, model_info: &ModelInfo) -> bool {
-        let provider = self.resolve_provider_for_model(model_info);
-        if !provider.supports_websockets
+    pub fn responses_websocket_enabled(&self) -> bool {
+        if !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
             || (*CODEX_RS_SSE_FIXTURE).is_some()
         {
@@ -668,61 +654,14 @@ impl ModelClient {
     ///
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
-    fn resolve_provider_for_model(&self, model_info: &ModelInfo) -> ModelProviderInfo {
-        if !self.state.provider.is_openai() {
-            return self.state.provider.clone();
-        }
-
-        match infer_builtin_provider_id_for_model(&model_info.slug) {
-            Some(GEMINI_PROVIDER_ID) => ModelProviderInfo::create_gemini_provider(),
-            Some(OPENROUTER_PROVIDER_ID) => ModelProviderInfo::create_openrouter_provider(),
-            Some(_) | None => self.state.provider.clone(),
-        }
-    }
-
-    async fn current_client_setup_default(&self) -> Result<CurrentClientSetup> {
-        let auth = match self.state.auth_manager.as_ref() {
-            Some(manager) => manager.auth().await,
-            None => None,
-        };
-        let provider = self.state.provider.clone();
-        let api_provider = provider.to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &provider)?;
-        let codex_api_key_env_enabled = self
-            .state
-            .auth_manager
-            .as_ref()
-            .is_some_and(|manager| manager.codex_api_key_env_enabled());
-        let auth_env_telemetry = collect_auth_env_telemetry(&provider, codex_api_key_env_enabled);
+    async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        let auth = self.state.provider.auth().await;
+        let api_provider = self.state.provider.api_provider().await?;
+        let api_auth = self.state.provider.api_auth().await?;
         Ok(CurrentClientSetup {
             auth,
-            provider,
             api_provider,
             api_auth,
-            auth_env_telemetry,
-        })
-    }
-
-    async fn current_client_setup(&self, model_info: &ModelInfo) -> Result<CurrentClientSetup> {
-        let auth = match self.state.auth_manager.as_ref() {
-            Some(manager) => manager.auth().await,
-            None => None,
-        };
-        let provider = self.resolve_provider_for_model(model_info);
-        let api_provider = provider.to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &provider)?;
-        let codex_api_key_env_enabled = self
-            .state
-            .auth_manager
-            .as_ref()
-            .is_some_and(|manager| manager.codex_api_key_env_enabled());
-        let auth_env_telemetry = collect_auth_env_telemetry(&provider, codex_api_key_env_enabled);
-        Ok(CurrentClientSetup {
-            auth,
-            provider,
-            api_provider,
-            api_auth,
-            auth_env_telemetry,
         })
     }
 
@@ -735,7 +674,7 @@ impl ModelClient {
         &self,
         session_telemetry: &SessionTelemetry,
         api_provider: codex_api::Provider,
-        api_auth: CoreAuthProvider,
+        api_auth: SharedAuthProvider,
         turn_state: Option<Arc<OnceLock<String>>>,
         turn_metadata_header: Option<&str>,
         auth_context: AuthRequestTelemetryContext,
@@ -748,7 +687,7 @@ impl ModelClient {
             request_route_telemetry,
             self.state.auth_env_telemetry.clone(),
         );
-        let websocket_connect_timeout = self.state.provider.websocket_connect_timeout();
+        let websocket_connect_timeout = self.state.provider.info().websocket_connect_timeout();
         let start = Instant::now();
         let result = match tokio::time::timeout(
             websocket_connect_timeout,
@@ -868,8 +807,7 @@ impl ModelClientSession {
 
     fn build_responses_request(
         &self,
-        api_provider: &codex_api::Provider,
-        model_provider: &ModelProviderInfo,
+        provider: &codex_api::Provider,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -914,16 +852,14 @@ impl ModelClientSession {
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
         let request = ResponsesApiRequest {
-            model: model_provider
-                .effective_model_name(&model_info.slug)
-                .to_string(),
+            model: self.client.state.provider.info().effective_model_name(&model_info.slug).to_string(),
             instructions: instructions.clone(),
             input,
             tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls,
             reasoning,
-            store: api_provider.is_azure_responses_endpoint(),
+            store: provider.is_azure_responses_endpoint(),
             stream: true,
             include,
             service_tier: match service_tier {
@@ -1053,27 +989,23 @@ impl ModelClientSession {
     pub async fn preconnect_websocket(
         &mut self,
         session_telemetry: &SessionTelemetry,
-        model_info: &ModelInfo,
+        _model_info: &ModelInfo,
     ) -> std::result::Result<(), ApiError> {
-        if !self.client.responses_websocket_enabled(model_info) {
+        if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
         if self.websocket_session.connection.is_some() {
             return Ok(());
         }
 
-        let client_setup = self
-            .client
-            .current_client_setup(model_info)
-            .await
-            .map_err(|err| {
-                ApiError::Stream(format!(
-                    "failed to build websocket prewarm client setup: {err}"
-                ))
-            })?;
+        let client_setup = self.client.current_client_setup().await.map_err(|err| {
+            ApiError::Stream(format!(
+                "failed to build websocket prewarm client setup: {err}"
+            ))
+        })?;
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-            &client_setup.api_auth,
+            client_setup.api_auth.as_ref(),
             PendingUnauthorizedRetry::default(),
         );
         let connection = self
@@ -1099,8 +1031,8 @@ impl ModelClientSession {
         level = "info",
         skip_all,
         fields(
-            provider = %self.client.state.provider.name,
-            wire_api = %self.client.state.provider.wire_api,
+            provider = %self.client.state.provider.info().name,
+            wire_api = %self.client.state.provider.info().wire_api,
             transport = "responses_websocket",
             api.path = "responses",
             turn.has_metadata_header = params.turn_metadata_header.is_some()
@@ -1171,7 +1103,7 @@ impl ModelClientSession {
     fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
         if self.client.state.enable_request_compression
             && auth.is_some_and(CodexAuth::is_chatgpt_auth)
-            && self.client.state.provider.is_openai()
+            && self.client.state.provider.info().is_openai()
         {
             Compression::Zstd
         } else {
@@ -1190,7 +1122,7 @@ impl ModelClientSession {
         skip_all,
         fields(
             model = %model_info.slug,
-            wire_api = %self.client.state.provider.wire_api,
+            wire_api = %self.client.state.provider.info().wire_api,
             transport = "responses_http",
             http.method = "POST",
             api.path = "responses",
@@ -1211,40 +1143,37 @@ impl ModelClientSession {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(
                 path,
-                self.client
-                    .resolve_provider_for_model(model_info)
-                    .stream_idle_timeout(),
+                self.client.state.provider.info().stream_idle_timeout(),
             )
             .map_err(map_api_error)?;
             let (stream, _last_request_rx) = map_response_stream(stream, session_telemetry.clone());
             return Ok(stream);
         }
 
-        let auth_manager = self.client.state.auth_manager.clone();
+        let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup(model_info).await?;
+            let client_setup = self.client.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                &client_setup.api_auth,
+                client_setup.api_auth.as_ref(),
                 pending_retry,
             );
             let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
                 session_telemetry,
                 request_auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-                client_setup.auth_env_telemetry.clone(),
+                self.client.state.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
             let options = self.build_responses_options(turn_metadata_header, compression);
 
             let request = self.build_responses_request(
                 &client_setup.api_provider,
-                &client_setup.provider,
                 prompt,
                 model_info,
                 effort,
@@ -1290,7 +1219,7 @@ impl ModelClientSession {
         skip_all,
         fields(
             model = %model_info.slug,
-            wire_api = %self.client.state.provider.wire_api,
+            wire_api = %self.client.state.provider.info().wire_api,
             transport = "responses_websocket",
             api.path = "responses",
             turn.has_metadata_header = turn_metadata_header.is_some(),
@@ -1309,17 +1238,17 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
     ) -> Result<WebsocketStreamOutcome> {
-        let auth_manager = self.client.state.auth_manager.clone();
+        let auth_manager = self.client.state.provider.auth_manager();
 
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup(model_info).await?;
+            let client_setup = self.client.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                &client_setup.api_auth,
+                client_setup.api_auth.as_ref(),
                 pending_retry,
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
@@ -1327,7 +1256,6 @@ impl ModelClientSession {
             let options = self.build_responses_options(turn_metadata_header, compression);
             let request = self.build_responses_request(
                 &client_setup.api_provider,
-                &client_setup.provider,
                 prompt,
                 model_info,
                 effort,
@@ -1445,7 +1373,7 @@ impl ModelClientSession {
         service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled(model_info) {
+        if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
         if self.websocket_session.last_request.is_some() {
@@ -1502,10 +1430,10 @@ impl ModelClientSession {
         service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
-        let wire_api = self.client.resolve_provider_for_model(model_info).wire_api;
+        let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled(model_info) {
+                if self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -1750,16 +1678,17 @@ struct AuthRequestTelemetryContext {
 impl AuthRequestTelemetryContext {
     fn new(
         auth_mode: Option<AuthMode>,
-        api_auth: &CoreAuthProvider,
+        api_auth: &dyn AuthProvider,
         retry: PendingUnauthorizedRetry,
     ) -> Self {
+        let auth_telemetry = auth_header_telemetry(api_auth);
         Self {
             auth_mode: auth_mode.map(|mode| match mode {
                 AuthMode::ApiKey => "ApiKey",
                 AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => "Chatgpt",
             }),
-            auth_header_attached: api_auth.auth_header_attached(),
-            auth_header_name: api_auth.auth_header_name(),
+            auth_header_attached: auth_telemetry.attached,
+            auth_header_name: auth_telemetry.name,
             retry_after_unauthorized: retry.retry_after_unauthorized,
             recovery_mode: retry.recovery_mode,
             recovery_phase: retry.recovery_phase,
@@ -1770,7 +1699,7 @@ impl AuthRequestTelemetryContext {
 struct WebsocketConnectParams<'a> {
     session_telemetry: &'a SessionTelemetry,
     api_provider: codex_api::Provider,
-    api_auth: CoreAuthProvider,
+    api_auth: SharedAuthProvider,
     turn_metadata_header: Option<&'a str>,
     options: &'a ApiResponsesOptions,
     auth_context: AuthRequestTelemetryContext,

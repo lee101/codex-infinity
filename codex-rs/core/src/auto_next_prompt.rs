@@ -81,7 +81,7 @@ pub async fn generate_auto_next_prompt(
 
     let auth_manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
     let models_manager = ModelsManager::new(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         Arc::clone(&auth_manager),
         /*model_catalog*/ None,
         CollaborationModesConfig::default(),

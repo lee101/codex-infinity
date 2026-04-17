@@ -1,3 +1,4 @@
+use codex_utils_absolute_path::AbsolutePathBuf;
 use dirs::home_dir;
 use std::path::PathBuf;
 
@@ -13,7 +14,7 @@ const AUTH_FILES: &[&str] = &["auth.json", ".credentials.json"];
 ///
 /// On first use, auto-migrates config.toml from `~/.codex/` and symlinks
 /// auth files so credentials are shared without re-login.
-pub fn find_codex_home() -> std::io::Result<PathBuf> {
+pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     let infinity_env = std::env::var("CODEX_INFINITY_HOME")
         .ok()
         .filter(|val| !val.is_empty());
@@ -24,7 +25,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
     find_codex_home_from_env(env_val)
 }
 
-fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<PathBuf> {
+fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
     match codex_home_env {
         Some(val) => {
             let path = PathBuf::from(val);
@@ -47,14 +48,15 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Pat
                     ),
                 ))
             } else {
-                path.canonicalize().map_err(|err| {
+                let canonical = path.canonicalize().map_err(|err| {
                     std::io::Error::new(
                         err.kind(),
                         format!(
                             "failed to canonicalize CODEX_HOME/CODEX_INFINITY_HOME {val:?}: {err}"
                         ),
                     )
-                })
+                })?;
+                AbsolutePathBuf::from_absolute_path(canonical)
             }
         }
         None => {
@@ -73,7 +75,7 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Pat
                 }
             }
 
-            Ok(new_dir)
+            AbsolutePathBuf::from_absolute_path(new_dir)
         }
     }
 }
@@ -139,6 +141,7 @@ fn auto_migrate(legacy: &std::path::Path, new: &std::path::Path) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::find_codex_home_from_env;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -183,10 +186,10 @@ mod tests {
             .expect("temp codex home path should be valid utf-8");
 
         let resolved = find_codex_home_from_env(Some(temp_str)).expect("valid CODEX_HOME");
-        let expected = temp_home
-            .path()
-            .canonicalize()
-            .expect("canonicalize temp home");
+        let expected = AbsolutePathBuf::from_absolute_path(
+            temp_home.path().canonicalize().expect("canonicalize temp home"),
+        )
+        .expect("absolute path");
         assert_eq!(resolved, expected);
     }
 
@@ -196,6 +199,7 @@ mod tests {
             find_codex_home_from_env(/*codex_home_env*/ None).expect("default CODEX_HOME");
         let mut expected = home_dir().expect("home dir");
         expected.push(".codexinfinity");
+        let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute path");
         assert_eq!(resolved, expected);
     }
 
