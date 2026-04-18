@@ -198,6 +198,17 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             base_instructions: GPT_5_1_INSTRUCTIONS.to_string(),
             default_reasoning_effort: Some(ReasoningEffort::Medium),
         )
+    } else if slug.starts_with("gpt-5.4-mini") {
+        model_family!(
+            slug, "gpt-5.4-mini",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
+        )
     } else if slug.starts_with("gpt-5.4") {
         model_family!(
             slug, "gpt-5.4",
