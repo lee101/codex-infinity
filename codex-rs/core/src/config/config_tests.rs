@@ -4,6 +4,7 @@ use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
 use crate::config_loader::RequirementSource;
+use crate::config_loader::project_trust_key;
 use crate::plugins::PluginsManager;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
@@ -221,7 +222,7 @@ persistence = "none"
 
     let memories = r#"
 [memories]
-no_memories_if_mcp_or_web_search = true
+disable_on_external_context = true
 generate_memories = false
 use_memories = false
 max_raw_memories_for_consolidation = 512
@@ -236,7 +237,7 @@ consolidation_model = "gpt-5"
         toml::from_str::<ConfigToml>(memories).expect("TOML deserialization should succeed");
     assert_eq!(
         Some(MemoriesToml {
-            no_memories_if_mcp_or_web_search: Some(true),
+            disable_on_external_context: Some(true),
             generate_memories: Some(false),
             use_memories: Some(false),
             max_raw_memories_for_consolidation: Some(512),
@@ -260,7 +261,7 @@ consolidation_model = "gpt-5"
     assert_eq!(
         config.memories,
         MemoriesConfig {
-            no_memories_if_mcp_or_web_search: true,
+            disable_on_external_context: true,
             generate_memories: false,
             use_memories: false,
             max_raw_memories_for_consolidation: 512,
@@ -271,6 +272,18 @@ consolidation_model = "gpt-5"
             extract_model: Some("gpt-5-mini".to_string()),
             consolidation_model: Some("gpt-5".to_string()),
         }
+    );
+
+    let legacy_memories_cfg =
+        toml::from_str::<ConfigToml>("[memories]\nno_memories_if_mcp_or_web_search = true\n")
+            .expect("legacy memories TOML should deserialize");
+    assert!(
+        MemoriesConfig::from(
+            legacy_memories_cfg
+                .memories
+                .expect("legacy memories config")
+        )
+        .disable_on_external_context
     );
 }
 
@@ -5438,7 +5451,9 @@ model = "foo""#;
 
     // Since we created the [projects] table as part of migration, it is kept implicit.
     // Expect explicit per-project tables, preserving prior entries and appending the new one.
-    let expected = r#"toplevel = "baz"
+    let new_project_key = project_trust_key(new_project);
+    let expected = format!(
+        r#"toplevel = "baz"
 model = "foo"
 
 [projects."/Users/mbolin/code/codex4"]
@@ -5448,10 +5463,38 @@ foo = "bar"
 [projects."/Users/mbolin/code/codex3"]
 trust_level = "trusted"
 
-[projects."/Users/mbolin/code/codex2"]
+[projects."{new_project_key}"]
 trust_level = "trusted"
-"#;
+"#
+    );
     assert_eq!(contents, expected);
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn active_project_does_not_match_configured_alias_for_canonical_cwd() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let project_root = tmp.path().join("project");
+    let alias_root = tmp.path().join("project_alias");
+    std::fs::create_dir_all(&project_root)?;
+    std::os::unix::fs::symlink(&project_root, &alias_root)?;
+
+    let config = ConfigToml {
+        projects: Some(HashMap::from([(
+            alias_root.to_string_lossy().to_string(),
+            ProjectConfig {
+                trust_level: Some(TrustLevel::Trusted),
+            },
+        )])),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        config.get_active_project(&project_root, /*repo_root*/ None),
+        None
+    );
 
     Ok(())
 }

@@ -4,7 +4,6 @@ use codex_protocol::models::ShellToolCallParams;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use crate::codex::TurnContext;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
@@ -12,6 +11,7 @@ use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -82,7 +82,7 @@ struct RunExecLikeArgs {
     hook_command: String,
     additional_permissions: Option<PermissionProfile>,
     prefix_rule: Option<Vec<String>>,
-    session: Arc<crate::codex::Session>,
+    session: Arc<crate::session::session::Session>,
     turn: Arc<TurnContext>,
     tracker: crate::tools::context::SharedTurnDiffTracker,
     call_id: String,
@@ -147,7 +147,7 @@ impl ShellCommandHandler {
 
     fn to_exec_params(
         params: &ShellCommandToolCallParams,
-        session: &crate::codex::Session,
+        session: &crate::session::session::Session,
         turn_context: &TurnContext,
         thread_id: ThreadId,
         allow_login_shell: bool,
