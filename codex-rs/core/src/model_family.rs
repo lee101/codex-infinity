@@ -121,6 +121,13 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             supports_reasoning_summaries: true,
             needs_special_apply_patch_instructions: true,
         )
+    } else if slug.starts_with("o5") {
+        model_family!(
+            slug, "o5",
+            supports_reasoning_summaries: true,
+            needs_special_apply_patch_instructions: true,
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+        )
     } else if slug.starts_with("codex-mini-latest") {
         model_family!(
             slug, "codex-mini-latest",
