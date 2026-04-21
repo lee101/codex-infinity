@@ -1,8 +1,9 @@
+use clap::Args;
+use clap::FromArgMatches;
 use clap::Parser;
-use clap::ValueHint;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
-use std::path::PathBuf;
+use codex_utils_cli::SharedCliOptions;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -10,10 +11,6 @@ pub struct Cli {
     /// Optional user prompt to start the session.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
-
-    /// Optional image(s) to attach to the initial prompt.
-    #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
-    pub images: Vec<PathBuf>,
 
     // Internal controls set by the top-level `codex resume` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -53,36 +50,12 @@ pub struct Cli {
     #[clap(skip)]
     pub fork_show_all: bool,
 
-    /// Model the agent should use.
-    #[arg(long, short = 'm')]
-    pub model: Option<String>,
-
-    /// Convenience flag to select the local open source model provider. Equivalent to -c
-    /// model_provider=oss; verifies a local LM Studio or Ollama server is running.
-    #[arg(long = "oss", default_value_t = false)]
-    pub oss: bool,
-
-    /// Specify which local provider to use (lmstudio or ollama).
-    /// If not specified with --oss, will use config default or show selection.
-    #[arg(long = "local-provider")]
-    pub oss_provider: Option<String>,
-
-    /// Configuration profile from config.toml to specify default options.
-    #[arg(long = "profile", short = 'p')]
-    pub config_profile: Option<String>,
-
-    /// Select the sandbox policy to use when executing model-generated shell
-    /// commands.
-    #[arg(long = "sandbox", short = 's')]
-    pub sandbox_mode: Option<codex_utils_cli::SandboxModeCliArg>,
+    #[clap(flatten)]
+    pub shared: TuiSharedCliOptions,
 
     /// Configure when the model requires human approval before executing a command.
     #[arg(long = "ask-for-approval", short = 'a')]
     pub approval_policy: Option<ApprovalModeCliArg>,
-
-    /// Convenience alias for low-friction sandboxed automatic execution (-a on-request, --sandbox workspace-write).
-    #[arg(long = "full-auto", default_value_t = false)]
-    pub full_auto: bool,
 
     /// After each Codex response, automatically ask it to continue with the natural next steps (including testing).
     #[arg(long = "auto-next-steps", default_value_t = false)]
@@ -92,52 +65,22 @@ pub struct Cli {
     #[arg(long = "auto-next-idea", default_value_t = false)]
     pub auto_next_idea: bool,
 
-    /// Skip all confirmation prompts and execute commands without sandboxing.
-    /// EXTREMELY DANGEROUS. Intended solely for running in environments that are externally sandboxed.
-    #[arg(
-        long = "dangerously-bypass-approvals-and-sandbox",
-        alias = "yolo",
-        default_value_t = false,
-        conflicts_with_all = ["approval_policy", "full_auto"]
-    )]
-    pub dangerously_bypass_approvals_and_sandbox: bool,
-
     /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo2",
-        default_value_t = false,
-        conflicts_with_all = ["approval_policy", "full_auto"]
-    )]
+    #[arg(long = "yolo2", default_value_t = false)]
     pub dangerously_disable_timeouts: bool,
 
     /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo3",
-        default_value_t = false,
-        conflicts_with_all = ["approval_policy", "full_auto"]
-    )]
+    #[arg(long = "yolo3", default_value_t = false)]
     pub dangerously_disable_environment_wrapping: bool,
 
     /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
-    #[arg(
-        long = "yolo4",
-        default_value_t = false,
-        conflicts_with_all = ["approval_policy", "full_auto"]
-    )]
+    #[arg(long = "yolo4", default_value_t = false)]
     pub dangerously_passthrough_stdio: bool,
 
-    /// Tell the agent to use the specified directory as its working root.
-    /// In remote mode, the path is forwarded to the server and resolved there.
-    #[clap(long = "cd", short = 'C', value_name = "DIR")]
-    pub cwd: Option<PathBuf>,
 
     /// Enable live web search. When enabled, the native Responses `web_search` tool is available to the model (no per‑call approval).
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
-
-    /// Additional directories that should be writable alongside the primary workspace.
-    #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
-    pub add_dir: Vec<PathBuf>,
 
     /// Disable alternate screen mode
     ///
@@ -149,4 +92,67 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+impl std::ops::Deref for Cli {
+    type Target = SharedCliOptions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared.0
+    }
+}
+
+impl std::ops::DerefMut for Cli {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shared.0
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TuiSharedCliOptions(SharedCliOptions);
+
+impl TuiSharedCliOptions {
+    pub fn into_inner(self) -> SharedCliOptions {
+        self.0
+    }
+}
+
+impl std::ops::Deref for TuiSharedCliOptions {
+    type Target = SharedCliOptions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TuiSharedCliOptions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Args for TuiSharedCliOptions {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        mark_tui_args(SharedCliOptions::augment_args(cmd))
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        mark_tui_args(SharedCliOptions::augment_args_for_update(cmd))
+    }
+}
+
+impl FromArgMatches for TuiSharedCliOptions {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        SharedCliOptions::from_arg_matches(matches).map(Self)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(matches)
+    }
+}
+
+fn mark_tui_args(cmd: clap::Command) -> clap::Command {
+    cmd.mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
+        arg.conflicts_with("approval_policy")
+    })
 }
