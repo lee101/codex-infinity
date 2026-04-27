@@ -28,10 +28,10 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_config::types::McpServerEnvVar;
-use codex_config::types::ShellEnvironmentPolicyInherit;
 use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecParams;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
 #[cfg(unix)]
@@ -162,14 +162,27 @@ impl StdioServerCommand {
 /// process spawns the configured command and rmcp talks to the child's local
 /// stdin/stdout pipes directly.
 #[derive(Clone)]
-pub struct LocalStdioServerLauncher;
+pub struct LocalStdioServerLauncher {
+    fallback_cwd: PathBuf,
+}
+
+impl LocalStdioServerLauncher {
+    /// Creates a local stdio launcher.
+    ///
+    /// `fallback_cwd` is used when the MCP server config omits `cwd`, so
+    /// relative commands resolve from the caller's runtime working directory.
+    pub fn new(fallback_cwd: PathBuf) -> Self {
+        Self { fallback_cwd }
+    }
+}
 
 impl StdioServerLauncher for LocalStdioServerLauncher {
     fn launch(
         &self,
         command: StdioServerCommand,
     ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
-        async move { Self::launch_server(command) }.boxed()
+        let fallback_cwd = self.fallback_cwd.clone();
+        async move { Self::launch_server(command, fallback_cwd) }.boxed()
     }
 }
 
@@ -193,7 +206,10 @@ mod private {
 impl private::Sealed for LocalStdioServerLauncher {}
 
 impl LocalStdioServerLauncher {
-    fn launch_server(command: StdioServerCommand) -> io::Result<StdioServerTransport> {
+    fn launch_server(
+        command: StdioServerCommand,
+        fallback_cwd: PathBuf,
+    ) -> io::Result<StdioServerTransport> {
         let StdioServerCommand {
             program,
             args,
@@ -203,22 +219,21 @@ impl LocalStdioServerLauncher {
         } = command;
         let program_name = program.to_string_lossy().into_owned();
         let envs = create_env_for_mcp_server(env, &env_vars).map_err(io::Error::other)?;
+        let cwd = cwd.unwrap_or(fallback_cwd);
         let resolved_program =
-            program_resolver::resolve(program, &envs).map_err(io::Error::other)?;
+            program_resolver::resolve(program, &envs, &cwd).map_err(io::Error::other)?;
 
         let mut command = Command::new(resolved_program);
         command
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .current_dir(cwd)
             .env_clear()
             .envs(envs)
             .args(args);
         #[cfg(unix)]
         command.process_group(0);
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
 
         let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(Stdio::piped())
@@ -449,9 +464,9 @@ impl ExecutorStdioServerLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_config::shell_environment;
-    use codex_config::types::EnvironmentVariablePattern;
-    use codex_config::types::ShellEnvironmentPolicy;
+    use codex_protocol::config_types::EnvironmentVariablePattern;
+    use codex_protocol::config_types::ShellEnvironmentPolicy;
+    use codex_protocol::shell_environment;
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

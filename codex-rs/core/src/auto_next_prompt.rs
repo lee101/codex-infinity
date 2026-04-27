@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use codex_login::AuthManager;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::model_info::model_info_from_slug;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -22,6 +21,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_rollout_trace::InferenceTraceContext;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -80,15 +80,7 @@ pub async fn generate_auto_next_prompt(
     );
 
     let auth_manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
-    let models_manager = ModelsManager::new(
-        config.codex_home.to_path_buf(),
-        Arc::clone(&auth_manager),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    );
-    let model_info = models_manager
-        .get_model_info(GENERATOR_MODEL, &config.to_models_manager_config())
-        .await;
+    let model_info = model_info_from_slug(GENERATOR_MODEL);
 
     let installation_id = resolve_installation_id(&config.codex_home).await.ok()?;
     let conversation_id = ThreadId::new();
@@ -122,7 +114,6 @@ pub async fn generate_auto_next_prompt(
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: user_message }],
-        end_turn: None,
         phase: None,
     }];
     prompt.base_instructions = BaseInstructions {
@@ -147,6 +138,7 @@ pub async fn generate_auto_next_prompt(
             ReasoningSummaryConfig::None,
             config.service_tier,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .ok()?;

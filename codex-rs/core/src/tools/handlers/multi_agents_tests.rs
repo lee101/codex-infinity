@@ -3,6 +3,7 @@ use crate::CodexThread;
 use crate::ThreadManager;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
+use crate::context::TurnAborted;
 use crate::function_tool::FunctionCallError;
 use crate::session::tests::make_session_and_context;
 use crate::session_prefix::format_subagent_notification_message;
@@ -17,7 +18,6 @@ use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHa
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use codex_config::types::ShellEnvironmentPolicy;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -25,15 +25,21 @@ use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::FileSystemAccessMode;
+use codex_protocol::protocol::FileSystemPath;
+use codex_protocol::protocol::FileSystemSandboxEntry;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -72,6 +78,7 @@ fn invocation(
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
         tool_name: codex_tools::ToolName::plain(tool_name),
+        source: crate::tools::context::ToolCallSource::Direct,
         payload,
     }
 }
@@ -431,7 +438,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -465,7 +472,7 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides() {
     assert_eq!(
         err,
             FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -509,13 +516,13 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
         )
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_fork_turns_rejects_child_model_overrides() {
+async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_overrides() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -540,17 +547,16 @@ async fn multi_agent_v2_spawn_fork_turns_rejects_child_model_overrides() {
                 "message": "inspect this repo",
                 "task_name": "fork_context_v2",
                 "model": "gpt-5-child-override",
-                "reasoning_effort": "low",
-                "fork_turns": "all"
+                "reasoning_effort": "low"
             })),
         ))
         .await
-        .expect_err("forked spawn should reject child model overrides");
+        .expect_err("default full fork should reject child model overrides");
 
     assert_eq!(
         err,
             FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -1156,6 +1162,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_messa
                 last_agent_message: Some("done".to_string()),
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         )
         .await;
@@ -1565,6 +1572,52 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
     }));
 
     wait_for_turn_aborted(&thread, &interrupted_turn_id, TurnAbortReason::Interrupted).await;
+    let history_items = thread
+        .codex
+        .session
+        .clone_history()
+        .await
+        .raw_items()
+        .to_vec();
+    assert!(
+        history_items.iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|content_item| matches!(
+                        content_item,
+                        ContentItem::InputText { text }
+                            if text.contains(TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE)
+                    ))
+        )),
+        "v2 interrupted-turn marker should be recorded as a developer input message"
+    );
+    assert!(
+        !history_items.iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && content.iter().any(|content_item| matches!(
+                        content_item,
+                        ContentItem::InputText { text } | ContentItem::OutputText { text }
+                            if text.contains(TurnAborted::INTERRUPTED_GUIDANCE)
+                    ))
+        )),
+        "v2 interrupted-turn marker should not be recorded as a user message"
+    );
+    assert!(
+        !history_items.iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "assistant"
+                    && content.iter().any(|content_item| matches!(
+                        content_item,
+                        ContentItem::InputText { text } | ContentItem::OutputText { text }
+                            if text.contains(TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE)
+                    ))
+        )),
+        "v2 interrupted-turn marker should not be recorded as an assistant message"
+    );
     wait_for_redirected_envelope_in_history(
         &thread,
         &InterAgentCommunication::new(
@@ -1576,6 +1629,104 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
         ),
     )
     .await;
+
+    let _ = thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_followup_task_can_disable_interrupted_marker() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+    let mut config = turn.config.as_ref().clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.agent_interrupt_message_enabled = false;
+    turn.config = Arc::new(config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
+    let agent_id = session
+        .services
+        .agent_control
+        .spawn_agent_with_metadata(
+            (*turn.config).clone(),
+            Op::CleanBackgroundTerminals,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(worker_path),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("worker spawn should succeed")
+        .thread_id;
+    let thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker thread should exist");
+
+    let active_turn = thread.codex.session.new_default_turn().await;
+    let interrupted_turn_id = active_turn.sub_id.clone();
+    thread
+        .codex
+        .session
+        .spawn_task(
+            Arc::clone(&active_turn),
+            vec![UserInput::Text {
+                text: "working".to_string(),
+                text_elements: Vec::new(),
+            }],
+            NeverEndingTask,
+        )
+        .await;
+
+    FollowupTaskHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "followup_task",
+            function_payload(json!({
+                "target": agent_id.to_string(),
+                "message": "continue",
+                "interrupt": true
+            })),
+        ))
+        .await
+        .expect("interrupting v2 followup_task should succeed");
+
+    wait_for_turn_aborted(&thread, &interrupted_turn_id, TurnAbortReason::Interrupted).await;
+    let history_items = thread
+        .codex
+        .session
+        .clone_history()
+        .await
+        .raw_items()
+        .to_vec();
+    assert!(
+        !history_items.iter().any(|item| matches!(
+            item,
+            ResponseItem::Message { content, .. }
+                if content.iter().any(|content_item| matches!(
+                    content_item,
+                    ContentItem::InputText { text } | ContentItem::OutputText { text }
+                        if text.contains(TurnAborted::INTERRUPTED_GUIDANCE)
+                            || text.contains(TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE)
+                ))
+        )),
+        "disabled interrupted-turn marker should not be recorded in history"
+    );
 
     let _ = thread
         .submit(Op::Shutdown {})
@@ -1634,6 +1785,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                 last_agent_message: Some("first done".to_string()),
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         )
         .await;
@@ -1662,6 +1814,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                 last_agent_message: Some("second done".to_string()),
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         )
         .await;
@@ -1924,21 +2077,6 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
 
 #[tokio::test]
 async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
-    fn pick_allowed_sandbox_policy(
-        constraint: &crate::config::Constrained<SandboxPolicy>,
-        base: SandboxPolicy,
-    ) -> SandboxPolicy {
-        let candidates = [
-            SandboxPolicy::DangerFullAccess,
-            SandboxPolicy::new_workspace_write_policy(),
-            SandboxPolicy::new_read_only_policy(),
-        ];
-        candidates
-            .into_iter()
-            .find(|candidate| *candidate != base && constraint.can_set(candidate).is_ok())
-            .unwrap_or(base)
-    }
-
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -1948,25 +2086,31 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
-    let expected_sandbox = pick_allowed_sandbox_policy(
-        &turn.config.permissions.sandbox_policy,
-        turn.config.permissions.sandbox_policy.get().clone(),
-    );
-    let expected_file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&expected_sandbox, &turn.cwd);
+    let expected_sandbox = turn.config.legacy_sandbox_policy();
+    let mut expected_file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected_sandbox, &turn.cwd);
+    expected_file_system_sandbox_policy
+        .entries
+        .push(FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: "**/.env".to_string(),
+            },
+            access: FileSystemAccessMode::None,
+        });
     let expected_network_sandbox_policy = NetworkSandboxPolicy::from(&expected_sandbox);
+    let expected_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&expected_sandbox),
+        &expected_file_system_sandbox_policy,
+        expected_network_sandbox_policy,
+    );
     turn.approval_policy
         .set(AskForApproval::OnRequest)
         .expect("approval policy should be set");
-    turn.sandbox_policy
-        .set(expected_sandbox.clone())
-        .expect("sandbox policy should be set");
-    turn.file_system_sandbox_policy = expected_file_system_sandbox_policy.clone();
-    turn.network_sandbox_policy = expected_network_sandbox_policy;
+    turn.permission_profile = expected_permission_profile.clone();
     assert_ne!(
-        expected_sandbox,
-        turn.config.permissions.sandbox_policy.get().clone(),
-        "test requires a runtime sandbox override that differs from base config"
+        expected_permission_profile,
+        turn.config.permissions.permission_profile(),
+        "test requires a runtime profile override that differs from base config"
     );
 
     let invocation = invocation(
@@ -2001,19 +2145,21 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .await;
     assert_eq!(snapshot.sandbox_policy, expected_sandbox);
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
+    assert_eq!(snapshot.permission_profile, expected_permission_profile);
     let child_thread = manager
         .get_thread(agent_id)
         .await
         .expect("spawned agent thread should exist");
     let child_turn = child_thread.codex.session.new_default_turn().await;
     assert_eq!(
-        child_turn.file_system_sandbox_policy,
+        child_turn.file_system_sandbox_policy(),
         expected_file_system_sandbox_policy
     );
     assert_eq!(
-        child_turn.network_sandbox_policy,
+        child_turn.network_sandbox_policy(),
         expected_network_sandbox_policy
     );
+    assert_eq!(child_turn.permission_profile(), expected_permission_profile);
 }
 
 #[tokio::test]
@@ -2240,6 +2386,7 @@ async fn send_input_accepts_structured_items() {
         .expect("send_input should succeed");
 
     let expected = Op::UserInput {
+        environments: None,
         items: vec![
             UserInput::Mention {
                 name: "drive".to_string(),
@@ -2356,7 +2503,6 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
                 content: vec![ContentItem::InputText {
                     text: "materialized".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             })]),
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
@@ -2848,7 +2994,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_waits_for_new_mail_after_start() {
+async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -2893,46 +3039,25 @@ async fn multi_agent_v2_wait_agent_waits_for_new_mail_after_start() {
         .expect("worker path");
 
     session.enqueue_mailbox_communication(InterAgentCommunication::new(
-        worker_path.clone(),
+        worker_path,
         AgentPath::root(),
         Vec::new(),
         "already queued".to_string(),
         /*trigger_turn*/ false,
     ));
 
-    let wait_task = tokio::spawn({
-        let session = session.clone();
-        let turn = turn.clone();
-        async move {
-            WaitAgentHandlerV2
-                .handle(invocation(
-                    session,
-                    turn,
-                    "wait_agent",
-                    function_payload(json!({"timeout_ms": 1000})),
-                ))
-                .await
-        }
-    });
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !wait_task.is_finished(),
-        "mail already queued before wait should not wake wait_agent"
-    );
-
-    session.enqueue_mailbox_communication(InterAgentCommunication::new(
-        worker_path,
-        AgentPath::root(),
-        Vec::new(),
-        "new mail".to_string(),
-        /*trigger_turn*/ false,
-    ));
-
-    let output = wait_task
-        .await
-        .expect("wait task should join")
-        .expect("wait_agent should succeed");
+    let output = timeout(
+        Duration::from_millis(500),
+        WaitAgentHandlerV2.handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({"timeout_ms": 1000})),
+        )),
+    )
+    .await
+    .expect("already queued mail should complete wait_agent immediately")
+    .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
@@ -3460,8 +3585,9 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
 #[tokio::test]
 async fn build_agent_spawn_config_uses_turn_context_values() {
     fn pick_allowed_sandbox_policy(
-        constraint: &crate::config::Constrained<SandboxPolicy>,
+        constraint: &crate::config::Constrained<PermissionProfile>,
         base: SandboxPolicy,
+        cwd: &std::path::Path,
     ) -> SandboxPolicy {
         let candidates = [
             SandboxPolicy::new_read_only_policy(),
@@ -3470,7 +3596,21 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         ];
         candidates
             .into_iter()
-            .find(|candidate| *candidate != base && constraint.can_set(candidate).is_ok())
+            .find(|candidate| {
+                if *candidate == base {
+                    return false;
+                }
+                let file_system_sandbox_policy =
+                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(candidate, cwd);
+                let network_sandbox_policy = NetworkSandboxPolicy::from(candidate);
+                let permission_profile =
+                    PermissionProfile::from_runtime_permissions_with_enforcement(
+                        SandboxEnforcement::from_legacy_sandbox_policy(candidate),
+                        &file_system_sandbox_policy,
+                        network_sandbox_policy,
+                    );
+                constraint.can_set(&permission_profile).is_ok()
+            })
             .unwrap_or(base)
     }
 
@@ -3488,17 +3628,19 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     turn.cwd = temp_dir.abs();
     turn.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
     let sandbox_policy = pick_allowed_sandbox_policy(
-        &turn.config.permissions.sandbox_policy,
-        turn.config.permissions.sandbox_policy.get().clone(),
+        &turn.config.permissions.permission_profile,
+        turn.config.legacy_sandbox_policy(),
+        turn.cwd.as_path(),
     );
     let file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&sandbox_policy, &turn.cwd);
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, &turn.cwd);
     let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
-    turn.sandbox_policy
-        .set(sandbox_policy)
-        .expect("sandbox policy set");
-    turn.file_system_sandbox_policy = file_system_sandbox_policy.clone();
-    turn.network_sandbox_policy = network_sandbox_policy;
+    let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+    );
+    turn.permission_profile = permission_profile.clone();
     turn.approval_policy
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
@@ -3522,11 +3664,8 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .expect("approval policy set");
     expected
         .permissions
-        .sandbox_policy
-        .set(turn.sandbox_policy.get().clone())
-        .expect("sandbox policy set");
-    expected.permissions.file_system_sandbox_policy = file_system_sandbox_policy;
-    expected.permissions.network_sandbox_policy = network_sandbox_policy;
+        .set_permission_profile(permission_profile)
+        .expect("permission profile set");
     assert_eq!(config, expected);
 }
 
@@ -3576,8 +3715,7 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("approval policy set");
     expected
         .permissions
-        .sandbox_policy
-        .set(turn.sandbox_policy.get().clone())
-        .expect("sandbox policy set");
+        .set_permission_profile(turn.permission_profile())
+        .expect("permission profile set");
     assert_eq!(config, expected);
 }

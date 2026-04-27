@@ -15,6 +15,7 @@ pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::EnvironmentManager;
+use codex_app_server_client::EnvironmentManagerArgs;
 use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
@@ -51,6 +52,9 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_config::ConfigLoadError;
+use codex_config::LoaderOverrides;
+use codex_config::format_config_error_with_source;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -58,9 +62,6 @@ use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_and_loader_overrides;
 use codex_core::config::resolve_oss_provider;
-use codex_core::config_loader::ConfigLoadError;
-use codex_core::config_loader::LoaderOverrides;
-use codex_core::config_loader::format_config_error_with_source;
 use codex_core::find_thread_meta_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
@@ -75,6 +76,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
@@ -415,14 +417,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         approval_policy: Some(AskForApproval::Never),
         approvals_reviewer: None,
         sandbox_mode,
+        permission_profile: None,
         cwd: resolved_cwd,
         model_provider: model_provider.clone(),
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
-        js_repl_node_path: None,
-        js_repl_node_module_dirs: None,
         zsh_path: None,
         base_instructions: None,
         developer_instructions: None,
@@ -523,8 +524,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cloud_requirements: run_cloud_requirements,
         feedback: CodexFeedback::new(),
         log_db: None,
-        environment_manager: std::sync::Arc::new(EnvironmentManager::from_env_with_runtime_paths(
-            Some(local_runtime_paths),
+        environment_manager: std::sync::Arc::new(EnvironmentManager::new(
+            EnvironmentManagerArgs::from_env(local_runtime_paths),
         )),
         config_warnings,
         session_source: SessionSource::Exec,
@@ -600,7 +601,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
@@ -742,7 +742,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
         && let Some(message) =
-            codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
+            codex_core::config::system_bwrap_warning(config.permissions.permission_profile.get())
     {
         event_processor.process_warning(message);
     }
@@ -762,6 +762,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             items,
             output_schema,
         } => {
+            let permission_profile = Some(config.permissions.permission_profile().into());
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
@@ -770,10 +771,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         thread_id: primary_thread_id_for_span.clone(),
                         input: items.into_iter().map(Into::into).collect(),
                         responsesapi_client_metadata: None,
+                        environments: None,
                         cwd: Some(default_cwd),
                         approval_policy: Some(default_approval_policy.into()),
                         approvals_reviewer: None,
-                        sandbox_policy: Some(default_sandbox_policy.clone().into()),
+                        sandbox_policy: None,
+                        permission_profile,
                         model: None,
                         service_tier: None,
                         effort: default_effort,
@@ -929,23 +932,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sandbox_mode_from_policy(
-    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
-) -> Option<codex_app_server_protocol::SandboxMode> {
-    match sandbox_policy {
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess => {
-            Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-        }
-        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::ReadOnly)
-        }
-        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
-        }
-        codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => None,
-    }
-}
-
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     ThreadStartParams {
         model: config.model.clone(),
@@ -953,7 +939,8 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: None,
+        permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
@@ -968,7 +955,8 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: None,
+        permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
         ..ThreadResumeParams::default()
     }
@@ -1017,6 +1005,7 @@ fn session_configured_from_thread_start_response(
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
+        response.permission_profile.clone().map(Into::into),
         response.cwd.clone(),
         response.reasoning_effort,
     )
@@ -1035,6 +1024,7 @@ fn session_configured_from_thread_resume_response(
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
+        response.permission_profile.clone().map(Into::into),
         response.cwd.clone(),
         response.reasoning_effort,
     )
@@ -1063,6 +1053,7 @@ fn session_configured_from_thread_response(
     approval_policy: AskForApproval,
     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
     sandbox_policy: SandboxPolicy,
+    permission_profile: Option<PermissionProfile>,
     cwd: AbsolutePathBuf,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
 ) -> Result<SessionConfiguredEvent, String> {
@@ -1079,6 +1070,7 @@ fn session_configured_from_thread_response(
         approval_policy,
         approvals_reviewer,
         sandbox_policy,
+        permission_profile,
         cwd,
         reasoning_effort,
         history_log_id: 0,
@@ -1124,6 +1116,9 @@ fn should_process_notification(
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
         ServerNotification::ModelRerouted(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
+        ServerNotification::ModelVerification(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
@@ -1280,6 +1275,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         cwd: None,
+                        use_state_db_only: false,
                         search_term: None,
                     },
                 },
@@ -1343,6 +1339,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     cwd: None,
+                    use_state_db_only: false,
                     search_term: Some(session_id.to_string()),
                 },
             },

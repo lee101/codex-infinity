@@ -71,6 +71,7 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 #[cfg(test)]
 use crate::test_support::test_path_display;
+use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -190,18 +191,18 @@ mod loaded_threads;
 mod pending_interactive_replay;
 mod platform_actions;
 mod replay_filter;
+mod resize_reflow;
 mod session_lifecycle;
 mod side;
 mod startup_prompts;
 mod thread_events;
+mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
 use self::app_server_requests::PendingAppServerRequests;
-#[cfg(test)]
-use self::background_requests::*;
 use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
 use self::platform_actions::*;
@@ -291,7 +292,7 @@ fn default_exec_approval_decisions(
     proposed_network_policy_amendments: Option<
         &[codex_protocol::approvals::NetworkPolicyAmendment],
     >,
-    additional_permissions: Option<&codex_protocol::models::PermissionProfile>,
+    additional_permissions: Option<&codex_protocol::models::AdditionalPermissionProfile>,
 ) -> Vec<codex_protocol::protocol::ReviewDecision> {
     ExecApprovalRequestEvent::default_available_decisions(
         network_approval_context,
@@ -302,7 +303,7 @@ fn default_exec_approval_decisions(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GuardianApprovalsMode {
+struct AutoReviewMode {
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
     sandbox_policy: SandboxPolicy,
@@ -311,11 +312,11 @@ struct GuardianApprovalsMode {
 /// Enabling the Auto-review experiment in the TUI should also switch the
 /// current `/approvals` settings to the matching Auto-review mode. Users
 /// can still change `/approvals` afterward; this just assumes that opting into
-/// the experiment means they want guardian review enabled immediately.
-fn guardian_approvals_mode() -> GuardianApprovalsMode {
-    GuardianApprovalsMode {
+/// the experiment means they want Auto-review enabled immediately.
+fn auto_review_mode() -> AutoReviewMode {
+    AutoReviewMode {
         approval_policy: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
         sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
     }
 }
@@ -489,6 +490,11 @@ struct SessionSummary {
     resume_command: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct InitialHistoryReplayBuffer {
+    retained_lines: VecDeque<Line<'static>>,
+}
+
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
@@ -510,6 +516,8 @@ pub(crate) struct App {
     pub(crate) overlay: Option<Overlay>,
     pub(crate) deferred_history_lines: Vec<Line<'static>>,
     has_emitted_history_lines: bool,
+    transcript_reflow: TranscriptReflowState,
+    initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
 
     pub(crate) enhanced_keys_supported: bool,
 
@@ -907,6 +915,8 @@ impl App {
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
+            transcript_reflow: TranscriptReflowState::default(),
+            initial_history_replay_buffer: None,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: terminal_title_invalid_items_warned.clone(),
@@ -943,10 +953,14 @@ impl App {
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
         {
+            let startup_sandbox_policy = app
+                .config
+                .permissions
+                .legacy_sandbox_policy(app.config.cwd.as_path());
             let should_check = WindowsSandboxLevel::from_config(&app.config)
                 != WindowsSandboxLevel::Disabled
                 && matches!(
-                    app.config.permissions.sandbox_policy.get(),
+                    &startup_sandbox_policy,
                     codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
                         | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
                 )
@@ -960,7 +974,7 @@ impl App {
                 let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
                 let tx = app.app_event_tx.clone();
                 let logs_base_dir = app.config.codex_home.clone();
-                let sandbox_policy = app.config.permissions.sandbox_policy.get().clone();
+                let sandbox_policy = startup_sandbox_policy;
                 Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, sandbox_policy, tx);
             }
         }
@@ -1101,7 +1115,10 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
-        if matches!(event, TuiEvent::Draw) {
+        let terminal_resize_reflow_enabled = self.terminal_resize_reflow_enabled();
+        if terminal_resize_reflow_enabled && matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
+            self.handle_draw_pre_render(tui)?;
+        } else if matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
             let size = tui.terminal.size()?;
             if size != tui.terminal.last_known_screen_size {
                 self.refresh_status_line();
@@ -1123,7 +1140,7 @@ impl App {
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::Draw => {
+                TuiEvent::Draw | TuiEvent::Resize => {
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;
                         self.render_transcript_once(tui);
@@ -1137,15 +1154,23 @@ impl App {
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
+                    let desired_height =
+                        self.chat_widget.desired_height(tui.terminal.size()?.width);
+                    if terminal_resize_reflow_enabled {
+                        tui.draw_with_resize_reflow(desired_height, |frame| {
                             self.chat_widget.render(frame.area(), frame.buffer);
                             if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
                                 frame.set_cursor_position((x, y));
                             }
-                        },
-                    )?;
+                        })?;
+                    } else {
+                        tui.draw(desired_height, |frame| {
+                            self.chat_widget.render(frame.area(), frame.buffer);
+                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                                frame.set_cursor_position((x, y));
+                            }
+                        })?;
+                    }
                     if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {
                         self.chat_widget
                             .set_external_editor_state(ExternalEditorState::Active);
@@ -1166,5 +1191,7 @@ impl Drop for App {
     }
 }
 
+#[cfg(test)]
+pub(super) mod test_support;
 #[cfg(test)]
 mod tests;

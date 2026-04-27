@@ -45,6 +45,7 @@ use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
+use codex_app_server_protocol::GuardianWarningNotification;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
@@ -60,6 +61,7 @@ use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::ModelReroutedNotification;
+use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::NetworkApprovalContext as V2NetworkApprovalContext;
 use codex_app_server_protocol::NetworkPolicyAmendment as V2NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction as V2NetworkPolicyRuleAction;
@@ -76,6 +78,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::TerminalInteractionNotification;
+use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -120,6 +123,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::items::parse_hook_prompt_message;
+use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
@@ -219,6 +223,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
+            respond_to_pending_interrupts(&thread_state, &outgoing, /*abort_reason*/ None).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -282,6 +287,22 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }
                 outgoing
                     .send_server_notification(ServerNotification::Warning(notification))
+                    .await;
+            }
+        }
+        EventMsg::GuardianWarning(warning_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = GuardianWarningNotification {
+                    thread_id: conversation_id.to_string(),
+                    message: warning_event.message,
+                };
+                if let Some(analytics_events_client) = analytics_events_client.as_ref() {
+                    analytics_events_client.track_notification(
+                        ServerNotification::GuardianWarning(notification.clone()),
+                    );
+                }
+                outgoing
+                    .send_server_notification(ServerNotification::GuardianWarning(notification))
                     .await;
             }
         }
@@ -378,6 +399,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                 };
                 outgoing
                     .send_server_notification(ServerNotification::ModelRerouted(notification))
+                    .await;
+            }
+        }
+        EventMsg::ModelVerification(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ModelVerificationNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    verifications: event.verifications.into_iter().map(Into::into).collect(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ModelVerification(notification))
                     .await;
             }
         }
@@ -908,27 +941,32 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .note_permission_requested(&conversation_id.to_string())
                     .await;
                 let requested_permissions = request.permissions.clone();
+                let request_cwd = match request.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => conversation.config_snapshot().await.cwd,
+                };
                 let params = PermissionsRequestApprovalParams {
                     thread_id: conversation_id.to_string(),
                     turn_id: request.turn_id.clone(),
                     item_id: request.call_id.clone(),
+                    cwd: request_cwd.clone(),
                     reason: request.reason,
                     permissions: request.permissions.into(),
                 };
                 let (pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::PermissionsRequestApproval(params))
                     .await;
+                let pending_response = PendingRequestPermissionsResponse {
+                    call_id: request.call_id,
+                    requested_permissions,
+                    request_cwd,
+                    pending_request_id,
+                    receiver: rx,
+                    request_permissions_guard: permission_guard,
+                };
                 tokio::spawn(async move {
-                    on_request_permissions_response(
-                        request.call_id,
-                        requested_permissions,
-                        pending_request_id,
-                        rx,
-                        conversation,
-                        thread_state,
-                        permission_guard,
-                    )
-                    .await;
+                    on_request_permissions_response(pending_response, conversation, thread_state)
+                        .await;
                 });
             } else {
                 error!(
@@ -938,6 +976,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let empty = CoreRequestPermissionsResponse {
                     permissions: Default::default(),
                     scope: CorePermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 };
                 if let Err(err) = conversation
                     .submit(Op::RequestPermissionsResponse {
@@ -1809,26 +1848,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            let pending = {
-                let mut state = thread_state.lock().await;
-                std::mem::take(&mut state.pending_interrupts)
-            };
-            if !pending.is_empty() {
-                for (rid, ver) in pending {
-                    match ver {
-                        ApiVersion::V1 => {
-                            let response = InterruptConversationResponse {
-                                abort_reason: turn_aborted_event.reason.clone(),
-                            };
-                            outgoing.send_response(rid, response).await;
-                        }
-                        ApiVersion::V2 => {
-                            let response = TurnInterruptResponse {};
-                            outgoing.send_response(rid, response).await;
-                        }
-                    }
-                }
-            }
+            respond_to_pending_interrupts(
+                &thread_state,
+                &outgoing,
+                Some(turn_aborted_event.reason.clone()),
+            )
+            .await;
 
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
@@ -1925,6 +1950,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 };
                 outgoing
                     .send_global_server_notification(ServerNotification::ThreadNameUpdated(
+                        notification,
+                    ))
+                    .await;
+            }
+        }
+        EventMsg::ThreadGoalUpdated(thread_goal_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ThreadGoalUpdatedNotification {
+                    thread_id: thread_goal_event.thread_id.to_string(),
+                    turn_id: thread_goal_event.turn_id,
+                    goal: thread_goal_event.goal.clone().into(),
+                };
+                outgoing
+                    .send_global_server_notification(ServerNotification::ThreadGoalUpdated(
                         notification,
                     ))
                     .await;
@@ -2305,6 +2344,33 @@ async fn handle_thread_rollback_failed(
     }
 }
 
+async fn respond_to_pending_interrupts(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    abort_reason: Option<codex_protocol::protocol::TurnAbortReason>,
+) {
+    let pending = {
+        let mut state = thread_state.lock().await;
+        std::mem::take(&mut state.pending_interrupts)
+    };
+
+    for (rid, ver) in pending {
+        match ver {
+            ApiVersion::V1 => {
+                let Some(abort_reason) = abort_reason.clone() else {
+                    debug_assert!(false, "v1 interrupts only resolve from TurnAborted");
+                    continue;
+                };
+                let response = InterruptConversationResponse { abort_reason };
+                outgoing.send_response(rid, response).await;
+            }
+            ApiVersion::V2 => {
+                outgoing.send_response(rid, TurnInterruptResponse {}).await;
+            }
+        }
+    }
+}
+
 async fn handle_token_count_event(
     conversation_id: ThreadId,
     turn_id: String,
@@ -2590,20 +2656,26 @@ fn mcp_server_elicitation_response_from_client_result(
 }
 
 async fn on_request_permissions_response(
-    call_id: String,
-    requested_permissions: CoreRequestPermissionProfile,
-    pending_request_id: RequestId,
-    receiver: oneshot::Receiver<ClientRequestResult>,
+    pending_response: PendingRequestPermissionsResponse,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
-    request_permissions_guard: ThreadWatchActiveGuard,
 ) {
+    let PendingRequestPermissionsResponse {
+        call_id,
+        requested_permissions,
+        request_cwd,
+        pending_request_id,
+        receiver,
+        request_permissions_guard,
+    } = pending_response;
     let response = receiver.await;
     resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(request_permissions_guard);
-    let Some(response) =
-        request_permissions_response_from_client_result(requested_permissions, response)
-    else {
+    let Some(response) = request_permissions_response_from_client_result(
+        requested_permissions,
+        response,
+        request_cwd.as_path(),
+    ) else {
         return;
     };
 
@@ -2618,9 +2690,19 @@ async fn on_request_permissions_response(
     }
 }
 
+struct PendingRequestPermissionsResponse {
+    call_id: String,
+    requested_permissions: CoreRequestPermissionProfile,
+    request_cwd: AbsolutePathBuf,
+    pending_request_id: RequestId,
+    receiver: oneshot::Receiver<ClientRequestResult>,
+    request_permissions_guard: ThreadWatchActiveGuard,
+}
+
 fn request_permissions_response_from_client_result(
     requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
+    cwd: &std::path::Path,
 ) -> Option<CoreRequestPermissionsResponse> {
     let value = match response {
         Ok(Ok(value)) => value,
@@ -2630,6 +2712,7 @@ fn request_permissions_response_from_client_result(
             return Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
             });
         }
         Err(err) => {
@@ -2637,6 +2720,7 @@ fn request_permissions_response_from_client_result(
             return Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
             });
         }
     };
@@ -2647,15 +2731,33 @@ fn request_permissions_response_from_client_result(
             PermissionsRequestApprovalResponse {
                 permissions: V2GrantedPermissionProfile::default(),
                 scope: codex_app_server_protocol::PermissionGrantScope::Turn,
+                strict_auto_review: None,
             }
         });
-    Some(CoreRequestPermissionsResponse {
-        permissions: intersect_permission_profiles(
-            requested_permissions.into(),
-            response.permissions.into(),
+    let strict_auto_review = response.strict_auto_review.unwrap_or(false);
+    if strict_auto_review
+        && matches!(
+            response.scope,
+            codex_app_server_protocol::PermissionGrantScope::Session
         )
-        .into(),
+    {
+        error!("strict auto review is only supported for turn-scoped permission grants");
+        return Some(CoreRequestPermissionsResponse {
+            permissions: Default::default(),
+            scope: CorePermissionGrantScope::Turn,
+            strict_auto_review: false,
+        });
+    }
+    let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.into();
+    let permissions = if granted_permissions.is_empty() {
+        CoreRequestPermissionProfile::default()
+    } else {
+        intersect_permission_profiles(requested_permissions.into(), granted_permissions, cwd).into()
+    };
+    Some(CoreRequestPermissionsResponse {
+        permissions,
         scope: response.scope.to_core(),
+        strict_auto_review,
     })
 }
 
@@ -3027,6 +3129,10 @@ mod tests {
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
     use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::CollabResumeBeginEvent;
@@ -3079,6 +3185,7 @@ mod tests {
             last_agent_message: None,
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
+            time_to_first_token_ms: None,
         }
     }
 
@@ -3469,9 +3576,7 @@ mod tests {
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
@@ -3711,6 +3816,7 @@ mod tests {
         let response = request_permissions_response_from_client_result(
             CoreRequestPermissionProfile::default(),
             Ok(Err(error)),
+            std::env::current_dir().expect("current dir").as_path(),
         );
 
         assert_eq!(response, None);
@@ -3797,12 +3903,14 @@ mod tests {
             ),
         ];
 
+        let cwd = std::env::current_dir().expect("current dir");
         for (granted_permissions, expected_permissions) in cases {
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
                     "permissions": granted_permissions,
                 }))),
+                cwd.as_path(),
             )
             .expect("response should be accepted");
 
@@ -3811,6 +3919,7 @@ mod tests {
                 CoreRequestPermissionsResponse {
                     permissions: expected_permissions,
                     scope: CorePermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 }
             );
         }
@@ -3824,6 +3933,7 @@ mod tests {
                 "scope": "session",
                 "permissions": {},
             }))),
+            std::env::current_dir().expect("current dir").as_path(),
         )
         .expect("response should be accepted");
 
@@ -3832,7 +3942,183 @@ mod tests {
             CoreRequestPermissionsResponse {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
+                strict_auto_review: false,
             }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_session_scoped_strict_auto_review() {
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": "session",
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            std::env::current_dir().expect("current dir").as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response,
+            CoreRequestPermissionsResponse {
+                permissions: CoreRequestPermissionProfile::default(),
+                scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_preserves_turn_scoped_strict_auto_review() {
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile {
+                network: Some(codex_protocol::models::NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            },
+            Ok(Ok(serde_json::json!({
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            std::env::current_dir().expect("current dir").as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(response.scope, CorePermissionGrantScope::Turn);
+        assert!(response.strict_auto_review);
+    }
+
+    #[test]
+    fn request_permissions_response_accepts_explicit_child_grant_for_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [child],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile {
+                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                    /*read*/ None,
+                    Some(vec![child]),
+                )),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_child_grant_outside_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let request_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("request-cwd"))
+            .expect("absolute request cwd");
+        let later_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("later-cwd"))
+            .expect("absolute later cwd");
+        let later_child = later_cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [later_child],
+                    },
+                },
+            }))),
+            request_cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_ignores_broader_cwd_grant_for_requested_child_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![child]),
+            )),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "entries": [{
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "current_working_directory"
+                                }
+                            },
+                            "access": "write"
+                        }],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
         );
     }
 
@@ -3935,17 +4221,19 @@ mod tests {
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                &event_turn_id,
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: event_turn_id.clone(),
                     started_at: Some(42),
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                }),
+            );
+            state.track_current_turn_event(
                 &event_turn_id,
-            )));
+                &EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+            );
         }
 
         handle_turn_complete(

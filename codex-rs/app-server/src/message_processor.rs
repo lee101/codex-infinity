@@ -1,16 +1,16 @@
-use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::config_manager::ConfigManager;
+use crate::device_key_api::DeviceKeyApi;
+use crate::error_code::invalid_request;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
 use crate::fs_watch::FsWatchManager;
@@ -19,6 +19,7 @@ use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::transport::AppServerTransport;
+use crate::transport::ConnectionOrigin;
 use crate::transport::RemoteControlHandle;
 use async_trait::async_trait;
 use axum::http::HeaderValue;
@@ -33,25 +34,17 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
-use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWarningNotification;
+use codex_app_server_protocol::DeviceKeyCreateParams;
+use codex_app_server_protocol::DeviceKeyPublicParams;
+use codex_app_server_protocol::DeviceKeySignParams;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
-use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
-use codex_app_server_protocol::FsCopyParams;
-use codex_app_server_protocol::FsCreateDirectoryParams;
-use codex_app_server_protocol::FsGetMetadataParams;
-use codex_app_server_protocol::FsReadDirectoryParams;
-use codex_app_server_protocol::FsReadFileParams;
-use codex_app_server_protocol::FsRemoveParams;
-use codex_app_server_protocol::FsUnwatchParams;
-use codex_app_server_protocol::FsWatchParams;
-use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -63,11 +56,8 @@ use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::connectors;
-use codex_config::ThreadConfigLoader;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
@@ -91,11 +81,9 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::timeout;
-use toml::Value as TomlValue;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
     outgoing: Arc<OutgoingMessageSender>,
@@ -169,6 +157,7 @@ pub(crate) struct MessageProcessor {
     codex_message_processor: CodexMessageProcessor,
     thread_manager: Arc<ThreadManager>,
     config_api: ConfigApi,
+    device_key_api: DeviceKeyApi,
     external_agent_config_api: ExternalAgentConfigApi,
     fs_api: FsApi,
     auth_manager: Arc<AuthManager>,
@@ -180,8 +169,9 @@ pub(crate) struct MessageProcessor {
     remote_control_handle: Option<RemoteControlHandle>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
+    origin: ConnectionOrigin,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -193,9 +183,26 @@ struct InitializedConnectionSessionState {
     client_version: String,
 }
 
+impl Default for ConnectionSessionState {
+    fn default() -> Self {
+        Self::new(ConnectionOrigin::WebSocket)
+    }
+}
+
 impl ConnectionSessionState {
+    pub(crate) fn new(origin: ConnectionOrigin) -> Self {
+        Self {
+            origin,
+            initialized: OnceLock::new(),
+        }
+    }
+
     pub(crate) fn initialized(&self) -> bool {
         self.initialized.get().is_some()
+    }
+
+    fn allows_device_key_requests(&self) -> bool {
+        self.origin.allows_device_key_requests()
     }
 
     pub(crate) fn experimental_api_enabled(&self) -> bool {
@@ -232,11 +239,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) config: Arc<Config>,
+    pub(crate) config_manager: ConfigManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
-    pub(crate) cli_overrides: Vec<(String, TomlValue)>,
-    pub(crate) loader_overrides: LoaderOverrides,
-    pub(crate) cloud_requirements: CloudRequirementsLoader,
-    pub(crate) thread_config_loader: Arc<dyn ThreadConfigLoader>,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
@@ -244,6 +248,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
+    pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
 }
 
 impl MessageProcessor {
@@ -254,11 +259,8 @@ impl MessageProcessor {
             outgoing,
             arg0_paths,
             config,
+            config_manager,
             environment_manager,
-            cli_overrides,
-            loader_overrides,
-            cloud_requirements,
-            thread_config_loader,
             feedback,
             log_db,
             config_warnings,
@@ -266,6 +268,7 @@ impl MessageProcessor {
             auth_manager,
             rpc_transport,
             remote_control_handle,
+            plugin_startup_tasks,
         } = args;
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
@@ -291,9 +294,6 @@ impl MessageProcessor {
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
 
-        let cli_overrides = Arc::new(RwLock::new(cli_overrides));
-        let runtime_feature_enablement = Arc::new(RwLock::new(BTreeMap::new()));
-        let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
             auth_manager: auth_manager.clone(),
             thread_manager: Arc::clone(&thread_manager),
@@ -301,30 +301,32 @@ impl MessageProcessor {
             analytics_events_client: analytics_events_client.clone(),
             arg0_paths,
             config: Arc::clone(&config),
-            cli_overrides: cli_overrides.clone(),
-            runtime_feature_enablement: runtime_feature_enablement.clone(),
-            cloud_requirements: cloud_requirements.clone(),
-            thread_config_loader,
+            config_manager: config_manager.clone(),
             feedback,
             log_db,
         });
-        // Keep plugin startup warmups aligned at app-server startup.
-        // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
-        thread_manager
-            .plugins_manager()
-            .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
+        if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
+            // Keep plugin startup warmups aligned at app-server startup.
+            // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
+            thread_manager
+                .plugins_manager()
+                .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
+        }
         let config_api = ConfigApi::new(
-            config.codex_home.to_path_buf(),
-            cli_overrides,
-            runtime_feature_enablement,
-            loader_overrides,
-            cloud_requirements,
+            config_manager,
             thread_manager.clone(),
             analytics_events_client.clone(),
         );
+        let device_key_api =
+            DeviceKeyApi::new(config.sqlite_home.clone(), config.model_provider_id.clone());
         let external_agent_config_api =
             ExternalAgentConfigApi::new(config.codex_home.to_path_buf());
-        let fs_api = FsApi::default();
+        let fs_api = FsApi::new(
+            thread_manager
+                .environment_manager()
+                .local_environment()
+                .get_filesystem(),
+        );
         let fs_watch_manager = FsWatchManager::new(outgoing.clone());
 
         Self {
@@ -332,6 +334,7 @@ impl MessageProcessor {
             codex_message_processor,
             thread_manager: Arc::clone(&thread_manager),
             config_api,
+            device_key_api,
             external_agent_config_api,
             fs_api,
             auth_manager,
@@ -352,7 +355,7 @@ impl MessageProcessor {
         self: &Arc<Self>,
         connection_id: ConnectionId,
         request: JSONRPCRequest,
-        transport: AppServerTransport,
+        transport: &AppServerTransport,
         session: Arc<ConnectionSessionState>,
     ) {
         let request_method = request.method.as_str();
@@ -376,43 +379,28 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
-                let request_json = match serde_json::to_value(&request) {
-                    Ok(request_json) => request_json,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("Invalid request: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(request_id.clone(), error).await;
-                        return;
-                    }
-                };
-
-                let codex_request = match serde_json::from_value::<ClientRequest>(request_json) {
-                    Ok(codex_request) => codex_request,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("Invalid request: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(request_id.clone(), error).await;
-                        return;
-                    }
-                };
-                // Websocket callers finalize outbound readiness in lib.rs after mirroring
-                // session state into outbound state and sending initialize notifications to
-                // this specific connection. Passing `None` avoids marking the connection
-                // ready too early from inside the shared request handler.
-                self.handle_client_request(
-                    request_id.clone(),
-                    codex_request,
-                    Arc::clone(&session),
-                    /*outbound_initialized*/ None,
-                    request_context.clone(),
-                )
+                let result = async {
+                    let request_json = serde_json::to_value(&request)
+                        .map_err(|err| invalid_request(format!("Invalid request: {err}")))?;
+                    let codex_request = serde_json::from_value::<ClientRequest>(request_json)
+                        .map_err(|err| invalid_request(format!("Invalid request: {err}")))?;
+                    // Websocket callers finalize outbound readiness in lib.rs after mirroring
+                    // session state into outbound state and sending initialize notifications to
+                    // this specific connection. Passing `None` avoids marking the connection
+                    // ready too early from inside the shared request handler.
+                    self.handle_client_request(
+                        request_id.clone(),
+                        codex_request,
+                        Arc::clone(&session),
+                        /*outbound_initialized*/ None,
+                        request_context.clone(),
+                    )
+                    .await
+                }
                 .await;
+                if let Err(error) = result {
+                    self.outgoing.send_error(request_id.clone(), error).await;
+                }
             },
         )
         .await;
@@ -449,14 +437,18 @@ impl MessageProcessor {
                 // In-process clients do not have the websocket transport loop that performs
                 // post-initialize bookkeeping, so they still finalize outbound readiness in
                 // the shared request handler.
-                self.handle_client_request(
-                    request_id.clone(),
-                    request,
-                    Arc::clone(&session),
-                    Some(outbound_initialized),
-                    request_context.clone(),
-                )
-                .await;
+                let result = self
+                    .handle_client_request(
+                        request_id.clone(),
+                        request,
+                        Arc::clone(&session),
+                        Some(outbound_initialized),
+                        request_context.clone(),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    self.outgoing.send_error(request_id.clone(), error).await;
+                }
             },
         )
         .await;
@@ -584,7 +576,7 @@ impl MessageProcessor {
         // lib.rs can deliver connection-scoped initialize notifications first.
         outbound_initialized: Option<&AtomicBool>,
         request_context: RequestContext,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         if let ClientRequest::Initialize { request_id, params } = codex_request {
             // Handle Initialize internally so CodexMessageProcessor does not have to concern
@@ -594,13 +586,7 @@ impl MessageProcessor {
                 request_id,
             };
             if session.initialized() {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: "Already initialized".to_string(),
-                    data: None,
-                };
-                self.outgoing.send_error(connection_request_id, error).await;
-                return;
+                return Err(invalid_request("Already initialized"));
             }
 
             // TODO(maxj): Revisit capability scoping for `experimental_api_enabled`.
@@ -628,17 +614,9 @@ impl MessageProcessor {
             // Validate before committing; set_default_originator validates while
             // mutating process-global metadata.
             if HeaderValue::from_str(&name).is_err() {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
-                    ),
-                    data: None,
-                };
-                self.outgoing
-                    .send_error(connection_request_id.clone(), error)
-                    .await;
-                return;
+                return Err(invalid_request(format!(
+                    "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
+                )));
             }
             let originator = name.clone();
             let user_agent_suffix = format!("{name}; {version}");
@@ -654,13 +632,7 @@ impl MessageProcessor {
                 })
                 .is_err()
             {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: "Already initialized".to_string(),
-                    data: None,
-                };
-                self.outgoing.send_error(connection_request_id, error).await;
-                return;
+                return Err(invalid_request("Already initialized"));
             }
 
             // Only the request that wins session initialization may mutate
@@ -715,7 +687,7 @@ impl MessageProcessor {
                     .connection_initialized(connection_id)
                     .await;
             }
-            return;
+            return Ok(());
         }
 
         self.dispatch_initialized_client_request(
@@ -724,7 +696,7 @@ impl MessageProcessor {
             session,
             request_context,
         )
-        .await;
+        .await
     }
 
     async fn dispatch_initialized_client_request(
@@ -733,27 +705,15 @@ impl MessageProcessor {
         codex_request: ClientRequest,
         session: Arc<ConnectionSessionState>,
         request_context: RequestContext,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         if !session.initialized() {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: "Not initialized".to_string(),
-                data: None,
-            };
-            self.outgoing.send_error(connection_request_id, error).await;
-            return;
+            return Err(invalid_request("Not initialized"));
         }
 
         if let Some(reason) = codex_request.experimental_reason()
             && !session.experimental_api_enabled()
         {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: experimental_required_message(reason),
-                data: None,
-            };
-            self.outgoing.send_error(connection_request_id, error).await;
-            return;
+            return Err(invalid_request(experimental_required_message(reason)));
         }
         let connection_id = connection_request_id.connection_id;
         if self.config.features.enabled(Feature::GeneralAnalytics)
@@ -769,6 +729,7 @@ impl MessageProcessor {
 
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let client_version = session.client_version().map(str::to_string);
+        let device_key_requests_allowed = session.allows_device_key_requests();
         Arc::clone(self)
             .handle_initialized_client_request(
                 connection_request_id,
@@ -776,8 +737,9 @@ impl MessageProcessor {
                 request_context,
                 app_server_client_name,
                 client_version,
+                device_key_requests_allowed,
             )
-            .await;
+            .await
     }
 
     async fn handle_initialized_client_request(
@@ -787,66 +749,49 @@ impl MessageProcessor {
         request_context: RequestContext,
         app_server_client_name: Option<String>,
         client_version: Option<String>,
-    ) {
+        device_key_requests_allowed: bool,
+    ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        let request_id_for_connection = |request_id| ConnectionRequestId {
+            connection_id,
+            request_id,
+        };
 
         match codex_request {
             ClientRequest::ConfigRead { request_id, params } => {
-                self.handle_config_read(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.config_api.read(params).await,
+                    )
+                    .await;
             }
             ClientRequest::ExternalAgentConfigDetect { request_id, params } => {
-                self.handle_external_agent_config_detect(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.external_agent_config_api.detect(params).await,
+                    )
+                    .await;
             }
             ClientRequest::ExternalAgentConfigImport { request_id, params } => {
                 self.handle_external_agent_config_import(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                 )
-                .await;
+                .await?;
             }
             ClientRequest::ConfigValueWrite { request_id, params } => {
-                self.handle_config_value_write(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.handle_config_value_write(request_id_for_connection(request_id), params)
+                    .await;
             }
             ClientRequest::ConfigBatchWrite { request_id, params } => {
-                self.handle_config_batch_write(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.handle_config_batch_write(request_id_for_connection(request_id), params)
+                    .await;
             }
             ClientRequest::ExperimentalFeatureEnablementSet { request_id, params } => {
                 self.handle_experimental_feature_enablement_set(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                 )
                 .await;
@@ -855,103 +800,105 @@ impl MessageProcessor {
                 request_id,
                 params: _,
             } => {
-                self.handle_config_requirements_read(ConnectionRequestId {
-                    connection_id,
-                    request_id,
-                })
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.config_api.config_requirements_read().await,
+                    )
+                    .await;
+            }
+            ClientRequest::DeviceKeyCreate { request_id, params } => {
+                self.handle_device_key_create(
+                    request_id_for_connection(request_id),
+                    params,
+                    device_key_requests_allowed,
+                );
+            }
+            ClientRequest::DeviceKeyPublic { request_id, params } => {
+                self.handle_device_key_public(
+                    request_id_for_connection(request_id),
+                    params,
+                    device_key_requests_allowed,
+                );
+            }
+            ClientRequest::DeviceKeySign { request_id, params } => {
+                self.handle_device_key_sign(
+                    request_id_for_connection(request_id),
+                    params,
+                    device_key_requests_allowed,
+                );
             }
             ClientRequest::FsReadFile { request_id, params } => {
-                self.handle_fs_read_file(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.read_file(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsWriteFile { request_id, params } => {
-                self.handle_fs_write_file(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.write_file(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsCreateDirectory { request_id, params } => {
-                self.handle_fs_create_directory(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.create_directory(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsGetMetadata { request_id, params } => {
-                self.handle_fs_get_metadata(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.get_metadata(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsReadDirectory { request_id, params } => {
-                self.handle_fs_read_directory(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.read_directory(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsRemove { request_id, params } => {
-                self.handle_fs_remove(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.remove(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsCopy { request_id, params } => {
-                self.handle_fs_copy(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.copy(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsWatch { request_id, params } => {
-                self.handle_fs_watch(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    connection_id,
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_watch_manager.watch(connection_id, params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsUnwatch { request_id, params } => {
-                self.handle_fs_unwatch(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    connection_id,
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_watch_manager.unwatch(connection_id, params).await,
+                    )
+                    .await;
             }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
@@ -969,13 +916,7 @@ impl MessageProcessor {
                     .await;
             }
         }
-    }
-
-    async fn handle_config_read(&self, request_id: ConnectionRequestId, params: ConfigReadParams) {
-        match self.config_api.read(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
+        Ok(())
     }
 
     async fn handle_config_value_write(
@@ -1032,17 +973,20 @@ impl MessageProcessor {
         let auth = self.auth_manager.auth().await;
         if !config.features.apps_enabled_for_auth(
             auth.as_ref()
-                .is_some_and(codex_login::CodexAuth::is_chatgpt_auth),
+                .is_some_and(codex_login::CodexAuth::uses_codex_backend),
         ) {
             return;
         }
 
         let outgoing = Arc::clone(&self.outgoing);
+        let environment_manager = self.thread_manager.environment_manager();
         tokio::spawn(async move {
             let (all_connectors_result, accessible_connectors_result) = tokio::join!(
                 connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
-                connectors::list_accessible_connectors_from_mcp_tools_with_options(
-                    &config, /*force_refetch*/ true,
+                connectors::list_accessible_connectors_from_mcp_tools_with_environment_manager(
+                    &config,
+                    /*force_refetch*/ true,
+                    &environment_manager,
                 ),
             );
             let all_connectors = match all_connectors_result {
@@ -1055,7 +999,7 @@ impl MessageProcessor {
                 }
             };
             let accessible_connectors = match accessible_connectors_result {
-                Ok(connectors) => connectors,
+                Ok(status) => status.connectors,
                 Err(err) => {
                     tracing::warn!(
                         "failed to force-refresh accessible apps after experimental feature enablement: {err:#}"
@@ -1117,179 +1061,136 @@ impl MessageProcessor {
         }
     }
 
-    async fn handle_config_requirements_read(&self, request_id: ConnectionRequestId) {
-        match self.config_api.config_requirements_read().await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_external_agent_config_detect(
+    fn handle_device_key_create(
         &self,
         request_id: ConnectionRequestId,
-        params: ExternalAgentConfigDetectParams,
+        params: DeviceKeyCreateParams,
+        device_key_requests_allowed: bool,
     ) {
-        match self.external_agent_config_api.detect(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
+        self.spawn_device_key_request(
+            request_id,
+            "device/key/create",
+            device_key_requests_allowed,
+            move |device_key_api| async move { device_key_api.create(params).await },
+        );
+    }
+
+    fn handle_device_key_public(
+        &self,
+        request_id: ConnectionRequestId,
+        params: DeviceKeyPublicParams,
+        device_key_requests_allowed: bool,
+    ) {
+        self.spawn_device_key_request(
+            request_id,
+            "device/key/public",
+            device_key_requests_allowed,
+            move |device_key_api| async move { device_key_api.public(params).await },
+        );
+    }
+
+    fn handle_device_key_sign(
+        &self,
+        request_id: ConnectionRequestId,
+        params: DeviceKeySignParams,
+        device_key_requests_allowed: bool,
+    ) {
+        self.spawn_device_key_request(
+            request_id,
+            "device/key/sign",
+            device_key_requests_allowed,
+            move |device_key_api| async move { device_key_api.sign(params).await },
+        );
+    }
+
+    fn spawn_device_key_request<R, F, Fut>(
+        &self,
+        request_id: ConnectionRequestId,
+        method: &'static str,
+        device_key_requests_allowed: bool,
+        run_request: F,
+    ) where
+        R: serde::Serialize + Send + 'static,
+        F: FnOnce(DeviceKeyApi) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, JSONRPCErrorError>> + Send + 'static,
+    {
+        let device_key_api = self.device_key_api.clone();
+        let outgoing = Arc::clone(&self.outgoing);
+        tokio::spawn(async move {
+            let result = async {
+                if !device_key_requests_allowed {
+                    return Err(invalid_request(format!(
+                        "{method} is not available over remote transports"
+                    )));
+                }
+                run_request(device_key_api).await
+            }
+            .await;
+            outgoing.send_result(request_id, result).await;
+        });
     }
 
     async fn handle_external_agent_config_import(
         &self,
         request_id: ConnectionRequestId,
         params: ExternalAgentConfigImportParams,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         let has_plugin_imports = params.migration_items.iter().any(|item| {
             matches!(
                 item.item_type,
                 ExternalAgentConfigMigrationItemType::Plugins
             )
         });
-        match self.external_agent_config_api.import(params).await {
-            Ok(pending_plugin_imports) => {
-                if has_plugin_imports {
-                    self.handle_config_mutation().await;
-                }
-                self.outgoing
-                    .send_response(request_id, ExternalAgentConfigImportResponse {})
-                    .await;
 
-                if !has_plugin_imports {
-                    return;
-                }
+        let pending_plugin_imports = self.external_agent_config_api.import(params).await?;
+        if has_plugin_imports {
+            self.handle_config_mutation().await;
+        }
+        self.outgoing
+            .send_response(request_id, ExternalAgentConfigImportResponse {})
+            .await;
 
-                if pending_plugin_imports.is_empty() {
-                    self.outgoing
-                        .send_server_notification(
-                            ServerNotification::ExternalAgentConfigImportCompleted(
-                                ExternalAgentConfigImportCompletedNotification {},
-                            ),
-                        )
-                        .await;
-                    return;
-                }
+        if !has_plugin_imports {
+            return Ok(());
+        }
 
-                let external_agent_config_api = self.external_agent_config_api.clone();
-                let outgoing = Arc::clone(&self.outgoing);
-                let thread_manager = Arc::clone(&self.thread_manager);
-                tokio::spawn(async move {
-                    for pending_plugin_import in pending_plugin_imports {
-                        match external_agent_config_api
-                            .complete_pending_plugin_import(pending_plugin_import)
-                            .await
-                        {
-                            Ok(()) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error.message,
-                                    "external agent config plugin import failed"
-                                );
-                            }
-                        }
+        if pending_plugin_imports.is_empty() {
+            self.outgoing
+                .send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
+                    ExternalAgentConfigImportCompletedNotification {},
+                ))
+                .await;
+            return Ok(());
+        }
+
+        let external_agent_config_api = self.external_agent_config_api.clone();
+        let outgoing = Arc::clone(&self.outgoing);
+        let thread_manager = Arc::clone(&self.thread_manager);
+        tokio::spawn(async move {
+            for pending_plugin_import in pending_plugin_imports {
+                match external_agent_config_api
+                    .complete_pending_plugin_import(pending_plugin_import)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message,
+                            "external agent config plugin import failed"
+                        );
                     }
-                    thread_manager.plugins_manager().clear_cache();
-                    thread_manager.skills_manager().clear_cache();
-                    outgoing
-                        .send_server_notification(
-                            ServerNotification::ExternalAgentConfigImportCompleted(
-                                ExternalAgentConfigImportCompletedNotification {},
-                            ),
-                        )
-                        .await;
-                });
+                }
             }
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
+            thread_manager.plugins_manager().clear_cache();
+            thread_manager.skills_manager().clear_cache();
+            outgoing
+                .send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
+                    ExternalAgentConfigImportCompletedNotification {},
+                ))
+                .await;
+        });
 
-    async fn handle_fs_read_file(&self, request_id: ConnectionRequestId, params: FsReadFileParams) {
-        match self.fs_api.read_file(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_write_file(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsWriteFileParams,
-    ) {
-        match self.fs_api.write_file(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_create_directory(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsCreateDirectoryParams,
-    ) {
-        match self.fs_api.create_directory(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_get_metadata(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsGetMetadataParams,
-    ) {
-        match self.fs_api.get_metadata(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_read_directory(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsReadDirectoryParams,
-    ) {
-        match self.fs_api.read_directory(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_remove(&self, request_id: ConnectionRequestId, params: FsRemoveParams) {
-        match self.fs_api.remove(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_copy(&self, request_id: ConnectionRequestId, params: FsCopyParams) {
-        match self.fs_api.copy(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_watch(
-        &self,
-        request_id: ConnectionRequestId,
-        connection_id: ConnectionId,
-        params: FsWatchParams,
-    ) {
-        match self.fs_watch_manager.watch(connection_id, params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_unwatch(
-        &self,
-        request_id: ConnectionRequestId,
-        connection_id: ConnectionId,
-        params: FsUnwatchParams,
-    ) {
-        match self.fs_watch_manager.unwatch(connection_id, params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
+        Ok(())
     }
 }
 

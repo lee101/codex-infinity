@@ -73,7 +73,9 @@ impl App {
             ));
         }
         if let Some(policy) = self.runtime_sandbox_policy_override.as_ref()
-            && let Err(err) = config.permissions.sandbox_policy.set(policy.clone())
+            && let Err(err) = config
+                .permissions
+                .set_legacy_sandbox_policy(policy.clone(), config.cwd.as_path())
         {
             tracing::warn!(%err, "failed to carry forward sandbox policy override");
             self.chat_widget.add_error_message(format!(
@@ -111,7 +113,10 @@ impl App {
         user_message_prefix: &str,
         log_message: &str,
     ) -> bool {
-        if let Err(err) = config.permissions.sandbox_policy.set(policy) {
+        if let Err(err) = config
+            .permissions
+            .set_legacy_sandbox_policy(policy, config.cwd.as_path())
+        {
             tracing::warn!(error = %err, "{log_message}");
             self.chat_widget
                 .add_error_message(format!("{user_message_prefix}: {err}"));
@@ -126,7 +131,7 @@ impl App {
             return;
         }
 
-        let guardian_approvals_preset = guardian_approvals_mode();
+        let auto_review_preset = auto_review_mode();
         let mut next_config = self.config.clone();
         let active_profile = self.active_profile.clone();
         let scoped_segments = |key: &str| {
@@ -202,16 +207,12 @@ impl App {
                     // Persist the reviewer setting so future sessions keep the
                     // experiment's matching `/approvals` mode until the user
                     // changes it explicitly.
-                    feature_config.approvals_reviewer =
-                        guardian_approvals_preset.approvals_reviewer;
+                    feature_config.approvals_reviewer = auto_review_preset.approvals_reviewer;
                     feature_edits.push(ConfigEdit::SetPath {
                         segments: scoped_segments("approvals_reviewer"),
-                        value: guardian_approvals_preset
-                            .approvals_reviewer
-                            .to_string()
-                            .into(),
+                        value: auto_review_preset.approvals_reviewer.to_string().into(),
                     });
-                    if previous_approvals_reviewer != guardian_approvals_preset.approvals_reviewer {
+                    if previous_approvals_reviewer != auto_review_preset.approvals_reviewer {
                         permissions_history_label = Some("Auto-review");
                     }
                 } else if !effective_enabled {
@@ -234,17 +235,17 @@ impl App {
                 // makes guardian review observable in the current thread.
                 if !self.try_set_approval_policy_on_config(
                     &mut feature_config,
-                    guardian_approvals_preset.approval_policy,
+                    auto_review_preset.approval_policy,
                     "Failed to enable Auto-review",
-                    "failed to set guardian approvals approval policy on staged config",
+                    "failed to set auto-review approval policy on staged config",
                 ) {
                     continue;
                 }
                 if !self.try_set_sandbox_policy_on_config(
                     &mut feature_config,
-                    guardian_approvals_preset.sandbox_policy.clone(),
+                    auto_review_preset.sandbox_policy.clone(),
                     "Failed to enable Auto-review",
-                    "failed to set guardian approvals sandbox policy on staged config",
+                    "failed to set auto-review sandbox policy on staged config",
                 ) {
                     continue;
                 }
@@ -258,8 +259,8 @@ impl App {
                         value: "workspace-write".into(),
                     },
                 ]);
-                approval_policy_override = Some(guardian_approvals_preset.approval_policy);
-                sandbox_policy_override = Some(guardian_approvals_preset.sandbox_policy.clone());
+                approval_policy_override = Some(auto_review_preset.approval_policy);
+                sandbox_policy_override = Some(auto_review_preset.sandbox_policy.clone());
             }
             next_config = feature_config;
             feature_updates_to_apply.push((feature, effective_enabled));
@@ -299,22 +300,33 @@ impl App {
                 .set_approval_policy(self.config.permissions.approval_policy.value());
         }
         if sandbox_policy_override.is_some()
-            && let Err(err) = self
-                .chat_widget
-                .set_sandbox_policy(self.config.permissions.sandbox_policy.get().clone())
+            && let Err(err) = self.chat_widget.set_sandbox_policy(
+                self.config
+                    .permissions
+                    .legacy_sandbox_policy(self.config.cwd.as_path()),
+            )
         {
             tracing::error!(
                 error = %err,
-                "failed to set guardian approvals sandbox policy on chat config"
+                "failed to set auto-review sandbox policy on chat config"
             );
             self.chat_widget
                 .add_error_message(format!("Failed to enable Auto-review: {err}"));
+        }
+        if sandbox_policy_override.is_some() {
+            self.runtime_sandbox_policy_override = Some(
+                self.config
+                    .permissions
+                    .legacy_sandbox_policy(self.config.cwd.as_path()),
+            );
         }
 
         if approval_policy_override.is_some()
             || approvals_reviewer_override.is_some()
             || sandbox_policy_override.is_some()
         {
+            self.sync_active_thread_permission_settings_to_cached_session()
+                .await;
             // This uses `OverrideTurnContext` intentionally: toggling the
             // experiment should update the active thread's effective approval
             // settings immediately, just like a `/approvals` selection. Without
@@ -535,5 +547,201 @@ impl App {
             Personality::Friendly => "Friendly",
             Personality::Pragmatic => "Pragmatic",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::app_enabled_in_effective_config;
+    use crate::app::test_support::make_test_app;
+    use crate::test_support::PathBufExt;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SessionConfiguredEvent;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn update_reasoning_effort_updates_collaboration_mode() {
+        let mut app = make_test_app().await;
+        app.chat_widget
+            .set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+
+        app.on_update_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_loads_latest_apps_state() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let app_id = "unit_test_refresh_in_memory_config_connector".to_string();
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits([
+                ConfigEdit::SetPath {
+                    segments: vec!["apps".to_string(), app_id.clone(), "enabled".to_string()],
+                    value: false.into(),
+                },
+                ConfigEdit::SetPath {
+                    segments: vec![
+                        "apps".to_string(),
+                        app_id.clone(),
+                        "disabled_reason".to_string(),
+                    ],
+                    value: "user".into(),
+                },
+            ])
+            .apply()
+            .await
+            .expect("persist app toggle");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_best_effort_keeps_current_config_on_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let original_config = app.config.clone();
+
+        app.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
+            .await;
+
+        assert_eq!(app.config, original_config);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_uses_active_chat_widget_cwd() -> Result<()> {
+        let mut app = make_test_app().await;
+        let original_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
+                cwd: next_cwd.clone().abs(),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
+        assert_eq!(app.config.cwd, original_cwd);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_updates_resize_reflow_config() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            r#"
+[tui]
+terminal_resize_reflow_max_rows = 9000
+"#,
+        )?;
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app.config.terminal_resize_reflow.max_rows,
+            crate::legacy_core::config::TerminalResizeReflowMaxRows::Limit(9000)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_config = app.config.clone();
+        let current_cwd = current_config.cwd.clone();
+
+        let resume_config = app
+            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+            .await?;
+
+        assert_eq!(resume_config, current_config);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_errors_when_cwd_changes() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        let result = app
+            .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
+            .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_tui_theme_selection_updates_chat_widget_config_copy() {
+        let mut app = make_test_app().await;
+
+        app.sync_tui_theme_selection("dracula".to_string());
+
+        assert_eq!(app.config.tui_theme.as_deref(), Some("dracula"));
+        assert_eq!(
+            app.chat_widget.config_ref().tui_theme.as_deref(),
+            Some("dracula")
+        );
     }
 }

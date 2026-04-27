@@ -14,6 +14,7 @@ use crate::tui::TuiEvent;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::Thread;
+use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
@@ -247,7 +248,7 @@ async fn run_session_picker_with_loader(
                             return Ok(sel);
                         }
                     }
-                    TuiEvent::Draw => {
+                    TuiEvent::Draw | TuiEvent::Resize => {
                         if let Ok(size) = alt.tui.terminal.size() {
                             let list_height = size.height.saturating_sub(4) as usize;
                             state.update_view_rows(list_height);
@@ -1002,7 +1003,8 @@ fn thread_list_params(
         source_kinds: (!include_non_interactive)
             .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
-        cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
+        cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
+        use_state_db_only: false,
         search_term: None,
     }
 }
@@ -1573,7 +1575,10 @@ mod tests {
             params.source_kinds,
             Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
         );
-        assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
+        assert_eq!(
+            params.cwd,
+            Some(ThreadListCwdFilter::One(String::from("repo/on/server")))
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![
                 UserInput::LocalImage {
                     path: abs_path.clone(),
@@ -125,6 +126,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -162,7 +164,6 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                 text: "pasted image".to_string(),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 
@@ -198,6 +199,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
@@ -212,6 +214,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -249,7 +252,6 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
                 text: "dropped image".to_string(),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 

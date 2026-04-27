@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "aws-auth",
     "analytics",
+    "agent-identity",
     "backend-client",
     "ansi-escape",
     "async-utils",
@@ -24,6 +26,7 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "device-key",
     "shell-command",
     "shell-escalation",
     "skills",
@@ -43,6 +46,8 @@ members = [
     "login",
     "codex-mcp",
     "mcp-server",
+    "memories/read",
+    "memories/write",
     "model-provider-info",
     "models-manager",
     "network-proxy",
@@ -51,6 +56,7 @@ members = [
     "protocol",
     "realtime-webrtc",
     "rollout",
+    "rollout-trace",
     "rmcp-client",
     "responses-api-proxy",
     "response-debug-context",
@@ -109,8 +115,10 @@ license = "Apache-2.0"
 # Internal
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
+codex-agent-identity = { path = "agent-identity" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
+codex-aws-auth = { path = "aws-auth" }
 codex-app-server = { path = "app-server" }
 codex-app-server-client = { path = "app-server-client" }
 codex-app-server-protocol = { path = "app-server-protocol" }
@@ -132,6 +140,7 @@ codex-connectors = { path = "connectors" }
 codex-core = { path = "core" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }
+codex-device-key = { path = "device-key" }
 codex-exec = { path = "exec" }
 codex-exec-server = { path = "exec-server" }
 codex-execpolicy = { path = "execpolicy" }
@@ -146,6 +155,8 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
+codex-memories-read = { path = "memories/read" }
+codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-server = { path = "mcp-server" }
 codex-model-provider-info = { path = "model-provider-info" }
@@ -162,6 +173,7 @@ codex-responses-api-proxy = { path = "responses-api-proxy" }
 codex-response-debug-context = { path = "response-debug-context" }
 codex-rmcp-client = { path = "rmcp-client" }
 codex-rollout = { path = "rollout" }
+codex-rollout-trace = { path = "rollout-trace" }
 codex-sandboxing = { path = "sandboxing" }
 codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
@@ -215,6 +227,10 @@ async-channel = "2.3.1"
 async-io = "2.6.0"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
+aws-config = "1"
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-types = "1"
 axum = { version = "0.8", default-features = false }
 base64 = "0.22.1"
 bm25 = "2.3.2"
@@ -226,8 +242,8 @@ clap_complete = "4"
 color-eyre = "0.6.3"
 constant_time_eq = "0.3.1"
 crossbeam-channel = "0.5.15"
-crossterm = "0.28.1"
 crypto_box = { version = "0.9.1", features = ["seal"] }
+crossterm = "0.28.1"
 csv = "1.3.1"
 ctor = "0.6.3"
 deno_core_icudata = "0.77.0"
@@ -244,6 +260,7 @@ env_logger = "0.11.9"
 eventsource-stream = "0.2.3"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
+gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
 glob = "0.3"
 globset = "0.4"
 hmac = "0.12.1"
@@ -282,6 +299,7 @@ os_info = "3.12.0"
 owo-colors = "4.3.0"
 path-absolutize = "3.1.1"
 pathdiff = "0.2"
+p256 = "0.13.2"
 portable-pty = "0.9.0"
 predicates = "3"
 pretty_assertions = "1.4.1"
@@ -292,7 +310,7 @@ ratatui = "0.29.0"
 ratatui-macros = "0.6.0"
 regex = "1.12.3"
 regex-lite = "0.1.8"
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["cookies"] }
 rmcp = { version = "0.15.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustls = { version = "0.23", default-features = false, features = [
@@ -429,6 +447,11 @@ ignored = [
     "codex-utils-template",
     "codex-v8-poc",
 ]
+
+[profile.dev]
+# Keep line tables/backtraces while avoiding expensive full variable debug info
+# across local dev builds.
+debug = 1
 
 [profile.dev-small]
 inherits = "dev"

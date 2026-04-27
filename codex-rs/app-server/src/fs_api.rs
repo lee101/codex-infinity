@@ -1,5 +1,5 @@
-use crate::error_code::INTERNAL_ERROR_CODE;
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::error_code::internal_error;
+use crate::error_code::invalid_request;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::FsCopyParams;
@@ -20,7 +20,6 @@ use codex_app_server_protocol::FsWriteFileResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::Environment;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
 use std::io;
@@ -31,15 +30,11 @@ pub(crate) struct FsApi {
     file_system: Arc<dyn ExecutorFileSystem>,
 }
 
-impl Default for FsApi {
-    fn default() -> Self {
-        Self {
-            file_system: Environment::default().get_filesystem(),
-        }
-    }
-}
-
 impl FsApi {
+    pub(crate) fn new(file_system: Arc<dyn ExecutorFileSystem>) -> Self {
+        Self { file_system }
+    }
+
     pub(crate) async fn read_file(
         &self,
         params: FsReadFileParams,
@@ -163,22 +158,10 @@ impl FsApi {
     }
 }
 
-pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: INVALID_REQUEST_ERROR_CODE,
-        message: message.into(),
-        data: None,
-    }
-}
-
 pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     if err.kind() == io::ErrorKind::InvalidInput {
         invalid_request(err.to_string())
     } else {
-        JSONRPCErrorError {
-            code: INTERNAL_ERROR_CODE,
-            message: err.to_string(),
-            data: None,
-        }
+        internal_error(err.to_string())
     }
 }

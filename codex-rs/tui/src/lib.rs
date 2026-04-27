@@ -28,6 +28,7 @@ use codex_app_server_protocol::Account as AppServerAccount;
 use codex_app_server_protocol::AuthMode as AppServerAuthMode;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::Thread as AppServerThread;
+use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
@@ -37,6 +38,7 @@ use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::EnvironmentManagerArgs;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -116,6 +118,7 @@ mod collaboration_modes;
 mod color;
 pub(crate) mod custom_terminal;
 pub use custom_terminal::Terminal;
+mod auto_review_denials;
 mod cwd_prompt;
 mod debug_config;
 mod diff_render;
@@ -127,6 +130,7 @@ mod external_editor;
 mod file_search;
 mod frames;
 mod get_git_diff;
+mod goal_display;
 mod history_cell;
 pub(crate) mod insert_history;
 pub use insert_history::insert_history_lines;
@@ -143,11 +147,14 @@ mod model_catalog;
 mod model_migration;
 mod multi_agents;
 mod notifications;
+#[cfg(any(not(debug_assertions), test))]
+mod npm_registry;
 pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
 pub(crate) mod public_widgets;
 mod render;
+mod resize_reflow_cap;
 mod resume_picker;
 mod selection_list;
 mod session_log;
@@ -163,15 +170,19 @@ mod terminal_title;
 mod text_formatting;
 mod theme_picker;
 mod tooltips;
+mod transcript_reflow;
 mod tui;
 mod ui_consts;
 pub(crate) mod update_action;
 pub use update_action::UpdateAction;
 mod update_prompt;
+#[cfg(any(not(debug_assertions), test))]
+mod update_versions;
 mod updates;
 mod version;
 #[cfg(not(target_os = "linux"))]
 mod voice;
+mod width;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 mod voice {
@@ -429,7 +440,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
     start_app_server_for_picker(
         config,
         &AppServerTarget::Embedded,
-        Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        Arc::new(EnvironmentManager::default_for_tests()),
     )
     .await
 }
@@ -526,6 +537,7 @@ async fn lookup_session_target_by_name_with_app_server(
                 source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
                 archived: Some(false),
                 cwd: None,
+                use_state_db_only: false,
                 search_term: Some(name.to_string()),
             })
             .await?;
@@ -617,7 +629,8 @@ fn latest_session_lookup_params(
         source_kinds: (!include_non_interactive)
             .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
-        cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
+        cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
+        use_state_db_only: false,
         search_term: None,
     }
 }
@@ -627,7 +640,9 @@ fn config_cwd_for_app_server_target(
     app_server_target: &AppServerTarget,
     environment_manager: &EnvironmentManager,
 ) -> std::io::Result<Option<AbsolutePathBuf>> {
-    if environment_manager.is_remote()
+    if environment_manager
+        .default_environment()
+        .is_some_and(|environment| environment.is_remote())
         || matches!(app_server_target, AppServerTarget::Remote { .. })
     {
         return Ok(None);
@@ -752,7 +767,7 @@ pub async fn run_main(
         }
     };
 
-    let environment_manager = Arc::new(EnvironmentManager::from_env_with_runtime_paths(Some(
+    let environment_manager = Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
         ExecServerRuntimePaths::from_optional_paths(
             arg0_paths.codex_self_exe.clone(),
             arg0_paths.codex_linux_sandbox_exe.clone(),
@@ -887,9 +902,12 @@ pub async fn run_main(
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
-    if let Some(warning) =
-        add_dir_warning_message(&cli.add_dir, config.permissions.sandbox_policy.get())
-    {
+    if let Some(warning) = add_dir_warning_message(
+        &cli.add_dir,
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
+    ) {
         #[allow(clippy::print_stderr)]
         {
             eprintln!("Error adding directories: {warning}");
@@ -1717,6 +1735,7 @@ async fn get_login_status(
     Ok(match account.account {
         Some(AppServerAccount::ApiKey {}) => LoginStatus::AuthMode(AppServerAuthMode::ApiKey),
         Some(AppServerAccount::Chatgpt { .. }) => LoginStatus::AuthMode(AppServerAuthMode::Chatgpt),
+        Some(AppServerAccount::AmazonBedrock {}) => LoginStatus::NotAuthenticated,
         None => LoginStatus::NotAuthenticated,
     })
 }
@@ -1825,7 +1844,7 @@ mod tests {
             CloudRequirementsLoader::default(),
             codex_feedback::CodexFeedback::new(),
             /*log_db*/ None,
-            Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+            Arc::new(EnvironmentManager::default_for_tests()),
         )
         .await
     }
@@ -1934,7 +1953,10 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
-        assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
+        assert_eq!(
+            params.cwd,
+            Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
+        );
         Ok(())
     }
 
@@ -1969,12 +1991,16 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, None);
-        assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
+        assert_eq!(
+            params.cwd,
+            Some(ThreadListCwdFilter::One(String::from("repo/on/server")))
+        );
         Ok(())
     }
 
-    #[test]
-    fn config_cwd_for_app_server_target_omits_cwd_for_remote_sessions() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn config_cwd_for_app_server_target_omits_cwd_for_remote_sessions() -> std::io::Result<()>
+    {
         let remote_only_cwd = if cfg!(windows) {
             Path::new(r"C:\definitely\not\local\to\this\test")
         } else {
@@ -1984,7 +2010,7 @@ mod tests {
             websocket_url: "ws://127.0.0.1:1234/".to_string(),
             auth_token: None,
         };
-        let environment_manager = EnvironmentManager::new(/*exec_server_url*/ None);
+        let environment_manager = EnvironmentManager::default_for_tests();
 
         let config_cwd =
             config_cwd_for_app_server_target(Some(remote_only_cwd), &target, &environment_manager)?;
@@ -1993,11 +2019,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn config_cwd_for_app_server_target_canonicalizes_embedded_cli_cwd() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn config_cwd_for_app_server_target_canonicalizes_embedded_cli_cwd() -> std::io::Result<()>
+    {
         let temp_dir = TempDir::new()?;
         let target = AppServerTarget::Embedded;
-        let environment_manager = EnvironmentManager::new(/*exec_server_url*/ None);
+        let environment_manager = EnvironmentManager::default_for_tests();
 
         let config_cwd =
             config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?;
@@ -2011,13 +2038,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn config_cwd_for_app_server_target_errors_for_missing_embedded_cli_cwd() -> std::io::Result<()>
-    {
+    #[tokio::test]
+    async fn config_cwd_for_app_server_target_errors_for_missing_embedded_cli_cwd()
+    -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let missing = temp_dir.path().join("missing");
         let target = AppServerTarget::Embedded;
-        let environment_manager = EnvironmentManager::new(/*exec_server_url*/ None);
+        let environment_manager = EnvironmentManager::default_for_tests();
 
         let err = config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager)
             .expect_err("missing embedded cwd should fail");
@@ -2026,15 +2053,23 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn config_cwd_for_app_server_target_omits_cwd_for_remote_exec_server() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn config_cwd_for_app_server_target_omits_cwd_for_remote_exec_server()
+    -> std::io::Result<()> {
         let remote_only_cwd = if cfg!(windows) {
             Path::new(r"C:\definitely\not\local\to\this\test")
         } else {
             Path::new("/definitely/not/local/to/this/test")
         };
         let target = AppServerTarget::Embedded;
-        let environment_manager = EnvironmentManager::new(Some("ws://127.0.0.1:8765".to_string()));
+        let environment_manager =
+            EnvironmentManager::new(codex_exec_server::EnvironmentManagerArgs {
+                exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
+                local_runtime_paths: ExecServerRuntimePaths::new(
+                    std::env::current_exe().expect("current exe"),
+                    /*codex_linux_sandbox_exe*/ None,
+                )?,
+            });
 
         let config_cwd =
             config_cwd_for_app_server_target(Some(remote_only_cwd), &target, &environment_manager)?;
@@ -2161,7 +2196,7 @@ mod tests {
             CloudRequirementsLoader::default(),
             codex_feedback::CodexFeedback::new(),
             /*log_db*/ None,
-            Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+            Arc::new(EnvironmentManager::default_for_tests()),
             |_args| async { Err(std::io::Error::other("boom")) },
         )
         .await;
@@ -2228,7 +2263,10 @@ mod tests {
             current_date: None,
             timezone: None,
             approval_policy: config.permissions.approval_policy.value(),
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
+            permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model,
@@ -2350,6 +2388,7 @@ trust_level = "untrusted"
             ..Default::default()
         };
         let trusted_config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.clone())
             .harness_overrides(trusted_overrides.clone())
             .build()
@@ -2364,6 +2403,7 @@ trust_level = "untrusted"
             ..trusted_overrides
         };
         let untrusted_config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home)
             .harness_overrides(untrusted_overrides)
             .build()

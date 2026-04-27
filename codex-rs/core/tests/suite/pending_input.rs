@@ -95,6 +95,7 @@ async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
 async fn submit_user_input(codex: &CodexThread, text: &str) {
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
@@ -109,6 +110,7 @@ async fn submit_user_input(codex: &CodexThread, text: &str) {
 async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
@@ -118,6 +120,7 @@ async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -272,6 +275,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "first prompt".into(),
                 text_elements: Vec::new(),
@@ -289,6 +293,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "second prompt".into(),
                 text_elements: Vec::new(),
@@ -667,12 +672,24 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
 async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_request() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
+    let large_output_command = if cfg!(windows) {
+        "[Console]::Out.Write([string]::new([char]'0', 4000))"
+    } else {
+        "printf '%04000d' 0"
+    };
+    let large_output_args = json!({
+        "command": large_output_command,
+        "login": false,
+        "timeout_ms": 2000,
+    })
+    .to_string();
+
     let first_chunks = vec![
         chunk(ev_response_created("resp-1")),
         chunk(ev_function_call(
             "call-1",
             "shell_command",
-            r#"{"command":"printf '%04000d' 0","login":false,"timeout_ms":2000}"#,
+            &large_output_args,
         )),
         gated_chunk(
             gate_first_completed_rx,
