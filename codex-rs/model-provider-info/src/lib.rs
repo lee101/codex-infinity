@@ -448,7 +448,6 @@ impl ModelProviderInfo {
         }
     }
 
-
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -457,7 +456,9 @@ impl ModelProviderInfo {
         if self.name == GEMINI_PROVIDER_NAME {
             slug.strip_prefix("google/").unwrap_or(slug)
         } else if self.name == ZHIPU_PROVIDER_NAME {
-            slug.strip_prefix("zhipu/").unwrap_or(slug)
+            slug.strip_prefix("zhipu/")
+                .or_else(|| slug.strip_prefix("z-ai/"))
+                .unwrap_or(slug)
         } else {
             slug
         }
@@ -467,11 +468,9 @@ impl ModelProviderInfo {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
     }
 
-
     pub fn supports_remote_compaction(&self) -> bool {
         self.is_openai() || is_azure_responses_provider(&self.name, self.base_url.as_deref())
     }
-
 
     pub fn has_command_auth(&self) -> bool {
         self.auth.is_some()
@@ -523,7 +522,15 @@ fn non_empty_env_var(name: &str) -> bool {
 
 pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
-    if lower.starts_with("glm-") && non_empty_env_var("ZAI_API_KEY") {
+    if (lower.starts_with("glm-")
+        || lower
+            .strip_prefix("z-ai/")
+            .is_some_and(|slug| slug.starts_with("glm-"))
+        || lower
+            .strip_prefix("zhipu/")
+            .is_some_and(|slug| slug.starts_with("glm-")))
+        && non_empty_env_var("ZAI_API_KEY")
+    {
         return Some(ZHIPU_PROVIDER_ID);
     }
     match model.split_once('/') {
@@ -576,7 +583,6 @@ pub fn merge_configured_model_providers(
 
     Ok(model_providers)
 }
-
 
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
     // These CODEX_OSS_ environment variables are experimental: we may

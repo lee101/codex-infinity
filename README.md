@@ -106,6 +106,30 @@ cargo build --release -p codex-tui
 ./target/release/codex "your prompt here"
 ```
 
+### Fast dev builds
+
+The Rust workspace has ~90 crates. Speed up compilation with:
+
+```bash
+# One-time setup
+sudo apt install -y mold          # fast linker
+cargo install sccache             # compile cache
+
+# Add to ~/.cargo/config.toml
+cat > ~/.cargo/config.toml << 'EOF'
+[build]
+jobs = 72
+rustc-wrapper = "sccache"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+EOF
+
+# Add to shell rc
+export SCCACHE_DIR=/path/to/fast/disk/sccache
+export SCCACHE_CACHE_SIZE=50G
+```
+
+Profile bottlenecks with `cargo build --timings` and check cache hits with `sccache --show-stats`.
+
 ### Build npm package
 
 ```bash

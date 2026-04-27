@@ -469,6 +469,9 @@ strip = "symbols"
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
 
+[profile.dev]
+codegen-units = 512
+
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
 inherits = "test"

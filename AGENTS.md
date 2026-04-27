@@ -48,6 +48,48 @@ In the codex-rs folder where the rust code lives:
     trivial; prefer new modules/files and keep `chatwidget.rs` focused on orchestration.
 - When running Rust commands (e.g. `just fix` or `cargo test`) be patient with the command and never try to kill them using the PID. Rust lock can make the execution slow, this is expected.
 
+## Fast Rust Builds
+
+The workspace is large (~90 crates). Use these defaults for fast dev builds:
+
+### Prerequisites (one-time)
+```bash
+sudo apt install -y mold        # fast linker
+cargo install sccache            # compile cache
+```
+
+### Global cargo config (`~/.cargo/config.toml`)
+```toml
+[build]
+jobs = 72                                        # match core count (nproc)
+rustc-wrapper = "sccache"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+target-dir = "/nvme0n1-disk/cargo-target"        # fast disk; adjust per machine
+```
+
+### Environment (`~/.bashrc` or `~/.zshrc`)
+```bash
+export SCCACHE_DIR=/nvme0n1-disk/sccache          # keep cache on fast disk
+export SCCACHE_CACHE_SIZE=50G
+```
+
+### Dev profile (already in `codex-rs/Cargo.toml`)
+```toml
+[profile.dev]
+codegen-units = 512    # trades binary size for parallel codegen speed
+```
+
+### Verifying
+```bash
+cargo build --timings   # produces HTML timing report in target/cargo-timings/
+sccache --show-stats    # check cache hit rate
+```
+
+### Portable setup
+`~/code/dotfiles/linux-setup.sh` auto-detects the fastest available disk (`/nvme0n1-disk` → `/scratch` → `$HOME`) and configures all of the above.
+
+---
+
 Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Additionally, run the tests:
 
 1. Run the test for the specific project that was changed. For example, if changes were made in `codex-rs/tui`, run `cargo test -p codex-tui`.

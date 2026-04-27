@@ -260,6 +260,14 @@ fn gemini_provider_normalizes_google_prefix() {
 }
 
 #[test]
+fn zhipu_provider_normalizes_zai_prefix() {
+    let provider = ModelProviderInfo::create_zhipu_provider();
+    assert_eq!(provider.effective_model_name("z-ai/glm-5.1"), "glm-5.1");
+    assert_eq!(provider.effective_model_name("zhipu/glm-5.1"), "glm-5.1");
+    assert_eq!(provider.effective_model_name("glm-5.1"), "glm-5.1");
+}
+
+#[test]
 fn infer_builtin_provider_prefers_env_backed_routes() {
     let gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
     let openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
@@ -268,7 +276,6 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
         None
     );
 
-    drop(gemini_remove_guard);
     let gemini_set_guard = EnvVarGuard::set("GEMINI_API_KEY", "gemini-key");
     assert_eq!(
         infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
@@ -276,7 +283,6 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     );
 
     drop(gemini_set_guard);
-    drop(openrouter_remove_guard);
     let _openrouter_set_guard = EnvVarGuard::set("OPENROUTER_API_KEY", "openrouter-key");
     assert_eq!(
         infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
@@ -289,6 +295,16 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     assert_eq!(
         infer_builtin_provider_id_for_model("z-ai/glm-5"),
         Some(OPENROUTER_PROVIDER_ID)
+    );
+
+    let _zai_set_guard = EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("glm-5.1"),
+        Some(ZHIPU_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("z-ai/glm-5.1"),
+        Some(ZHIPU_PROVIDER_ID)
     );
 }
 
