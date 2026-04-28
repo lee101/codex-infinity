@@ -210,6 +210,10 @@ async fn queued_bang_shell_dispatches_after_active_turn() {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected queued shell command op, got {other:?}"),
     }
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::AddToHistory { text }) if text == "!echo hi"
+    );
     assert!(chat.queued_user_messages.is_empty());
 }
 
@@ -287,7 +291,10 @@ async fn queued_bang_shell_waits_for_user_shell_completion_before_next_input() {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected queued shell command op, got {other:?}"),
     }
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::AddToHistory { text }) if text == "!echo hi"
+    );
     assert_eq!(chat.queued_user_messages.len(), 1);
 
     let begin = begin_exec_with_source(
@@ -1331,6 +1338,65 @@ async fn ctrl_o_copy_reports_when_no_agent_response_exists() {
     assert!(
         rendered.contains("No agent response to copy"),
         "expected no-output message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn keymap_capture_can_capture_current_copy_shortcut() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let runtime_keymap = crate::keymap::RuntimeKeymap::defaults();
+    chat.open_keymap_capture(
+        "composer".to_string(),
+        "submit".to_string(),
+        crate::app_event::KeymapEditIntent::ReplaceAll,
+        &runtime_keymap,
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+    let AppEvent::KeymapCaptured {
+        context,
+        action,
+        key,
+        intent,
+    } = rx.try_recv().expect("captured key event")
+    else {
+        panic!("expected keymap capture event");
+    };
+    assert_eq!(context, "composer");
+    assert_eq!(action, "submit");
+    assert_eq!(key, "ctrl-o");
+    assert_eq!(intent, crate::app_event::KeymapEditIntent::ReplaceAll);
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "copy shortcut should not run while key capture is active"
+    );
+}
+
+#[tokio::test]
+async fn copy_shortcut_can_be_remapped() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut keymap_config = chat.config_ref().tui_keymap.clone();
+    keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("ctrl-x".to_string()),
+    ));
+    let runtime_keymap =
+        crate::keymap::RuntimeKeymap::from_config(&keymap_config).expect("valid copy remap");
+    chat.apply_keymap_update(keymap_config, &runtime_keymap);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "old copy shortcut should no longer copy"
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("No agent response to copy"),
+        "expected remapped copy shortcut to run, got {rendered:?}"
     );
 }
 
