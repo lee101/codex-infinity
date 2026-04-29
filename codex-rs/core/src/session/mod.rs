@@ -18,6 +18,7 @@ use crate::build_available_skills;
 use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
 use crate::config::ManagedFeatures;
+use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::connectors;
 use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AppsInstructions;
@@ -488,6 +489,7 @@ impl Codex {
 
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
             && depth >= config.agent_max_depth
+            && !config.features.enabled(Feature::MultiAgentV2)
         {
             let _ = config.features.disable(Feature::SpawnCsv);
             let _ = config.features.disable(Feature::Collab);
@@ -1407,6 +1409,8 @@ impl Session {
         config.config_layer_stack = config
             .config_layer_stack
             .with_user_config(&config_toml_path, user_config);
+        config.tool_suggest =
+            resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
         state.session_configuration.original_config_do_not_use = Arc::new(config);
         self.services.skills_manager.clear_cache();
         self.services.plugins_manager.clear_cache();

@@ -422,13 +422,13 @@ use crate::streaming::controller::StreamController;
 
 use chrono::Local;
 use codex_file_search::FileMatch;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_approval_presets::ApprovalPreset;
 use codex_utils_approval_presets::builtin_approval_presets;
 use strum::IntoEnumIterator;
@@ -938,6 +938,7 @@ pub(crate) struct ChatWidget {
     plugin_install_apps_needing_auth: Vec<AppSummary>,
     plugin_install_auth_flow: Option<PluginInstallAuthFlowState>,
     plugins_active_tab_id: Option<String>,
+    newly_installed_marketplace_tab_id: Option<String>,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
@@ -962,6 +963,11 @@ pub(crate) struct ChatWidget {
     pending_status_indicator_restore: bool,
     suppress_queue_autosend: bool,
     thread_id: Option<ThreadId>,
+    /// Nudge dismissals that should survive draft edits within the current thread scope.
+    ///
+    /// The nudge is only a discovery aid, so once a user dismisses it or enters Plan mode we keep it
+    /// hidden for that thread instead of resurfacing it on every matching draft.
+    dismissed_plan_mode_nudge_scopes: HashSet<PlanModeNudgeScope>,
     last_turn_id: Option<String>,
     budget_limited_turn_ids: HashSet<String>,
     thread_name: Option<String>,
@@ -1030,13 +1036,12 @@ pub(crate) struct ChatWidget {
     // Whether the next streamed assistant content should be preceded by a final message separator.
     //
     // This is set whenever we insert a visible history cell that conceptually belongs to a turn.
-    // The separator itself is only rendered if the turn recorded "work" activity (see
-    // `had_work_activity`).
+    // The separator itself is only rendered if the turn recorded "work" activity.
     needs_final_message_separator: bool,
     // Whether the current turn performed "work" (exec commands, MCP tool calls, patch applications).
     //
     // This gates rendering of the "Worked for …" separator so purely conversational turns don't
-    // show an empty divider. It is reset when the separator is emitted.
+    // show an empty divider.
     had_work_activity: bool,
     // Whether the current turn emitted a plan update.
     saw_plan_update_this_turn: bool,
@@ -1050,11 +1055,6 @@ pub(crate) struct ChatWidget {
     plan_delta_buffer: String,
     // True while a plan item is streaming.
     plan_item_active: bool,
-    // Status-indicator elapsed seconds captured at the last emitted final-message separator.
-    //
-    // This lets the separator show per-chunk work time (since the previous separator) rather than
-    // the total task-running time reported by the status indicator.
-    last_separator_elapsed_secs: Option<u64>,
     // Runtime metrics accumulated across delta snapshots for the active turn.
     turn_runtime_metrics: RuntimeMetricsSummary,
     last_rendered_width: std::cell::Cell<Option<usize>>,
@@ -1634,6 +1634,25 @@ enum SessionConfiguredDisplay {
     SideConversation,
 }
 
+/// Scope used to keep Plan-mode nudge dismissal local to one conversation context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PlanModeNudgeScope {
+    /// Drafts entered before the server has assigned a thread id.
+    NewThread,
+    /// Drafts associated with one configured thread.
+    Thread(ThreadId),
+}
+
+/// Returns whether `text` contains the standalone word `plan`.
+///
+/// This intentionally mirrors the App suggestion heuristic instead of trying to infer broader
+/// planning intent from substrings such as `planning`. Slash and shell drafts still match here so
+/// callers can keep lexical matching separate from presentation policy.
+fn contains_plan_keyword(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .any(|word| word.eq_ignore_ascii_case("plan"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadItemRenderSource {
     Live,
@@ -2033,6 +2052,7 @@ impl ChatWidget {
     fn update_task_running_state(&mut self) {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
+        self.refresh_plan_mode_nudge();
         self.refresh_status_surfaces();
     }
 
@@ -2382,6 +2402,7 @@ impl ChatWidget {
         if previous_thread_id != self.thread_id {
             self.recent_auto_review_denials = RecentAutoReviewDenials::default();
         }
+        self.refresh_plan_mode_nudge();
         self.last_turn_id = None;
         self.thread_name = event.thread_name.clone();
         self.current_goal_status_indicator = None;
@@ -2782,6 +2803,7 @@ impl ChatWidget {
         self.saw_copy_source_this_turn = false;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
+        self.had_work_activity = false;
         self.latest_proposed_plan_markdown = None;
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
@@ -2807,7 +2829,12 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_task_complete(&mut self, last_agent_message: Option<String>, from_replay: bool) {
+    fn on_task_complete(
+        &mut self,
+        last_agent_message: Option<String>,
+        duration_ms: Option<i64>,
+        from_replay: bool,
+    ) {
         self.submit_pending_steers_after_interrupt = false;
         // Use `last_agent_message` from the turn-complete notification as the copy
         // source only when no earlier item-level event (AgentMessageItem, plan
@@ -2852,13 +2879,18 @@ impl ChatWidget {
             self.collect_runtime_metrics_delta();
             let runtime_metrics =
                 (!self.turn_runtime_metrics.is_empty()).then_some(self.turn_runtime_metrics);
-            let show_work_separator = self.needs_final_message_separator && self.had_work_activity;
+            let show_work_separator = self.had_work_activity
+                && (self.needs_final_message_separator || runtime_metrics.is_some());
             if show_work_separator || runtime_metrics.is_some() {
                 let elapsed_seconds = if show_work_separator {
-                    self.bottom_pane
-                        .status_widget()
-                        .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
-                        .map(|current| self.worked_elapsed_from(current))
+                    duration_ms
+                        .and_then(|duration_ms| u64::try_from(duration_ms).ok())
+                        .map(|duration_ms| duration_ms / 1_000)
+                        .or_else(|| {
+                            self.bottom_pane
+                                .status_widget()
+                                .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
+                        })
                 } else {
                     None
                 };
@@ -5114,6 +5146,7 @@ impl ChatWidget {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
         self.bottom_pane.pre_draw_tick();
+        self.refresh_plan_mode_nudge();
         self.refresh_goal_status_indicator_for_time_tick();
         if self.terminal_title_shows_action_required() != self.last_terminal_title_requires_action {
             self.refresh_terminal_title();
@@ -5145,7 +5178,7 @@ impl ChatWidget {
         }
         self.pending_status_indicator_restore = match item.phase {
             // Models that don't support preambles only output AgentMessageItems on turn completion.
-            Some(MessagePhase::FinalAnswer) | None => false,
+            Some(MessagePhase::FinalAnswer) | None => !self.pending_steers.is_empty(),
             Some(MessagePhase::Commentary) => true,
         };
         self.maybe_restore_status_indicator_after_stream_idle();
@@ -5238,17 +5271,10 @@ impl ChatWidget {
             // If the previous turn inserted non-stream history (exec output, patch status, MCP
             // calls), render a separator before starting the next streamed assistant message.
             if self.needs_final_message_separator && self.had_work_activity {
-                let elapsed_seconds = self
-                    .bottom_pane
-                    .status_widget()
-                    .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
-                    .map(|current| self.worked_elapsed_from(current));
                 self.add_to_history(history_cell::FinalMessageSeparator::new(
-                    elapsed_seconds,
-                    /*runtime_metrics*/ None,
+                    /*elapsed_seconds*/ None, /*runtime_metrics*/ None,
                 ));
                 self.needs_final_message_separator = false;
-                self.had_work_activity = false;
             } else if self.needs_final_message_separator {
                 // Reset the flag even if we don't show separator (no work was done)
                 self.needs_final_message_separator = false;
@@ -5265,17 +5291,6 @@ impl ChatWidget {
             self.run_catch_up_commit_tick();
         }
         self.request_redraw();
-    }
-
-    fn worked_elapsed_from(&mut self, current_elapsed: u64) -> u64 {
-        let baseline = match self.last_separator_elapsed_secs {
-            Some(last) if current_elapsed < last => 0,
-            Some(last) => last,
-            None => 0,
-        };
-        let elapsed = current_elapsed.saturating_sub(baseline);
-        self.last_separator_elapsed_secs = Some(current_elapsed);
-        elapsed
     }
 
     /// Finalizes an exec call while preserving the active exec cell grouping contract.
@@ -5791,6 +5806,7 @@ impl ChatWidget {
             plugin_install_apps_needing_auth: Vec::new(),
             plugin_install_auth_flow: None,
             plugins_active_tab_id: None,
+            newly_installed_marketplace_tab_id: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
@@ -5803,6 +5819,7 @@ impl ChatWidget {
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
             thread_id: None,
+            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             last_turn_id: None,
             budget_limited_turn_ids: HashSet::new(),
             thread_name: None,
@@ -5837,7 +5854,6 @@ impl ChatWidget {
             last_plan_progress: None,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
-            last_separator_elapsed_secs: None,
             turn_runtime_metrics: RuntimeMetricsSummary::default(),
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
@@ -6034,6 +6050,14 @@ impl ChatWidget {
             return;
         }
 
+        if matches!(key_event.code, KeyCode::Esc)
+            && key_event.kind == KeyEventKind::Press
+            && self.should_show_plan_mode_nudge()
+        {
+            self.dismiss_plan_mode_nudge();
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::BackTab,
@@ -6044,6 +6068,7 @@ impl ChatWidget {
                 && self.bottom_pane.no_modal_or_popup_active() =>
             {
                 self.cycle_collaboration_mode();
+                self.refresh_plan_mode_nudge();
             }
             _ => {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
@@ -6121,6 +6146,7 @@ impl ChatWidget {
                 if had_modal_or_popup && self.bottom_pane.no_modal_or_popup_active() {
                     self.maybe_send_next_queued_input();
                 }
+                self.refresh_plan_mode_nudge();
             }
         }
     }
@@ -6148,6 +6174,7 @@ impl ChatWidget {
 
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.bottom_pane.apply_external_edit(text);
+        self.refresh_plan_mode_nudge();
         self.request_redraw();
     }
 
@@ -6165,6 +6192,7 @@ impl ChatWidget {
 
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
+        self.refresh_plan_mode_nudge();
         self.request_redraw();
     }
 
@@ -6288,11 +6316,13 @@ impl ChatWidget {
 
     pub(crate) fn handle_paste(&mut self, text: String) {
         self.bottom_pane.handle_paste(text);
+        self.refresh_plan_mode_nudge();
     }
 
     // Returns true if caller should skip rendering this frame (a future frame is scheduled).
     pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
         if self.bottom_pane.flush_paste_burst_if_due() {
+            self.refresh_plan_mode_nudge();
             // A paste just flushed; request an immediate redraw and skip this frame.
             self.request_redraw();
             true
@@ -6669,14 +6699,11 @@ impl ChatWidget {
             None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
             None => None,
         };
-        let permission_profile = Some(self.config.permissions.permission_profile());
+        let permission_profile = self.config.permissions.permission_profile();
         let op = AppCommand::user_turn(
             items,
             self.config.cwd.to_path_buf(),
             self.config.permissions.approval_policy.value(),
-            self.config
-                .permissions
-                .legacy_sandbox_policy(self.config.cwd.as_path()),
             permission_profile,
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
@@ -7451,6 +7478,7 @@ impl ChatWidget {
             | ServerNotification::McpToolCallProgress(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
+            | ServerNotification::RemoteControlStatusChanged(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
             | ServerNotification::FsChanged(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
@@ -7512,7 +7540,11 @@ impl ChatWidget {
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;
-                self.on_task_complete(/*last_agent_message*/ None, replay_kind.is_some())
+                self.on_task_complete(
+                    /*last_agent_message*/ None,
+                    notification.turn.duration_ms,
+                    replay_kind.is_some(),
+                )
             }
             TurnStatus::Interrupted => {
                 self.last_non_retry_error = None;
@@ -7863,9 +7895,11 @@ impl ChatWidget {
                 }
             }
             EventMsg::TurnComplete(TurnCompleteEvent {
-                last_agent_message, ..
+                last_agent_message,
+                duration_ms,
+                ..
             }) => {
-                self.on_task_complete(last_agent_message, from_replay);
+                self.on_task_complete(last_agent_message, duration_ms, from_replay);
             }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
@@ -8754,7 +8788,7 @@ impl ChatWidget {
                     /*cwd*/ None,
                     /*approval_policy*/ None,
                     /*approvals_reviewer*/ None,
-                    /*sandbox_policy*/ None,
+                    /*permission_profile*/ None,
                     /*windows_sandbox_level*/ None,
                     Some(switch_model_for_events.clone()),
                     Some(Some(default_effort)),
@@ -8978,7 +9012,7 @@ impl ChatWidget {
                             /*cwd*/ None,
                             /*approval_policy*/ None,
                             /*approvals_reviewer*/ None,
-                            /*sandbox_policy*/ None,
+                            /*permission_profile*/ None,
                             /*windows_sandbox_level*/ None,
                             /*model*/ None,
                             /*effort*/ None,
@@ -9727,14 +9761,11 @@ impl ChatWidget {
         self.open_permissions_popup();
     }
 
-    /// Open a popup to choose the permissions mode (approval policy + sandbox policy).
+    /// Open a popup to choose the permissions mode.
     pub(crate) fn open_permissions_popup(&mut self) {
         let include_read_only = cfg!(target_os = "windows");
         let current_approval = self.config.permissions.approval_policy.value();
-        let current_sandbox = self
-            .config
-            .permissions
-            .legacy_sandbox_policy(self.config.cwd.as_path());
+        let current_permission_profile = self.config.permissions.permission_profile();
         let guardian_approval_enabled = self.config.features.enabled(Feature::GuardianApproval);
         let current_review_policy = self.config.approvals_reviewer;
         let mut items: Vec<SelectionItem> = Vec::new();
@@ -9840,7 +9871,7 @@ impl ChatWidget {
                     } else {
                         Self::approval_preset_actions(
                             preset.approval,
-                            preset.sandbox.clone(),
+                            preset.permission_profile.clone(),
                             base_name.clone(),
                             ApprovalsReviewer::User,
                         )
@@ -9850,7 +9881,7 @@ impl ChatWidget {
                 {
                     Self::approval_preset_actions(
                         preset.approval,
-                        preset.sandbox.clone(),
+                        preset.permission_profile.clone(),
                         base_name.clone(),
                         ApprovalsReviewer::User,
                     )
@@ -9858,7 +9889,7 @@ impl ChatWidget {
             } else {
                 Self::approval_preset_actions(
                     preset.approval,
-                    preset.sandbox.clone(),
+                    preset.permission_profile.clone(),
                     base_name.clone(),
                     ApprovalsReviewer::User,
                 )
@@ -9870,7 +9901,8 @@ impl ChatWidget {
                     is_current: current_review_policy == ApprovalsReviewer::User
                         && Self::preset_matches_current(
                             current_approval,
-                            &current_sandbox,
+                            &current_permission_profile,
+                            self.config.cwd.as_path(),
                             &preset,
                         ),
                     actions: default_actions,
@@ -9888,13 +9920,14 @@ impl ChatWidget {
                         ),
                         is_current: current_review_policy == ApprovalsReviewer::AutoReview
                             && Self::preset_matches_current(
-                                current_approval,
-                                &current_sandbox,
-                                &preset,
-                            ),
+                            current_approval,
+                            &current_permission_profile,
+                            self.config.cwd.as_path(),
+                            &preset,
+                        ),
                         actions: Self::approval_preset_actions(
                             preset.approval,
-                            preset.sandbox.clone(),
+                            preset.permission_profile.clone(),
                             "Auto-review".to_string(),
                             ApprovalsReviewer::AutoReview,
                         ),
@@ -9910,7 +9943,8 @@ impl ChatWidget {
                     description: base_description,
                     is_current: Self::preset_matches_current(
                         current_approval,
-                        &current_sandbox,
+                        &current_permission_profile,
+                        self.config.cwd.as_path(),
                         &preset,
                     ),
                     actions: default_actions,
@@ -10035,18 +10069,18 @@ impl ChatWidget {
 
     fn approval_preset_actions(
         approval: AskForApproval,
-        sandbox: SandboxPolicy,
+        permission_profile: PermissionProfile,
         label: String,
         approvals_reviewer: ApprovalsReviewer,
     ) -> Vec<SelectionAction> {
         vec![Box::new(move |tx| {
-            let sandbox_clone = sandbox.clone();
+            let permission_profile_clone = permission_profile.clone();
             tx.send(AppEvent::CodexOp(
                 AppCommand::override_turn_context(
                     /*cwd*/ None,
                     Some(approval),
                     Some(approvals_reviewer),
-                    Some(sandbox_clone.clone()),
+                    Some(permission_profile_clone.clone()),
                     /*windows_sandbox_level*/ None,
                     /*model*/ None,
                     /*effort*/ None,
@@ -10058,7 +10092,7 @@ impl ChatWidget {
                 .into_core(),
             ));
             tx.send(AppEvent::UpdateAskForApprovalPolicy(approval));
-            tx.send(AppEvent::UpdateSandboxPolicy(sandbox_clone));
+            tx.send(AppEvent::UpdatePermissionProfile(permission_profile_clone));
             tx.send(AppEvent::UpdateApprovalsReviewer(approvals_reviewer));
             tx.send(AppEvent::InsertHistoryCell(Box::new(
                 history_cell::new_info_event(
@@ -10071,36 +10105,39 @@ impl ChatWidget {
 
     fn preset_matches_current(
         current_approval: AskForApproval,
-        current_sandbox: &SandboxPolicy,
+        current_permission_profile: &PermissionProfile,
+        cwd: &std::path::Path,
         preset: &ApprovalPreset,
     ) -> bool {
         if current_approval != preset.approval {
             return false;
         }
 
-        match (current_sandbox, &preset.sandbox) {
-            (SandboxPolicy::DangerFullAccess, SandboxPolicy::DangerFullAccess) => true,
-            (
-                SandboxPolicy::ReadOnly {
-                    network_access: current_network_access,
-                    ..
-                },
-                SandboxPolicy::ReadOnly {
-                    network_access: preset_network_access,
-                    ..
-                },
-            ) => current_network_access == preset_network_access,
-            (
-                SandboxPolicy::WorkspaceWrite {
-                    network_access: current_network_access,
-                    ..
-                },
-                SandboxPolicy::WorkspaceWrite {
-                    network_access: preset_network_access,
-                    ..
-                },
-            ) => current_network_access == preset_network_access,
-            _ => false,
+        match preset.id {
+            "full-access" => matches!(current_permission_profile, PermissionProfile::Disabled),
+            "read-only" => {
+                let file_system_policy = current_permission_profile.file_system_sandbox_policy();
+                matches!(
+                    current_permission_profile,
+                    PermissionProfile::Managed { .. }
+                ) && !file_system_policy.has_full_disk_write_access()
+                    && file_system_policy
+                        .get_writable_roots_with_cwd(cwd)
+                        .is_empty()
+                    && current_permission_profile.network_sandbox_policy()
+                        == preset.permission_profile.network_sandbox_policy()
+            }
+            "auto" => {
+                let file_system_policy = current_permission_profile.file_system_sandbox_policy();
+                matches!(
+                    current_permission_profile,
+                    PermissionProfile::Managed { .. }
+                ) && file_system_policy.can_write_path_with_cwd(cwd, cwd)
+                    && !file_system_policy.has_full_disk_write_access()
+                    && current_permission_profile.network_sandbox_policy()
+                        == preset.permission_profile.network_sandbox_policy()
+            }
+            _ => current_permission_profile == &preset.permission_profile,
         }
     }
 
@@ -10116,14 +10153,19 @@ impl ChatWidget {
         }
         let cwd = self.config.cwd.clone();
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let Ok(policy) = self
+            .config
+            .permissions
+            .permission_profile()
+            .to_legacy_sandbox_policy(self.config.cwd.as_path())
+        else {
+            return Some((Vec::new(), 0, true));
+        };
         match codex_windows_sandbox::apply_world_writable_scan_and_denies(
             self.config.codex_home.as_path(),
             cwd.as_path(),
             &env_map,
-            &self
-                .config
-                .permissions
-                .legacy_sandbox_policy(self.config.cwd.as_path()),
+            &policy,
             Some(self.config.codex_home.as_path()),
         ) {
             Ok(_) => None,
@@ -10144,7 +10186,7 @@ impl ChatWidget {
     ) {
         let selected_name = preset.label.to_string();
         let approval = preset.approval;
-        let sandbox = preset.sandbox;
+        let permission_profile = preset.permission_profile;
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
         let title_line = Line::from("Enable full access?").bold();
         let info_line = Line::from(vec![
@@ -10161,7 +10203,7 @@ impl ChatWidget {
 
         let mut accept_actions = Self::approval_preset_actions(
             approval,
-            sandbox.clone(),
+            permission_profile.clone(),
             selected_name.clone(),
             ApprovalsReviewer::User,
         );
@@ -10171,7 +10213,7 @@ impl ChatWidget {
 
         let mut accept_and_remember_actions = Self::approval_preset_actions(
             approval,
-            sandbox,
+            permission_profile,
             selected_name,
             ApprovalsReviewer::User,
         );
@@ -10228,27 +10270,27 @@ impl ChatWidget {
         extra_count: usize,
         failed_scan: bool,
     ) {
-        let (approval, sandbox) = match &preset {
-            Some(p) => (Some(p.approval), Some(p.sandbox.clone())),
+        let (approval, permission_profile) = match &preset {
+            Some(p) => (Some(p.approval), Some(p.permission_profile.clone())),
             None => (None, None),
         };
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
-        let describe_policy = |policy: &SandboxPolicy| match policy {
-            SandboxPolicy::WorkspaceWrite { .. } => "Agent mode",
-            SandboxPolicy::ReadOnly { .. } => "Read-Only mode",
-            _ => "Agent mode",
+        let describe_profile = |profile: &PermissionProfile| {
+            if matches!(profile, PermissionProfile::Disabled) {
+                "Full Access mode"
+            } else if profile
+                .file_system_sandbox_policy()
+                .can_write_path_with_cwd(self.config.cwd.as_path(), self.config.cwd.as_path())
+            {
+                "Agent mode"
+            } else {
+                "Read-Only mode"
+            }
         };
         let mode_label = preset
             .as_ref()
-            .map(|p| describe_policy(&p.sandbox))
-            .unwrap_or_else(|| {
-                describe_policy(
-                    &self
-                        .config
-                        .permissions
-                        .legacy_sandbox_policy(self.config.cwd.as_path()),
-                )
-            });
+            .map(|p| describe_profile(&p.permission_profile))
+            .unwrap_or_else(|| describe_profile(&self.config.permissions.permission_profile()));
         let info_line = if failed_scan {
             Line::from(vec![
                 "We couldn't complete the world-writable scan, so protections cannot be verified. "
@@ -10280,8 +10322,9 @@ impl ChatWidget {
         }
         let header = ColumnRenderable::with(header_children);
 
-        // Build actions ensuring acknowledgement happens before applying the new sandbox policy,
-        // so downstream policy-change hooks don't re-trigger the warning.
+        // Build actions ensuring acknowledgement happens before applying the
+        // new permission profile, so downstream policy-change hooks don't
+        // re-trigger the warning.
         let mut accept_actions: Vec<SelectionAction> = Vec::new();
         // Suppress the immediate re-scan only when a preset will be applied (i.e., via /approvals or
         // /permissions), to avoid duplicate warnings from the ensuing policy change.
@@ -10290,10 +10333,10 @@ impl ChatWidget {
                 tx.send(AppEvent::SkipNextWorldWritableScan);
             }));
         }
-        if let (Some(approval), Some(sandbox)) = (approval, sandbox.clone()) {
+        if let (Some(approval), Some(permission_profile)) = (approval, permission_profile.clone()) {
             accept_actions.extend(Self::approval_preset_actions(
                 approval,
-                sandbox,
+                permission_profile,
                 mode_label.to_string(),
                 ApprovalsReviewer::User,
             ));
@@ -10304,10 +10347,10 @@ impl ChatWidget {
             tx.send(AppEvent::UpdateWorldWritableWarningAcknowledged(true));
             tx.send(AppEvent::PersistWorldWritableWarningAcknowledged);
         }));
-        if let (Some(approval), Some(sandbox)) = (approval, sandbox) {
+        if let (Some(approval), Some(permission_profile)) = (approval, permission_profile) {
             accept_and_remember_actions.extend(Self::approval_preset_actions(
                 approval,
-                sandbox,
+                permission_profile,
                 mode_label.to_string(),
                 ApprovalsReviewer::User,
             ));
@@ -10626,12 +10669,13 @@ impl ChatWidget {
         }
     }
 
-    /// Set the sandbox policy in the widget's config copy.
+    /// Set the permission profile in the widget's config copy.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) -> ConstraintResult<()> {
-        self.config
-            .permissions
-            .set_legacy_sandbox_policy(policy, self.config.cwd.as_path())
+    pub(crate) fn set_permission_profile(
+        &mut self,
+        profile: PermissionProfile,
+    ) -> ConstraintResult<()> {
+        self.config.permissions.set_permission_profile(profile)
     }
 
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -10888,7 +10932,7 @@ impl ChatWidget {
                 /*cwd*/ None,
                 /*approval_policy*/ None,
                 /*approvals_reviewer*/ None,
-                /*sandbox_policy*/ None,
+                /*permission_profile*/ None,
                 /*windows_sandbox_level*/ None,
                 /*model*/ None,
                 /*effort*/ None,
@@ -11026,6 +11070,48 @@ impl ChatWidget {
 
     fn collaboration_modes_enabled(&self) -> bool {
         true
+    }
+
+    /// Returns the dismissal scope that applies to the currently visible draft.
+    fn plan_mode_nudge_scope(&self) -> PlanModeNudgeScope {
+        self.thread_id
+            .map_or(PlanModeNudgeScope::NewThread, PlanModeNudgeScope::Thread)
+    }
+
+    /// Returns whether the current draft should replace the normal footer with the Plan-mode nudge.
+    ///
+    /// `ChatWidget` owns this policy because it can combine lexical draft matching with mode
+    /// availability, interaction state, and thread-scoped dismissal. `ChatComposer` only renders
+    /// the resulting visibility bit. Keeping slash and shell drafts out here avoids advertising a
+    /// mode switch while the user is intentionally composing another local command.
+    fn should_show_plan_mode_nudge(&self) -> bool {
+        let text = self.bottom_pane.composer_text();
+        let trimmed = text.trim_start();
+        self.collaboration_modes_enabled()
+            && collaboration_modes::plan_mask(self.model_catalog.as_ref()).is_some()
+            && self.active_mode_kind() != ModeKind::Plan
+            && self.bottom_pane.composer_input_enabled()
+            && !self.bottom_pane.is_task_running()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && !trimmed.starts_with('/')
+            && !trimmed.starts_with('!')
+            && contains_plan_keyword(&text)
+            && !self
+                .dismissed_plan_mode_nudge_scopes
+                .contains(&self.plan_mode_nudge_scope())
+    }
+
+    /// Synchronizes the footer presentation with the current Plan-mode nudge policy.
+    fn refresh_plan_mode_nudge(&mut self) {
+        self.bottom_pane
+            .set_plan_mode_nudge_visible(self.should_show_plan_mode_nudge());
+    }
+
+    /// Hides the nudge for the current thread scope until the user changes conversation context.
+    fn dismiss_plan_mode_nudge(&mut self) {
+        self.dismissed_plan_mode_nudge_scopes
+            .insert(self.plan_mode_nudge_scope());
+        self.refresh_plan_mode_nudge();
     }
 
     fn initial_collaboration_mask(
@@ -11218,8 +11304,13 @@ impl ChatWidget {
         {
             mask.reasoning_effort = Some(Some(effort));
         }
+        if mask.mode == Some(ModeKind::Plan) {
+            self.dismissed_plan_mode_nudge_scopes
+                .insert(self.plan_mode_nudge_scope());
+        }
         self.active_collaboration_mask = Some(mask);
         self.update_collaboration_mode_indicator();
+        self.refresh_plan_mode_nudge();
         self.refresh_model_dependent_surfaces();
         let next_mode = self.active_mode_kind();
         let next_model = self.current_model();
@@ -11845,6 +11936,7 @@ impl ChatWidget {
     ) {
         self.bottom_pane
             .set_composer_text(text, text_elements, local_image_paths);
+        self.refresh_plan_mode_nudge();
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>) {

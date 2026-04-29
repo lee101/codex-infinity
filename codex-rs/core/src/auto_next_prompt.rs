@@ -79,7 +79,7 @@ pub async fn generate_auto_next_prompt(
         }
     );
 
-    let auth_manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+    let auth_manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
     let model_info = model_info_from_slug(GENERATOR_MODEL);
 
     let installation_id = resolve_installation_id(&config.codex_home).await.ok()?;

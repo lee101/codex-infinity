@@ -80,7 +80,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
 }
 
 pub(super) fn render_device_code_login(
-    _widget: &AuthModeWidget,
+    widget: &AuthModeWidget,
     area: Rect,
     buf: &mut Buffer,
     state: &ContinueWithDeviceCodeState,
