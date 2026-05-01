@@ -267,6 +267,15 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             needs_special_apply_patch_instructions: true,
             support_verbosity: true,
         )
+    } else if slug == "auto"
+        || slug == "autothink"
+        || slug.starts_with("auto-")
+        || slug.starts_with("openpaths/auto")
+    {
+        model_family!(
+            slug, "openpaths-auto",
+            needs_special_apply_patch_instructions: true,
+        )
     } else if slug.starts_with("glm-5") || slug.starts_with("GLM-5") {
         model_family!(
             slug, "glm-5",
@@ -280,6 +289,11 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
     } else if slug.contains("grok") {
         model_family!(
             slug, "grok",
+            needs_special_apply_patch_instructions: true,
+        )
+    } else if slug.starts_with("deepseek-") || slug.starts_with("DeepSeek-") {
+        model_family!(
+            slug, "deepseek",
             needs_special_apply_patch_instructions: true,
         )
     } else {

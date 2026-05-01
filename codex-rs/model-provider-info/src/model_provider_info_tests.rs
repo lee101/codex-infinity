@@ -268,9 +268,23 @@ fn zhipu_provider_normalizes_zai_prefix() {
 }
 
 #[test]
+fn openpaths_provider_normalizes_openpaths_prefix() {
+    let provider = ModelProviderInfo::create_openpaths_provider();
+    assert_eq!(
+        provider.effective_model_name("openpaths/auto-medium-task"),
+        "auto-medium-task"
+    );
+    assert_eq!(
+        provider.effective_model_name("auto-medium-task"),
+        "auto-medium-task"
+    );
+}
+
+#[test]
 fn infer_builtin_provider_prefers_env_backed_routes() {
-    let gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
-    let openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let _gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
+    let _openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let openpaths_remove_guard = EnvVarGuard::remove("OPENPATHS_API_KEY");
     assert_eq!(
         infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
         None
@@ -305,6 +319,17 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     assert_eq!(
         infer_builtin_provider_id_for_model("z-ai/glm-5.1"),
         Some(ZHIPU_PROVIDER_ID)
+    );
+
+    drop(openpaths_remove_guard);
+    let _openpaths_set_guard = EnvVarGuard::set("OPENPATHS_API_KEY", "op-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("auto-medium-task"),
+        Some(OPENPATHS_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("openpaths/auto-think"),
+        Some(OPENPATHS_PROVIDER_ID)
     );
 }
 
