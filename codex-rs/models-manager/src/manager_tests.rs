@@ -203,6 +203,57 @@ fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManage
     )
 }
 
+#[tokio::test]
+async fn get_default_model_resolves_latest_to_highest_available_model() {
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![
+            remote_model("gpt-5.5", "GPT-5.5", /*priority*/ 2),
+            remote_model("gpt-5.5-max", "GPT-5.5 Max", /*priority*/ 1),
+            remote_model("gpt-5.6", "GPT-5.6", /*priority*/ 3),
+            remote_model("gpt-5.10", "GPT-5.10", /*priority*/ 4),
+            remote_model("gpt-5.9", "GPT-5.9", /*priority*/ 0),
+        ],
+    });
+
+    let model = manager
+        .get_default_model(&Some("latest".to_string()), RefreshStrategy::Offline)
+        .await;
+
+    assert_eq!(model, "gpt-5.10");
+}
+
+#[tokio::test]
+async fn get_default_model_resolves_latest_to_longest_model_when_numbers_tie() {
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![
+            remote_model("gpt-5.5", "GPT-5.5", /*priority*/ 0),
+            remote_model("gpt-5.5-max", "GPT-5.5 Max", /*priority*/ 1),
+        ],
+    });
+
+    let model = manager
+        .get_default_model(&Some("latest".to_string()), RefreshStrategy::Offline)
+        .await;
+
+    assert_eq!(model, "gpt-5.5-max");
+}
+
+#[tokio::test]
+async fn get_default_model_keeps_explicit_model_without_fetching_catalog() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
+        "gpt-5.6", "GPT-5.6", /*priority*/ 0,
+    )]]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+
+    let model = manager
+        .get_default_model(&Some("gpt-custom".to_string()), RefreshStrategy::Online)
+        .await;
+
+    assert_eq!(model, "gpt-custom");
+    assert_eq!(endpoint.fetch_count(), 0);
+}
+
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
     let auth_dot_json = codex_login::AuthDotJson {
         auth_mode: Some(AuthMode::ChatgptAuthTokens),

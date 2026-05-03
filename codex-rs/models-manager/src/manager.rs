@@ -143,10 +143,17 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         refresh_strategy: RefreshStrategy,
     ) -> String {
         async move {
-            if let Some(model) = model.as_ref() {
+            if let Some(model) = model.as_ref()
+                && model != "latest"
+            {
                 return model.to_string();
             }
-            default_model_from_available(self.list_models(refresh_strategy).await)
+            let available = self.list_models(refresh_strategy).await;
+            if model.as_deref() == Some("latest") {
+                return latest_model_from_available(&available)
+                    .unwrap_or_else(|| default_model_from_available(available));
+            }
+            default_model_from_available(available)
         }
         .instrument(tracing::info_span!(
             "get_default_model",
@@ -408,6 +415,44 @@ fn default_model_from_available(available: Vec<ModelPreset>) -> String {
         .or_else(|| available.first())
         .map(|model| model.model.clone())
         .unwrap_or_default()
+}
+
+fn latest_model_from_available(available: &[ModelPreset]) -> Option<String> {
+    available
+        .iter()
+        .filter(|model| model.show_in_picker)
+        .filter(|model| !numeric_parts(&model.model).is_empty())
+        .max_by(|a, b| compare_model_latest_rank(&a.model, &b.model))
+        .map(|model| model.model.clone())
+}
+
+fn compare_model_latest_rank(a: &str, b: &str) -> std::cmp::Ordering {
+    numeric_parts(a)
+        .cmp(&numeric_parts(b))
+        .then_with(|| a.len().cmp(&b.len()))
+        .then_with(|| a.cmp(b))
+}
+
+fn numeric_parts(model: &str) -> Vec<u64> {
+    let mut parts = Vec::new();
+    let mut current: Option<u64> = None;
+    for c in model.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            let digit = u64::from(digit);
+            current = Some(
+                current
+                    .unwrap_or_default()
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            );
+        } else if let Some(value) = current.take() {
+            parts.push(value);
+        }
+    }
+    if let Some(value) = current {
+        parts.push(value);
+    }
+    parts
 }
 
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
