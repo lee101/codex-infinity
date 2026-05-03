@@ -17,6 +17,7 @@ const platformGroups = {
 
 const requiredGroups = process.env.CODEX_INFINITY_REQUIRED_GROUPS || 'any';
 let foundAny = false;
+const foundGroups = new Set();
 
 for (const [group, triples] of Object.entries(platformGroups)) {
   for (const triple of triples) {
@@ -25,12 +26,31 @@ for (const [group, triples] of Object.entries(platformGroups)) {
     if (existsSync(binaryPath)) {
       console.log(`Found binary for ${triple}`);
       foundAny = true;
+      foundGroups.add(group);
       break;
     }
   }
 }
 
-if (!foundAny && requiredGroups !== 'any') {
+if (requiredGroups === 'any') {
+  if (!foundAny) {
+    console.error('No vendor binaries found');
+    process.exit(1);
+  }
+} else {
+  const missingGroups = requiredGroups
+    .split(',')
+    .map((group) => group.trim())
+    .filter(Boolean)
+    .filter((group) => !foundGroups.has(group));
+
+  if (missingGroups.length > 0) {
+    console.error(`Missing vendor binaries for: ${missingGroups.join(', ')}`);
+    process.exit(1);
+  }
+}
+
+if (!foundAny) {
   console.error('No vendor binaries found');
   process.exit(1);
 }

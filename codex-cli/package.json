@@ -7,6 +7,8 @@
     "codex-infinity": "bin/codex-infinity.js"
   },
   "scripts": {
+    "deploy": "bash scripts/deploy_new_binary.sh",
+    "deploy:dry-run": "bash scripts/deploy_new_binary.sh --dry-run",
     "prepack": "node -e \"process.env.CODEX_INFINITY_REQUIRED_GROUPS='any';require('child_process').execFileSync(process.execPath,['scripts/verify_vendor.js'],{stdio:'inherit'})\""
   },
   "type": "module",
