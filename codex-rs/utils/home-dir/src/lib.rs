@@ -187,7 +187,10 @@ mod tests {
 
         let resolved = find_codex_home_from_env(Some(temp_str)).expect("valid CODEX_HOME");
         let expected = AbsolutePathBuf::from_absolute_path(
-            temp_home.path().canonicalize().expect("canonicalize temp home"),
+            temp_home
+                .path()
+                .canonicalize()
+                .expect("canonicalize temp home"),
         )
         .expect("absolute path");
         assert_eq!(resolved, expected);

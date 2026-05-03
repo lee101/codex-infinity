@@ -20,15 +20,27 @@ pub struct Cli {
     pub shared: ExecSharedCliOptions,
 
     /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
-    #[arg(long = "yolo2", alias = "dangerously-disable-timeouts", default_value_t = false)]
+    #[arg(
+        long = "yolo2",
+        alias = "dangerously-disable-timeouts",
+        default_value_t = false
+    )]
     pub dangerously_disable_timeouts: bool,
 
     /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
-    #[arg(long = "yolo3", alias = "dangerously-disable-env-wrapping", default_value_t = false)]
+    #[arg(
+        long = "yolo3",
+        alias = "dangerously-disable-env-wrapping",
+        default_value_t = false
+    )]
     pub dangerously_disable_environment_wrapping: bool,
 
     /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
-    #[arg(long = "yolo4", alias = "dangerously-passthrough-stdio", default_value_t = false)]
+    #[arg(
+        long = "yolo4",
+        alias = "dangerously-passthrough-stdio",
+        default_value_t = false
+    )]
     pub dangerously_passthrough_stdio: bool,
 
     /// Allow running Codex outside a Git repository.

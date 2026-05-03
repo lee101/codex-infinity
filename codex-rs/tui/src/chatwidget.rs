@@ -3060,25 +3060,20 @@ impl ChatWidget {
         let app_event_tx = self.app_event_tx.clone();
         let config = self.config.clone();
         let rollout_path = self.current_rollout_path.clone();
-        let examples: Vec<String> = if matches!(
-            mode,
-            codex_core::auto_next_prompt::AutoNextMode::Idea
-        ) {
-            AUTO_NEXT_IDEA_META_TEMPLATES
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            AUTO_NEXT_STEPS_META_TEMPLATES
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        };
+        let examples: Vec<String> =
+            if matches!(mode, codex_core::auto_next_prompt::AutoNextMode::Idea) {
+                AUTO_NEXT_IDEA_META_TEMPLATES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                AUTO_NEXT_STEPS_META_TEMPLATES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            };
         let append_done_suffix = self.auto_next_steps;
-        let done_path = self
-            .auto_next_done_file
-            .display()
-            .to_string();
+        let done_path = self.auto_next_done_file.display().to_string();
         let reminder = if self.auto_next_counter > 0
             && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
         {
@@ -3087,14 +3082,13 @@ impl ChatWidget {
             None
         };
         tokio::spawn(async move {
-            let generated =
-                codex_core::auto_next_prompt::generate_auto_next_prompt(
-                    config,
-                    rollout_path,
-                    mode,
-                    examples,
-                )
-                .await;
+            let generated = codex_core::auto_next_prompt::generate_auto_next_prompt(
+                config,
+                rollout_path,
+                mode,
+                examples,
+            )
+            .await;
             let mut prompt = match generated {
                 Some(p) => p,
                 None => fallback_prompt,

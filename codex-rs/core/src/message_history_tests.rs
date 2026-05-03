@@ -16,11 +16,13 @@ async fn lookup_reads_history_entries() {
             session_id: "first-session".to_string(),
             ts: 1,
             text: "first".to_string(),
+            cwd: None,
         },
         HistoryEntry {
             session_id: "second-session".to_string(),
             ts: 2,
             text: "second".to_string(),
+            cwd: None,
         },
     ];
 
@@ -51,11 +53,13 @@ async fn lookup_uses_stable_log_id_after_appends() {
         session_id: "first-session".to_string(),
         ts: 1,
         text: "first".to_string(),
+        cwd: None,
     };
     let appended = HistoryEntry {
         session_id: "second-session".to_string(),
         ts: 2,
         text: "second".to_string(),
+        cwd: None,
     };
 
     let mut file = File::create(&history_path).expect("create history file");

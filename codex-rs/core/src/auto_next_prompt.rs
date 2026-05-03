@@ -7,7 +7,6 @@
 //! The caller is responsible for appending any DONE-file suffix.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use codex_login::AuthManager;
 use codex_model_provider_info::ModelProviderInfo;
@@ -79,7 +78,8 @@ pub async fn generate_auto_next_prompt(
         }
     );
 
-    let auth_manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
     let model_info = model_info_from_slug(GENERATOR_MODEL);
 
     let installation_id = resolve_installation_id(&config.codex_home).await.ok()?;
@@ -202,7 +202,10 @@ fn format_response_item(item: &ResponseItem) -> Option<String> {
             .map(|text| format!("{role}: {}", truncate(&text, ITEM_CHARS))),
         ResponseItem::FunctionCall {
             name, arguments, ..
-        } => Some(format!("tool_call {name}: {}", truncate(arguments, ITEM_CHARS))),
+        } => Some(format!(
+            "tool_call {name}: {}",
+            truncate(arguments, ITEM_CHARS)
+        )),
         ResponseItem::FunctionCallOutput { call_id, output } => Some(format!(
             "tool_output {call_id}: {}",
             truncate(&output.to_string(), ITEM_CHARS)

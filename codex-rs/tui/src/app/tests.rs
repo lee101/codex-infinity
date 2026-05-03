@@ -413,6 +413,8 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         status_line_invalid_items_warned: app.status_line_invalid_items_warned.clone(),
         terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
         session_telemetry: app.session_telemetry.clone(),
+        auto_next_steps: false,
+        auto_next_idea: false,
     });
 
     app.enqueue_primary_thread_session(
@@ -3716,6 +3718,8 @@ async fn make_test_app() -> App {
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         remote_app_server_url: None,
         remote_app_server_auth_token: None,
+        auto_next_steps: false,
+        auto_next_idea: false,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
@@ -3776,6 +3780,8 @@ async fn make_test_app_with_channels() -> (
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             remote_app_server_url: None,
             remote_app_server_auth_token: None,
+            auto_next_steps: false,
+            auto_next_idea: false,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
@@ -4633,6 +4639,8 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         status_line_invalid_items_warned: app.status_line_invalid_items_warned.clone(),
         terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
         session_telemetry: app.session_telemetry.clone(),
+        auto_next_steps: false,
+        auto_next_idea: false,
     });
     app.replace_chat_widget(replacement);
 

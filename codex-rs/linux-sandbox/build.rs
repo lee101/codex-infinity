@@ -30,6 +30,18 @@ fn main() {
         "cargo:rerun-if-changed={}",
         vendor_dir.join("utils.c").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("capability_compat.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("capability_compat.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("sys/capability.h").display()
+    );
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "linux" || env::var_os("CODEX_SKIP_VENDORED_BWRAP").is_some() {
@@ -46,9 +58,7 @@ fn try_build_vendored_bwrap() -> Result<(), String> {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|err| err.to_string())?);
     let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(|err| err.to_string())?);
     let src_dir = resolve_bwrap_source_dir(&manifest_dir)?;
-    let libcap = pkg_config::Config::new()
-        .probe("libcap")
-        .map_err(|err| format!("libcap not available via pkg-config: {err}"))?;
+    let libcap = pkg_config::Config::new().probe("libcap").ok();
 
     let config_h = out_dir.join("config.h");
     std::fs::write(
@@ -66,14 +76,20 @@ fn try_build_vendored_bwrap() -> Result<(), String> {
         .file(src_dir.join("network.c"))
         .file(src_dir.join("utils.c"))
         .include(&out_dir)
+        .include(&manifest_dir)
         .include(&src_dir)
         .define("_GNU_SOURCE", None)
         // Rename `main` so we can call it via FFI.
         .define("main", Some("bwrap_main"));
-    for include_path in libcap.include_paths {
-        // Use -idirafter so target sysroot headers win (musl cross builds),
-        // while still allowing libcap headers from the host toolchain.
-        build.flag(format!("-idirafter{}", include_path.display()));
+
+    if let Some(libcap) = libcap {
+        for include_path in libcap.include_paths {
+            // Use -idirafter so target sysroot headers win (musl cross builds),
+            // while still allowing libcap headers from the host toolchain.
+            build.flag(format!("-idirafter{}", include_path.display()));
+        }
+    } else {
+        build.file(manifest_dir.join("capability_compat.c"));
     }
 
     build.compile("build_time_bwrap");

@@ -17,8 +17,8 @@ pub use server::ServerOptions;
 pub use server::ShutdownHandle;
 pub use server::run_login_server;
 
-pub use auth::AgentIdentityAuthRecord;
 pub use auth::ANTHROPIC_API_KEY_ENV_VAR;
+pub use auth::AgentIdentityAuthRecord;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
 pub use auth::AuthManager;

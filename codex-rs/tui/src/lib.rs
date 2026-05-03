@@ -39,9 +39,9 @@ use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::EnvironmentManagerArgs;
+use codex_exec_server::ExecServerRuntimePaths;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
-use codex_exec_server::ExecServerRuntimePaths;
 use codex_login::AuthConfig;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::enforce_login_restrictions;
@@ -1423,7 +1423,11 @@ async fn run_ratatui_app(
         let target = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &config.cwd)
             .await
             .unwrap_or_else(|| config.cwd.clone());
-        match set_project_trust_level(config.codex_home.as_path(), target.as_path(), TrustLevel::Trusted) {
+        match set_project_trust_level(
+            config.codex_home.as_path(),
+            target.as_path(),
+            TrustLevel::Trusted,
+        ) {
             Ok(()) => {
                 trust_decision_was_made = true;
                 config = load_config_or_exit_with_fallback_cwd(

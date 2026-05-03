@@ -458,7 +458,11 @@ impl ModelClient {
             prompt.output_schema_strict,
         );
         let payload = ApiCompactionInput {
-            model: self.state.provider.info().effective_model_name(&model_info.slug),
+            model: self
+                .state
+                .provider
+                .info()
+                .effective_model_name(&model_info.slug),
             input: &input,
             instructions: &instructions,
             tools,
@@ -879,7 +883,13 @@ impl ModelClientSession {
         );
         let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
         let request = ResponsesApiRequest {
-            model: self.client.state.provider.info().effective_model_name(&model_info.slug).to_string(),
+            model: self
+                .client
+                .state
+                .provider
+                .info()
+                .effective_model_name(&model_info.slug)
+                .to_string(),
             instructions: instructions.clone(),
             input,
             tools,
