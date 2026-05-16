@@ -527,6 +527,7 @@ const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
 ];
 
 const AUTO_NEXT_DONE_SUFFIX_STEPS: &str = "\n\nIMPORTANT: If you have genuinely completed all follow-up work and there are no more natural next steps remaining, you MUST write the single word DONE to the file at: ";
+const AUTO_NEXT_GIT_FINALIZER_PROMPT: &str = "Continue: The implementation work above appears complete. Do a focused git finalization pass now.\n\n1. Inspect repository state with `git status --short --branch`, `git diff --stat`, and any relevant unmerged/conflict-marker checks.\n2. If a merge/rebase is in progress, resolve conflicts carefully, preserving the user's intended work and current upstream changes.\n3. Run only the formatting and focused verification commands required by the changed files and repo instructions.\n4. If everything is clean enough to publish, commit any remaining local changes with a concise message and push the current branch.\n5. If publishing is blocked by credentials, failing tests, unresolved conflicts, or unclear remote state, stop after gathering the concrete blocker and report it.\n\nKeep this as a short execution pass: use the shell and git directly, avoid broad redesign or unrelated refactors, and do not open GitHub skills or connector workflows unless the local git/gh commands show they are actually needed.";
 
 const REVIEW_INTERVAL: usize = 3;
 const ORIGINAL_TASK_REMINDER_INTERVAL: usize = 7;
@@ -2989,13 +2990,16 @@ impl ChatWidget {
         }
         // DONE-file gate only applies to --auto-next-steps. When steps has run
         // out of work, promote the session to --auto-next-idea (the outer
-        // infinite re-prompting layer) and clear the done file so the loop
-        // keeps exploring new ideas.
+        // infinite re-prompting layer) after first queuing a focused git
+        // finalization pass.
         if self.auto_next_steps && self.auto_next_done_file.exists() {
             let _ = std::fs::remove_file(&self.auto_next_done_file);
             self.auto_next_steps = false;
             self.auto_next_idea = true;
             self.auto_next_counter = 0;
+            self.queued_user_messages
+                .push_back(UserMessage::from(AUTO_NEXT_GIT_FINALIZER_PROMPT).into());
+            return;
         }
 
         let is_review_turn =
