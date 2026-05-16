@@ -17,10 +17,10 @@ jobs:
     outputs:
       codex_output: ${{ steps.codex.outputs.final-message }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - id: codex
-        uses: openai/codex-action@main
+        uses: openai/codex-action@5c3f4ccdb2b8790f73d6b21751ac00e602aa0c02 # v1.7
         with:
           openai-api-key: ${{ secrets.CODEX_OPENAI_API_KEY }}
           allow-users: "*"
@@ -44,20 +44,31 @@ jobs:
             6. iOS — Issues with the Codex iOS app.
 
             - Additionally add zero or more of the following labels that are relevant to the issue content. Prefer a small set of precise labels over many broad ones.
+            - For agent-area issues, prefer the most specific applicable label. Use "agent" only as a fallback for agent-related issues that do not fit a more specific agent-area label. Prefer "app-server" over "session" or "config" when the issue is about app-server protocol, API, RPC, schema, launch, or bridge behavior.
             1. windows-os — Bugs or friction specific to Windows environments (always when PowerShell is mentioned, path handling, copy/paste, OS-specific auth or tooling failures).
             2. mcp — Topics involving Model Context Protocol servers/clients.
             3. mcp-server — Problems related to the codex mcp-server command, where codex runs as an MCP server.
             4. azure — Problems or requests tied to Azure OpenAI deployments.
             5. model-behavior — Undesirable LLM behavior: forgetting goals, refusing work, hallucinating environment details, quota misreports, or other reasoning/performance anomalies.
             6. code-review — Issues related to the code review feature or functionality.
-            7. auth - Problems related to authentication, login, or access tokens.
-            8. codex-exec - Problems related to the "codex exec" command or functionality.
-            9. context-management - Problems related to compaction, context windows, or available context reporting.
-            10. custom-model - Problems that involve using custom model providers, local models, or OSS models.
-            11. rate-limits - Problems related to token limits, rate limits, or token usage reporting.
-            12. sandbox - Issues related to local sandbox environments or tool call approvals to override sandbox restrictions.
-            13. tool-calls - Problems related to specific tool call invocations including unexpected errors, failures, or hangs.
-            14. TUI - Problems with the terminal user interface (TUI) including keyboard shortcuts, copy & pasting, menus, or screen update issues.
+            7. safety-check - Issues related to cyber risk detection or trusted access verification.
+            8. auth - Problems related to authentication, login, or access tokens.
+            9. exec - Problems related to the "codex exec" command or functionality.
+            10. hooks - Problems related to event hooks
+            11. context - Problems related to compaction, context windows, or available context reporting.
+            12. skills - Problems related to skills or plugins
+            13. custom-model - Problems that involve using custom model providers, local models, or OSS models.
+            14. rate-limits - Problems related to token limits, rate limits, or token usage reporting.
+            15. sandbox - Issues related to local sandbox environments or tool call approvals to override sandbox restrictions.
+            16. tool-calls - Problems related to specific tool call invocations including unexpected errors, failures, or hangs.
+            17. TUI - Problems with the terminal user interface (TUI) including keyboard shortcuts, copy & pasting, menus, or screen update issues.
+            18. app-server - Issues involving the app-server protocol or interfaces, including SDK/API payloads, thread/* and turn/* RPCs, app-server launch behavior, external app/controller bridges, and app-server protocol/schema behavior.
+            19. connectivity - Network connectivity or endpoint issues, including reconnecting messages, stream dropped/disconnected errors, websocket/SSE/transport failures, timeout/network/VPN/proxy/API endpoint failures, and related retry behavior.
+            20. subagent - Issues involving subagents, sub-agents, or multi-agent behavior, including spawn_agent, wait_agent, close_agent, worker/explorer roles, delegation, agent teams, lifecycle, model/config inheritance, quotas, and orchestration.
+            21. session - Issues involving session or thread management, including resume, fork, archive, rename/title, thread history, rollout persistence, compaction, checkpoints, retention, and cross-session state.
+            22. config - Issues involving config.toml, config keys, config key merging, config updates, profiles, hooks config, project config, agent role TOMLs, instruction/personality config, and config schema behavior.
+            23. plan - Issues involving plan mode, planning workflows, or plan-specific tools/behavior.
+            24. agent - Fallback only for core agent loop or agent-related issues that do not fit app-server, connectivity, subagent, session, config, or plan.
 
             Issue number: ${{ github.event.issue.number }}
 

@@ -1,6 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    },
+    "AgentPath": {
+      "type": "string"
+    },
     "ByteRange": {
       "properties": {
         "end": {
@@ -27,6 +34,8 @@
           "enum": [
             "contextWindowExceeded",
             "usageLimitExceeded",
+            "serverOverloaded",
+            "cyberPolicy",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -35,35 +44,6 @@
             "other"
           ],
           "type": "string"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "modelCap": {
-              "properties": {
-                "model": {
-                  "type": "string"
-                },
-                "reset_after_seconds": {
-                  "format": "uint64",
-                  "minimum": 0.0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                }
-              },
-              "required": [
-                "model"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "modelCap"
-          ],
-          "title": "ModelCapCodexErrorInfo",
-          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -159,6 +139,28 @@
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Returned when `turn/start` or `turn/steer` is submitted while the current active turn cannot accept same-turn steering, for example `/review` or manual `/compact`.",
+          "properties": {
+            "activeTurnNotSteerable": {
+              "properties": {
+                "turnKind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind"
+                }
+              },
+              "required": [
+                "turnKind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "activeTurnNotSteerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
         }
       ]
     },
@@ -183,6 +185,7 @@
       "enum": [
         "pendingInit",
         "running",
+        "interrupted",
         "completed",
         "errored",
         "shutdown",
@@ -219,7 +222,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -318,12 +321,73 @@
         }
       ]
     },
+    "CommandExecutionSource": {
+      "enum": [
+        "agent",
+        "userShell",
+        "unifiedExecStartup",
+        "unifiedExecInteraction"
+      ],
+      "type": "string"
+    },
     "CommandExecutionStatus": {
       "enum": [
         "inProgress",
         "completed",
         "failed",
         "declined"
+      ],
+      "type": "string"
+    },
+    "DynamicToolCallOutputContentItem": {
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "inputText"
+              ],
+              "title": "InputTextDynamicToolCallOutputContentItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "title": "InputTextDynamicToolCallOutputContentItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "imageUrl": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "inputImage"
+              ],
+              "title": "InputImageDynamicToolCallOutputContentItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "imageUrl",
+            "type"
+          ],
+          "title": "InputImageDynamicToolCallOutputContentItem",
+          "type": "object"
+        }
+      ]
+    },
+    "DynamicToolCallStatus": {
+      "enum": [
+        "inProgress",
+        "completed",
+        "failed"
       ],
       "type": "string"
     },
@@ -369,6 +433,21 @@
       },
       "type": "object"
     },
+    "HookPromptFragment": {
+      "properties": {
+        "hookRunId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hookRunId",
+        "text"
+      ],
+      "type": "object"
+    },
     "McpToolCallError": {
       "properties": {
         "message": {
@@ -382,6 +461,7 @@
     },
     "McpToolCallResult": {
       "properties": {
+        "_meta": true,
         "content": {
           "items": true,
           "type": "array"
@@ -398,6 +478,80 @@
         "inProgress",
         "completed",
         "failed"
+      ],
+      "type": "string"
+    },
+    "MemoryCitation": {
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/definitions/MemoryCitationEntry"
+          },
+          "type": "array"
+        },
+        "threadIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries",
+        "threadIds"
+      ],
+      "type": "object"
+    },
+    "MemoryCitationEntry": {
+      "properties": {
+        "lineEnd": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "lineStart": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "note": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "lineEnd",
+        "lineStart",
+        "note",
+        "path"
+      ],
+      "type": "object"
+    },
+    "MessagePhase": {
+      "description": "Classifies an assistant message as interim commentary or final answer text.\n\nProviders do not emit this consistently, so callers must treat `None` as \"phase unknown\" and keep compatibility behavior for legacy models.",
+      "oneOf": [
+        {
+          "description": "Mid-turn assistant text (for example preamble/progress narration).\n\nAdditional tool calls or assistant output may follow before turn completion.",
+          "enum": [
+            "commentary"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The assistant's terminal answer text for the current turn.",
+          "enum": [
+            "final_answer"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "NonSteerableTurnKind": {
+      "enum": [
+        "review",
+        "compact"
       ],
       "type": "string"
     },
@@ -468,6 +622,18 @@
         }
       ]
     },
+    "ReasoningEffort": {
+      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "type": "string"
+    },
     "SessionSource": {
       "oneOf": [
         {
@@ -479,6 +645,19 @@
             "unknown"
           ],
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom"
+          ],
+          "title": "CustomSessionSource",
+          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -500,7 +679,8 @@
         {
           "enum": [
             "review",
-            "compact"
+            "compact",
+            "memory_consolidation"
           ],
           "type": "string"
         },
@@ -509,6 +689,31 @@
           "properties": {
             "thread_spawn": {
               "properties": {
+                "agent_nickname": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "agent_path": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/AgentPath"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "agent_role": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "depth": {
                   "format": "int32",
                   "type": "integer"
@@ -570,6 +775,20 @@
     },
     "Thread": {
       "properties": {
+        "agentNickname": {
+          "description": "Optional random unique nickname assigned to an AgentControl-spawned sub-agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "description": "Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "cliVersion": {
           "description": "Version of the CLI that created the thread.",
           "type": "string"
@@ -580,8 +799,23 @@
           "type": "integer"
         },
         "cwd": {
-          "description": "Working directory captured for the thread.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Working directory captured for the thread."
+        },
+        "ephemeral": {
+          "description": "Whether the thread is ephemeral and should not be materialized on disk.",
+          "type": "boolean"
+        },
+        "forkedFromId": {
+          "description": "Source thread id when this thread was created by forking another thread.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "gitInfo": {
           "anyOf": [
@@ -600,6 +834,13 @@
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
+        },
+        "name": {
+          "description": "Optional user-facing thread title.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "path": {
           "description": "[UNSTABLE] Path to the thread on disk.",
@@ -620,6 +861,14 @@
           ],
           "description": "Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.)."
         },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThreadStatus"
+            }
+          ],
+          "description": "Current runtime status for the thread."
+        },
         "turns": {
           "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
           "items": {
@@ -637,14 +886,23 @@
         "cliVersion",
         "createdAt",
         "cwd",
+        "ephemeral",
         "id",
         "modelProvider",
         "preview",
         "source",
+        "status",
         "turns",
         "updatedAt"
       ],
       "type": "object"
+    },
+    "ThreadActiveFlag": {
+      "enum": [
+        "waitingOnApproval",
+        "waitingOnUserInput"
+      ],
+      "type": "string"
     },
     "ThreadId": {
       "type": "string"
@@ -680,8 +938,57 @@
         },
         {
           "properties": {
+            "fragments": {
+              "items": {
+                "$ref": "#/definitions/HookPromptFragment"
+              },
+              "type": "array"
+            },
             "id": {
               "type": "string"
+            },
+            "type": {
+              "enum": [
+                "hookPrompt"
+              ],
+              "title": "HookPromptThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "fragments",
+            "id",
+            "type"
+          ],
+          "title": "HookPromptThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "memoryCitation": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/MemoryCitation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "phase": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/MessagePhase"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "text": {
               "type": "string"
@@ -782,8 +1089,12 @@
               "type": "array"
             },
             "cwd": {
-              "description": "The command's working directory.",
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                }
+              ],
+              "description": "The command's working directory."
             },
             "durationMs": {
               "description": "The duration of the command execution in milliseconds.",
@@ -810,6 +1121,14 @@
                 "string",
                 "null"
               ]
+            },
+            "source": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionSource"
+                }
+              ],
+              "default": "agent"
             },
             "status": {
               "$ref": "#/definitions/CommandExecutionStatus"
@@ -888,6 +1207,12 @@
             "id": {
               "type": "string"
             },
+            "mcpAppResourceUri": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "result": {
               "anyOf": [
                 {
@@ -928,6 +1253,65 @@
         },
         {
           "properties": {
+            "arguments": true,
+            "contentItems": {
+              "items": {
+                "$ref": "#/definitions/DynamicToolCallOutputContentItem"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "durationMs": {
+              "description": "The duration of the dynamic tool call in milliseconds.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/DynamicToolCallStatus"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "dynamicToolCall"
+              ],
+              "title": "DynamicToolCallThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "arguments",
+            "id",
+            "status",
+            "tool",
+            "type"
+          ],
+          "title": "DynamicToolCallThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
             "agentsStates": {
               "additionalProperties": {
                 "$ref": "#/definitions/CollabAgentState"
@@ -939,12 +1323,30 @@
               "description": "Unique identifier for this collab tool call.",
               "type": "string"
             },
+            "model": {
+              "description": "Model requested for the spawned agent, when applicable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "prompt": {
               "description": "Prompt text sent as part of the collab tool call, when available.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "reasoningEffort": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Reasoning effort requested for the spawned agent, when applicable."
             },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
@@ -1033,7 +1435,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -1049,6 +1451,50 @@
             "type"
           ],
           "title": "ImageViewThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "result": {
+              "type": "string"
+            },
+            "revisedPrompt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "savedPath": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "imageGeneration"
+              ],
+              "title": "ImageGenerationThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "result",
+            "status",
+            "type"
+          ],
+          "title": "ImageGenerationThreadItem",
           "type": "object"
         },
         {
@@ -1121,8 +1567,99 @@
         }
       ]
     },
+    "ThreadStatus": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "notLoaded"
+              ],
+              "title": "NotLoadedThreadStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "NotLoadedThreadStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "idle"
+              ],
+              "title": "IdleThreadStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "IdleThreadStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "systemError"
+              ],
+              "title": "SystemErrorThreadStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "SystemErrorThreadStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "activeFlags": {
+              "items": {
+                "$ref": "#/definitions/ThreadActiveFlag"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "active"
+              ],
+              "title": "ActiveThreadStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "activeFlags",
+            "type"
+          ],
+          "title": "ActiveThreadStatus",
+          "type": "object"
+        }
+      ]
+    },
     "Turn": {
       "properties": {
+        "completedAt": {
+          "description": "Unix timestamp (in seconds) when the turn completed.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "durationMs": {
+          "description": "Duration between turn start and completion in milliseconds, if known.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "error": {
           "anyOf": [
             {
@@ -1143,6 +1680,14 @@
             "$ref": "#/definitions/ThreadItem"
           },
           "type": "array"
+        },
+        "startedAt": {
+          "description": "Unix timestamp (in seconds) when the turn started.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "status": {
           "$ref": "#/definitions/TurnStatus"
@@ -1415,6 +1960,13 @@
     }
   },
   "properties": {
+    "backwardsCursor": {
+      "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one thread. Use it with the opposite `sortDirection`; for timestamp sorts it anchors at the start of the page timestamp so same-second updates are not skipped.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "data": {
       "items": {
         "$ref": "#/definitions/Thread"

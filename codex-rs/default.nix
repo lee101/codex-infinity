@@ -2,26 +2,39 @@
   cmake,
   llvmPackages,
   openssl,
+  libcap ? null,
   rustPlatform,
   pkg-config,
   lib,
+  stdenv,
+  version ? "0.0.0",
   ...
 }:
 rustPlatform.buildRustPackage (_: {
-  env = {
-    PKG_CONFIG_PATH = "${openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH";
-  };
+  env.PKG_CONFIG_PATH = lib.makeSearchPathOutput "dev" "lib/pkgconfig" (
+    [ openssl ] ++ lib.optionals stdenv.isLinux [ libcap ]
+  );
   pname = "codex-rs";
-  version = "0.1.0";
+  inherit version;
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false;
   src = ./.;
+
+  # Patch the workspace Cargo.toml so that cargo embeds the correct version in
+  # CARGO_PKG_VERSION (which the binary reads via env!("CARGO_PKG_VERSION")).
+  # On release commits the Cargo.toml already contains the real version and
+  # this sed is a no-op.
+  postPatch = ''
+    sed -i 's/^version = "0\.0\.0"$/version = "${version}"/' Cargo.toml
+  '';
   nativeBuildInputs = [
     cmake
     llvmPackages.clang
     llvmPackages.libclang.lib
     openssl
     pkg-config
+  ] ++ lib.optionals stdenv.isLinux [
+    libcap
   ];
 
   cargoLock.outputHashes = {
@@ -35,8 +48,9 @@ rustPlatform.buildRustPackage (_: {
   };
 
   meta = with lib; {
-    description = "OpenAI Codex command‑line interface rust implementation";
+    description = "Codex Infinity command-line interface";
     license = licenses.asl20;
-    homepage = "https://github.com/openai/codex";
+    homepage = "https://github.com/lee101/codex-infinity";
+    mainProgram = "codex";
   };
 })

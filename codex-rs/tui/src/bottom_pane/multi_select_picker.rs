@@ -25,7 +25,7 @@
 //! .build();
 //! ```
 
-use codex_common::fuzzy_match::fuzzy_match;
+use codex_utils_fuzzy_match::fuzzy_match;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -46,8 +46,8 @@ use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::popup_consts::MAX_POPUP_ROWS;
 use crate::bottom_pane::scroll_state::ScrollState;
 use crate::bottom_pane::selection_popup_common::render_rows_single_line;
-use crate::bottom_pane::selection_popup_common::truncate_line_with_ellipsis_if_overflow;
 use crate::key_hint;
+use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::ColumnRenderable;
@@ -533,7 +533,7 @@ impl Renderable for MultiSelectPicker {
             Constraint::Length(2),
             Constraint::Length(rows_height),
         ])
-        .areas(content_area.inset(Insets::vh(1, 2)));
+        .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
 
         self.header.render(header_area, buf);
 

@@ -1,30 +1,42 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::SubAgentSource;
+use codex_utils_template::Template;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Constrained;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
+use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
+use std::sync::LazyLock;
 
 use super::SessionTask;
 use super::SessionTaskContext;
+
+static REVIEW_EXIT_SUCCESS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    let normalized =
+        normalize_review_template_line_endings(crate::client_common::REVIEW_EXIT_SUCCESS_TMPL);
+    Template::parse(normalized.as_ref())
+        .unwrap_or_else(|err| panic!("review exit success template must parse: {err}"))
+});
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReviewTask;
@@ -35,10 +47,13 @@ impl ReviewTask {
     }
 }
 
-#[async_trait]
 impl SessionTask for ReviewTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Review
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.review"
     }
 
     async fn run(
@@ -48,11 +63,11 @@ impl SessionTask for ReviewTask {
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
     ) -> Option<String> {
-        let _ = session
-            .session
-            .services
-            .otel_manager
-            .counter("codex.task.review", 1, &[]);
+        session.session.services.session_telemetry.counter(
+            "codex.task.review",
+            /*inc*/ 1,
+            &[],
+        );
 
         // Start sub-codex conversation and get the receiver for events.
         let output = match start_review_conversation(
@@ -73,7 +88,7 @@ impl SessionTask for ReviewTask {
     }
 
     async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
-        exit_review_mode(session.clone_session(), None, ctx).await;
+        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
     }
 }
 
@@ -86,24 +101,19 @@ async fn start_review_conversation(
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
-    // re-enable blocked tools (web search, view image).
+    // re-enable blocked tools (web search, collab tools, view image).
     if let Err(err) = sub_agent_config
         .web_search_mode
         .set(WebSearchMode::Disabled)
     {
-        tracing::warn!(
-            "failed to force review web_search_mode=disabled; falling back to a normalizer: {err}"
-        );
-        sub_agent_config.web_search_mode =
-            Constrained::normalized(WebSearchMode::Disabled, |_| WebSearchMode::Disabled)
-                .unwrap_or_else(|err| {
-                    tracing::warn!("failed to build normalizer for review web_search_mode: {err}");
-                    Constrained::allow_any(WebSearchMode::Disabled)
-                });
+        panic!("by construction Constrained<WebSearchMode> must always support Disabled: {err}");
     }
+    let _ = sub_agent_config.features.disable(Feature::SpawnCsv);
+    let _ = sub_agent_config.features.disable(Feature::Collab);
 
     // Set explicit review rubric for the sub-agent
     sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
     let model = config
         .review_model
@@ -118,7 +128,9 @@ async fn start_review_conversation(
         session.clone_session(),
         ctx.clone(),
         cancellation_token,
-        None,
+        SubAgentSource::Review,
+        /*final_output_json_schema*/ None,
+        /*initial_history*/ None,
     )
     .await)
         .ok()
@@ -213,15 +225,17 @@ pub(crate) async fn exit_review_mode(
             findings_str.push_str(text);
         }
         if !out.findings.is_empty() {
-            let block = format_review_findings_block(&out.findings, None);
+            let block = format_review_findings_block(&out.findings, /*selection*/ None);
             findings_str.push_str(&format!("\n{block}"));
         }
-        let rendered =
-            crate::client_common::REVIEW_EXIT_SUCCESS_TMPL.replace("{results}", &findings_str);
+        let rendered = render_review_exit_success(&findings_str);
         let assistant_message = render_review_output_text(&out);
         (rendered, assistant_message)
     } else {
-        let rendered = crate::client_common::REVIEW_EXIT_INTERRUPTED_TMPL.to_string();
+        let rendered = normalize_review_template_line_endings(
+            crate::client_common::REVIEW_EXIT_INTERRUPTED_TMPL,
+        )
+        .into_owned();
         let assistant_message =
             "Review was interrupted. Please re-run /review and wait for it to complete."
                 .to_string();
@@ -235,7 +249,6 @@ pub(crate) async fn exit_review_mode(
                 id: Some(REVIEW_USER_MESSAGE_ID.to_string()),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
-                end_turn: None,
                 phase: None,
             }],
         )
@@ -256,7 +269,6 @@ pub(crate) async fn exit_review_mode(
                 content: vec![ContentItem::OutputText {
                     text: assistant_message,
                 }],
-                end_turn: None,
                 phase: None,
             },
         )
@@ -266,4 +278,41 @@ pub(crate) async fn exit_review_mode(
     // materialize rollout persistence. Do this after emitting review output so
     // file creation + git metadata collection cannot delay client-facing items.
     session.ensure_rollout_materialized().await;
+}
+
+fn render_review_exit_success(results: &str) -> String {
+    REVIEW_EXIT_SUCCESS_TEMPLATE
+        .render([("results", results)])
+        .unwrap_or_else(|err| panic!("review exit success template must render: {err}"))
+}
+
+fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
+    if template.contains('\r') {
+        Cow::Owned(template.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(template)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_review_template_line_endings;
+    use super::render_review_exit_success;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn render_review_exit_success_replaces_results_placeholder() {
+        assert_eq!(
+            render_review_exit_success("Finding A\nFinding B"),
+            "<user_action>\n  <context>User initiated a review task. Here's the full review output from reviewer model. User may select one or more comments to resolve.</context>\n  <action>review</action>\n  <results>\n  Finding A\nFinding B\n  </results>\n  </user_action>\n"
+        );
+    }
+
+    #[test]
+    fn normalize_review_template_line_endings_rewrites_crlf() {
+        assert_eq!(
+            normalize_review_template_line_endings("<user_action>\r\n  <results>\r\n  None.\r\n"),
+            "<user_action>\n  <results>\n  None.\n"
+        );
+    }
 }

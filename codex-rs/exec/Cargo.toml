@@ -3,6 +3,7 @@ name = "codex-exec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [[bin]]
 name = "codex-exec"
@@ -12,6 +13,10 @@ path = "src/main.rs"
 name = "codex_exec"
 path = "src/lib.rs"
 
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
 [lints]
 workspace = true
 
@@ -19,19 +24,23 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }
+codex-app-server-client = { workspace = true }
+codex-app-server-protocol = { workspace = true }
 codex-cloud-requirements = { workspace = true }
-codex-common = { workspace = true, features = [
-    "cli",
-    "elapsed",
-    "sandbox_summary",
-] }
+codex-config = { workspace = true }
 codex-core = { workspace = true }
+codex-feedback = { workspace = true }
+codex-git-utils = { workspace = true }
+codex-login = { workspace = true }
+codex-model-provider-info = { workspace = true }
+codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-cli = { workspace = true }
+codex-utils-oss = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-shlex = { workspace = true }
 supports-color = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
@@ -52,13 +61,16 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+codex-apply-patch = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 libc = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
-rmcp = { workspace = true }
 tempfile = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 wiremock = { workspace = true }

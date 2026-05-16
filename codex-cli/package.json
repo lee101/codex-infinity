@@ -1,12 +1,14 @@
 {
   "name": "@codex-infinity/codex-infinity",
-  "version": "0.0.5",
+  "version": "1.3.40",
   "license": "Apache-2.0",
   "description": "Codex Infinity - a smarter coding agent that can run forever",
   "bin": {
     "codex-infinity": "bin/codex-infinity.js"
   },
   "scripts": {
+    "deploy": "bash scripts/deploy_new_binary.sh",
+    "deploy:dry-run": "bash scripts/deploy_new_binary.sh --dry-run",
     "prepack": "node -e \"process.env.CODEX_INFINITY_REQUIRED_GROUPS='any';require('child_process').execFileSync(process.execPath,['scripts/verify_vendor.js'],{stdio:'inherit'})\""
   },
   "type": "module",
@@ -38,5 +40,6 @@
     "cli",
     "autonomous",
     "codex"
-  ]
+  ],
+  "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
 }

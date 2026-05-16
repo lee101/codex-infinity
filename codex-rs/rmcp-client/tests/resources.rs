@@ -1,15 +1,18 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::RmcpClient;
 use codex_utils_cargo_bin::CargoBinError;
 use futures::FutureExt as _;
 use rmcp::model::AnnotateAble;
 use rmcp::model::ClientCapabilities;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::FormElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ListResourceTemplatesResult;
@@ -29,10 +32,14 @@ fn init_params() -> InitializeRequestParams {
         meta: None,
         capabilities: ClientCapabilities {
             experimental: None,
+            extensions: None,
             roots: None,
             sampling: None,
             elicitation: Some(ElicitationCapability {
-                schema_validation: None,
+                form: Some(FormElicitationCapability {
+                    schema_validation: None,
+                }),
+                url: None,
             }),
             tasks: None,
         },
@@ -40,6 +47,7 @@ fn init_params() -> InitializeRequestParams {
             name: "codex-test".into(),
             version: "0.0.0-test".into(),
             title: Some("Codex rmcp resource test".into()),
+            description: None,
             icons: None,
             website_url: None,
         },
@@ -52,9 +60,10 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
     let client = RmcpClient::new_stdio_client(
         stdio_server_bin()?.into(),
         Vec::<OsString>::new(),
-        None,
+        /*env*/ None,
         &[],
-        None,
+        /*cwd*/ None,
+        Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
     )
     .await?;
 
@@ -67,6 +76,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
                     Ok(ElicitationResponse {
                         action: ElicitationAction::Accept,
                         content: Some(json!({})),
+                        meta: None,
                     })
                 }
                 .boxed()
@@ -75,7 +85,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         .await?;
 
     let list = client
-        .list_resources(None, Some(Duration::from_secs(5)))
+        .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
         .await?;
     let memo = list
         .resources
@@ -97,7 +107,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         .no_annotation()
     );
     let templates = client
-        .list_resource_templates(None, Some(Duration::from_secs(5)))
+        .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
         .await?;
     assert_eq!(
         templates,

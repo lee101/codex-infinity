@@ -1,0 +1,11 @@
+---
+source: tui_app_server/src/app.rs
+assertion_line: 7800
+expression: rendered
+---
+╭────────────────────────────────────────────────────╮
+│ >_ ∞ Codex Infinity (v<VERSION>)                   │
+│                                                    │
+│ model:     gpt-5.4 xhigh   fast   /model to change │
+│ directory: /tmp/project                            │
+╰────────────────────────────────────────────────────╯

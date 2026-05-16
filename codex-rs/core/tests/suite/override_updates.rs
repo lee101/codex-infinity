@@ -1,13 +1,13 @@
 use anyhow::Result;
 use codex_core::config::Constrained;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::COLLABORATION_MODE_CLOSE_TAG;
-use codex_core::protocol::COLLABORATION_MODE_OPEN_TAG;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::RolloutItem;
-use codex_core::protocol::RolloutLine;
-use codex_core::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -26,7 +26,7 @@ fn collab_mode_with_instructions(instructions: Option<&str>) -> CollaborationMod
     CollaborationMode {
         mode: ModeKind::Default,
         settings: Settings {
-            model: "gpt-5.1".to_string(),
+            model: "gpt-5.4".to_string(),
             reasoning_effort: None,
             developer_instructions: instructions.map(str::to_string),
         },
@@ -108,7 +108,7 @@ async fn override_turn_context_without_user_turn_does_not_record_permissions_upd
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -116,11 +116,14 @@ async fn override_turn_context_without_user_turn_does_not_record_permissions_upd
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -156,11 +159,14 @@ async fn override_turn_context_without_user_turn_does_not_record_environment_upd
         .submit(Op::OverrideTurnContext {
             cwd: Some(new_cwd.path().to_path_buf()),
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -193,11 +199,14 @@ async fn override_turn_context_without_user_turn_does_not_record_collaboration_u
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: Some(collaboration_mode),
             personality: None,
         })

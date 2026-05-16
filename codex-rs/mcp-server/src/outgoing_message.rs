@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
-use codex_core::protocol::Event;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::Event;
 use rmcp::model::CustomNotification;
 use rmcp::model::CustomRequest;
 use rmcp::model::ErrorData;
@@ -200,7 +200,7 @@ pub(crate) struct OutgoingNotificationParams {
     pub event: serde_json::Value,
 }
 
-// Additional mcp-specific data to be added to a [`codex_core::protocol::Event`] as notification.params._meta
+// Additional mcp-specific data to be added to a [`codex_protocol::protocol::Event`] as notification.params._meta
 // MCP Spec: https://modelcontextprotocol.io/specification/2025-06-18/basic#meta
 // Typescript Schema: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/0695a497eb50a804fc0e88c18a93a21a675d6b3e/schema/2025-06-18/schema.ts
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -228,15 +228,16 @@ pub(crate) struct OutgoingError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use anyhow::Result;
-    use codex_core::protocol::AskForApproval;
-    use codex_core::protocol::EventMsg;
-    use codex_core::protocol::SandboxPolicy;
-    use codex_core::protocol::SessionConfiguredEvent;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tempfile::NamedTempFile;
@@ -300,9 +301,11 @@ mod tests {
                 thread_name: None,
                 model: "gpt-4o".to_string(),
                 model_provider_id: "test-provider".to_string(),
+                service_tier: None,
                 approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,
-                cwd: PathBuf::from("/home/user/project"),
+                approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+                permission_profile: PermissionProfile::read_only(),
+                cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffort::default()),
                 history_log_id: 1,
                 history_entry_count: 1000,
@@ -313,7 +316,7 @@ mod tests {
         };
 
         outgoing_message_sender
-            .send_event_as_notification(&event, None)
+            .send_event_as_notification(&event, /*meta*/ None)
             .await;
 
         let result = outgoing_rx.recv().await.unwrap();
@@ -342,9 +345,11 @@ mod tests {
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),
+            service_tier: None,
             approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::ReadOnly,
-            cwd: PathBuf::from("/home/user/project"),
+            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::read_only(),
+            cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
             history_log_id: 1,
             history_entry_count: 1000,
@@ -381,10 +386,9 @@ mod tests {
                 "model": "gpt-4o",
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
-                "cwd": "/home/user/project",
+                "approvals_reviewer": "user",
+                "permission_profile": session_configured_event.permission_profile,
+                "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
                 "history_log_id": session_configured_event.history_log_id,
                 "history_entry_count": session_configured_event.history_entry_count,
@@ -408,9 +412,11 @@ mod tests {
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),
+            service_tier: None,
             approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::ReadOnly,
-            cwd: PathBuf::from("/home/user/project"),
+            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::read_only(),
+            cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
             history_log_id: 1,
             history_entry_count: 1000,
@@ -448,10 +454,9 @@ mod tests {
                 "model": "gpt-4o",
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
-                "cwd": "/home/user/project",
+                "approvals_reviewer": "user",
+                "permission_profile": session_configured_event.permission_profile,
+                "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
                 "history_log_id": session_configured_event.history_log_id,
                 "history_entry_count": session_configured_event.history_entry_count,

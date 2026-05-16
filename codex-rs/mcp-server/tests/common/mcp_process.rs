@@ -11,6 +11,7 @@ use tokio::process::ChildStdout;
 
 use anyhow::Context;
 use codex_mcp_server::CodexToolCallParam;
+use codex_terminal_detection::user_agent;
 
 use pretty_assertions::assert_eq;
 use rmcp::model::CallToolRequestParams;
@@ -18,6 +19,7 @@ use rmcp::model::ClientCapabilities;
 use rmcp::model::CustomNotification;
 use rmcp::model::CustomRequest;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::FormElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonRpcMessage;
@@ -116,9 +118,13 @@ impl McpProcess {
             meta: None,
             capabilities: ClientCapabilities {
                 elicitation: Some(ElicitationCapability {
-                    schema_validation: None,
+                    form: Some(FormElicitationCapability {
+                        schema_validation: None,
+                    }),
+                    url: None,
                 }),
                 experimental: None,
+                extensions: None,
                 roots: None,
                 sampling: None,
                 tasks: None,
@@ -127,6 +133,7 @@ impl McpProcess {
                 name: "elicitation test".into(),
                 title: Some("Elicitation Test".into()),
                 version: "0.0.0".into(),
+                description: None,
                 icons: None,
                 website_url: None,
             },
@@ -144,13 +151,13 @@ impl McpProcess {
         let initialized = self.read_jsonrpc_message().await?;
         let os_info = os_info::get();
         let build_version = env!("CARGO_PKG_VERSION");
-        let originator = codex_core::default_client::originator().value;
+        let originator = codex_login::default_client::originator().value;
         let user_agent = format!(
             "{originator}/{build_version} ({} {}; {}) {} (elicitation test; 0.0.0)",
             os_info.os_type(),
             os_info.version(),
             os_info.architecture().unwrap_or("unknown"),
-            codex_core::terminal::user_agent()
+            user_agent()
         );
         let JsonRpcMessage::Response(JsonRpcResponse {
             jsonrpc,

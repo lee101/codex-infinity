@@ -4,15 +4,16 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use codex_core::EventPersistenceMode;
 use codex_core::RolloutRecorder;
 use codex_core::RolloutRecorderParams;
 use codex_core::config::ConfigBuilder;
 use codex_core::find_archived_thread_path_by_id_str;
+use codex_core::find_thread_meta_by_name_str;
 use codex_core::find_thread_path_by_id_str;
-use codex_core::find_thread_path_by_name_str;
-use codex_core::protocol::SessionSource;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
@@ -56,10 +57,13 @@ fn write_minimal_rollout_with_id(codex_home: &Path, id: Uuid) -> PathBuf {
 }
 
 async fn upsert_thread_metadata(codex_home: &Path, thread_id: ThreadId, rollout_path: PathBuf) {
-    let runtime = StateRuntime::init(codex_home.to_path_buf(), "test-provider".to_string(), None)
+    let runtime = StateRuntime::init(codex_home.to_path_buf(), "test-provider".to_string())
         .await
         .unwrap();
-    runtime.mark_backfill_complete(None).await.unwrap();
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .unwrap();
     let mut builder = ThreadMetadataBuilder::new(
         thread_id,
         rollout_path,
@@ -167,13 +171,14 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
         &config,
         RolloutRecorderParams::new(
             thread_id,
-            None,
+            /*forked_from_id*/ None,
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),
+            EventPersistenceMode::Limited,
         ),
-        None,
-        None,
+        /*state_db_ctx*/ None,
+        /*state_builder*/ None,
     )
     .await?;
     recorder.persist().await?;
@@ -192,9 +197,10 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
         ),
     )?;
 
-    let found = find_thread_path_by_name_str(home.path(), thread_name).await?;
+    let found = find_thread_meta_by_name_str(home.path(), thread_name).await?;
 
-    let path = found.expect("expected rollout path to be found");
+    let (path, session_meta) = found.expect("expected rollout path to be found");
+    assert_eq!(session_meta.meta.id, thread_id);
     assert!(path.exists());
     let contents = std::fs::read_to_string(&path)?;
     assert!(contents.contains(&thread_id.to_string()));

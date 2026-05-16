@@ -7,7 +7,6 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_core::protocol::Op;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -19,25 +18,32 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::exec_cell::spinner;
 use crate::key_hint;
+use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
-use crate::shimmer::shimmer_spans;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_lines;
 
-const DETAILS_MAX_LINES: usize = 3;
+pub(crate) const STATUS_DETAILS_DEFAULT_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
+const STATUS_ELAPSED_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusDetailsCapitalization {
+    CapitalizeFirst,
+    Preserve,
+}
 
 /// Displays a single-line in-progress status with optional wrapped details.
 pub(crate) struct StatusIndicatorWidget {
     /// Animated header text (defaults to "Working").
     header: String,
     details: Option<String>,
+    details_max_lines: usize,
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
     show_interrupt_hint: bool,
@@ -47,7 +53,6 @@ pub(crate) struct StatusIndicatorWidget {
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
-    animations_enabled: bool,
 }
 
 // Format elapsed seconds into a compact human-friendly form used by the status line.
@@ -71,11 +76,12 @@ impl StatusIndicatorWidget {
     pub(crate) fn new(
         app_event_tx: AppEventSender,
         frame_requester: FrameRequester,
-        animations_enabled: bool,
+        _animations_enabled: bool,
     ) -> Self {
         Self {
             header: String::from("Working"),
             details: None,
+            details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
             inline_message: None,
             show_interrupt_hint: true,
             elapsed_running: Duration::ZERO,
@@ -84,12 +90,11 @@ impl StatusIndicatorWidget {
 
             app_event_tx,
             frame_requester,
-            animations_enabled,
         }
     }
 
     pub(crate) fn interrupt(&self) {
-        self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+        self.app_event_tx.interrupt();
     }
 
     /// Update the animated header label (left of the brackets).
@@ -98,10 +103,22 @@ impl StatusIndicatorWidget {
     }
 
     /// Update the details text shown below the header.
-    pub(crate) fn update_details(&mut self, details: Option<String>) {
+    pub(crate) fn update_details(
+        &mut self,
+        details: Option<String>,
+        capitalization: StatusDetailsCapitalization,
+        max_lines: usize,
+    ) {
+        self.details_max_lines = max_lines.max(1);
         self.details = details
             .filter(|details| !details.is_empty())
-            .map(|details| capitalize_first(details.trim_start()));
+            .map(|details| {
+                let trimmed = details.trim_start();
+                match capitalization {
+                    StatusDetailsCapitalization::CapitalizeFirst => capitalize_first(trimmed),
+                    StatusDetailsCapitalization::Preserve => trimmed.to_string(),
+                }
+            });
     }
 
     /// Update the inline suffix text shown after `({elapsed} • esc to interrupt)`.
@@ -171,6 +188,11 @@ impl StatusIndicatorWidget {
         self.elapsed_duration_at(now).as_secs()
     }
 
+    fn displayed_elapsed_seconds_at(&self, now: Instant) -> u64 {
+        let elapsed_seconds = self.elapsed_seconds_at(now);
+        elapsed_seconds - elapsed_seconds % STATUS_ELAPSED_REFRESH_INTERVAL.as_secs()
+    }
+
     pub fn elapsed_seconds(&self) -> u64 {
         self.elapsed_seconds_at(Instant::now())
     }
@@ -188,12 +210,12 @@ impl StatusIndicatorWidget {
         let opts = RtOptions::new(usize::from(width))
             .initial_indent(Line::from(DETAILS_PREFIX.dim()))
             .subsequent_indent(Line::from(Span::from(" ".repeat(prefix_width)).dim()))
-            .break_words(true);
+            .break_words(/*break_words*/ true);
 
         let mut out = word_wrap_lines(details.lines().map(|line| vec![line.dim()]), opts);
 
-        if out.len() > DETAILS_MAX_LINES {
-            out.truncate(DETAILS_MAX_LINES);
+        if out.len() > self.details_max_lines {
+            out.truncate(self.details_max_lines);
             let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
             let max_base_len = content_width.saturating_sub(1);
             if let Some(last) = out.last_mut()
@@ -218,19 +240,27 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        // Schedule next animation frame.
-        self.frame_requester
-            .schedule_frame_in(Duration::from_millis(32));
+        if !self.is_paused {
+            let elapsed_duration = self.elapsed_duration_at(Instant::now());
+            let elapsed_millis = elapsed_duration.as_millis();
+            let refresh_millis = STATUS_ELAPSED_REFRESH_INTERVAL.as_millis();
+            let remainder_millis = elapsed_millis % refresh_millis;
+            let delay_millis = if remainder_millis == 0 {
+                refresh_millis
+            } else {
+                refresh_millis - remainder_millis
+            };
+            let delay_millis_u64 = u64::try_from(delay_millis).unwrap_or(u64::MAX);
+            self.frame_requester
+                .schedule_frame_in(Duration::from_millis(delay_millis_u64));
+        }
         let now = Instant::now();
-        let elapsed_duration = self.elapsed_duration_at(now);
-        let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
+        let pretty_elapsed = fmt_elapsed_compact(self.displayed_elapsed_seconds_at(now));
 
         let mut spans = Vec::with_capacity(5);
-        spans.push(spinner(Some(self.last_resume_at), self.animations_enabled));
+        spans.push(spinner(Some(self.last_resume_at), false));
         spans.push(" ".into());
-        if self.animations_enabled {
-            spans.extend(shimmer_spans(&self.header));
-        } else if !self.header.is_empty() {
+        if !self.header.is_empty() {
             spans.push(self.header.clone().into());
         }
         spans.push(" ".into());
@@ -251,7 +281,10 @@ impl Renderable for StatusIndicatorWidget {
         }
 
         let mut lines = Vec::new();
-        lines.push(Line::from(spans));
+        lines.push(truncate_line_with_ellipsis_if_overflow(
+            Line::from(spans),
+            usize::from(area.width),
+        ));
         if area.height > 1 {
             // If there is enough space, add the details lines below the header.
             let details = self.wrapped_details_lines(area.width);
@@ -278,14 +311,14 @@ mod tests {
 
     #[test]
     fn fmt_elapsed_compact_formats_seconds_minutes_hours() {
-        assert_eq!(fmt_elapsed_compact(0), "0s");
-        assert_eq!(fmt_elapsed_compact(1), "1s");
-        assert_eq!(fmt_elapsed_compact(59), "59s");
-        assert_eq!(fmt_elapsed_compact(60), "1m 00s");
-        assert_eq!(fmt_elapsed_compact(61), "1m 01s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 0), "0s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 1), "1s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 59), "59s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 60), "1m 00s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 61), "1m 01s");
         assert_eq!(fmt_elapsed_compact(3 * 60 + 5), "3m 05s");
         assert_eq!(fmt_elapsed_compact(59 * 60 + 59), "59m 59s");
-        assert_eq!(fmt_elapsed_compact(3600), "1h 00m 00s");
+        assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 3600), "1h 00m 00s");
         assert_eq!(fmt_elapsed_compact(3600 + 60 + 1), "1h 01m 01s");
         assert_eq!(fmt_elapsed_compact(25 * 3600 + 2 * 60 + 3), "25h 02m 03s");
     }
@@ -294,7 +327,11 @@ mod tests {
     fn renders_with_working_header() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
+        let w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
 
         // Render into a fixed-size test terminal and snapshot the backend.
         let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
@@ -308,7 +345,11 @@ mod tests {
     fn renders_truncated() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
+        let w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
 
         // Render into a fixed-size test terminal and snapshot the backend.
         let mut terminal = Terminal::new(TestBackend::new(20, 2)).expect("terminal");
@@ -322,9 +363,17 @@ mod tests {
     fn renders_wrapped_details_panama_two_lines() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), false);
-        w.update_details(Some("A man a plan a canal panama".to_string()));
-        w.set_interrupt_hint_visible(false);
+        let mut w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        w.update_details(
+            Some("A man a plan a canal panama".to_string()),
+            StatusDetailsCapitalization::CapitalizeFirst,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
+        w.set_interrupt_hint_visible(/*visible*/ false);
 
         // Freeze time-dependent rendering (elapsed + spinner) to keep the snapshot stable.
         w.is_paused = true;
@@ -343,8 +392,11 @@ mod tests {
     fn timer_pauses_when_requested() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut widget =
-            StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
+        let mut widget = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
 
         let baseline = Instant::now();
         widget.last_resume_at = baseline;
@@ -362,18 +414,82 @@ mod tests {
     }
 
     #[test]
+    fn displayed_elapsed_rounds_down_to_ten_seconds() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget =
+            StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
+
+        let baseline = Instant::now();
+        widget.last_resume_at = baseline;
+
+        assert_eq!(widget.displayed_elapsed_seconds_at(baseline), 0);
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(9)),
+            0
+        );
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(10)),
+            10
+        );
+        assert_eq!(
+            widget.displayed_elapsed_seconds_at(baseline + Duration::from_secs(19)),
+            10
+        );
+    }
+
+    #[test]
     fn details_overflow_adds_ellipsis() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), true);
-        w.update_details(Some("abcd abcd abcd abcd".to_string()));
+        let mut w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+        w.update_details(
+            Some("abcd abcd abcd abcd".to_string()),
+            StatusDetailsCapitalization::CapitalizeFirst,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
 
-        let lines = w.wrapped_details_lines(6);
-        assert_eq!(lines.len(), DETAILS_MAX_LINES);
+        let lines = w.wrapped_details_lines(/*width*/ 6);
+        assert_eq!(lines.len(), STATUS_DETAILS_DEFAULT_MAX_LINES);
         let last = lines.last().expect("expected last details line");
         assert!(
             last.spans[1].content.as_ref().ends_with("…"),
             "expected ellipsis in last line: {last:?}"
+        );
+    }
+
+    #[test]
+    fn details_args_can_disable_capitalization_and_limit_lines() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+        w.update_details(
+            Some("cargo test -p codex-core and then cargo test -p codex-tui".to_string()),
+            StatusDetailsCapitalization::Preserve,
+            /*max_lines*/ 1,
+        );
+
+        assert_eq!(
+            w.details(),
+            Some("cargo test -p codex-core and then cargo test -p codex-tui")
+        );
+
+        let lines = w.wrapped_details_lines(/*width*/ 24);
+        assert_eq!(lines.len(), 1);
+        let last = lines.last().expect("expected one details line");
+        assert!(
+            last.spans
+                .last()
+                .is_some_and(|span| span.content.as_ref().contains('…')),
+            "expected one-line details to be ellipsized, got {last:?}"
         );
     }
 }

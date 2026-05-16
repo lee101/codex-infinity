@@ -1,7 +1,7 @@
 [package]
 name = "codex-network-proxy"
-edition = "2024"
-version = { workspace = true }
+edition.workspace = true
+version.workspace = true
 license.workspace = true
 
 [lib]
@@ -15,7 +15,9 @@ workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+chrono = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-home-dir = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 globset = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

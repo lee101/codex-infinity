@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_core::parse_command::extract_shell_command;
+use codex_shell_command::parse_command::extract_shell_command;
 use dirs::home_dir;
 use shlex::try_join;
 
@@ -14,6 +14,22 @@ pub(crate) fn strip_bash_lc_and_escape(command: &[String]) -> String {
         return script.to_string();
     }
     escape_command(command)
+}
+
+pub(crate) fn split_command_string(command: &str) -> Vec<String> {
+    let Some(parts) = shlex::split(command) else {
+        return vec![command.to_string()];
+    };
+    match shlex::try_join(parts.iter().map(String::as_str)) {
+        Ok(round_trip)
+            if round_trip == command
+                || (!command.contains(":\\")
+                    && shlex::split(&round_trip).as_ref() == Some(&parts)) =>
+        {
+            parts
+        }
+        _ => vec![command.to_string()],
+    }
 }
 
 /// If `path` is absolute and inside $HOME, return the part *after* the home
@@ -66,5 +82,26 @@ mod tests {
         let args = vec!["/bin/bash".into(), "-lc".into(), "echo hello".into()];
         let cmdline = strip_bash_lc_and_escape(&args);
         assert_eq!(cmdline, "echo hello");
+    }
+
+    #[test]
+    fn split_command_string_round_trips_shell_wrappers() {
+        let command =
+            shlex::try_join(["/bin/zsh", "-lc", r#"python3 -c 'print("Hello, world!")'"#])
+                .expect("round-trippable command");
+        assert_eq!(
+            split_command_string(&command),
+            vec![
+                "/bin/zsh".to_string(),
+                "-lc".to_string(),
+                r#"python3 -c 'print("Hello, world!")'"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_command_string_preserves_non_roundtrippable_windows_commands() {
+        let command = r#"C:\Program Files\Git\bin\bash.exe -lc "echo hi""#;
+        assert_eq!(split_command_string(command), vec![command.to_string()]);
     }
 }

@@ -1,14 +1,18 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use codex_core::AuthManager;
+use codex_arg0::Arg0DispatchPaths;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::default_client::USER_AGENT_SUFFIX;
-use codex_core::default_client::get_codex_user_agent;
-use codex_core::protocol::Submission;
+use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
+use codex_login::AuthManager;
+use codex_login::default_client::USER_AGENT_SUFFIX;
+use codex_login::default_client::get_codex_user_agent;
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::Submission;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientNotification;
@@ -25,7 +29,6 @@ use rmcp::model::RequestId;
 use rmcp::model::ServerCapabilities;
 use rmcp::model::ToolsCapability;
 use serde_json::json;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task;
 
@@ -38,7 +41,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
-    codex_linux_sandbox_exe: Option<PathBuf>,
+    arg0_paths: Arg0DispatchPaths,
     thread_manager: Arc<ThreadManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 }
@@ -46,26 +49,34 @@ pub(crate) struct MessageProcessor {
 impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
-    pub(crate) fn new(
+    pub(crate) async fn new(
         outgoing: OutgoingMessageSender,
-        codex_linux_sandbox_exe: Option<PathBuf>,
+        arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
+        environment_manager: Arc<EnvironmentManager>,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
-        let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
-            false,
-            config.cli_auth_credentials_store_mode,
-        );
+        let auth_manager = AuthManager::shared_from_config(
+            config.as_ref(),
+            /*enable_codex_api_key_env*/ false,
+        )
+        .await;
         let thread_manager = Arc::new(ThreadManager::new(
-            config.codex_home.clone(),
+            config.as_ref(),
             auth_manager,
             SessionSource::Mcp,
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+            environment_manager,
+            /*analytics_events_client*/ None,
         ));
         Self {
             outgoing,
             initialized: false,
-            codex_linux_sandbox_exe,
+            arg0_paths,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -209,6 +220,7 @@ impl MessageProcessor {
             name: "codex-mcp-server".to_string(),
             title: Some("Codex".to_string()),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            description: None,
             icons: None,
             website_url: None,
         };
@@ -306,12 +318,16 @@ impl MessageProcessor {
         params: Option<rmcp::model::PaginatedRequestParams>,
     ) {
         tracing::trace!("tools/list -> {params:?}");
+        let mut tools = vec![
+            create_tool_for_codex_tool_call_param(),
+            create_tool_for_codex_tool_call_reply_param(),
+        ];
+        if crate::ra1_tool::is_ra1_available() {
+            tools.push(crate::ra1_tool::create_tool_for_ra1_art_generator());
+        }
         let result = rmcp::model::ListToolsResult {
             meta: None,
-            tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
-            ],
+            tools,
             next_cursor: None,
         };
 
@@ -329,6 +345,10 @@ impl MessageProcessor {
             "codex-reply" => {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
+            }
+            "ra1-art-generator" => {
+                let result = crate::ra1_tool::handle_ra1_art_generator(arguments).await;
+                self.outgoing.send_response(id, result).await;
             }
             _ => {
                 let result = CallToolResult {
@@ -350,10 +370,7 @@ impl MessageProcessor {
         let arguments = arguments.map(serde_json::Value::Object);
         let (initial_prompt, config): (String, Config) = match arguments {
             Some(json_val) => match serde_json::from_value::<CodexToolCallParam>(json_val) {
-                Ok(tool_cfg) => match tool_cfg
-                    .into_config(self.codex_linux_sandbox_exe.clone())
-                    .await
-                {
+                Ok(tool_cfg) => match tool_cfg.into_config(self.arg0_paths.clone()).await {
                     Ok(cfg) => cfg,
                     Err(e) => {
                         let result = CallToolResult {
@@ -570,7 +587,8 @@ impl MessageProcessor {
         if let Err(e) = codex_arc
             .submit_with_id(Submission {
                 id: request_id_string,
-                op: codex_core::protocol::Op::Interrupt,
+                op: codex_protocol::protocol::Op::Interrupt,
+                trace: None,
             })
             .await
         {

@@ -1,5 +1,32 @@
 # npm releases
 
+## Codex Infinity local publish
+
+To publish a new `@codex-infinity/codex-infinity` package with the current Rust
+binary:
+
+```bash
+cd codex-cli
+npm run deploy
+```
+
+This builds `codex-rs`, copies `target/release/codex` into
+`codex-cli/vendor/x86_64-unknown-linux-gnu/codex/codex`, bumps the package patch
+version, verifies the Linux x64 vendor payload, and runs `npm publish --access
+public`.
+
+Preview the package without publishing:
+
+```bash
+cd codex-cli
+npm run deploy:dry-run
+```
+
+Use `scripts/deploy_new_binary.sh --no-bump` only when `package.json` already
+contains an unpublished version.
+
+## OpenAI release staging
+
 Use the staging helper in the repo root to generate npm tarballs for a release. For
 example, to stage the CLI, responses proxy, and SDK packages for version `0.6.0`:
 

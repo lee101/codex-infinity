@@ -22,6 +22,23 @@
     },
     "Model": {
       "properties": {
+        "additionalSpeedTiers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "availabilityNux": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelAvailabilityNux"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "defaultReasoningEffort": {
           "$ref": "#/definitions/ReasoningEffort"
         },
@@ -30,6 +47,9 @@
         },
         "displayName": {
           "type": "string"
+        },
+        "hidden": {
+          "type": "boolean"
         },
         "id": {
           "type": "string"
@@ -65,16 +85,67 @@
             "string",
             "null"
           ]
+        },
+        "upgradeInfo": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelUpgradeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "defaultReasoningEffort",
         "description",
         "displayName",
+        "hidden",
         "id",
         "isDefault",
         "model",
         "supportedReasoningEfforts"
+      ],
+      "type": "object"
+    },
+    "ModelAvailabilityNux": {
+      "properties": {
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
+    "ModelUpgradeInfo": {
+      "properties": {
+        "migrationMarkdown": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "modelLink": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upgradeCopy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     },

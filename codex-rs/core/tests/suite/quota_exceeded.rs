@@ -1,6 +1,6 @@
 use anyhow::Result;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -41,11 +41,13 @@ async fn quota_exceeded_emits_single_error_event() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "quota?".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();

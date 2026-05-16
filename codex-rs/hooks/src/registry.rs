@@ -1,41 +1,175 @@
+use codex_config::ConfigLayerStack;
+use codex_plugin::PluginHookSource;
 use tokio::process::Command;
 
+use crate::engine::ClaudeHooksEngine;
+use crate::engine::CommandShell;
+use crate::events::permission_request::PermissionRequestOutcome;
+use crate::events::permission_request::PermissionRequestRequest;
+use crate::events::post_tool_use::PostToolUseOutcome;
+use crate::events::post_tool_use::PostToolUseRequest;
+use crate::events::pre_tool_use::PreToolUseOutcome;
+use crate::events::pre_tool_use::PreToolUseRequest;
+use crate::events::session_start::SessionStartOutcome;
+use crate::events::session_start::SessionStartRequest;
+use crate::events::stop::StopOutcome;
+use crate::events::stop::StopRequest;
+use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
+use crate::events::user_prompt_submit::UserPromptSubmitRequest;
 use crate::types::Hook;
 use crate::types::HookEvent;
-use crate::types::HookOutcome;
 use crate::types::HookPayload;
+use crate::types::HookResponse;
 
 #[derive(Default, Clone)]
-pub struct Hooks {
-    after_agent: Vec<Hook>,
+pub struct HooksConfig {
+    pub legacy_notify_argv: Option<Vec<String>>,
+    pub feature_enabled: bool,
+    pub config_layer_stack: Option<ConfigLayerStack>,
+    pub plugin_hook_sources: Vec<PluginHookSource>,
+    pub plugin_hook_load_warnings: Vec<String>,
+    pub shell_program: Option<String>,
+    pub shell_args: Vec<String>,
 }
 
-// Hooks are arbitrary, user-specified functions that are deterministically
-// executed after specific events in the Codex lifecycle.
+#[derive(Clone)]
+pub struct Hooks {
+    after_agent: Vec<Hook>,
+    after_tool_use: Vec<Hook>,
+    engine: ClaudeHooksEngine,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Self::new(HooksConfig::default())
+    }
+}
+
 impl Hooks {
-    pub fn new(notify: Option<Vec<String>>) -> Self {
-        let after_agent = notify
+    pub fn new(config: HooksConfig) -> Self {
+        let after_agent = config
+            .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
             .map(crate::notify_hook)
             .into_iter()
             .collect();
-        Self { after_agent }
+        let engine = ClaudeHooksEngine::new(
+            config.feature_enabled,
+            config.config_layer_stack.as_ref(),
+            config.plugin_hook_sources,
+            config.plugin_hook_load_warnings,
+            CommandShell {
+                program: config.shell_program.unwrap_or_default(),
+                args: config.shell_args,
+            },
+        );
+        Self {
+            after_agent,
+            after_tool_use: Vec::new(),
+            engine,
+        }
+    }
+
+    pub fn startup_warnings(&self) -> &[String] {
+        self.engine.warnings()
     }
 
     fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
         match hook_event {
             HookEvent::AfterAgent { .. } => &self.after_agent,
+            HookEvent::AfterToolUse { .. } => &self.after_tool_use,
         }
     }
 
-    pub async fn dispatch(&self, hook_payload: HookPayload) {
-        // TODO(gt): support interrupting program execution by returning a result here.
-        for hook in self.hooks_for_event(&hook_payload.hook_event) {
+    pub async fn dispatch(&self, hook_payload: HookPayload) -> Vec<HookResponse> {
+        let hooks = self.hooks_for_event(&hook_payload.hook_event);
+        let mut outcomes = Vec::with_capacity(hooks.len());
+        for hook in hooks {
             let outcome = hook.execute(&hook_payload).await;
-            if matches!(outcome, HookOutcome::Stop) {
+            let should_abort_operation = outcome.result.should_abort_operation();
+            outcomes.push(outcome);
+            if should_abort_operation {
                 break;
             }
         }
+
+        outcomes
+    }
+
+    pub fn preview_session_start(
+        &self,
+        request: &SessionStartRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_session_start(request)
+    }
+
+    pub fn preview_pre_tool_use(
+        &self,
+        request: &PreToolUseRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_pre_tool_use(request)
+    }
+
+    pub fn preview_permission_request(
+        &self,
+        request: &PermissionRequestRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_permission_request(request)
+    }
+
+    pub fn preview_post_tool_use(
+        &self,
+        request: &PostToolUseRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_post_tool_use(request)
+    }
+
+    pub async fn run_session_start(
+        &self,
+        request: SessionStartRequest,
+        turn_id: Option<String>,
+    ) -> SessionStartOutcome {
+        self.engine.run_session_start(request, turn_id).await
+    }
+
+    pub async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
+        self.engine.run_pre_tool_use(request).await
+    }
+
+    pub async fn run_permission_request(
+        &self,
+        request: PermissionRequestRequest,
+    ) -> PermissionRequestOutcome {
+        self.engine.run_permission_request(request).await
+    }
+
+    pub async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome {
+        self.engine.run_post_tool_use(request).await
+    }
+
+    pub fn preview_user_prompt_submit(
+        &self,
+        request: &UserPromptSubmitRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_user_prompt_submit(request)
+    }
+
+    pub async fn run_user_prompt_submit(
+        &self,
+        request: UserPromptSubmitRequest,
+    ) -> UserPromptSubmitOutcome {
+        self.engine.run_user_prompt_submit(request).await
+    }
+
+    pub fn preview_stop(
+        &self,
+        request: &StopRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_stop(request)
+    }
+
+    pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
+        self.engine.run_stop(request).await
     }
 }
 
@@ -47,252 +181,4 @@ pub fn command_from_argv(argv: &[String]) -> Option<Command> {
     let mut command = Command::new(program);
     command.args(args);
     Some(command)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::process::Stdio;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use anyhow::Result;
-    use chrono::TimeZone;
-    use chrono::Utc;
-    use codex_protocol::ThreadId;
-    use pretty_assertions::assert_eq;
-    use serde_json::to_string;
-    use tempfile::tempdir;
-    use tokio::time::timeout;
-
-    use super::*;
-    use crate::types::HookEventAfterAgent;
-
-    const CWD: &str = "/tmp";
-    const INPUT_MESSAGE: &str = "hello";
-
-    fn hook_payload(label: &str) -> HookPayload {
-        HookPayload {
-            session_id: ThreadId::new(),
-            cwd: PathBuf::from(CWD),
-            triggered_at: Utc
-                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
-                .single()
-                .expect("valid timestamp"),
-            hook_event: HookEvent::AfterAgent {
-                event: HookEventAfterAgent {
-                    thread_id: ThreadId::new(),
-                    turn_id: format!("turn-{label}"),
-                    input_messages: vec![INPUT_MESSAGE.to_string()],
-                    last_assistant_message: Some("hi".to_string()),
-                },
-            },
-        }
-    }
-
-    fn counting_hook(calls: &Arc<AtomicUsize>, outcome: HookOutcome) -> Hook {
-        let calls = Arc::clone(calls);
-        Hook {
-            func: Arc::new(move |_| {
-                let calls = Arc::clone(&calls);
-                Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    outcome
-                })
-            }),
-        }
-    }
-
-    fn hooks_for_after_agent(hooks: Vec<Hook>) -> Hooks {
-        Hooks { after_agent: hooks }
-    }
-
-    #[test]
-    fn command_from_argv_returns_none_for_empty_args() {
-        assert!(command_from_argv(&[]).is_none());
-        assert!(command_from_argv(&["".to_string()]).is_none());
-    }
-
-    #[tokio::test]
-    async fn command_from_argv_builds_command() -> Result<()> {
-        let argv = if cfg!(windows) {
-            vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                "echo hello world".to_string(),
-            ]
-        } else {
-            vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
-        };
-        let mut command = command_from_argv(&argv).ok_or_else(|| anyhow::anyhow!("command"))?;
-        let output = command.stdout(Stdio::piped()).output().await?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim_end_matches(['\r', '\n']);
-        assert_eq!(trimmed, "hello world");
-        Ok(())
-    }
-
-    #[test]
-    fn hooks_new_requires_program_name() {
-        assert!(Hooks::new(None).after_agent.is_empty());
-        assert!(Hooks::new(Some(vec![])).after_agent.is_empty());
-        assert!(
-            Hooks::new(Some(vec!["".to_string()]))
-                .after_agent
-                .is_empty()
-        );
-        assert_eq!(
-            Hooks::new(Some(vec!["notify-send".to_string()]))
-                .after_agent
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_hook() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = hooks_for_after_agent(vec![counting_hook(&calls, HookOutcome::Continue)]);
-
-        hooks.dispatch(hook_payload("1")).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn default_hook_is_noop_and_continues() {
-        let payload = hook_payload("d");
-        let outcome = Hook::default().execute(&payload).await;
-        assert_eq!(outcome, HookOutcome::Continue);
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_multiple_hooks_for_same_event() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = hooks_for_after_agent(vec![
-            counting_hook(&calls, HookOutcome::Continue),
-            counting_hook(&calls, HookOutcome::Continue),
-        ]);
-
-        hooks.dispatch(hook_payload("2")).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn dispatch_stops_when_hook_returns_stop() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = hooks_for_after_agent(vec![
-            counting_hook(&calls, HookOutcome::Stop),
-            counting_hook(&calls, HookOutcome::Continue),
-        ]);
-
-        hooks.dispatch(hook_payload("3")).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn hook_executes_program_with_payload_argument_unix() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let payload_path = temp_dir.path().join("payload.json");
-        let payload_path_arg = payload_path.to_string_lossy().into_owned();
-        let hook = Hook {
-            func: Arc::new(move |payload: &HookPayload| {
-                let payload_path_arg = payload_path_arg.clone();
-                Box::pin(async move {
-                    let json = to_string(payload).expect("serialize hook payload");
-                    let mut command = command_from_argv(&[
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        "printf '%s' \"$2\" > \"$1\"".to_string(),
-                        "sh".to_string(),
-                        payload_path_arg,
-                        json,
-                    ])
-                    .expect("build command");
-                    command.status().await.expect("run hook command");
-                    HookOutcome::Continue
-                })
-            }),
-        };
-
-        let payload = hook_payload("4");
-        let expected = to_string(&payload)?;
-
-        let hooks = hooks_for_after_agent(vec![hook]);
-        hooks.dispatch(payload).await;
-
-        let contents = timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(contents) = fs::read_to_string(&payload_path)
-                    && !contents.is_empty()
-                {
-                    return contents;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-
-        assert_eq!(contents, expected);
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn hook_executes_program_with_payload_argument_windows() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let payload_path = temp_dir.path().join("payload.json");
-        let payload_path_arg = payload_path.to_string_lossy().into_owned();
-        let script_path = temp_dir.path().join("write_payload.ps1");
-        fs::write(&script_path, "[IO.File]::WriteAllText($args[0], $args[1])")?;
-        let script_path_arg = script_path.to_string_lossy().into_owned();
-        let hook = Hook {
-            func: Arc::new(move |payload: &HookPayload| {
-                let payload_path_arg = payload_path_arg.clone();
-                let script_path_arg = script_path_arg.clone();
-                Box::pin(async move {
-                    let json = to_string(payload).expect("serialize hook payload");
-                    let mut command = command_from_argv(&[
-                        "powershell.exe".to_string(),
-                        "-NoLogo".to_string(),
-                        "-NoProfile".to_string(),
-                        "-ExecutionPolicy".to_string(),
-                        "Bypass".to_string(),
-                        "-File".to_string(),
-                        script_path_arg,
-                        payload_path_arg,
-                        json,
-                    ])
-                    .expect("build command");
-                    command.status().await.expect("run hook command");
-                    HookOutcome::Continue
-                })
-            }),
-        };
-
-        let payload = hook_payload("4");
-        let expected = to_string(&payload)?;
-
-        let hooks = hooks_for_after_agent(vec![hook]);
-        hooks.dispatch(payload).await;
-
-        let contents = timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(contents) = fs::read_to_string(&payload_path)
-                    && !contents.is_empty()
-                {
-                    return contents;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-
-        assert_eq!(contents, expected);
-        Ok(())
-    }
 }

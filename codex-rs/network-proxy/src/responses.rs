@@ -3,15 +3,15 @@ use crate::network_policy::NetworkPolicyDecision;
 use crate::network_policy::NetworkProtocol;
 use crate::reasons::REASON_DENIED;
 use crate::reasons::REASON_METHOD_NOT_ALLOWED;
+use crate::reasons::REASON_MITM_REQUIRED;
 use crate::reasons::REASON_NOT_ALLOWED;
 use crate::reasons::REASON_NOT_ALLOWED_LOCAL;
+use crate::reasons::REASON_PROXY_DISABLED;
 use rama_http::Body;
 use rama_http::Response;
 use rama_http::StatusCode;
 use serde::Serialize;
 use tracing::error;
-
-const NETWORK_POLICY_DECISION_PREFIX: &str = "CODEX_NETWORK_POLICY_DECISION";
 
 pub struct PolicyDecisionDetails<'a> {
     pub decision: NetworkPolicyDecision,
@@ -20,17 +20,6 @@ pub struct PolicyDecisionDetails<'a> {
     pub protocol: NetworkProtocol,
     pub host: &'a str,
     pub port: u16,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PolicyDecisionPayload<'a> {
-    decision: &'a str,
-    reason: &'a str,
-    source: &'a str,
-    protocol: &'a str,
-    host: &'a str,
-    port: u16,
 }
 
 pub fn text_response(status: StatusCode, body: &str) -> Response {
@@ -64,49 +53,34 @@ pub fn blocked_header_value(reason: &str) -> &'static str {
         REASON_NOT_ALLOWED | REASON_NOT_ALLOWED_LOCAL => "blocked-by-allowlist",
         REASON_DENIED => "blocked-by-denylist",
         REASON_METHOD_NOT_ALLOWED => "blocked-by-method-policy",
+        REASON_MITM_REQUIRED => "blocked-by-mitm-required",
         _ => "blocked-by-policy",
     }
 }
 
 pub fn blocked_message(reason: &str) -> &'static str {
     match reason {
-        REASON_NOT_ALLOWED => "Codex blocked this request: domain not in allowlist.",
-        REASON_NOT_ALLOWED_LOCAL => {
-            "Codex blocked this request: local/private addresses not allowed."
-        }
-        REASON_DENIED => "Codex blocked this request: domain denied by policy.",
-        REASON_METHOD_NOT_ALLOWED => {
-            "Codex blocked this request: method not allowed in limited mode."
-        }
-        _ => "Codex blocked this request by network policy.",
+        REASON_NOT_ALLOWED => "Domain not in allowlist.",
+        REASON_NOT_ALLOWED_LOCAL => "Sandbox policy blocks local/private network addresses.",
+        REASON_DENIED => "Domain denied by the sandbox policy.",
+        REASON_METHOD_NOT_ALLOWED => "Method not allowed in limited mode.",
+        REASON_MITM_REQUIRED => "MITM required for limited HTTPS.",
+        REASON_PROXY_DISABLED => "network proxy is disabled",
+        _ => "Request blocked by network policy.",
     }
 }
 
-pub fn policy_decision_prefix(details: &PolicyDecisionDetails<'_>) -> String {
-    let payload = PolicyDecisionPayload {
-        decision: details.decision.as_str(),
-        reason: details.reason,
-        source: details.source.as_str(),
-        protocol: details.protocol.as_policy_protocol(),
-        host: details.host,
-        port: details.port,
-    };
-    let payload_json = match serde_json::to_string(&payload) {
-        Ok(json) => json,
-        Err(err) => {
-            error!("failed to serialize policy decision payload: {err}");
-            "{}".to_string()
-        }
-    };
-    format!("{NETWORK_POLICY_DECISION_PREFIX} {payload_json}")
+pub fn blocked_text_response(reason: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "text/plain")
+        .header("x-proxy-error", blocked_header_value(reason))
+        .body(Body::from(blocked_message(reason)))
+        .unwrap_or_else(|_| Response::new(Body::from("blocked")))
 }
-
 pub fn blocked_message_with_policy(reason: &str, details: &PolicyDecisionDetails<'_>) -> String {
-    format!(
-        "{}\n{}",
-        policy_decision_prefix(details),
-        blocked_message(reason)
-    )
+    let _ = (details.reason, details.host);
+    blocked_message(reason).to_string()
 }
 
 pub fn blocked_text_response_with_policy(
@@ -128,7 +102,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn policy_decision_prefix_serializes_expected_payload() {
+    fn blocked_message_with_policy_returns_human_message() {
         let details = PolicyDecisionDetails {
             decision: NetworkPolicyDecision::Ask,
             reason: REASON_NOT_ALLOWED,
@@ -138,29 +112,7 @@ mod tests {
             port: 443,
         };
 
-        let line = policy_decision_prefix(&details);
-        assert_eq!(
-            line,
-            r#"CODEX_NETWORK_POLICY_DECISION {"decision":"ask","reason":"not_allowed","source":"decider","protocol":"https_connect","host":"api.example.com","port":443}"#
-        );
-    }
-
-    #[test]
-    fn blocked_message_with_policy_includes_prefix_and_human_message() {
-        let details = PolicyDecisionDetails {
-            decision: NetworkPolicyDecision::Deny,
-            reason: REASON_NOT_ALLOWED,
-            source: NetworkDecisionSource::BaselinePolicy,
-            protocol: NetworkProtocol::Http,
-            host: "api.example.com",
-            port: 80,
-        };
-
         let message = blocked_message_with_policy(REASON_NOT_ALLOWED, &details);
-        assert_eq!(
-            message,
-            r#"CODEX_NETWORK_POLICY_DECISION {"decision":"deny","reason":"not_allowed","source":"baseline_policy","protocol":"http","host":"api.example.com","port":80}
-Codex blocked this request: domain not in allowlist."#
-        );
+        assert_eq!(message, "Domain not in allowlist.");
     }
 }
