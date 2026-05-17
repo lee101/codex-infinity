@@ -21,7 +21,8 @@ set -e
 
 CODEX_LOCAL="${CODEX_LOCAL:-$HOME/code/codex/codex-rs/target/release/codex}"
 
-for cmd in npm git; do
+# verify required tools
+for cmd in cargo npm git; do
     command -v "$cmd" >/dev/null || { echo "FATAL: $cmd not found in PATH"; exit 1; }
 done
 [ -x "$CODEX_LOCAL" ] || { echo "FATAL: local codex not found at $CODEX_LOCAL"; exit 1; }
