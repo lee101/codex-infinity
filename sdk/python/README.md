@@ -24,14 +24,45 @@ automatically.
 from codex_app_server import Codex
 
 with Codex() as codex:
+    # Call login_api_key(...) first when this app-server session is not
+    # already authenticated.
     thread = codex.thread_start(model="gpt-5")
     result = thread.run("Say hello in one sentence.")
     print(result.final_response)
     print(len(result.items))
 ```
 
-`result.final_response` is `None` when the turn completes without a final-answer
-or phase-less assistant message item.
+`thread.run(...)` and `thread.turn(...).run()` return `TurnResult`. Its
+`final_response` is `None` when the turn completes without a final-answer or
+phase-less assistant message item.
+
+## Login
+
+Use the auth helper that matches your app:
+
+```python
+from openai_codex import Codex
+
+with Codex() as codex:
+    codex.login_api_key("sk-...")
+    account = codex.account()
+    print(account.account)
+```
+
+Interactive ChatGPT login returns a handle. Open the provided URL or device-code
+page, then wait for the matching completion event:
+
+```python
+with Codex() as codex:
+    login = codex.login_chatgpt()
+    print(login.auth_url)
+    completed = login.wait()
+    print(completed.success)
+```
+
+Use `login_chatgpt_device_code()` for device-code auth, `handle.cancel()` to
+stop an in-progress interactive login, and `logout()` to clear the active
+app-server account session.
 
 ## Docs map
 
@@ -105,6 +136,8 @@ This supports the CI release flow:
 
 - `Codex()` is eager and performs startup + `initialize` in the constructor.
 - Use context managers (`with Codex() as codex:`) to ensure shutdown.
+- Plain strings are accepted anywhere a turn input is accepted; they are
+  shorthand for `TextInput(...)`.
 - Prefer `thread.run("...")` for the common case. Use `thread.turn(...)` when
   you need streaming, steering, or interrupt control.
 - For transient overload, use `codex_app_server.retry.retry_on_overload`.

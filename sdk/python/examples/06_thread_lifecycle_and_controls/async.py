@@ -49,21 +49,17 @@ async def main() -> None:
         except Exception as exc:
             forked_info = f"skipped({type(exc).__name__})"
 
-        compact_info = "sent"
-        try:
-            _ = await unarchived.compact()
-        except Exception as exc:
-            compact_info = f"skipped({type(exc).__name__})"
+        compact_result = await unarchived.compact()
 
         print("Lifecycle OK:", thread.id)
         print("first:", first.id, first.status)
         print("second:", second.id, second.status)
-        print("read.turns:", len(reading.thread.turns or []))
+        print("read.turns:", len(reading.thread.turns))
         print("list.active:", len(listing_active.data))
         print("list.archived:", len(listing_archived.data))
-        print("resumed:", resumed_info)
-        print("forked:", forked_info)
-        print("compact:", compact_info)
+        print("resumed:", resumed_result.id, resumed_result.status)
+        print("forked:", forked_result.id, forked_result.status)
+        print("compact:", compact_result.model_dump(mode="json", by_alias=True))
 
 
 if __name__ == "__main__":

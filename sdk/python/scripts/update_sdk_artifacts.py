@@ -863,7 +863,7 @@ def _render_thread_block(
     lines = [
         "    def turn(",
         "        self,",
-        "        input: Input,",
+        "        input: RunInput,",
         "        *,",
         *_kw_signature_lines(turn_fields),
         "    ) -> TurnHandle:",
@@ -885,7 +885,7 @@ def _render_async_thread_block(
     lines = [
         "    async def turn(",
         "        self,",
-        "        input: Input,",
+        "        input: RunInput,",
         "        *,",
         *_kw_signature_lines(turn_fields),
         "    ) -> AsyncTurnHandle:",

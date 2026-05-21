@@ -39,19 +39,23 @@ from .generated.v2_all import (
 from .models import InitializeResponse
 from .api import (
     AsyncCodex,
+    AsyncDeviceCodeLoginHandle,
     AsyncThread,
     AsyncTurnHandle,
+    ChatgptLoginHandle,
     Codex,
+    DeviceCodeLoginHandle,
     ImageInput,
     Input,
     InputItem,
     LocalImageInput,
     MentionInput,
-    RunResult,
+    RunInput,
     SkillInput,
     TextInput,
     Thread,
     TurnHandle,
+    TurnResult,
 )
 from .retry import retry_on_overload
 from ._version import __version__
@@ -71,6 +75,7 @@ __all__ = [
     "RunResult",
     "Input",
     "InputItem",
+    "RunInput",
     "TextInput",
     "ImageInput",
     "LocalImageInput",

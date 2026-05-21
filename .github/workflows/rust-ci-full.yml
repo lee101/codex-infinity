@@ -507,56 +507,30 @@ jobs:
             /var/cache/apt
           key: apt-${{ matrix.runner }}-${{ matrix.target }}-v1
 
-  tests:
-    name: Tests — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.remote_env == 'true' && ' (remote)' || '' }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
-    # Perhaps we can bring this back down to 30m once we finish the cutover
-    # from tui_app_server/ to tui/. Incidentally, windows-arm64 was the main
-    # offender for exceeding the timeout.
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: codex-rs
-    env:
-      # Speed up repeated builds across CI runs by caching compiled objects, except on
-      # arm64 macOS runners cross-targeting x86_64 where ring/cc-rs can produce
-      # mixed-architecture archives under sccache.
-      USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
-      CARGO_INCREMENTAL: "0"
-      SCCACHE_CACHE_SIZE: 10G
+  tests_macos_aarch64:
+    name: Tests — macos-15-xlarge - aarch64-apple-darwin
+    uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
+    with:
+      runner: macos-15-xlarge
+      target: aarch64-apple-darwin
+      profile: ci-test
+      artifact_id: macos-aarch64
+      use_sccache: true
+    secrets: inherit
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15-xlarge
-            target: aarch64-apple-darwin
-            profile: dev
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            profile: dev
-            remote_env: "true"
-            runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            profile: dev
-            runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            profile: dev
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            profile: dev
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+  tests_linux_x64_remote:
+    name: Tests — ubuntu-24.04 - x86_64-unknown-linux-gnu (remote)
+    uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
+    with:
+      runner: ubuntu-24.04
+      runner_group: codex-runners
+      runner_labels: codex-linux-x64
+      target: x86_64-unknown-linux-gnu
+      profile: ci-test
+      artifact_id: linux-x64-remote
+      remote_env: true
+      use_sccache: true
+    secrets: inherit
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -570,10 +544,18 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
           fi
 
-      # Some integration tests rely on DotSlash being installed.
-      # See https://github.com/openai/codex/pull/7617.
-      - name: Install DotSlash
-        uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+  tests_windows_x64:
+    name: Tests — windows-x64 - x86_64-pc-windows-msvc
+    uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
+    with:
+      runner: windows-x64
+      runner_group: codex-runners
+      runner_labels: codex-windows-x64
+      target: x86_64-pc-windows-msvc
+      profile: ci-test
+      artifact_id: windows-x64
+      test_threads: 8
+    secrets: inherit
 
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
@@ -743,7 +725,11 @@ jobs:
         argument_comment_lint_package,
         argument_comment_lint_prebuilt,
         lint_build,
-        tests,
+        tests_macos_aarch64,
+        tests_linux_x64_remote,
+        tests_linux_arm64,
+        tests_windows_x64,
+        tests_windows_arm64,
       ]
     if: always()
     runs-on: ubuntu-24.04
@@ -756,13 +742,21 @@ jobs:
           echo "general: ${{ needs.general.result }}"
           echo "shear  : ${{ needs.cargo_shear.result }}"
           echo "lint   : ${{ needs.lint_build.result }}"
-          echo "tests  : ${{ needs.tests.result }}"
+          echo "test macos : ${{ needs.tests_macos_aarch64.result }}"
+          echo "test linux : ${{ needs.tests_linux_x64_remote.result }}"
+          echo "test arm64 : ${{ needs.tests_linux_arm64.result }}"
+          echo "test winx64: ${{ needs.tests_windows_x64.result }}"
+          echo "test winarm: ${{ needs.tests_windows_arm64.result }}"
           [[ '${{ needs.argument_comment_lint_package.result }}' == 'success' ]] || { echo 'argument_comment_lint_package failed'; exit 1; }
           [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
           [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
+          [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
+          [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
+          [[ '${{ needs.tests_linux_arm64.result }}' == 'success' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_x64.result }}' == 'success' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_arm64.result }}' == 'success' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
 
       - name: sccache summary note
         if: always()

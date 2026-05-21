@@ -7,7 +7,7 @@ import sys
 import tempfile
 import zlib
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterator
 
 _SDK_PYTHON_DIR = Path(__file__).resolve().parents[1]
 _SDK_PYTHON_STR = str(_SDK_PYTHON_DIR)

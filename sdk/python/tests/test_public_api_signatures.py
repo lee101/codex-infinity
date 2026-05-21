@@ -268,7 +268,7 @@ def test_lifecycle_methods_are_codex_scoped() -> None:
 
 def test_initialize_metadata_parses_user_agent_shape() -> None:
     payload = InitializeResponse.model_validate({"userAgent": "codex-cli/1.2.3"})
-    parsed = Codex._validate_initialize(payload)
+    parsed = validate_initialize_metadata(payload)
     assert parsed is payload
     assert parsed.userAgent == "codex-cli/1.2.3"
     assert parsed.serverInfo is not None
@@ -278,7 +278,7 @@ def test_initialize_metadata_parses_user_agent_shape() -> None:
 
 def test_initialize_metadata_requires_non_empty_information() -> None:
     try:
-        Codex._validate_initialize(InitializeResponse.model_validate({}))
+        validate_initialize_metadata(InitializeResponse.model_validate({}))
     except RuntimeError as exc:
         assert "missing required metadata" in str(exc)
     else:

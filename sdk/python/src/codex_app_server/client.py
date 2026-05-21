@@ -15,7 +15,16 @@ from pydantic import BaseModel
 from .errors import AppServerError, TransportClosedError, map_jsonrpc_error
 from .generated.notification_registry import NOTIFICATION_MODELS
 from .generated.v2_all import (
+    AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
+    CancelLoginAccountResponse,
+    ChatgptDeviceCodeLoginAccountResponse,
+    ChatgptLoginAccountResponse,
+    GetAccountParams as V2GetAccountParams,
+    GetAccountResponse,
+    LoginAccountParams as V2LoginAccountParams,
+    LoginAccountResponse,
+    LogoutAccountResponse,
     ModelListResponse,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,
@@ -58,6 +67,8 @@ def _params_dict(
         | V2ThreadListParams
         | V2ThreadForkParams
         | V2TurnStartParams
+        | V2GetAccountParams
+        | V2LoginAccountParams
         | JsonObject
         | None
     ),
@@ -429,6 +440,24 @@ class AppServerClient:
             out.append(notification)
             if notification.method in target_methods:
                 return out
+
+    def wait_for_login_completed(
+        self,
+        login_id: str,
+    ) -> AccountLoginCompletedNotification:
+        """Block until the matching interactive login attempt completes."""
+        self.register_login_notifications(login_id)
+        try:
+            while True:
+                notification = self.next_login_notification(login_id)
+                if (
+                    notification.method == "account/login/completed"
+                    and isinstance(notification.payload, AccountLoginCompletedNotification)
+                    and notification.payload.login_id == login_id
+                ):
+                    return notification.payload
+        finally:
+            self.unregister_login_notifications(login_id)
 
     def stream_text(
         self,
