@@ -247,9 +247,8 @@ jobs:
           echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
           echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
-        name: Configure musl rusty_v8 artifact overrides and verify checksums
-        uses: ./.github/actions/setup-rusty-v8-musl
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}
 
@@ -363,6 +362,148 @@ jobs:
             cp target/${{ matrix.target }}/release/codex-${{ matrix.target }}.dmg "$dest/codex-${{ matrix.target }}.dmg"
           fi
 
+<<<<<<< HEAD
+||||||| 60b45d92d9
+      - name: Build Codex package archive
+        if: ${{ runner.os != 'macOS' || env.SIGN_MACOS == 'true' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLE: ${{ matrix.bundle }}
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle "$BUNDLE" \
+            --entrypoint-dir "target/${TARGET}/release" \
+            --archive-dir "dist/${TARGET}"
+
+      - name: Build Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' && (runner.os != 'macOS' || env.SIGN_MACOS == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              platform_tag="macosx_11_0_arm64"
+              ;;
+            x86_64-apple-darwin)
+              platform_tag="macosx_10_9_x86_64"
+              ;;
+            aarch64-unknown-linux-musl)
+              platform_tag="manylinux_2_17_aarch64"
+              ;;
+            x86_64-unknown-linux-musl)
+              platform_tag="manylinux_2_17_x86_64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python3 -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          # Do not install into the runner's system Python; macOS runners mark
+          # the Homebrew Python as externally managed under PEP 668.
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          stage_runtime_args=(
+            "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py"
+            stage-runtime
+            "$stage_dir"
+            "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex"
+            --codex-version "${GITHUB_REF_NAME}"
+            --platform-tag "$platform_tag"
+          )
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            # Keep bwrap in the runtime wheel so Linux sandbox fallback behavior
+            # matches the standalone release bundle on hosts without system bwrap.
+            stage_runtime_args+=(
+              --resource-binary
+              "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/bwrap"
+            )
+          fi
+          python3 "${stage_runtime_args[@]}"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Upload Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' && (runner.os != 'macOS' || env.SIGN_MACOS == 'true') }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+=======
+      - name: Build Codex package archive
+        if: ${{ runner.os != 'macOS' || env.SIGN_MACOS == 'true' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLE: ${{ matrix.bundle }}
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle "$BUNDLE" \
+            --entrypoint-dir "target/${TARGET}/release" \
+            --archive-dir "dist/${TARGET}"
+
+      - name: Build Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' && (runner.os != 'macOS' || env.SIGN_MACOS == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              platform_tag="macosx_11_0_arm64"
+              ;;
+            x86_64-apple-darwin)
+              platform_tag="macosx_10_9_x86_64"
+              ;;
+            aarch64-unknown-linux-musl)
+              platform_tag="manylinux_2_17_aarch64"
+              ;;
+            x86_64-unknown-linux-musl)
+              platform_tag="manylinux_2_17_x86_64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python3 -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          # Do not install into the runner's system Python; macOS runners mark
+          # the Homebrew Python as externally managed under PEP 668.
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          stage_runtime_args=(
+            "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py"
+            stage-runtime
+            "$stage_dir"
+            "dist/${{ matrix.target }}/codex-package-${{ matrix.target }}.tar.gz"
+            --codex-version "${GITHUB_REF_NAME}"
+            --platform-tag "$platform_tag"
+          )
+          python3 "${stage_runtime_args[@]}"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Upload Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' && (runner.os != 'macOS' || env.SIGN_MACOS == 'true') }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+>>>>>>> upstream/main
       - name: Compress artifacts
         shell: bash
         run: |
@@ -399,7 +540,497 @@ jobs:
             zstd -T0 -19 --rm "$dest/$base"
           done
 
+<<<<<<< HEAD
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+||||||| 60b45d92d9
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ runner.os != 'macOS' || env.SIGN_MACOS == 'true' }}
+        with:
+          name: ${{ matrix.artifact_name }}
+          # Upload the per-binary .zst files, .tar.gz equivalents, and any
+          # prebuilt archives staged above.
+          path: |
+            codex-rs/dist/${{ matrix.target }}/*
+
+  stage-signed-macos:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode == 'promote_signed' }}
+    needs: tag-check
+    name: Stage signed macOS handoff - ${{ matrix.target }} - ${{ matrix.bundle }}
+    runs-on: macos-15-xlarge
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            bundle: primary
+            artifact_name: aarch64-apple-darwin
+            binaries: "codex codex-responses-api-proxy"
+            build_dmg: "false"
+          - target: aarch64-apple-darwin
+            bundle: app-server
+            artifact_name: aarch64-apple-darwin-app-server
+            binaries: "codex-app-server"
+            build_dmg: "false"
+          - target: x86_64-apple-darwin
+            bundle: primary
+            artifact_name: x86_64-apple-darwin
+            binaries: "codex codex-responses-api-proxy"
+            build_dmg: "false"
+          - target: x86_64-apple-darwin
+            bundle: app-server
+            artifact_name: x86_64-apple-darwin-app-server
+            binaries: "codex-app-server"
+            build_dmg: "false"
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download signed macOS handoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_MACOS_ASSET: ${{ inputs.signed_macos_asset }}
+          SIGNED_MACOS_SHA256: ${{ inputs.signed_macos_sha256 }}
+        run: |
+          set -euo pipefail
+
+          download_dir="${RUNNER_TEMP}/signed-macos-download"
+          handoff_dir="${RUNNER_TEMP}/signed-macos-handoff"
+          rm -rf "$download_dir" "$handoff_dir"
+          mkdir -p "$download_dir" "$handoff_dir"
+
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SIGNED_MACOS_ASSET" \
+            --dir "$download_dir"
+
+          asset_count="$(find "$download_dir" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')"
+          if [[ "$asset_count" != "1" ]]; then
+            echo "Expected exactly one signed macOS handoff asset named ${SIGNED_MACOS_ASSET}; found ${asset_count}"
+            find "$download_dir" -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          asset_path="$(find "$download_dir" -maxdepth 1 -type f -print -quit)"
+          if [[ -n "${SIGNED_MACOS_SHA256}" ]]; then
+            expected_sha="$(printf '%s' "$SIGNED_MACOS_SHA256" | tr '[:upper:]' '[:lower:]')"
+            actual_sha="$(shasum -a 256 "$asset_path" | awk '{print $1}')"
+            if [[ "$actual_sha" != "$expected_sha" ]]; then
+              echo "signed_macos_sha256 mismatch for ${SIGNED_MACOS_ASSET}"
+              echo "expected: ${expected_sha}"
+              echo "actual:   ${actual_sha}"
+              exit 1
+            fi
+          fi
+
+          asset_name="$(basename "$asset_path")"
+          case "$asset_name" in
+            *.tar.zst)
+              zstd -dc "$asset_path" | tar -C "$handoff_dir" -xf -
+              ;;
+            *.tar.gz|*.tgz)
+              tar -C "$handoff_dir" -xzf "$asset_path"
+              ;;
+            *.zip)
+              ditto -x -k "$asset_path" "$handoff_dir"
+              ;;
+            *)
+              echo "Unsupported signed macOS handoff archive format: ${asset_name}"
+              exit 1
+              ;;
+          esac
+
+          echo "SIGNED_MACOS_HANDOFF_DIR=$handoff_dir" >> "$GITHUB_ENV"
+
+      - name: Stage signed macOS artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target="${{ matrix.target }}"
+          artifact_name="${{ matrix.artifact_name }}"
+          source_dir="${SIGNED_MACOS_HANDOFF_DIR}/${artifact_name}"
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}"
+          fi
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/${target}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/${target}"
+          fi
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}"
+          fi
+          if [[ ! -d "$source_dir" ]]; then
+            echo "Signed macOS handoff is missing ${artifact_name}/"
+            echo "Expected either:"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/${artifact_name}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/${target}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}"
+            find "$SIGNED_MACOS_HANDOFF_DIR" -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          dest="dist/${target}"
+          mkdir -p "$dest"
+
+          for binary in ${{ matrix.binaries }}; do
+            source_path="${source_dir}/${binary}"
+            if [[ ! -f "$source_path" ]]; then
+              source_path="${source_dir}/${binary}-${target}"
+            fi
+            if [[ ! -f "$source_path" ]]; then
+              echo "Signed macOS handoff is missing ${binary} for ${artifact_name}"
+              exit 1
+            fi
+
+            release_path="${dest}/${binary}-${target}"
+            ditto "$source_path" "$release_path"
+            chmod 0755 "$release_path"
+            codesign --verify --strict --verbose=2 "$release_path"
+          done
+
+          # DMG staging is disabled for signed promotion because we no longer
+          # distribute DMGs from this release path. Keep the branch here so the
+          # handoff can opt back in by flipping matrix.build_dmg if needed.
+          if [[ "${{ matrix.build_dmg }}" == "true" ]]; then
+            dmg_name="codex-${target}.dmg"
+            dmg_source="${source_dir}/${dmg_name}"
+            if [[ ! -f "$dmg_source" ]]; then
+              echo "Signed macOS handoff is missing ${dmg_name} for ${artifact_name}"
+              exit 1
+            fi
+
+            codesign --verify --strict --verbose=2 "$dmg_source"
+            xcrun stapler validate "$dmg_source"
+            cp "$dmg_source" "$dest/$dmg_name"
+          fi
+
+      - name: Build Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              platform_tag="macosx_11_0_arm64"
+              ;;
+            x86_64-apple-darwin)
+              platform_tag="macosx_10_9_x86_64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python3 -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          python3 \
+            "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py" \
+            stage-runtime \
+            "$stage_dir" \
+            "${GITHUB_WORKSPACE}/codex-rs/dist/${{ matrix.target }}/codex-${{ matrix.target }}" \
+            --codex-version "${GITHUB_REF_NAME}" \
+            --platform-tag "$platform_tag"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Build Codex package archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLE: ${{ matrix.bundle }}
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle "$BUNDLE" \
+            --entrypoint-dir "dist/${TARGET}" \
+            --archive-dir "dist/${TARGET}" \
+            --target-suffixed-entrypoint
+
+      - name: Upload Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+      - name: Compress artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dest="dist/${{ matrix.target }}"
+          for f in "$dest"/*; do
+            base="$(basename "$f")"
+            if [[ "$base" == *.tar.gz || "$base" == *.tar.zst || "$base" == *.zip || "$base" == *.dmg ]]; then
+              continue
+            fi
+
+            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+            zstd -T0 -19 --rm "$dest/$base"
+          done
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+=======
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ runner.os != 'macOS' || env.SIGN_MACOS == 'true' }}
+        with:
+          name: ${{ matrix.artifact_name }}
+          # Upload the per-binary .zst files, .tar.gz equivalents, and any
+          # prebuilt archives staged above.
+          path: |
+            codex-rs/dist/${{ matrix.target }}/*
+
+  stage-signed-macos:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode == 'promote_signed' }}
+    needs: tag-check
+    name: Stage signed macOS handoff - ${{ matrix.target }} - ${{ matrix.bundle }}
+    runs-on: macos-15-xlarge
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            bundle: primary
+            artifact_name: aarch64-apple-darwin
+            binaries: "codex codex-responses-api-proxy"
+            build_dmg: "false"
+          - target: aarch64-apple-darwin
+            bundle: app-server
+            artifact_name: aarch64-apple-darwin-app-server
+            binaries: "codex-app-server"
+            build_dmg: "false"
+          - target: x86_64-apple-darwin
+            bundle: primary
+            artifact_name: x86_64-apple-darwin
+            binaries: "codex codex-responses-api-proxy"
+            build_dmg: "false"
+          - target: x86_64-apple-darwin
+            bundle: app-server
+            artifact_name: x86_64-apple-darwin-app-server
+            binaries: "codex-app-server"
+            build_dmg: "false"
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download signed macOS handoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_MACOS_ASSET: ${{ inputs.signed_macos_asset }}
+          SIGNED_MACOS_SHA256: ${{ inputs.signed_macos_sha256 }}
+        run: |
+          set -euo pipefail
+
+          download_dir="${RUNNER_TEMP}/signed-macos-download"
+          handoff_dir="${RUNNER_TEMP}/signed-macos-handoff"
+          rm -rf "$download_dir" "$handoff_dir"
+          mkdir -p "$download_dir" "$handoff_dir"
+
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SIGNED_MACOS_ASSET" \
+            --dir "$download_dir"
+
+          asset_count="$(find "$download_dir" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')"
+          if [[ "$asset_count" != "1" ]]; then
+            echo "Expected exactly one signed macOS handoff asset named ${SIGNED_MACOS_ASSET}; found ${asset_count}"
+            find "$download_dir" -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          asset_path="$(find "$download_dir" -maxdepth 1 -type f -print -quit)"
+          if [[ -n "${SIGNED_MACOS_SHA256}" ]]; then
+            expected_sha="$(printf '%s' "$SIGNED_MACOS_SHA256" | tr '[:upper:]' '[:lower:]')"
+            actual_sha="$(shasum -a 256 "$asset_path" | awk '{print $1}')"
+            if [[ "$actual_sha" != "$expected_sha" ]]; then
+              echo "signed_macos_sha256 mismatch for ${SIGNED_MACOS_ASSET}"
+              echo "expected: ${expected_sha}"
+              echo "actual:   ${actual_sha}"
+              exit 1
+            fi
+          fi
+
+          asset_name="$(basename "$asset_path")"
+          case "$asset_name" in
+            *.tar.zst)
+              zstd -dc "$asset_path" | tar -C "$handoff_dir" -xf -
+              ;;
+            *.tar.gz|*.tgz)
+              tar -C "$handoff_dir" -xzf "$asset_path"
+              ;;
+            *.zip)
+              ditto -x -k "$asset_path" "$handoff_dir"
+              ;;
+            *)
+              echo "Unsupported signed macOS handoff archive format: ${asset_name}"
+              exit 1
+              ;;
+          esac
+
+          echo "SIGNED_MACOS_HANDOFF_DIR=$handoff_dir" >> "$GITHUB_ENV"
+
+      - name: Stage signed macOS artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target="${{ matrix.target }}"
+          artifact_name="${{ matrix.artifact_name }}"
+          source_dir="${SIGNED_MACOS_HANDOFF_DIR}/${artifact_name}"
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}"
+          fi
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/${target}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/${target}"
+          fi
+          if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}" ]]; then
+            source_dir="${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}"
+          fi
+          if [[ ! -d "$source_dir" ]]; then
+            echo "Signed macOS handoff is missing ${artifact_name}/"
+            echo "Expected either:"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/${artifact_name}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/${target}"
+            echo "  ${SIGNED_MACOS_HANDOFF_DIR}/dist/${target}"
+            find "$SIGNED_MACOS_HANDOFF_DIR" -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          dest="dist/${target}"
+          mkdir -p "$dest"
+
+          for binary in ${{ matrix.binaries }}; do
+            source_path="${source_dir}/${binary}"
+            if [[ ! -f "$source_path" ]]; then
+              source_path="${source_dir}/${binary}-${target}"
+            fi
+            if [[ ! -f "$source_path" ]]; then
+              echo "Signed macOS handoff is missing ${binary} for ${artifact_name}"
+              exit 1
+            fi
+
+            release_path="${dest}/${binary}-${target}"
+            ditto "$source_path" "$release_path"
+            chmod 0755 "$release_path"
+            codesign --verify --strict --verbose=2 "$release_path"
+          done
+
+          # DMG staging is disabled for signed promotion because we no longer
+          # distribute DMGs from this release path. Keep the branch here so the
+          # handoff can opt back in by flipping matrix.build_dmg if needed.
+          if [[ "${{ matrix.build_dmg }}" == "true" ]]; then
+            dmg_name="codex-${target}.dmg"
+            dmg_source="${source_dir}/${dmg_name}"
+            if [[ ! -f "$dmg_source" ]]; then
+              echo "Signed macOS handoff is missing ${dmg_name} for ${artifact_name}"
+              exit 1
+            fi
+
+            codesign --verify --strict --verbose=2 "$dmg_source"
+            xcrun stapler validate "$dmg_source"
+            cp "$dmg_source" "$dest/$dmg_name"
+          fi
+
+      - name: Build Codex package archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLE: ${{ matrix.bundle }}
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle "$BUNDLE" \
+            --entrypoint-dir "dist/${TARGET}" \
+            --archive-dir "dist/${TARGET}" \
+            --target-suffixed-entrypoint
+
+      - name: Build Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              platform_tag="macosx_11_0_arm64"
+              ;;
+            x86_64-apple-darwin)
+              platform_tag="macosx_10_9_x86_64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python3 -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          python3 \
+            "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py" \
+            stage-runtime \
+            "$stage_dir" \
+            "dist/${{ matrix.target }}/codex-package-${{ matrix.target }}.tar.gz" \
+            --codex-version "${GITHUB_REF_NAME}" \
+            --platform-tag "$platform_tag"
+          "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Upload Python runtime wheel
+        if: ${{ matrix.bundle == 'primary' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+      - name: Compress artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dest="dist/${{ matrix.target }}"
+          for f in "$dest"/*; do
+            base="$(basename "$f")"
+            if [[ "$base" == *.tar.gz || "$base" == *.tar.zst || "$base" == *.zip || "$base" == *.dmg ]]; then
+              continue
+            fi
+
+            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+            zstd -T0 -19 --rm "$dest/$base"
+          done
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+>>>>>>> upstream/main
         with:
           name: ${{ matrix.artifact_name }}
           # Upload the per-binary .zst files as well as the new .tar.gz

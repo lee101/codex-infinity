@@ -15,6 +15,7 @@ use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -52,6 +53,21 @@ fn write_plugin_skill(
     let skill_path = skill_dir.join("SKILL.md");
     fs::write(&skill_path, content).unwrap();
     skill_path
+}
+
+fn plugin_skill_root_for_skill_path(skill_path: &Path, plugin_id: &str) -> PluginSkillRoot {
+    let skills_root = skill_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("plugin skill should live under a skills root");
+    let plugin_root = skills_root
+        .parent()
+        .expect("plugin skills root should live under a plugin root");
+    PluginSkillRoot {
+        path: skills_root.abs(),
+        plugin_id: plugin_id.to_string(),
+        plugin_root: plugin_root.abs(),
+    }
 }
 
 fn test_skill(name: &str, path: PathBuf) -> SkillMetadata {
@@ -142,7 +158,7 @@ async fn skills_for_config_with_stack(
     skills_manager: &SkillsManager,
     cwd: &TempDir,
     config_layer_stack: &ConfigLayerStack,
-    effective_skill_roots: &[AbsolutePathBuf],
+    effective_skill_roots: &[PluginSkillRoot],
 ) -> SkillLoadOutcome {
     let skills_input = SkillsLoadInput::new(
         cwd.path().abs(),
@@ -217,11 +233,7 @@ async fn skills_for_config_disables_plugin_skills_by_name() {
         &codex_home,
         &name_toggle_config("sample:sample-search", /*enabled*/ false),
     );
-    let plugin_skill_root = skill_path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("plugin skill should live under a skills root")
-        .abs();
+    let plugin_skill_root = plugin_skill_root_for_skill_path(&skill_path, "test-plugin@test");
     let skills_manager = SkillsManager::new(
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ true,
