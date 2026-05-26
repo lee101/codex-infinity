@@ -97,6 +97,7 @@ use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
@@ -194,6 +195,8 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
+#[cfg(test)]
+use codex_protocol::protocol::ModelVerification as CoreModelVerification;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitReachedType;
@@ -256,6 +259,7 @@ const MULTI_AGENT_ENABLE_TITLE: &str = "Enable subagents?";
 const MULTI_AGENT_ENABLE_YES: &str = "Yes, enable";
 const MULTI_AGENT_ENABLE_NO: &str = "Not now";
 const MULTI_AGENT_ENABLE_NOTICE: &str = "Subagents will be enabled in the next session.";
+const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING: &str = "Your conversations have multiple flags for possible cybersecurity risk. Responses may take longer because extra safety checks are on. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
 const MEMORIES_DOC_URL: &str = "https://developers.openai.com/codex/memories";
 const MEMORIES_ENABLE_TITLE: &str = "Enable memories?";
 const MEMORIES_ENABLE_YES: &str = "Yes, enable";
@@ -379,6 +383,7 @@ use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod realtime;
 use self::realtime::RealtimeConversationUiState;
 use self::realtime::RenderedUserMessageEvent;
+mod reasoning_shortcuts;
 mod side;
 mod status_surfaces;
 use self::status_surfaces::CachedProjectRootName;
@@ -678,6 +683,15 @@ fn app_server_rate_limit_error_kind(info: &AppServerCodexErrorInfo) -> Option<Ra
     }
 }
 
+#[cfg(test)]
+fn is_core_cyber_policy_error(info: &CoreCodexErrorInfo) -> bool {
+    matches!(info, CoreCodexErrorInfo::CyberPolicy)
+}
+
+fn is_app_server_cyber_policy_error(info: &AppServerCodexErrorInfo) -> bool {
+    matches!(info, AppServerCodexErrorInfo::CyberPolicy)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ExternalEditorState {
     #[default]
@@ -803,6 +817,8 @@ pub(crate) struct ChatWidget {
     /// where the overlay may briefly treat new tail content as already cached.
     active_cell_revision: u64,
     config: Config,
+    /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
+    effective_service_tier: Option<ServiceTier>,
     /// The unmasked collaboration mode settings (always Default mode).
     ///
     /// Masks are applied on top of this base mode to derive the effective mode.
@@ -1428,6 +1444,7 @@ fn thread_session_state_to_legacy_event(
         approval_policy: session.approval_policy,
         approvals_reviewer: session.approvals_reviewer,
         sandbox_policy: session.sandbox_policy,
+        permission_profile: session.permission_profile,
         cwd: session.cwd,
         reasoning_effort: session.reasoning_effort,
         history_log_id: session.history_log_id,
@@ -1707,6 +1724,7 @@ fn request_permissions_from_params(
         call_id: params.item_id,
         reason: params.reason,
         permissions: params.permissions.into(),
+        cwd: Some(params.cwd),
     }
 }
 
@@ -1824,7 +1842,7 @@ impl ChatWidget {
     fn update_task_running_state(&mut self) {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
-        self.refresh_terminal_title();
+        self.refresh_status_surfaces();
     }
 
     fn restore_reasoning_status_header(&mut self) {
@@ -1929,7 +1947,11 @@ impl ChatWidget {
             .config
             .tui_terminal_title
             .as_ref()
-            .is_some_and(|items| items.iter().any(|item| item == "status"));
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item == "run-state" || item == "status")
+            });
         let title_uses_spinner = self
             .config
             .tui_terminal_title
@@ -1939,7 +1961,7 @@ impl ChatWidget {
             || (title_uses_spinner
                 && self.terminal_title_status_kind == TerminalTitleStatusKind::Undoing)
         {
-            self.refresh_terminal_title();
+            self.refresh_status_surfaces();
         }
     }
 
@@ -2131,6 +2153,20 @@ impl ChatWidget {
         display: SessionConfiguredDisplay,
         fork_parent_title: Option<String>,
     ) {
+        let (file_system_sandbox_policy, network_sandbox_policy) = match event
+            .permission_profile
+            .as_ref()
+        {
+            Some(permission_profile) => permission_profile.to_runtime_permissions(),
+            None => (
+                codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+                    &event.sandbox_policy,
+                    &event.cwd,
+                ),
+                codex_protocol::permissions::NetworkSandboxPolicy::from(&event.sandbox_policy),
+            ),
+        };
+
         self.last_agent_markdown = None;
         self.agent_turn_markdowns.clear();
         self.visible_user_turn_count = 0;
@@ -2158,6 +2194,7 @@ impl ChatWidget {
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.to_path_buf());
         self.config.cwd = event.cwd.clone();
+        self.effective_service_tier = event.service_tier;
         if let Err(err) = self
             .config
             .permissions
@@ -2178,6 +2215,8 @@ impl ChatWidget {
             self.config.permissions.sandbox_policy =
                 Constrained::allow_only(event.sandbox_policy.clone());
         }
+        self.config.permissions.file_system_sandbox_policy = file_system_sandbox_policy;
+        self.config.permissions.network_sandbox_policy = network_sandbox_policy;
         self.config.approvals_reviewer = event.approvals_reviewer;
         self.status_line_project_root_name_cache = None;
         let forked_from_id = event.forked_from_id;
@@ -2326,7 +2365,6 @@ impl ChatWidget {
                 self.add_boxed_history(Box::new(cell));
             }
             self.thread_name = event.thread_name;
-            self.refresh_terminal_title();
             self.refresh_status_surfaces();
             self.request_redraw();
             self.maybe_send_next_queued_input();
@@ -2540,7 +2578,6 @@ impl ChatWidget {
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
         self.latest_proposed_plan_markdown = None;
-        self.last_plan_progress = None;
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
         self.adaptive_chunking.reset();
@@ -3236,6 +3273,16 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    fn on_cyber_policy_error(&mut self) {
+        self.submit_pending_steers_after_interrupt = false;
+        self.finalize_turn();
+        self.add_to_history(history_cell::new_cyber_policy_error_event());
+        self.request_redraw();
+
+        // After an error ends the turn, try sending the next queued input.
+        self.maybe_send_next_queued_input();
+    }
+
     fn workspace_owner_usage_nudge_enabled(&self) -> bool {
         self.config
             .features
@@ -3301,6 +3348,11 @@ impl ChatWidget {
             .as_ref()
             .is_some_and(|info| self.handle_app_server_steer_rejected_error(info))
         {
+        } else if codex_error_info
+            .as_ref()
+            .is_some_and(is_app_server_cyber_policy_error)
+        {
+            self.on_cyber_policy_error();
         } else if let Some(info) = codex_error_info
             .as_ref()
             .and_then(app_server_rate_limit_error_kind)
@@ -3319,6 +3371,19 @@ impl ChatWidget {
     fn on_warning(&mut self, message: impl Into<String>) {
         self.add_to_history(history_cell::new_warning_event(message.into()));
         self.request_redraw();
+    }
+
+    #[cfg(test)]
+    fn on_core_model_verification(&mut self, verifications: &[CoreModelVerification]) {
+        if verifications.contains(&CoreModelVerification::TrustedAccessForCyber) {
+            self.on_warning(TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING);
+        }
+    }
+
+    fn on_app_server_model_verification(&mut self, verifications: &[AppServerModelVerification]) {
+        if verifications.contains(&AppServerModelVerification::TrustedAccessForCyber) {
+            self.on_warning(TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING);
+        }
     }
 
     /// Record one MCP startup update, promoting it into either the active startup
@@ -3761,7 +3826,7 @@ impl ChatWidget {
         self.update_task_running_state();
         if restored_task_running && !self.bottom_pane.is_task_running() {
             self.bottom_pane.set_task_running(/*running*/ true);
-            self.refresh_terminal_title();
+            self.refresh_status_surfaces();
         }
         self.refresh_pending_input_preview();
         self.request_redraw();
@@ -3783,7 +3848,7 @@ impl ChatWidget {
             })
             .count();
         self.last_plan_progress = (total > 0).then_some((completed, total));
-        self.refresh_terminal_title();
+        self.refresh_status_surfaces();
         self.add_to_history(history_cell::new_plan_update(update));
     }
 
@@ -5307,6 +5372,7 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
         let current_cwd = Some(config.cwd.to_path_buf());
+        let effective_service_tier = config.service_tier;
         let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_info());
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -5325,6 +5391,7 @@ impl ChatWidget {
             active_cell,
             active_cell_revision: 0,
             config,
+            effective_service_tier,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -5489,6 +5556,13 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if self.handle_reasoning_shortcut(key_event) {
+            self.bottom_pane.clear_quit_shortcut_hint();
+            self.quit_shortcut_expires_at = None;
+            self.quit_shortcut_key = None;
+            return;
+        }
+
         match key_event {
             // Ctrl+O - copy last agent response from the main view.
             KeyEvent {
@@ -5625,6 +5699,12 @@ impl ChatWidget {
                         let should_submit_now =
                             self.is_session_configured() && !self.is_plan_streaming_in_tui();
                         if should_submit_now {
+                            if self.only_user_shell_commands_running()
+                                && !user_message.text.starts_with('!')
+                            {
+                                self.queue_user_message(user_message);
+                                return;
+                            }
                             // Submitted is emitted when user submits.
                             // Reset any reasoning header only when we are actually submitting a turn.
                             self.reasoning_buffer.clear();
@@ -6141,12 +6221,25 @@ impl ChatWidget {
             .personality
             .filter(|_| self.config.features.enabled(Feature::Personality))
             .filter(|_| self.current_model_supports_personality());
-        let service_tier = Some(self.config.service_tier);
+        let service_tier = match self.config.service_tier {
+            Some(service_tier) => Some(Some(service_tier)),
+            None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
+            None => None,
+        };
+        let permission_profile = if matches!(
+            self.config.permissions.sandbox_policy.get(),
+            SandboxPolicy::ExternalSandbox { .. }
+        ) {
+            None
+        } else {
+            Some(self.config.permissions.permission_profile())
+        };
         let op = AppCommand::user_turn(
             items,
             self.config.cwd.to_path_buf(),
             self.config.permissions.approval_policy.value(),
             self.config.permissions.sandbox_policy.get().clone(),
+            permission_profile,
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
             /*summary*/ None,
@@ -6769,7 +6862,13 @@ impl ChatWidget {
                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
             }
             ServerNotification::ModelRerouted(_) => {}
+            ServerNotification::ModelVerification(notification) => {
+                self.on_app_server_model_verification(&notification.verifications)
+            }
             ServerNotification::Warning(notification) => self.on_warning(notification.message),
+            ServerNotification::GuardianWarning(notification) => {
+                self.on_warning(notification.message)
+            }
             ServerNotification::DeprecationNotice(notification) => {
                 self.on_deprecation_notice(DeprecationNoticeEvent {
                     summary: notification.summary,
@@ -7267,9 +7366,13 @@ impl ChatWidget {
                 self.set_token_info(ev.info);
                 self.on_rate_limit_snapshot(ev.rate_limits);
             }
-            EventMsg::Warning(WarningEvent { message }) => self.on_warning(message),
+            EventMsg::Warning(WarningEvent { message })
+            | EventMsg::GuardianWarning(WarningEvent { message }) => self.on_warning(message),
             EventMsg::GuardianAssessment(ev) => self.on_guardian_assessment(ev),
             EventMsg::ModelReroute(_) => {}
+            EventMsg::ModelVerification(event) => {
+                self.on_core_model_verification(&event.verifications)
+            }
             EventMsg::Error(ErrorEvent {
                 message,
                 codex_error_info,
@@ -7278,6 +7381,11 @@ impl ChatWidget {
                     .as_ref()
                     .is_some_and(|info| self.handle_steer_rejected_error(info))
                 {
+                } else if codex_error_info
+                    .as_ref()
+                    .is_some_and(is_core_cyber_policy_error)
+                {
+                    self.on_cyber_policy_error();
                 } else if let Some(kind) = codex_error_info
                     .as_ref()
                     .and_then(core_rate_limit_error_kind)
@@ -7693,6 +7801,15 @@ impl ChatWidget {
         self.user_turn_pending_start || self.bottom_pane.is_task_running()
     }
 
+    fn only_user_shell_commands_running(&self) -> bool {
+        self.agent_turn_running
+            && !self.running_commands.is_empty()
+            && self
+                .running_commands
+                .values()
+                .all(|command| command.source == ExecCommandSource::UserShell)
+    }
+
     /// Rebuild and update the bottom-pane pending-input preview.
     fn refresh_pending_input_preview(&mut self) {
         let queued_messages: Vec<String> = self
@@ -7867,13 +7984,7 @@ impl ChatWidget {
     fn terminal_title_preview_data(&mut self) -> StatusSurfacePreviewData {
         let mut preview_data = self.status_surface_preview_data();
         let now = Instant::now();
-        for item in [
-            TerminalTitleItem::Project,
-            TerminalTitleItem::Thread,
-            TerminalTitleItem::GitBranch,
-            TerminalTitleItem::Model,
-            TerminalTitleItem::TaskProgress,
-        ] {
+        for item in TerminalTitleItem::iter() {
             let Some(preview_item) = item.preview_item() else {
                 continue;
             };
@@ -7884,7 +7995,6 @@ impl ChatWidget {
         }
         preview_data
     }
-
     fn open_theme_picker(&mut self) {
         let codex_home = crate::legacy_core::config::find_codex_home().ok();
         let terminal_width = self
@@ -9240,7 +9350,7 @@ impl ChatWidget {
                             "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the auto-reviewer subagent."
                                 .to_string(),
                         ),
-                        is_current: current_review_policy == ApprovalsReviewer::GuardianSubagent
+                        is_current: current_review_policy == ApprovalsReviewer::AutoReview
                             && Self::preset_matches_current(
                                 current_approval,
                                 current_sandbox,
@@ -9250,7 +9360,7 @@ impl ChatWidget {
                             preset.approval,
                             preset.sandbox.clone(),
                             "Auto-review".to_string(),
-                            ApprovalsReviewer::GuardianSubagent,
+                            ApprovalsReviewer::AutoReview,
                         ),
                         dismiss_on_select: true,
                         disabled_reason: approval_disabled_reason
@@ -9900,6 +10010,14 @@ impl ChatWidget {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) -> ConstraintResult<()> {
         self.config.permissions.sandbox_policy.set(policy)?;
+        let sandbox_policy = self.config.permissions.sandbox_policy.get();
+        self.config.permissions.file_system_sandbox_policy =
+            codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+                sandbox_policy,
+                &self.config.cwd,
+            );
+        self.config.permissions.network_sandbox_policy =
+            codex_protocol::permissions::NetworkSandboxPolicy::from(sandbox_policy);
         Ok(())
     }
 
@@ -10047,10 +10165,19 @@ impl ChatWidget {
     /// Set Fast mode in the widget's config copy.
     pub(crate) fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) {
         self.config.service_tier = service_tier;
+        self.effective_service_tier = service_tier;
     }
 
     pub(crate) fn current_service_tier(&self) -> Option<ServiceTier> {
+        self.effective_service_tier
+    }
+
+    pub(crate) fn configured_service_tier(&self) -> Option<ServiceTier> {
         self.config.service_tier
+    }
+
+    pub(crate) fn fast_default_opt_out(&self) -> Option<bool> {
+        self.config.notices.fast_default_opt_out
     }
 
     pub(crate) fn status_account_display(&self) -> Option<&StatusAccountDisplay> {
@@ -10129,6 +10256,9 @@ impl ChatWidget {
     }
 
     fn set_service_tier_selection(&mut self, service_tier: Option<ServiceTier>) {
+        if service_tier.is_none() {
+            self.config.notices.fast_default_opt_out = Some(true);
+        }
         self.set_service_tier(service_tier);
         self.app_event_tx.send(AppEvent::CodexOp(
             AppCommand::override_turn_context(

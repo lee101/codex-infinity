@@ -622,7 +622,8 @@ impl App {
 
     pub(super) fn fresh_session_config(&self) -> Config {
         let mut config = self.config.clone();
-        config.service_tier = self.chat_widget.current_service_tier();
+        config.service_tier = self.chat_widget.configured_service_tier();
+        config.notices.fast_default_opt_out = self.chat_widget.fast_default_opt_out();
         config
     }
     pub(super) async fn resume_target_session(
@@ -728,5 +729,63 @@ impl App {
         }
 
         Ok(AppRunControl::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_thread_read_error_detection_matches_not_loaded_errors() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
+        );
+
+        assert!(App::is_terminal_thread_read_error(&err));
+    }
+
+    #[test]
+    fn terminal_thread_read_error_detection_ignores_transient_failures() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
+        );
+
+        assert!(!App::is_terminal_thread_read_error(&err));
+    }
+
+    #[test]
+    fn closed_state_for_thread_read_error_preserves_live_state_without_cache_on_transient_error() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
+        );
+
+        assert!(!App::closed_state_for_thread_read_error(
+            &err, /*existing_is_closed*/ None
+        ));
+    }
+
+    #[test]
+    fn closed_state_for_thread_read_error_marks_terminal_uncached_threads_closed() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
+        );
+
+        assert!(App::closed_state_for_thread_read_error(
+            &err, /*existing_is_closed*/ None
+        ));
+    }
+
+    #[test]
+    fn include_turns_fallback_detection_handles_unmaterialized_and_ephemeral_threads() {
+        let unmaterialized = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread thr_123 is not materialized yet; includeTurns is unavailable before first user message"
+        );
+        let ephemeral = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: ephemeral threads do not support includeTurns"
+        );
+
+        assert!(App::can_fallback_from_include_turns_error(&unmaterialized));
+        assert!(App::can_fallback_from_include_turns_error(&ephemeral));
     }
 }

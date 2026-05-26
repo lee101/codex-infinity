@@ -142,6 +142,8 @@ pub struct ModelProviderInfo {
 pub struct ModelProviderAwsAuthInfo {
     /// AWS profile name to use. When unset, the AWS SDK default chain decides.
     pub profile: Option<String>,
+    /// AWS region to use for provider-specific endpoints.
+    pub region: Option<String>,
 }
 
 impl ModelProviderInfo {
@@ -233,7 +235,10 @@ impl ModelProviderInfo {
     }
 
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        let default_base_url = if matches!(auth_mode, Some(AuthMode::Chatgpt)) {
+        let default_base_url = if matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
+        ) {
             "https://chatgpt.com/backend-api/codex"
         } else {
             "https://api.openai.com/v1"
@@ -426,7 +431,10 @@ impl ModelProviderInfo {
             env_key_instructions: None,
             experimental_bearer_token: None,
             auth: None,
-            aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo { profile: None })),
+            aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            })),
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -532,6 +540,10 @@ pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> 
 }
 
 /// Merge configured providers into the built-in provider catalog.
+///
+/// Configured providers extend the built-in set. Built-in providers are not
+/// generally overridable, but the built-in Amazon Bedrock provider allows the
+/// user to set `aws.profile` and `aws.region`.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
@@ -542,15 +554,20 @@ pub fn merge_configured_model_providers(
             if provider != ModelProviderInfo::default() {
                 return Err(format!(
                     "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing \
-`aws.profile`; other non-default provider fields are not supported"
+`aws.profile` and `aws.region`; other non-default provider fields are not supported"
                 ));
             }
 
-            if let Some(profile) = aws_override.and_then(|aws| aws.profile)
-                && let Some(built_in) = model_providers.get_mut(AMAZON_BEDROCK_PROVIDER_ID)
-                && let Some(aws) = built_in.aws.as_mut()
+            if let Some(aws_override) = aws_override
+                && let Some(built_in_provider) = model_providers.get_mut(AMAZON_BEDROCK_PROVIDER_ID)
+                && let Some(built_in_aws) = built_in_provider.aws.as_mut()
             {
-                aws.profile = Some(profile);
+                if let Some(profile) = aws_override.profile {
+                    built_in_aws.profile = Some(profile);
+                }
+                if let Some(region) = aws_override.region {
+                    built_in_aws.region = Some(region);
+                }
             }
         } else {
             model_providers.entry(key).or_insert(provider);

@@ -96,6 +96,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -105,6 +106,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -147,6 +149,7 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -156,6 +159,7 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -205,6 +209,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -214,6 +219,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -269,6 +275,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -278,6 +285,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -321,6 +329,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -330,6 +339,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -347,6 +357,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -359,6 +370,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -368,6 +380,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -426,6 +439,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -435,6 +449,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -452,6 +467,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -464,6 +480,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -473,6 +490,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -544,6 +562,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -553,6 +572,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -570,6 +590,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -582,6 +603,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -591,6 +613,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             approval_policy: test.config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -701,6 +724,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -710,6 +734,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -822,6 +847,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -831,6 +857,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -848,6 +875,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -860,6 +888,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -869,6 +898,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,

@@ -185,6 +185,7 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
         || slug.starts_with("gpt-5.2-codex")
         || slug.starts_with("gpt-5.3-codex")
         || slug.starts_with("gpt-5.4-codex")
+        || slug.starts_with("gpt-5.5-codex")
         || slug.starts_with("codex-")
     {
         model_family!(
@@ -204,6 +205,28 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             default_verbosity: Some(Verbosity::Low),
             base_instructions: GPT_5_1_INSTRUCTIONS.to_string(),
             default_reasoning_effort: Some(ReasoningEffort::Medium),
+        )
+    } else if slug.starts_with("gpt-5.5-mini") {
+        model_family!(
+            slug, "gpt-5.5-mini",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
+        )
+    } else if slug.starts_with("gpt-5.5") {
+        model_family!(
+            slug, "gpt-5.5",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
         )
     } else if slug.starts_with("gpt-5.4-mini") {
         model_family!(
@@ -273,6 +296,50 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
         )
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_protocol::config_types::Verbosity;
+    use codex_protocol::openai_models::ApplyPatchToolType;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use pretty_assertions::assert_eq;
+
+    use super::find_family_for_model;
+
+    #[test]
+    fn gpt_5_5_models_use_frontier_coding_defaults() {
+        let family = find_family_for_model("gpt-5.5")
+            .expect("gpt-5.5 should be recognized as a model family");
+
+        assert_eq!(family.family, "gpt-5.5");
+        assert_eq!(
+            family.apply_patch_tool_type,
+            Some(ApplyPatchToolType::Freeform)
+        );
+        assert_eq!(family.default_reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(family.default_verbosity, Some(Verbosity::Low));
+        assert_eq!(family.supports_parallel_tool_calls, true);
+        assert_eq!(family.support_verbosity, true);
+        assert_eq!(family.supports_reasoning_summaries, true);
+    }
+
+    #[test]
+    fn gpt_5_5_mini_models_use_frontier_coding_defaults() {
+        let family = find_family_for_model("gpt-5.5-mini")
+            .expect("gpt-5.5-mini should be recognized as a model family");
+
+        assert_eq!(family.family, "gpt-5.5-mini");
+        assert_eq!(
+            family.apply_patch_tool_type,
+            Some(ApplyPatchToolType::Freeform)
+        );
+        assert_eq!(family.default_reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(family.default_verbosity, Some(Verbosity::Low));
+        assert_eq!(family.supports_parallel_tool_calls, true);
+        assert_eq!(family.support_verbosity, true);
+        assert_eq!(family.supports_reasoning_summaries, true);
     }
 }
 

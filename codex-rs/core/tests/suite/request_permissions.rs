@@ -187,6 +187,7 @@ async fn submit_turn(
     let session_model = test.session_configured.model.clone();
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
@@ -196,6 +197,7 @@ async fn submit_turn(
             approval_policy,
             approvals_reviewer: Some(ApprovalsReviewer::User),
             sandbox_policy,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -482,6 +484,7 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
         RequestPermissionsResponse {
             permissions: RequestPermissionProfile::default(),
             scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
         }
     );
 
@@ -1088,6 +1091,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1202,6 +1206,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1315,6 +1320,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1424,6 +1430,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1570,6 +1577,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
             response: RequestPermissionsResponse {
                 permissions: granted_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1586,17 +1594,17 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
         .unwrap_or_else(|| panic!("expected filesystem permissions"));
     let (approval_reads, approval_writes) = approval_file_system
         .legacy_read_write_roots()
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("expected legacy-compatible permissions"));
     assert!(approval_reads.as_ref().is_none_or(Vec::is_empty));
 
     let mut approval_writes = approval_writes.unwrap_or_default();
     approval_writes.sort_by_key(|path| path.display().to_string());
 
-    let (_expected_reads, expected_writes) = merged_permissions
+    let (_, expected_writes) = merged_permissions
         .file_system
         .unwrap_or_else(|| panic!("expected merged filesystem permissions"))
         .legacy_read_write_roots()
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("expected legacy-compatible permissions"));
     let mut expected_writes = expected_writes.unwrap_or_default();
     expected_writes.sort_by_key(|path| path.display().to_string());
 
@@ -1691,6 +1699,7 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1808,6 +1817,7 @@ async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Session,
+                strict_auto_review: false,
             },
         })
         .await?;

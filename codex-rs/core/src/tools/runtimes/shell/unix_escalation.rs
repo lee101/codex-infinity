@@ -53,8 +53,8 @@ use codex_shell_escalation::EscalationPolicy;
 use codex_shell_escalation::EscalationSession;
 use codex_shell_escalation::ExecParams;
 use codex_shell_escalation::ExecResult;
-use codex_shell_escalation::Permissions as EscalatedPermissions;
 use codex_shell_escalation::PreparedExec;
+use codex_shell_escalation::ResolvedPermissionProfile;
 use codex_shell_escalation::ShellCommandExecutor;
 use codex_shell_escalation::Stopwatch;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -134,6 +134,7 @@ pub(super) async fn try_run_zsh_fork(
         expiration: _sandbox_expiration,
         capture_policy: _capture_policy,
         sandbox,
+        windows_sandbox_policy_cwd: sandbox_policy_cwd,
         windows_sandbox_level,
         windows_sandbox_private_desktop: _windows_sandbox_private_desktop,
         sandbox_policy,
@@ -161,7 +162,7 @@ pub(super) async fn try_run_zsh_fork(
         network: sandbox_network,
         windows_sandbox_level,
         arg0,
-        sandbox_policy_cwd: ctx.turn.cwd.clone(),
+        sandbox_policy_cwd,
         codex_linux_sandbox_exe: ctx.turn.codex_linux_sandbox_exe.clone(),
         use_legacy_landlock: ctx.turn.features.use_legacy_landlock(),
     };
@@ -369,13 +370,17 @@ impl CoreShellActionProvider {
                 .map(|_| {
                     // Shell request additional permissions were already normalized and
                     // merged into the first-attempt sandbox policy.
-                    EscalationExecution::Permissions(EscalationPermissions::Permissions(
-                        EscalatedPermissions {
-                            sandbox_policy: sandbox_policy.clone(),
-                            file_system_sandbox_policy: file_system_sandbox_policy.clone(),
-                            network_sandbox_policy,
-                        },
-                    ))
+                    EscalationExecution::Permissions(
+                        EscalationPermissions::ResolvedPermissionProfile(
+                            ResolvedPermissionProfile {
+                                permission_profile: PermissionProfile::from_runtime_permissions(
+                                    file_system_sandbox_policy,
+                                    network_sandbox_policy,
+                                ),
+                                sandbox_policy: sandbox_policy.clone(),
+                            },
+                        ),
+                    )
                 })
                 .unwrap_or(EscalationExecution::TurnDefault),
         }
@@ -400,11 +405,10 @@ impl CoreShellActionProvider {
         Ok(stopwatch
             .pause_for(async move {
                 // 1) Run PermissionRequest hooks
-                let permission_request = PermissionRequestPayload {
-                    tool_name: "Bash".to_string(),
-                    command: codex_shell_command::parse_command::shlex_join(&command),
-                    description: None,
-                };
+                let permission_request = PermissionRequestPayload::bash(
+                    codex_shell_command::parse_command::shlex_join(&command),
+                    /*description*/ None,
+                );
                 let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
                 match run_permission_request_hooks(
                     &session,
@@ -785,6 +789,7 @@ impl ShellCommandExecutor for CoreShellCommandExecutor {
                 expiration: ExecExpiration::Cancellation(cancel_rx),
                 capture_policy: ExecCapturePolicy::ShellTool,
                 sandbox: self.sandbox,
+                windows_sandbox_policy_cwd: self.sandbox_policy_cwd.clone(),
                 windows_sandbox_level: self.windows_sandbox_level,
                 windows_sandbox_private_desktop: false,
                 sandbox_policy: self.sandbox_policy.clone(),
@@ -841,9 +846,9 @@ impl ShellCommandExecutor for CoreShellCommandExecutor {
                     additional_permissions: None,
                 })?
             }
-            EscalationExecution::Permissions(EscalationPermissions::PermissionProfile(
-                permission_profile,
-            )) => {
+            EscalationExecution::Permissions(
+                EscalationPermissions::AdditionalPermissionProfile(permission_profile),
+            ) => {
                 // Merge additive permissions into the existing turn/request sandbox policy.
                 self.prepare_sandboxed_exec(PrepareSandboxedExecParams {
                     command,
@@ -855,15 +860,19 @@ impl ShellCommandExecutor for CoreShellCommandExecutor {
                     additional_permissions: Some(permission_profile),
                 })?
             }
-            EscalationExecution::Permissions(EscalationPermissions::Permissions(permissions)) => {
-                // Use a fully specified sandbox policy instead of merging into the turn policy.
+            EscalationExecution::Permissions(EscalationPermissions::ResolvedPermissionProfile(
+                permissions,
+            )) => {
+                // Use a fully specified permission profile instead of merging into the turn policy.
+                let (file_system_sandbox_policy, network_sandbox_policy) =
+                    permissions.permission_profile.to_runtime_permissions();
                 self.prepare_sandboxed_exec(PrepareSandboxedExecParams {
                     command,
                     workdir,
                     env,
                     sandbox_policy: &permissions.sandbox_policy,
-                    file_system_sandbox_policy: &permissions.file_system_sandbox_policy,
-                    network_sandbox_policy: permissions.network_sandbox_policy,
+                    file_system_sandbox_policy: &file_system_sandbox_policy,
+                    network_sandbox_policy,
                     additional_permissions: None,
                 })?
             }
@@ -924,8 +933,11 @@ impl CoreShellCommandExecutor {
             windows_sandbox_level: self.windows_sandbox_level,
             windows_sandbox_private_desktop: false,
         })?;
-        let mut exec_request =
-            crate::sandboxing::ExecRequest::from_sandbox_exec_request(exec_request, options);
+        let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+            exec_request,
+            options,
+            self.sandbox_policy_cwd.clone(),
+        );
         if let Some(network) = exec_request.network.as_ref() {
             network.apply_to_env(&mut exec_request.env);
         }

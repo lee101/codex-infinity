@@ -171,7 +171,9 @@ async fn remote_models_config_context_window_override_clamps_to_max_context_wind
             summary: None,
             service_tier: None,
             collaboration_mode: None,
+            permission_profile: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -247,7 +249,9 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
             summary: None,
             service_tier: None,
             collaboration_mode: None,
+            permission_profile: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -322,7 +326,9 @@ async fn remote_models_use_context_window_when_config_override_is_absent() -> Re
             summary: None,
             service_tier: None,
             collaboration_mode: None,
+            permission_profile: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -405,12 +411,14 @@ async fn remote_models_long_model_slug_is_sent_with_high_reasoning() -> Result<(
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            permission_profile: None,
             model: requested_model.to_string(),
             effort: None,
             summary: None,
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -464,6 +472,7 @@ async fn namespaced_model_slug_uses_catalog_metadata_without_fallback_warning() 
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
             sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            permission_profile: None,
             model: requested_model.to_string(),
             effort: None,
             summary: Some(
@@ -474,6 +483,7 @@ async fn namespaced_model_slug_uses_catalog_metadata_without_fallback_warning() 
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -590,6 +600,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(REMOTE_MODEL_SLUG.to_string()),
             effort: None,
@@ -630,12 +641,14 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: REMOTE_MODEL_SLUG.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            environments: None,
         })
         .await?;
 
@@ -834,6 +847,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(model.to_string()),
             effort: None,
@@ -855,12 +869,14 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            environments: None,
         })
         .await?;
 

@@ -55,8 +55,13 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
         model.model_messages = None;
-    } else if !config.personality_enabled {
-        model.model_messages = None;
+    } else {
+        model.base_instructions = BASE_INSTRUCTIONS.to_string();
+        model.model_messages = if config.personality_enabled {
+            local_personality_messages_for_slug(&model.slug)
+        } else {
+            None
+        };
     }
 
     model
@@ -102,17 +107,22 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
 
 fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
     match slug {
-        "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
-            instructions_template: Some(format!(
-                "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
-            )),
-            instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: Some(String::new()),
-                personality_friendly: Some(LOCAL_FRIENDLY_TEMPLATE.to_string()),
-                personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
-            }),
-        }),
+        "gpt-5.2-codex" | "exp-codex-personality" => Some(local_personality_messages()),
+        _ if slug.starts_with("gpt-5.5") => Some(local_personality_messages()),
         _ => None,
+    }
+}
+
+fn local_personality_messages() -> ModelMessages {
+    ModelMessages {
+        instructions_template: Some(format!(
+            "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
+        )),
+        instructions_variables: Some(ModelInstructionsVariables {
+            personality_default: Some(String::new()),
+            personality_friendly: Some(LOCAL_FRIENDLY_TEMPLATE.to_string()),
+            personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
+        }),
     }
 }
 

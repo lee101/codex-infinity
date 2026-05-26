@@ -5,7 +5,6 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-mod agent_identity;
 mod apply_patch;
 mod apps;
 mod arc_monitor;
@@ -19,6 +18,7 @@ pub use session::SteerInputError;
 mod codex_thread;
 mod compact_remote;
 pub use codex_thread::CodexThread;
+pub use codex_thread::CodexThreadTurnContextOverrides;
 pub use codex_thread::ThreadConfigSnapshot;
 mod agent;
 mod codex_delegate;
@@ -27,7 +27,7 @@ mod commit_attribution;
 pub mod config;
 pub mod config_loader;
 pub mod connectors;
-mod context;
+pub mod context;
 mod context_manager;
 pub mod exec;
 pub mod exec_env;
@@ -95,6 +95,7 @@ pub(crate) use skills::SkillLoadOutcome;
 pub(crate) use skills::SkillMetadata;
 pub(crate) use skills::SkillsLoadInput;
 pub(crate) use skills::SkillsManager;
+pub(crate) use skills::build_available_skills;
 pub(crate) use skills::build_skill_injections;
 pub(crate) use skills::build_skill_name_counts;
 pub(crate) use skills::collect_env_var_dependencies;
@@ -103,7 +104,6 @@ pub(crate) use skills::default_skill_metadata_budget;
 pub(crate) use skills::injection;
 pub(crate) use skills::manager;
 pub(crate) use skills::maybe_emit_implicit_skill_invocation;
-pub(crate) use skills::render_skills_section;
 pub(crate) use skills::resolve_skill_dependencies_for_turn;
 pub(crate) use skills::skills_load_input_from_config;
 mod skills_watcher;
