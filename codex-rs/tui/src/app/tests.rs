@@ -415,6 +415,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         session_telemetry: app.session_telemetry.clone(),
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
     });
 
     app.enqueue_primary_thread_session(
@@ -3720,6 +3721,7 @@ async fn make_test_app() -> App {
         remote_app_server_auth_token: None,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
@@ -3782,6 +3784,7 @@ async fn make_test_app_with_channels() -> (
             remote_app_server_auth_token: None,
             auto_next_steps: false,
             auto_next_idea: false,
+            auto_next_goal: false,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
@@ -4641,6 +4644,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         session_telemetry: app.session_telemetry.clone(),
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
     });
     app.replace_chat_widget(replacement);
 

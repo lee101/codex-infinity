@@ -1,9 +1,10 @@
 # Codex CLI (Rust Implementation)
 
-> **New:** `--auto-next-steps` and `--auto-next-idea` let Codex keep going without manual prompts.  
+> **New:** `--auto-next-steps`, `--auto-next-idea`, and `--auto-next-goal` let Codex keep going without manual prompts.
 > Use `--auto-next-steps` to have Codex automatically continue with whatever natural follow-up work (including running relevant tests) makes sense after each response.  
 > Use `--auto-next-idea` to have Codex continually brainstorm fresh, creative improvements for the current project.  
-> Enable both flags together for a “full auto” loop: Codex will alternate between advancing the existing plan and proposing new avenues to explore, so the session never idles unless you intervene.
+> Use `--auto-next-goal` to have Codex create and start the next `/goal` automatically when the current goal is completed.
+> Combine these flags for a “full auto” loop: Codex can advance the existing plan, propose new avenues to explore, and chain completed goals into fresh objectives so the session never idles unless you intervene.
 
 We provide Codex CLI as a standalone, native executable to ensure a zero-dependency install.
 

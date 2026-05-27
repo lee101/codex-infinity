@@ -721,6 +721,13 @@ pub(crate) enum AppEvent {
         prompt: String,
     },
 
+    /// Deliver an asynchronously generated auto-next goal objective back to
+    /// the matching thread.
+    AutoNextGoalGenerated {
+        thread_id: codex_protocol::ThreadId,
+        objective: String,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

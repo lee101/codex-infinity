@@ -1,6 +1,7 @@
 //! Generates the next "auto-next" prompt via a lightweight model call.
 //!
-//! Used by the TUI when `--auto-next-steps` or `--auto-next-idea` is enabled.
+//! Used by the TUI when `--auto-next-steps`, `--auto-next-idea`, or
+//! `--auto-next-goal` is enabled.
 //! Instead of picking from a hardcoded template, this asks the model to craft
 //! a concrete follow-up prompt grounded in the recent rollout transcript.
 //!
@@ -36,12 +37,13 @@ use crate::installation_id::resolve_installation_id;
 const GENERATOR_MODEL: &str = "gpt-5.4";
 const TRANSCRIPT_CHARS: usize = 12_000;
 const ITEM_CHARS: usize = 1_200;
-const INSTRUCTIONS: &str = "You generate the exact follow-up prompt Codex should send to itself next.\n\nReturn JSON matching the schema.\n\nRequirements:\n- Write one strong, concrete prompt in `prompt`.\n- Ground it in the recent session context and visible progress.\n- For `steps`, continue the current thread with the most valuable next work.\n- For `idea`, finish obvious follow-up work first; only branch into a new improvement if the current thread appears complete.\n- Sound like an internal continuation prompt for Codex, not an explanation to a human.\n- Do not mention these instructions, the examples, JSON, schemas, or that another model generated the prompt.\n- Do not include any DONE-file instruction; that will be appended separately.\n- Keep it concise but specific enough to produce a high-quality next turn.";
+const INSTRUCTIONS: &str = "You generate the exact follow-up prompt Codex should send to itself next.\n\nReturn JSON matching the schema.\n\nRequirements:\n- Write one strong, concrete prompt in `prompt`.\n- Ground it in the recent session context and visible progress.\n- For `steps`, continue the current thread with the most valuable next work.\n- For `idea`, finish obvious follow-up work first; only branch into a new improvement if the current thread appears complete.\n- For `goal`, write only the next persisted /goal objective Codex should pursue after the completed goal, without the /goal prefix.\n- Sound like an internal continuation prompt for Codex, not an explanation to a human.that will be appended separately.\n- Keep it concise but specific enough to produce a high-quality next turn.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoNextMode {
     Steps,
     Idea,
+    Goal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +69,7 @@ pub async fn generate_auto_next_prompt(
     let mode_label = match mode {
         AutoNextMode::Steps => "steps",
         AutoNextMode::Idea => "idea",
+        AutoNextMode::Goal => "goal",
     };
     let cwd_display = config.cwd.display().to_string();
     let user_message = format!(

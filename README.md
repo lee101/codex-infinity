@@ -13,10 +13,11 @@
 
 ## What makes Codex Infinity different?
 
-Two arguments turn Codex into a fully autonomous coding agent:
+Three arguments turn Codex into a fully autonomous coding agent:
 
 - **`--auto-next-steps`** -- After each response, automatically continues with the next logical steps (including testing)
 - **`--auto-next-idea`** -- Generates and implements new improvement ideas for your codebase
+- **`--auto-next-goal`** -- When a `/goal` completes, generates and starts the next goal automatically
 
 ```shell
 # Autonomous coding -- completes tasks then moves to the next one
@@ -24,6 +25,9 @@ codex-infinity --auto-next-steps "fix all lint errors and add tests"
 
 # Fully autonomous -- dreams up and implements improvements forever
 codex-infinity --auto-next-steps --auto-next-idea
+
+# Goal loop -- finish a goal, then automatically create the next one
+codex-infinity --auto-next-goal "/goal improve startup parity with installed Codex"
 
 # Full auto mode with autonomous continuation
 codex-infinity --full-auto --auto-next-steps
@@ -56,6 +60,7 @@ codex-infinity "your prompt"
 |------|-------------|
 | `--auto-next-steps` | Auto-continue with next logical steps after each response |
 | `--auto-next-idea` | Auto-brainstorm and implement new improvement ideas |
+| `--auto-next-goal` | Auto-generate and start a new `/goal` after the current goal completes |
 | `--full-auto` | Low-friction sandboxed automatic execution |
 | `--yolo` | Skip approvals and sandbox (dangerous) |
 | `--yolo2` | Like yolo + disable command timeouts |
@@ -77,6 +82,9 @@ codex-infinity --full-auto --auto-next-steps "fix the failing test in auth.test.
 # Refactor with idea generation
 codex-infinity --auto-next-steps --auto-next-idea "refactor the API layer"
 
+# Keep goal mode running autonomously
+codex-infinity --auto-next-goal "/goal improve benchmark coverage"
+
 # Quick one-shot with yolo mode
 codex-infinity --yolo "add error handling to all API endpoints"
 
@@ -91,6 +99,7 @@ codex-infinity --oss -m llama3 "explain this codebase"
 
 - **Autonomous operation** -- `--auto-next-steps` keeps it working without intervention
 - **Idea generation** -- `--auto-next-idea` brainstorms and implements improvements
+- **Goal chaining** -- `--auto-next-goal` turns completed `/goal` work into the next objective
 - **AnyLLM** -- OpenAI, local models via LM Studio/Ollama, bring your own provider
 - **Local execution** -- runs entirely on your machine
 - **Concise prompts** -- stripped-down system prompts for faster, more focused responses

@@ -1506,6 +1506,7 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         session_telemetry,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
     };
 
     let chat = ChatWidget::new_with_app_event(init);
