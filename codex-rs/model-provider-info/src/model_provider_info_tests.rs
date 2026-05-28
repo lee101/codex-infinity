@@ -278,12 +278,30 @@ fn openpaths_provider_normalizes_openpaths_prefix() {
         provider.effective_model_name("auto-medium-task"),
         "auto-medium-task"
     );
+    assert_eq!(
+        provider.effective_model_name("openpaths/composer-2.5-fast"),
+        "composer-2.5-fast"
+    );
+}
+
+#[test]
+fn cursor_provider_normalizes_cursor_prefix() {
+    let provider = ModelProviderInfo::create_cursor_provider();
+    assert_eq!(
+        provider.effective_model_name("cursor/composer-2.5-fast"),
+        "composer-2.5-fast"
+    );
+    assert_eq!(
+        provider.effective_model_name("composer-2.5"),
+        "composer-2.5"
+    );
 }
 
 #[test]
 fn infer_builtin_provider_prefers_env_backed_routes() {
     let _gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
     let _openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let _cursor_remove_guard = EnvVarGuard::remove("CURSOR_API_KEY");
     let openpaths_remove_guard = EnvVarGuard::remove("OPENPATHS_API_KEY");
     assert_eq!(
         infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
@@ -330,6 +348,25 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     assert_eq!(
         infer_builtin_provider_id_for_model("openpaths/auto-think"),
         Some(OPENPATHS_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("composer-2.5"),
+        Some(OPENPATHS_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("composer-2.5-fast"),
+        Some(OPENPATHS_PROVIDER_ID)
+    );
+
+    drop(_openpaths_set_guard);
+    let _cursor_set_guard = EnvVarGuard::set("CURSOR_API_KEY", "cursor-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("composer-2.5"),
+        Some(CURSOR_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("cursor/composer-2.5-fast"),
+        Some(CURSOR_PROVIDER_ID)
     );
 }
 

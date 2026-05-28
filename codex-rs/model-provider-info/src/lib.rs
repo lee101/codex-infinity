@@ -40,6 +40,8 @@ const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 const OPENPATHS_PROVIDER_NAME: &str = "OpenPaths";
 pub const OPENPATHS_PROVIDER_ID: &str = "openpaths";
+pub const CURSOR_PROVIDER_NAME: &str = "Cursor";
+pub const CURSOR_PROVIDER_ID: &str = "cursor";
 const ZHIPU_PROVIDER_NAME: &str = "Z.AI (Zhipu)";
 pub const ZHIPU_PROVIDER_ID: &str = "zhipu";
 const DEEPSEEK_PROVIDER_NAME: &str = "DeepSeek";
@@ -405,10 +407,35 @@ impl ModelProviderInfo {
     pub fn create_openpaths_provider() -> ModelProviderInfo {
         ModelProviderInfo {
             name: OPENPATHS_PROVIDER_NAME.into(),
-            base_url: Some("https://openpaths.io/v1".into()),
+            base_url: Some(openpaths_base_url()),
             env_key: Some("OPENPATHS_API_KEY".into()),
             env_key_instructions: Some(
                 "Get your API key from https://openpaths.io and set OPENPATHS_API_KEY".into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_cursor_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: CURSOR_PROVIDER_NAME.into(),
+            base_url: Some(cursor_base_url()),
+            env_key: Some("CURSOR_API_KEY".into()),
+            env_key_instructions: Some(
+                "Get your API key from https://cursor.com/dashboard/integrations and set CURSOR_API_KEY"
+                    .into(),
             ),
             experimental_bearer_token: None,
             auth: None,
@@ -511,6 +538,8 @@ impl ModelProviderInfo {
             slug.strip_prefix("google/").unwrap_or(slug)
         } else if self.name == OPENPATHS_PROVIDER_NAME {
             slug.strip_prefix("openpaths/").unwrap_or(slug)
+        } else if self.name == CURSOR_PROVIDER_NAME {
+            slug.strip_prefix("cursor/").unwrap_or(slug)
         } else if self.name == ZHIPU_PROVIDER_NAME {
             slug.strip_prefix("zhipu/")
                 .or_else(|| slug.strip_prefix("z-ai/"))
@@ -556,6 +585,7 @@ pub fn built_in_model_providers(
         (OPENAI_PROVIDER_ID, openai_provider),
         (OPENROUTER_PROVIDER_ID, P::create_openrouter_provider()),
         (OPENPATHS_PROVIDER_ID, P::create_openpaths_provider()),
+        (CURSOR_PROVIDER_ID, P::create_cursor_provider()),
         (GEMINI_PROVIDER_ID, P::create_gemini_provider()),
         (ZHIPU_PROVIDER_ID, P::create_zhipu_provider()),
         (DEEPSEEK_PROVIDER_ID, P::create_deepseek_provider()),
@@ -578,6 +608,39 @@ fn non_empty_env_var(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn openpaths_base_url() -> String {
+    std::env::var("OPENPATHS_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let trimmed = value.trim().trim_end_matches('/');
+            if trimmed.ends_with("/v1") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1")
+            }
+        })
+        .unwrap_or_else(|| "https://openpaths.io/v1".to_string())
+}
+
+fn cursor_base_url() -> String {
+    std::env::var("CURSOR_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://api.cursor.com".to_string())
+}
+
+fn is_composer_model_slug(lower: &str) -> bool {
+    let slug = lower
+        .strip_prefix("openpaths/")
+        .or_else(|| lower.strip_prefix("cursor/"))
+        .unwrap_or(lower);
+    slug == "composer-2.5"
+        || slug == "composer-2.5-fast"
+        || slug.starts_with("composer-2.5-")
 }
 
 pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
@@ -611,6 +674,14 @@ pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> 
     {
         return Some(OPENPATHS_PROVIDER_ID);
     }
+    if is_composer_model_slug(&lower) {
+        if non_empty_env_var("OPENPATHS_API_KEY") {
+            return Some(OPENPATHS_PROVIDER_ID);
+        }
+        if non_empty_env_var("CURSOR_API_KEY") {
+            return Some(CURSOR_PROVIDER_ID);
+        }
+    }
     match model.split_once('/') {
         Some(("google", _)) if non_empty_env_var("GEMINI_API_KEY") => Some(GEMINI_PROVIDER_ID),
         Some(("google", _)) if non_empty_env_var("OPENROUTER_API_KEY") => {
@@ -623,6 +694,7 @@ pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> 
         Some(("openpaths", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
             Some(OPENPATHS_PROVIDER_ID)
         }
+        Some(("cursor", _)) if non_empty_env_var("CURSOR_API_KEY") => Some(CURSOR_PROVIDER_ID),
         Some(("deepseek", _)) if non_empty_env_var("DEEPSEEK_API_KEY") => {
             Some(DEEPSEEK_PROVIDER_ID)
         }

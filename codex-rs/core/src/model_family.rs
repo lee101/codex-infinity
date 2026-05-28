@@ -276,6 +276,16 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             slug, "openpaths-auto",
             needs_special_apply_patch_instructions: true,
         )
+    } else if slug == "composer-2.5"
+        || slug == "composer-2.5-fast"
+        || slug.starts_with("composer-2.5")
+        || slug.starts_with("openpaths/composer-2.5")
+        || slug.starts_with("cursor/composer-2.5")
+    {
+        model_family!(
+            slug, "composer-2.5",
+            needs_special_apply_patch_instructions: true,
+        )
     } else if slug.starts_with("glm-5") || slug.starts_with("GLM-5") {
         model_family!(
             slug, "glm-5",
