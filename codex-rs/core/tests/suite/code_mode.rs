@@ -11,10 +11,10 @@ use codex_models_manager::bundled_models_response;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::assert_regex_match;
@@ -30,6 +30,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
@@ -1177,6 +1178,159 @@ text("session b done");
         text_item(&fourth_items, /*index*/ 0),
     );
     assert_eq!(text_item(&fourth_items, /*index*/ 1), "session b done");
+
+    Ok(())
+}
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_concurrent_cells_merge_only_the_stored_values_they_write() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(move |config| {
+        let _ = config.features.enable(Feature::CodeMode);
+    });
+    let test = builder.build(&server).await?;
+    let first_gate = test.workspace_path("code-mode-first-store.ready");
+    let first_wait = wait_for_file_source(&first_gate)?;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-init",
+                "exec",
+                r#"
+store("a", 1);
+store("b", 2);
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "initialized"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("initialize stored values").await?;
+
+    let first_code = format!(
+        r#"
+store("a", 3);
+yield_control();
+{first_wait}
+"#
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-3"),
+            ev_custom_tool_call("call-first", "exec", &first_code),
+            ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+    let first_started = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-2", "first pending"),
+            ev_completed("resp-4"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("start first store").await?;
+
+    let first_request = first_started.single_request();
+    let first_items = custom_tool_output_items(&first_request, "call-first");
+    let first_cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-5"),
+            ev_custom_tool_call("call-second", "exec", r#"store("b", 4);"#),
+            ev_completed("resp-5"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-3", "second complete"),
+            ev_completed("resp-6"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("write the second key").await?;
+
+    fs::write(&first_gate, "ready")?;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-7"),
+            responses::ev_function_call(
+                "call-wait",
+                "wait",
+                &serde_json::to_string(&serde_json::json!({
+                    "cell_id": first_cell_id,
+                    "yield_time_ms": 1_000,
+                }))?,
+            ),
+            ev_completed("resp-7"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-4", "first completed"),
+            ev_completed("resp-8"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("complete the first store").await?;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-9"),
+            ev_custom_tool_call(
+                "call-check",
+                "exec",
+                r#"text(JSON.stringify({ a: load("a"), b: load("b") }));"#,
+            ),
+            ev_completed("resp-9"),
+        ]),
+    )
+    .await;
+    let check_response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-5", "checked"),
+            ev_completed("resp-10"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("check merged stored values").await?;
+
+    let check_request = check_response.single_request();
+    let stored_values: Value = serde_json::from_str(
+        &custom_tool_output_last_non_empty_text(&check_request, "call-check")
+            .expect("checking stored values should emit JSON"),
+    )?;
+    assert_eq!(stored_values, serde_json::json!({ "a": 3, "b": 4 }));
 
     Ok(())
 }
@@ -2607,6 +2761,10 @@ text(
     )
     .await;
 
+    let cwd = test.cwd.path().to_path_buf();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
+
     test.codex
         .submit(Op::UserTurn {
             environments: None,
@@ -2615,11 +2773,11 @@ text(
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: test.cwd.path().to_path_buf(),
+            cwd,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            permission_profile: None,
+            sandbox_policy,
+            permission_profile,
             model: test.session_configured.model.clone(),
             effort: None,
             summary: None,

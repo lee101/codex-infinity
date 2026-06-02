@@ -10,15 +10,18 @@ from .generated.v2_all import (
     ApprovalsReviewer,
     AskForApproval,
     ModelListResponse,
+    PermissionProfile,
     Personality,
     ReasoningEffort,
     ReasoningSummary,
     SandboxMode,
     SandboxPolicy,
     ServiceTier,
+    SortDirection,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,
     ThreadForkParams,
+    ThreadListCwdFilter,
     ThreadListParams,
     ThreadListResponse,
     ThreadReadResponse,
@@ -26,6 +29,7 @@ from .generated.v2_all import (
     ThreadSetNameResponse,
     ThreadSortKey,
     ThreadSourceKind,
+    ThreadStartSource,
     ThreadStartParams,
     Turn as AppServerTurn,
     TurnCompletedNotification,
@@ -73,7 +77,7 @@ class Codex:
         self._client = AppServerClient(config=config)
         try:
             self._client.start()
-            self._init = self._validate_initialize(self._client.initialize())
+            self._init = validate_initialize_metadata(self._client.initialize())
         except Exception:
             self._client.close()
             raise
@@ -133,6 +137,33 @@ class Codex:
     def close(self) -> None:
         self._client.close()
 
+    def login_api_key(self, api_key: str) -> None:
+        """Authenticate app-server with an API key."""
+        self._client.account_login_start(
+            LoginAccountParams(
+                root=ApiKeyLoginAccountParams(
+                    api_key=api_key,
+                    type="apiKey",
+                )
+            )
+        )
+
+    def login_chatgpt(self) -> ChatgptLoginHandle:
+        """Start browser-based ChatGPT login and return its live handle."""
+        return start_chatgpt_login(self._client)
+
+    def login_chatgpt_device_code(self) -> DeviceCodeLoginHandle:
+        """Start device-code ChatGPT login and return its live handle."""
+        return start_device_code_login(self._client)
+
+    def account(self, *, refresh_token: bool = False) -> GetAccountResponse:
+        """Read the current app-server account state."""
+        return self._client.account_read(GetAccountParams(refresh_token=refresh_token))
+
+    def logout(self) -> None:
+        """Clear the current app-server account session."""
+        self._client.account_logout()
+
     # BEGIN GENERATED: Codex.flat_methods
     def thread_start(
         self,
@@ -146,6 +177,7 @@ class Codex:
         ephemeral: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox: SandboxMode | None = None,
         service_name: str | None = None,
@@ -162,6 +194,7 @@ class Codex:
             ephemeral=ephemeral,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox=sandbox,
             service_name=service_name,
@@ -176,13 +209,14 @@ class Codex:
         *,
         archived: bool | None = None,
         cursor: str | None = None,
-        cwd: str | None = None,
+        cwd: ThreadListCwdFilter | None = None,
         limit: int | None = None,
         model_providers: list[str] | None = None,
         search_term: str | None = None,
         sort_direction: SortDirection | None = None,
         sort_key: ThreadSortKey | None = None,
         source_kinds: list[ThreadSourceKind] | None = None,
+        use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
         params = ThreadListParams(
             archived=archived,
@@ -194,6 +228,7 @@ class Codex:
             sort_direction=sort_direction,
             sort_key=sort_key,
             source_kinds=source_kinds,
+            use_state_db_only=use_state_db_only,
         )
         return self._client.thread_list(params)
 
@@ -207,8 +242,10 @@ class Codex:
         config: JsonObject | None = None,
         cwd: str | None = None,
         developer_instructions: str | None = None,
+        exclude_turns: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
@@ -221,8 +258,10 @@ class Codex:
             config=config,
             cwd=cwd,
             developer_instructions=developer_instructions,
+            exclude_turns=exclude_turns,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox=sandbox,
             service_tier=service_tier,
@@ -241,8 +280,10 @@ class Codex:
         cwd: str | None = None,
         developer_instructions: str | None = None,
         ephemeral: bool | None = None,
+        exclude_turns: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
     ) -> Thread:
@@ -255,8 +296,10 @@ class Codex:
             cwd=cwd,
             developer_instructions=developer_instructions,
             ephemeral=ephemeral,
+            exclude_turns=exclude_turns,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             sandbox=sandbox,
             service_tier=service_tier,
         )
@@ -305,7 +348,7 @@ class AsyncCodex:
             try:
                 await self._client.start()
                 payload = await self._client.initialize()
-                self._init = Codex._validate_initialize(payload)
+                self._init = validate_initialize_metadata(payload)
                 self._initialized = True
             except Exception:
                 await self._client.close()
@@ -327,6 +370,38 @@ class AsyncCodex:
         self._init = None
         self._initialized = False
 
+    async def login_api_key(self, api_key: str) -> None:
+        """Authenticate app-server with an API key."""
+        await self._ensure_initialized()
+        await self._client.account_login_start(
+            LoginAccountParams(
+                root=ApiKeyLoginAccountParams(
+                    api_key=api_key,
+                    type="apiKey",
+                )
+            )
+        )
+
+    async def login_chatgpt(self) -> AsyncChatgptLoginHandle:
+        """Start browser-based ChatGPT login and return its live handle."""
+        await self._ensure_initialized()
+        return await async_start_chatgpt_login(self)
+
+    async def login_chatgpt_device_code(self) -> AsyncDeviceCodeLoginHandle:
+        """Start device-code ChatGPT login and return its live handle."""
+        await self._ensure_initialized()
+        return await async_start_device_code_login(self)
+
+    async def account(self, *, refresh_token: bool = False) -> GetAccountResponse:
+        """Read the current app-server account state."""
+        await self._ensure_initialized()
+        return await self._client.account_read(GetAccountParams(refresh_token=refresh_token))
+
+    async def logout(self) -> None:
+        """Clear the current app-server account session."""
+        await self._ensure_initialized()
+        await self._client.account_logout()
+
     # BEGIN GENERATED: AsyncCodex.flat_methods
     async def thread_start(
         self,
@@ -340,6 +415,7 @@ class AsyncCodex:
         ephemeral: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox: SandboxMode | None = None,
         service_name: str | None = None,
@@ -357,6 +433,7 @@ class AsyncCodex:
             ephemeral=ephemeral,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox=sandbox,
             service_name=service_name,
@@ -371,13 +448,14 @@ class AsyncCodex:
         *,
         archived: bool | None = None,
         cursor: str | None = None,
-        cwd: str | None = None,
+        cwd: ThreadListCwdFilter | None = None,
         limit: int | None = None,
         model_providers: list[str] | None = None,
         search_term: str | None = None,
         sort_direction: SortDirection | None = None,
         sort_key: ThreadSortKey | None = None,
         source_kinds: list[ThreadSourceKind] | None = None,
+        use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
         await self._ensure_initialized()
         params = ThreadListParams(
@@ -390,6 +468,7 @@ class AsyncCodex:
             sort_direction=sort_direction,
             sort_key=sort_key,
             source_kinds=source_kinds,
+            use_state_db_only=use_state_db_only,
         )
         return await self._client.thread_list(params)
 
@@ -403,8 +482,10 @@ class AsyncCodex:
         config: JsonObject | None = None,
         cwd: str | None = None,
         developer_instructions: str | None = None,
+        exclude_turns: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
@@ -418,8 +499,10 @@ class AsyncCodex:
             config=config,
             cwd=cwd,
             developer_instructions=developer_instructions,
+            exclude_turns=exclude_turns,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox=sandbox,
             service_tier=service_tier,
@@ -438,8 +521,10 @@ class AsyncCodex:
         cwd: str | None = None,
         developer_instructions: str | None = None,
         ephemeral: bool | None = None,
+        exclude_turns: bool | None = None,
         model: str | None = None,
         model_provider: str | None = None,
+        permission_profile: PermissionProfile | None = None,
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
     ) -> AsyncThread:
@@ -453,8 +538,10 @@ class AsyncCodex:
             cwd=cwd,
             developer_instructions=developer_instructions,
             ephemeral=ephemeral,
+            exclude_turns=exclude_turns,
             model=model,
             model_provider=model_provider,
+            permission_profile=permission_profile,
             sandbox=sandbox,
             service_tier=service_tier,
         )
@@ -491,11 +578,12 @@ class Thread:
         effort: ReasoningEffort | None = None,
         model: str | None = None,
         output_schema: JsonObject | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox_policy: SandboxPolicy | None = None,
         service_tier: ServiceTier | None = None,
         summary: ReasoningSummary | None = None,
-    ) -> RunResult:
+    ) -> TurnResult:
         turn = self.turn(
             _normalize_run_input(input),
             approval_policy=approval_policy,
@@ -504,6 +592,7 @@ class Thread:
             effort=effort,
             model=model,
             output_schema=output_schema,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox_policy=sandbox_policy,
             service_tier=service_tier,
@@ -511,14 +600,14 @@ class Thread:
         )
         stream = turn.stream()
         try:
-            return _collect_run_result(stream, turn_id=turn.id)
+            return _collect_turn_result(stream, turn_id=turn.id)
         finally:
             stream.close()
 
     # BEGIN GENERATED: Thread.flat_methods
     def turn(
         self,
-        input: Input,
+        input: RunInput,
         *,
         approval_policy: AskForApproval | None = None,
         approvals_reviewer: ApprovalsReviewer | None = None,
@@ -526,6 +615,7 @@ class Thread:
         effort: ReasoningEffort | None = None,
         model: str | None = None,
         output_schema: JsonObject | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox_policy: SandboxPolicy | None = None,
         service_tier: ServiceTier | None = None,
@@ -541,6 +631,7 @@ class Thread:
             effort=effort,
             model=model,
             output_schema=output_schema,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox_policy=sandbox_policy,
             service_tier=service_tier,
@@ -575,11 +666,12 @@ class AsyncThread:
         effort: ReasoningEffort | None = None,
         model: str | None = None,
         output_schema: JsonObject | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox_policy: SandboxPolicy | None = None,
         service_tier: ServiceTier | None = None,
         summary: ReasoningSummary | None = None,
-    ) -> RunResult:
+    ) -> TurnResult:
         turn = await self.turn(
             _normalize_run_input(input),
             approval_policy=approval_policy,
@@ -588,6 +680,7 @@ class AsyncThread:
             effort=effort,
             model=model,
             output_schema=output_schema,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox_policy=sandbox_policy,
             service_tier=service_tier,
@@ -595,14 +688,14 @@ class AsyncThread:
         )
         stream = turn.stream()
         try:
-            return await _collect_async_run_result(stream, turn_id=turn.id)
+            return await _collect_async_turn_result(stream, turn_id=turn.id)
         finally:
             await stream.aclose()
 
     # BEGIN GENERATED: AsyncThread.flat_methods
     async def turn(
         self,
-        input: Input,
+        input: RunInput,
         *,
         approval_policy: AskForApproval | None = None,
         approvals_reviewer: ApprovalsReviewer | None = None,
@@ -610,6 +703,7 @@ class AsyncThread:
         effort: ReasoningEffort | None = None,
         model: str | None = None,
         output_schema: JsonObject | None = None,
+        permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
         sandbox_policy: SandboxPolicy | None = None,
         service_tier: ServiceTier | None = None,
@@ -626,6 +720,7 @@ class AsyncThread:
             effort=effort,
             model=model,
             output_schema=output_schema,
+            permission_profile=permission_profile,
             personality=personality,
             sandbox_policy=sandbox_policy,
             service_tier=service_tier,
@@ -660,8 +755,12 @@ class TurnHandle:
     thread_id: str
     id: str
 
-    def steer(self, input: Input) -> TurnSteerResponse:
-        return self._client.turn_steer(self.thread_id, self.id, _to_wire_input(input))
+    def steer(self, input: RunInput) -> TurnSteerResponse:
+        return self._client.turn_steer(
+            self.thread_id,
+            self.id,
+            _to_wire_input(_normalize_run_input(input)),
+        )
 
     def interrupt(self) -> TurnInterruptResponse:
         return self._client.turn_interrupt(self.thread_id, self.id)
@@ -682,8 +781,7 @@ class TurnHandle:
         finally:
             self._client.release_turn_consumer(self.id)
 
-    def run(self) -> AppServerTurn:
-        completed: TurnCompletedNotification | None = None
+    def run(self) -> TurnResult:
         stream = self.stream()
         try:
             for event in stream:
@@ -696,10 +794,6 @@ class TurnHandle:
         finally:
             stream.close()
 
-        if completed is None:
-            raise RuntimeError("turn completed event not received")
-        return completed.turn
-
 
 @dataclass(slots=True)
 class AsyncTurnHandle:
@@ -707,12 +801,12 @@ class AsyncTurnHandle:
     thread_id: str
     id: str
 
-    async def steer(self, input: Input) -> TurnSteerResponse:
+    async def steer(self, input: RunInput) -> TurnSteerResponse:
         await self._codex._ensure_initialized()
         return await self._codex._client.turn_steer(
             self.thread_id,
             self.id,
-            _to_wire_input(input),
+            _to_wire_input(_normalize_run_input(input)),
         )
 
     async def interrupt(self) -> TurnInterruptResponse:
@@ -736,8 +830,7 @@ class AsyncTurnHandle:
         finally:
             self._codex._client.release_turn_consumer(self.id)
 
-    async def run(self) -> AppServerTurn:
-        completed: TurnCompletedNotification | None = None
+    async def run(self) -> TurnResult:
         stream = self.stream()
         try:
             async for event in stream:
@@ -749,7 +842,3 @@ class AsyncTurnHandle:
                     completed = payload
         finally:
             await stream.aclose()
-
-        if completed is None:
-            raise RuntimeError("turn completed event not received")
-        return completed.turn

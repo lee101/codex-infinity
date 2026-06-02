@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::ExecutionStatus;
-use codex_rollout_trace::RolloutTraceRecorder;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ToolCallRequester;
 use pretty_assertions::assert_eq;
@@ -47,8 +46,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     let temp = TempDir::new()?;
     let (mut session, turn) = make_session_and_context().await;
     attach_test_trace(&mut session, &turn, temp.path())?;
-    session.services.rollout_trace.start_code_cell_trace(
-        session.conversation_id,
+    session.services.rollout_thread_trace.start_code_cell_trace(
         turn.sub_id.as_str(),
         "cell-1",
         "call-code",
@@ -129,11 +127,6 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     );
 
     Ok(())
-}
-
-#[tokio::test]
-async fn dispatch_lifecycle_trace_skips_noncanonical_boundaries() -> anyhow::Result<()> {
-    assert_dispatch_trace_skips(ToolCallSource::JsRepl).await
 }
 
 #[tokio::test]
@@ -236,35 +229,6 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     Ok(())
 }
 
-async fn assert_dispatch_trace_skips(source: ToolCallSource) -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let (mut session, turn) = make_session_and_context().await;
-    attach_test_trace(&mut session, &turn, temp.path())?;
-
-    let registry = ToolRegistry::with_handler_for_test(
-        codex_tools::ToolName::plain("test_tool"),
-        Arc::new(TestHandler),
-    );
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-
-    registry
-        .dispatch_any(test_invocation(
-            session,
-            turn,
-            "skipped-call",
-            "test_tool",
-            source,
-            "{}",
-        ))
-        .await?;
-
-    let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
-    assert_eq!(replayed.tool_calls, Default::default());
-
-    Ok(())
-}
-
 fn test_invocation(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -307,23 +271,26 @@ fn test_invocation_with_payload(
 
 fn attach_test_trace(session: &mut Session, turn: &TurnContext, root: &Path) -> anyhow::Result<()> {
     let thread_id = session.conversation_id;
-    let recorder = RolloutTraceRecorder::create_in_root_for_test(root, thread_id)?;
-    recorder.record_thread_started(ThreadStartedTraceMetadata {
-        thread_id: thread_id.to_string(),
-        agent_path: "/root".to_string(),
-        task_name: None,
-        nickname: None,
-        agent_role: None,
-        session_source: SessionSource::Exec,
-        cwd: PathBuf::from("/workspace"),
-        rollout_path: None,
-        model: "gpt-test".to_string(),
-        provider_name: "test-provider".to_string(),
-        approval_policy: "never".to_string(),
-        sandbox_policy: "danger-full-access".to_string(),
-    });
-    recorder.record_codex_turn_started(thread_id, turn.sub_id.as_str());
-    session.services.rollout_trace = recorder;
+    let rollout_thread_trace =
+        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            root,
+            ThreadStartedTraceMetadata {
+                thread_id: thread_id.to_string(),
+                agent_path: "/root".to_string(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: SessionSource::Exec,
+                cwd: PathBuf::from("/workspace"),
+                rollout_path: None,
+                model: "gpt-test".to_string(),
+                provider_name: "test-provider".to_string(),
+                approval_policy: "never".to_string(),
+                sandbox_policy: "danger-full-access".to_string(),
+            },
+        )?;
+    rollout_thread_trace.record_codex_turn_started(turn.sub_id.as_str());
+    session.services.rollout_thread_trace = rollout_thread_trace;
     Ok(())
 }
 

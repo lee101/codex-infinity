@@ -7,16 +7,47 @@ diff --git a/orig/v8-14.6.202.11/bazel/defs.bzl b/mod/v8-14.6.202.11/bazel/defs.
 index 9648e4a..88efd41 100644
 --- a/orig/v8-14.6.202.11/bazel/defs.bzl
 +++ b/mod/v8-14.6.202.11/bazel/defs.bzl
-@@ -97,7 +97,7 @@ v8_config = rule(
+@@ -33,9 +33,21 @@
+ )
+ 
+ def v8_flag(name, default = False):
+-    _create_option_flag(name = name, build_setting_default = default)
+-    native.config_setting(name = "is_" + name, flag_values = {name: "True"})
+-    native.config_setting(name = "is_not_" + name, flag_values = {name: "False"})
++    _create_option_flag(
++        name = name,
++        build_setting_default = default,
++        visibility = ["//visibility:public"],
++    )
++    native.config_setting(
++        name = "is_" + name,
++        flag_values = {name: "True"},
++        visibility = ["//visibility:public"],
++    )
++    native.config_setting(
++        name = "is_not_" + name,
++        flag_values = {name: "False"},
++        visibility = ["//visibility:public"],
++    )
+ 
+ def v8_string(name, default = ""):
+     _create_option_string(name = name, build_setting_default = default)
+@@ -97,7 +109,13 @@
  
  def _default_args():
      return struct(
 -        deps = [":define_flags", "@libcxx//:libc++"],
-+        deps = [":define_flags"],
++        deps = [":define_flags"] + select({
++            "@v8//:is_v8_use_rusty_v8_custom_libcxx": [
++                "@@//third_party/v8:rusty_v8_custom_libcxx_headers",
++                "@@//third_party/v8:rusty_v8_custom_libcxx_runtime",
++            ],
++            "//conditions:default": [],
++        }),
          defines = select({
              "@v8//bazel/config:is_windows": [
                  "UNICODE",
-@@ -128,12 +128,6 @@ def _default_args():
+@@ -127,12 +145,15 @@
              ],
              "//conditions:default": [],
          }) + select({
@@ -26,20 +57,29 @@ index 9648e4a..88efd41 100644
 -                "-Wno-deprecated-declarations",
 -                "-std=c++20",
 -            ],
++            "@v8//:is_v8_use_rusty_v8_custom_libcxx": [
++                "-nostdinc++",
++                "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
++                "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
++                "-D_LIBCPP_INSTRUMENTED_WITH_ASAN=0",
++                "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
++            ],
++            "//conditions:default": [],
++        }) + select({
              "@v8//bazel/config:is_gcc": [
                  "-Wno-extra",
                  "-Wno-array-bounds",
-@@ -155,7 +149,15 @@ def _default_args():
--            "@v8//bazel/config:is_windows": [
+@@ -152,9 +173,17 @@
+                 "-std=gnu++2a",
+             ],
+             "@v8//bazel/config:is_windows": [
 -                "/std:c++20",
--            ],
--            "//conditions:default": [],
-+            "@v8//bazel/config:is_windows": [
 +                "-Wno-invalid-offsetof",
 +                "-Wno-deprecated-this-capture",
 +                "-Wno-deprecated-declarations",
 +                "-std=c++20",
-+            ],
+             ],
+-            "//conditions:default": [],
 +            "//conditions:default": [
 +                "-Wno-invalid-offsetof",
 +                "-Wno-deprecated-this-capture",
@@ -49,7 +89,9 @@ index 9648e4a..88efd41 100644
          }) + select({
              "@v8//bazel/config:is_gcc_fastbuild": [
                  # Non-debug builds without optimizations fail because
-@@ -180,10 +179,10 @@ def _default_args():
+@@ -178,12 +207,12 @@
+         includes = ["include"],
+         linkopts = select({
              "@v8//bazel/config:is_windows": [
 -                "Winmm.lib",
 -                "DbgHelp.lib",
@@ -169,6 +211,26 @@ index 85f31b7..7314584 100644
 +    visibility = ["//visibility:public"],
 +)
 +
++cc_library(
++    name = "rusty_v8_crdtp_headers",
++    hdrs = [
++        "third_party/inspector_protocol/crdtp/cbor.h",
++        "third_party/inspector_protocol/crdtp/dispatch.h",
++        "third_party/inspector_protocol/crdtp/error_support.h",
++        "third_party/inspector_protocol/crdtp/export.h",
++        "third_party/inspector_protocol/crdtp/find_by_first.h",
++        "third_party/inspector_protocol/crdtp/frontend_channel.h",
++        "third_party/inspector_protocol/crdtp/json.h",
++        "third_party/inspector_protocol/crdtp/parser_handler.h",
++        "third_party/inspector_protocol/crdtp/protocol_core.h",
++        "third_party/inspector_protocol/crdtp/serializable.h",
++        "third_party/inspector_protocol/crdtp/span.h",
++        "third_party/inspector_protocol/crdtp/status.h",
++    ],
++    strip_include_prefix = "",
++    visibility = ["//visibility:public"],
++)
++
  filegroup(
      name = "d8_files",
      srcs = [
@@ -226,17 +288,53 @@ index 85f31b7..7314584 100644
      ],
  )
  
+@@ -4772,9 +4784,15 @@ v8_binary(
+         ":icu/generated_torque_initializers",
+         ":icu/v8_initializers_files",
+     ],
++    # Match GN's mksnapshot `disable_icf` config. If the linker folds distinct
++    # external-reference helpers together while producing the snapshot, the
++    # final embedder binary may not fold the same pair and startup
++    # deserialization will reject the snapshot.
+     linkopts = select({
+         "@v8//bazel/config:is_android": ["-llog"],
+-        "//conditions:default": [],
++        "@v8//bazel/config:is_macos": ["-Wl,-no_deduplicate"],
++        "@v8//bazel/config:is_windows": ["/OPT:NOICF"],
++        "//conditions:default": ["-Wl,--icf=none"],
+     }),
+     noicu_deps = [":v8_libshared_noicu"],
+     noicu_srcs = [
 diff --git a/orig/v8-14.6.202.11/bazel/BUILD.icu b/mod/v8-14.6.202.11/bazel/BUILD.icu
-index 5fda2f4..381386c 100644
+index 5fda2f4..9729451 100644
 --- a/orig/v8-14.6.202.11/bazel/BUILD.icu
 +++ b/mod/v8-14.6.202.11/bazel/BUILD.icu
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,24 @@
 +load("@rules_cc//cc:defs.bzl", "cc_library")
++
++CUSTOM_LIBCXX_COPTS = select({
++    "@v8//:is_v8_use_rusty_v8_custom_libcxx": [
++        "-nostdinc++",
++        "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
++        "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
++        "-D_LIBCPP_INSTRUMENTED_WITH_ASAN=0",
++        "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
++    ],
++    "//conditions:default": [],
++})
++
++CUSTOM_LIBCXX_DEPS = select({
++    "@v8//:is_v8_use_rusty_v8_custom_libcxx": [
++        "@@//third_party/v8:rusty_v8_custom_libcxx_headers",
++        "@@//third_party/v8:rusty_v8_custom_libcxx_runtime",
++    ],
++    "//conditions:default": [],
++})
 +
  # Copyright 2021 the V8 project authors. All rights reserved.
  # Use of this source code is governed by a BSD-style license that can be
  # found in the LICENSE file.
-@@ -16,10 +18,7 @@ cc_library(
+@@ -16,15 +37,12 @@
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -248,7 +346,21 @@ index 5fda2f4..381386c 100644
          ],
          "//conditions:default": [
              "-Wno-deprecated-declarations",
-@@ -65,10 +64,7 @@ cc_library(
+         ],
+-    }),
++    }) + CUSTOM_LIBCXX_COPTS,
+     data = [":icudata"],
+     defines = [
+         "HAVE_DLOPEN=0",
+@@ -54,6 +72,7 @@
+         "U_ICUDATAENTRY_IN_COMMON",
+     ],
+     tags = ["requires-rtti"],
++    deps = CUSTOM_LIBCXX_DEPS,
+     alwayslink = 1,
+ )
+ 
+@@ -65,19 +84,16 @@
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -260,7 +372,18 @@ index 5fda2f4..381386c 100644
          ],
          "//conditions:default": [
              "-Wno-deprecated-declarations",
-@@ -93,10 +89,7 @@ cc_library(
+         ],
+-    }),
++    }) + CUSTOM_LIBCXX_COPTS,
+     local_defines = [
+         "U_I18N_IMPLEMENTATION",
+     ],
+-    deps = [":icuuc"],
++    deps = [":icuuc"] + CUSTOM_LIBCXX_DEPS,
+     alwayslink = 1,
+ )
+ 
+@@ -93,13 +109,10 @@
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -271,4 +394,16 @@ index 5fda2f4..381386c 100644
 +            "-Wno-deprecated-declarations",
          ],
          "//conditions:default": [],
-     }),
+-    }),
++    }) + CUSTOM_LIBCXX_COPTS,
+     include_prefix = "third_party/icu",
+     local_defines = [
+         "U_COMMON_IMPLEMENTATION",
+@@ -108,6 +121,6 @@
+     deps = [
+         ":icui18n",
+         ":icuuc",
+-    ],
++    ] + CUSTOM_LIBCXX_DEPS,
+     alwayslink = 1,
+ )

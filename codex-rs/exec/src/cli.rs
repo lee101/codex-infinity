@@ -20,15 +20,27 @@ pub struct Cli {
     pub shared: ExecSharedCliOptions,
 
     /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
-    #[arg(long = "yolo2", alias = "dangerously-disable-timeouts", default_value_t = false)]
+    #[arg(
+        long = "yolo2",
+        alias = "dangerously-disable-timeouts",
+        default_value_t = false
+    )]
     pub dangerously_disable_timeouts: bool,
 
     /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
-    #[arg(long = "yolo3", alias = "dangerously-disable-env-wrapping", default_value_t = false)]
+    #[arg(
+        long = "yolo3",
+        alias = "dangerously-disable-env-wrapping",
+        default_value_t = false
+    )]
     pub dangerously_disable_environment_wrapping: bool,
 
     /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
-    #[arg(long = "yolo4", alias = "dangerously-passthrough-stdio", default_value_t = false)]
+    #[arg(
+        long = "yolo4",
+        alias = "dangerously-passthrough-stdio",
+        default_value_t = false
+    )]
     pub dangerously_passthrough_stdio: bool,
 
     /// Allow running Codex outside a Git repository.
@@ -46,6 +58,16 @@ pub struct Cli {
     /// Do not load user or project execpolicy `.rules` files.
     #[arg(long = "ignore-rules", global = true, default_value_t = false)]
     pub ignore_rules: bool,
+
+    /// Legacy compatibility trap for the removed `--full-auto` flag.
+    #[arg(
+        long = "full-auto",
+        hide = true,
+        global = true,
+        default_value_t = false,
+        conflicts_with = "dangerously_bypass_approvals_and_sandbox"
+    )]
+    pub removed_full_auto: bool,
 
     /// Path to a JSON Schema file describing the model's final response shape.
     #[arg(long = "output-schema", value_name = "FILE")]
@@ -101,6 +123,18 @@ impl std::ops::DerefMut for Cli {
     }
 }
 
+impl Cli {
+    pub fn removed_full_auto_warning(&self) -> Option<&'static str> {
+        if self.removed_full_auto {
+            return Some(
+                "warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.",
+            );
+        }
+
+        None
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ExecSharedCliOptions(SharedCliOptions);
 
@@ -146,7 +180,6 @@ impl FromArgMatches for ExecSharedCliOptions {
 
 fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
     cmd.mut_arg("model", |arg| arg.global(true))
-        .mut_arg("full_auto", |arg| arg.global(true))
         .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
             arg.global(true)
         })

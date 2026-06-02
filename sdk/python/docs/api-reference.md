@@ -18,6 +18,7 @@ from codex_app_server import (
     InitializeResponse,
     Input,
     InputItem,
+    RunInput,
     TextInput,
     ImageInput,
     LocalImageInput,
@@ -92,6 +93,30 @@ async with AsyncCodex() as codex:
     ...
 ```
 
+## Login handles
+
+### ChatgptLoginHandle / AsyncChatgptLoginHandle
+
+- `login_id: str`
+- `auth_url: str`
+- `wait() -> AccountLoginCompletedNotification`
+- `cancel() -> CancelLoginAccountResponse`
+
+Async handle methods return awaitables.
+
+### DeviceCodeLoginHandle / AsyncDeviceCodeLoginHandle
+
+- `login_id: str`
+- `verification_url: str`
+- `user_code: str`
+- `wait() -> AccountLoginCompletedNotification`
+- `cancel() -> CancelLoginAccountResponse`
+
+Async handle methods return awaitables.
+
+`wait()` consumes only the completion notification for its matching login
+attempt. API-key login completes synchronously and does not return a handle.
+
 ## Thread / AsyncThread
 
 `Thread` and `AsyncThread` share the same shape and intent.
@@ -116,6 +141,12 @@ async with AsyncCodex() as codex:
 the turn, consumes notifications until completion, and returns a small result
 object with:
 
+- `id: str`
+- `status: TurnStatus`
+- `error: TurnError | None`
+- `started_at: int | None`
+- `completed_at: int | None`
+- `duration_ms: int | None`
 - `final_response: str | None`
 - `items: list[ThreadItem]`
 - `usage: ThreadTokenUsage | None`
@@ -130,7 +161,7 @@ Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
 
 ### TurnHandle
 
-- `steer(input: Input) -> TurnSteerResponse`
+- `steer(input: str | Input) -> TurnSteerResponse`
 - `interrupt() -> TurnInterruptResponse`
 - `stream() -> Iterator[Notification]`
 - `run() -> codex_app_server.generated.v2_all.Turn`
@@ -142,7 +173,7 @@ Behavior notes:
 
 ### AsyncTurnHandle
 
-- `steer(input: Input) -> Awaitable[TurnSteerResponse]`
+- `steer(input: str | Input) -> Awaitable[TurnSteerResponse]`
 - `interrupt() -> Awaitable[TurnInterruptResponse]`
 - `stream() -> AsyncIterator[Notification]`
 - `run() -> Awaitable[codex_app_server.generated.v2_all.Turn]`
@@ -163,6 +194,7 @@ Behavior notes:
 
 InputItem = TextInput | ImageInput | LocalImageInput | SkillInput | MentionInput
 Input = list[InputItem] | InputItem
+RunInput = Input | str
 ```
 
 ## Generated Models

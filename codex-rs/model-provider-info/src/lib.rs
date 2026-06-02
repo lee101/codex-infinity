@@ -38,11 +38,16 @@ const GEMINI_PROVIDER_NAME: &str = "Google Gemini";
 pub const GEMINI_PROVIDER_ID: &str = "gemini";
 const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+const OPENPATHS_PROVIDER_NAME: &str = "OpenPaths";
+pub const OPENPATHS_PROVIDER_ID: &str = "openpaths";
 const ZHIPU_PROVIDER_NAME: &str = "Z.AI (Zhipu)";
 pub const ZHIPU_PROVIDER_ID: &str = "zhipu";
+const DEEPSEEK_PROVIDER_NAME: &str = "DeepSeek";
+pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
-pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/v1";
+pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
+    "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -397,6 +402,30 @@ impl ModelProviderInfo {
         }
     }
 
+    pub fn create_openpaths_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: OPENPATHS_PROVIDER_NAME.into(),
+            base_url: Some("https://openpaths.io/v1".into()),
+            env_key: Some("OPENPATHS_API_KEY".into()),
+            env_key_instructions: Some(
+                "Get your API key from https://openpaths.io and set OPENPATHS_API_KEY".into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            ..Default::default()
+        }
+    }
+
     pub fn create_zhipu_provider() -> ModelProviderInfo {
         ModelProviderInfo {
             name: ZHIPU_PROVIDER_NAME.into(),
@@ -404,6 +433,31 @@ impl ModelProviderInfo {
             env_key: Some("ZAI_API_KEY".into()),
             env_key_instructions: Some(
                 "Get your API key from https://z.ai and set ZAI_API_KEY".into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_deepseek_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: DEEPSEEK_PROVIDER_NAME.into(),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            env_key: Some("DEEPSEEK_API_KEY".into()),
+            env_key_instructions: Some(
+                "Get your API key from https://platform.deepseek.com and set DEEPSEEK_API_KEY"
+                    .into(),
             ),
             experimental_bearer_token: None,
             auth: None,
@@ -448,7 +502,6 @@ impl ModelProviderInfo {
         }
     }
 
-
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -456,8 +509,14 @@ impl ModelProviderInfo {
     pub fn effective_model_name<'a>(&self, slug: &'a str) -> &'a str {
         if self.name == GEMINI_PROVIDER_NAME {
             slug.strip_prefix("google/").unwrap_or(slug)
+        } else if self.name == OPENPATHS_PROVIDER_NAME {
+            slug.strip_prefix("openpaths/").unwrap_or(slug)
         } else if self.name == ZHIPU_PROVIDER_NAME {
-            slug.strip_prefix("zhipu/").unwrap_or(slug)
+            slug.strip_prefix("zhipu/")
+                .or_else(|| slug.strip_prefix("z-ai/"))
+                .unwrap_or(slug)
+        } else if self.name == DEEPSEEK_PROVIDER_NAME {
+            slug.strip_prefix("deepseek/").unwrap_or(slug)
         } else {
             slug
         }
@@ -467,11 +526,9 @@ impl ModelProviderInfo {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
     }
 
-
     pub fn supports_remote_compaction(&self) -> bool {
         self.is_openai() || is_azure_responses_provider(&self.name, self.base_url.as_deref())
     }
-
 
     pub fn has_command_auth(&self) -> bool {
         self.auth.is_some()
@@ -498,8 +555,10 @@ pub fn built_in_model_providers(
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (OPENROUTER_PROVIDER_ID, P::create_openrouter_provider()),
+        (OPENPATHS_PROVIDER_ID, P::create_openpaths_provider()),
         (GEMINI_PROVIDER_ID, P::create_gemini_provider()),
         (ZHIPU_PROVIDER_ID, P::create_zhipu_provider()),
+        (DEEPSEEK_PROVIDER_ID, P::create_deepseek_provider()),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
@@ -523,8 +582,34 @@ fn non_empty_env_var(name: &str) -> bool {
 
 pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
-    if lower.starts_with("glm-") && non_empty_env_var("ZAI_API_KEY") {
+    if (lower.starts_with("glm-")
+        || lower
+            .strip_prefix("z-ai/")
+            .is_some_and(|slug| slug.starts_with("glm-"))
+        || lower
+            .strip_prefix("zhipu/")
+            .is_some_and(|slug| slug.starts_with("glm-")))
+        && non_empty_env_var("ZAI_API_KEY")
+    {
         return Some(ZHIPU_PROVIDER_ID);
+    }
+    if (lower.starts_with("deepseek-")
+        || lower
+            .strip_prefix("deepseek/")
+            .is_some_and(|slug| slug.starts_with("deepseek-") || !slug.is_empty()))
+        && non_empty_env_var("DEEPSEEK_API_KEY")
+    {
+        return Some(DEEPSEEK_PROVIDER_ID);
+    }
+    if (lower == "auto"
+        || lower == "autothink"
+        || lower.starts_with("auto-")
+        || lower
+            .strip_prefix("openpaths/")
+            .is_some_and(|slug| slug == "auto" || slug == "autothink" || slug.starts_with("auto-")))
+        && non_empty_env_var("OPENPATHS_API_KEY")
+    {
+        return Some(OPENPATHS_PROVIDER_ID);
     }
     match model.split_once('/') {
         Some(("google", _)) if non_empty_env_var("GEMINI_API_KEY") => Some(GEMINI_PROVIDER_ID),
@@ -535,6 +620,12 @@ pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> 
             Some(OPENROUTER_PROVIDER_ID)
         }
         Some(("zhipu", _)) if non_empty_env_var("ZAI_API_KEY") => Some(ZHIPU_PROVIDER_ID),
+        Some(("openpaths", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
+            Some(OPENPATHS_PROVIDER_ID)
+        }
+        Some(("deepseek", _)) if non_empty_env_var("DEEPSEEK_API_KEY") => {
+            Some(DEEPSEEK_PROVIDER_ID)
+        }
         _ => None,
     }
 }
@@ -576,7 +667,6 @@ pub fn merge_configured_model_providers(
 
     Ok(model_providers)
 }
-
 
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
     // These CODEX_OSS_ environment variables are experimental: we may

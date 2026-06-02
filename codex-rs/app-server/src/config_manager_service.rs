@@ -12,16 +12,16 @@ use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
+use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
+use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::validate_feature_requirements_for_config_toml;
-use codex_core::config_loader::ConfigLayerEntry;
-use codex_core::config_loader::ConfigLayerStack;
-use codex_core::config_loader::ConfigLayerStackOrdering;
-use codex_core::config_loader::ConfigRequirementsToml;
-use codex_core::config_loader::merge_toml_values;
 use codex_core::path_utils;
 use codex_core::path_utils::SymlinkWritePaths;
 use codex_core::path_utils::resolve_symlink_write_paths;
@@ -125,7 +125,6 @@ impl ConfigManager {
         };
 
         let effective = layers.effective_config();
-
         let effective_config_toml: ConfigToml = effective
             .try_into()
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
@@ -237,6 +236,23 @@ impl ConfigManager {
             let segments = parse_key_path(&key_path).map_err(|message| {
                 ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)
             })?;
+            if !value.is_null() {
+                match segments.as_slice() {
+                    [segment] if segment == "profile" => {
+                        return Err(ConfigManagerError::write(
+                            ConfigWriteErrorCode::ConfigValidationError,
+                            "`profile` is a legacy config selector and can no longer be written; use `--profile <name>` with `<name>.config.toml` instead",
+                        ));
+                    }
+                    [segment, ..] if segment == "profiles" => {
+                        return Err(ConfigManagerError::write(
+                            ConfigWriteErrorCode::ConfigValidationError,
+                            "`profiles` contains legacy config profile tables and can no longer be written; use `--profile <name>` with `<name>.config.toml` instead",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             let original_value = value_at_path(&user_config, &segments).cloned();
             let parsed_value = parse_value(value).map_err(|message| {
                 ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)

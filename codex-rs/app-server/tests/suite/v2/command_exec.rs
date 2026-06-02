@@ -246,7 +246,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
+async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     let command_dir = codex_home.path().join("command-cwd");
@@ -256,17 +256,18 @@ async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let mut permission_profile = root_read_only_permission_profile();
-    permission_profile
-        .file_system
-        .as_mut()
-        .expect("root read-only helper should include filesystem permissions")
-        .entries
-        .push(FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::CurrentWorkingDirectory,
-            },
-            access: FileSystemAccessMode::Write,
-        });
+    let PermissionProfile::Managed { file_system, .. } = &mut permission_profile else {
+        panic!("root read-only helper should use managed permissions");
+    };
+    let PermissionProfileFileSystemPermissions::Restricted { entries, .. } = file_system else {
+        panic!("root read-only helper should use restricted filesystem permissions");
+    };
+    entries.push(FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+        },
+        access: FileSystemAccessMode::Write,
+    });
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -297,7 +298,7 @@ async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
     let response: CommandExecResponse = to_response(response)?;
     assert_eq!(
         response.exit_code, 0,
-        "parent cwd write should fail under command-cwd-scoped profile: {response:?}"
+        "parent cwd write should fail under command project-root profile: {response:?}"
     );
     assert_eq!(
         std::fs::read_to_string(command_dir.join("child.txt"))?,
@@ -305,7 +306,7 @@ async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
     );
     assert!(
         !codex_home.path().join("parent.txt").exists(),
-        "permissionProfile :cwd write should not grant the server cwd when command cwd differs"
+        "permissionProfile :project_roots write should not grant the server cwd when command cwd differs"
     );
 
     Ok(())
@@ -1061,11 +1062,9 @@ fn decode_delta_notification(
 }
 
 fn root_read_only_permission_profile() -> PermissionProfile {
-    PermissionProfile {
-        network: Some(PermissionProfileNetworkPermissions {
-            enabled: Some(false),
-        }),
-        file_system: Some(PermissionProfileFileSystemPermissions {
+    PermissionProfile::Managed {
+        network: PermissionProfileNetworkPermissions { enabled: false },
+        file_system: PermissionProfileFileSystemPermissions::Restricted {
             entries: vec![FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
                     value: FileSystemSpecialPath::Root,
@@ -1073,7 +1072,7 @@ fn root_read_only_permission_profile() -> PermissionProfile {
                 access: FileSystemAccessMode::Read,
             }],
             glob_scan_max_depth: None,
-        }),
+        },
     }
 }
 

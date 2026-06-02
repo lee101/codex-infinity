@@ -77,7 +77,6 @@ pub struct Cli {
     #[arg(long = "yolo4", default_value_t = false)]
     pub dangerously_passthrough_stdio: bool,
 
-
     /// Enable live web search. When enabled, the native Responses `web_search` tool is available to the model (no per‑call approval).
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,

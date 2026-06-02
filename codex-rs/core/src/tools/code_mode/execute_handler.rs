@@ -25,22 +25,19 @@ impl CodeModeExecuteHandler {
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
         let enabled_tools = build_enabled_tools(&exec).await;
-        let stored_values = exec
-            .session
-            .services
-            .code_mode_service
-            .stored_values()
-            .await;
         // Allocate before starting V8 so the trace can create the parent
         // CodeCell before model-authored JavaScript issues nested tool calls.
         let runtime_cell_id = exec.session.services.code_mode_service.allocate_cell_id();
-        let code_cell_trace = exec.session.services.rollout_trace.start_code_cell_trace(
-            exec.session.conversation_id,
-            exec.turn.sub_id.as_str(),
-            runtime_cell_id.as_str(),
-            call_id.as_str(),
-            args.code.as_str(),
-        );
+        let code_cell_trace = exec
+            .session
+            .services
+            .rollout_thread_trace
+            .start_code_cell_trace(
+                exec.turn.sub_id.as_str(),
+                runtime_cell_id.as_str(),
+                call_id.as_str(),
+                args.code.as_str(),
+            );
         let started_at = std::time::Instant::now();
         let response = exec
             .session
@@ -51,7 +48,6 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id,
                 enabled_tools,
                 source: args.code,
-                stored_values,
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
             })

@@ -26,7 +26,7 @@ impl ToolDispatchTrace {
         let context = invocation
             .session
             .services
-            .rollout_trace
+            .rollout_thread_trace
             .start_tool_dispatch_trace(|| tool_dispatch_invocation(invocation));
         Self { context }
     }
@@ -71,7 +71,6 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
             runtime_cell_id: cell_id.clone(),
             runtime_tool_call_id: runtime_tool_call_id.clone(),
         },
-        ToolCallSource::JsRepl => return None,
     };
 
     Some(ToolDispatchInvocation {
@@ -98,7 +97,6 @@ fn tool_dispatch_result(
         ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
             value: result.code_mode_result(payload),
         }),
-        ToolCallSource::JsRepl => None,
     }
 }
 

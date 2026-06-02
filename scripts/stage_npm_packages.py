@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Stage one or more Codex npm packages for release."""
 
-from __future__ import annotations
-
 import argparse
 import importlib.util
 import json
@@ -114,11 +112,15 @@ def install_native_components(
     workflow_url: str,
     components: set[str],
     vendor_root: Path,
+    *,
+    allow_legacy_codex_package: bool,
 ) -> None:
     if not components:
         return
 
     cmd = [str(INSTALL_NATIVE_DEPS), "--workflow-url", workflow_url]
+    if allow_legacy_codex_package:
+        cmd.append("--allow-legacy-codex-package")
     for component in sorted(components):
         cmd.extend(["--component", component])
     cmd.append(str(vendor_root))

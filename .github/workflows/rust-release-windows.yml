@@ -40,28 +40,42 @@ jobs:
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: primary
-            build_args: --bin codex --bin codex-responses-api-proxy
+            binaries: "codex codex-responses-api-proxy"
             runs_on:
               group: codex-runners
               labels: codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: primary
-            build_args: --bin codex --bin codex-responses-api-proxy
+            binaries: "codex codex-responses-api-proxy"
             runs_on:
               group: codex-runners
               labels: codex-windows-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: helpers
-            build_args: --bin codex-windows-sandbox-setup --bin codex-command-runner
+            binaries: "codex-windows-sandbox-setup codex-command-runner"
             runs_on:
               group: codex-runners
               labels: codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: helpers
-            build_args: --bin codex-windows-sandbox-setup --bin codex-command-runner
+            binaries: "codex-windows-sandbox-setup codex-command-runner"
+            runs_on:
+              group: codex-runners
+              labels: codex-windows-arm64
+          - runner: windows-x64
+            target: x86_64-pc-windows-msvc
+            bundle: app-server
+            binaries: "codex-app-server"
+            runs_on:
+              group: codex-runners
+              labels: codex-windows-x64
+          - runner: windows-arm64
+            target: aarch64-pc-windows-msvc
+            bundle: app-server
+            binaries: "codex-app-server"
             runs_on:
               group: codex-runners
               labels: codex-windows-arm64
@@ -89,7 +103,11 @@ jobs:
       - name: Cargo build (Windows binaries)
         shell: bash
         run: |
-          cargo build --target ${{ matrix.target }} --release --timings ${{ matrix.build_args }}
+          build_args=()
+          for binary in ${{ matrix.binaries }}; do
+            build_args+=(--bin "$binary")
+          done
+          cargo build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
 
       - name: Upload Cargo timings
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -103,13 +121,9 @@ jobs:
         run: |
           output_dir="target/${{ matrix.target }}/release/staged-${{ matrix.bundle }}"
           mkdir -p "$output_dir"
-          if [[ "${{ matrix.bundle }}" == "primary" ]]; then
-            cp target/${{ matrix.target }}/release/codex.exe "$output_dir/codex.exe"
-            cp target/${{ matrix.target }}/release/codex-responses-api-proxy.exe "$output_dir/codex-responses-api-proxy.exe"
-          else
-            cp target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe "$output_dir/codex-windows-sandbox-setup.exe"
-            cp target/${{ matrix.target }}/release/codex-command-runner.exe "$output_dir/codex-command-runner.exe"
-          fi
+          for binary in ${{ matrix.binaries }}; do
+            cp "target/${{ matrix.target }}/release/${binary}.exe" "$output_dir/${binary}.exe"
+          done
 
       - name: Upload Windows binaries
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -130,6 +144,8 @@ jobs:
     defaults:
       run:
         working-directory: codex-rs
+    env:
+      WINDOWS_BINARIES: "codex codex-responses-api-proxy codex-windows-sandbox-setup codex-command-runner codex-app-server"
 
     strategy:
       fail-fast: false
@@ -161,19 +177,25 @@ jobs:
           name: windows-binaries-${{ matrix.target }}-helpers
           path: codex-rs/target/${{ matrix.target }}/release
 
+      - name: Download prebuilt Windows app-server binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-binaries-${{ matrix.target }}-app-server
+          path: codex-rs/target/${{ matrix.target }}/release
+
       - name: Verify binaries
         shell: bash
         run: |
           set -euo pipefail
-          ls -lh target/${{ matrix.target }}/release/codex.exe
-          ls -lh target/${{ matrix.target }}/release/codex-responses-api-proxy.exe
-          ls -lh target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe
-          ls -lh target/${{ matrix.target }}/release/codex-command-runner.exe
+          for binary in ${WINDOWS_BINARIES}; do
+            ls -lh "target/${{ matrix.target }}/release/${binary}.exe"
+          done
 
       - name: Sign Windows binaries with Azure Trusted Signing
         uses: ./.github/actions/windows-code-sign
         with:
           target: ${{ matrix.target }}
+          binaries: ${{ env.WINDOWS_BINARIES }}
           client-id: ${{ secrets.AZURE_TRUSTED_SIGNING_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TRUSTED_SIGNING_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_TRUSTED_SIGNING_SUBSCRIPTION_ID }}
@@ -187,14 +209,122 @@ jobs:
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
 
-          cp target/${{ matrix.target }}/release/codex.exe "$dest/codex-${{ matrix.target }}.exe"
-          cp target/${{ matrix.target }}/release/codex-responses-api-proxy.exe "$dest/codex-responses-api-proxy-${{ matrix.target }}.exe"
-          cp target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe"
-          cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
+          for binary in ${WINDOWS_BINARIES}; do
+            cp "target/${{ matrix.target }}/release/${binary}.exe" \
+              "$dest/${binary}-${{ matrix.target }}.exe"
+          done
 
       - name: Install DotSlash
         uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
 
+<<<<<<< HEAD
+||||||| 60b45d92d9
+      - name: Build Codex package archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bundle in primary app-server; do
+            bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+              --target "${{ matrix.target }}" \
+              --bundle "$bundle" \
+              --entrypoint-dir "target/${{ matrix.target }}/release" \
+              --archive-dir "dist/${{ matrix.target }}"
+          done
+
+      - name: Build Python runtime wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-pc-windows-msvc)
+              platform_tag="win_arm64"
+              ;;
+            x86_64-pc-windows-msvc)
+              platform_tag="win_amd64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          "${RUNNER_TEMP}/python-runtime-build-venv/Scripts/python.exe" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          # Keep the helpers next to codex.exe in the runtime wheel so Windows
+          # sandbox/elevation lookup matches the standalone release zip.
+          python "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py" \
+            stage-runtime \
+            "$stage_dir" \
+            "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex.exe" \
+            --codex-version "${GITHUB_REF_NAME}" \
+            --platform-tag "$platform_tag" \
+            --resource-binary "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex-command-runner.exe" \
+            --resource-binary "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe"
+          "${RUNNER_TEMP}/python-runtime-build-venv/Scripts/python.exe" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Upload Python runtime wheel
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+=======
+      - name: Build Codex package archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bundle in primary app-server; do
+            bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+              --target "${{ matrix.target }}" \
+              --bundle "$bundle" \
+              --entrypoint-dir "target/${{ matrix.target }}/release" \
+              --archive-dir "dist/${{ matrix.target }}"
+          done
+
+      - name: Build Python runtime wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-pc-windows-msvc)
+              platform_tag="win_arm64"
+              ;;
+            x86_64-pc-windows-msvc)
+              platform_tag="win_amd64"
+              ;;
+            *)
+              echo "No Python runtime wheel platform tag for ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          python -m venv "${RUNNER_TEMP}/python-runtime-build-venv"
+          "${RUNNER_TEMP}/python-runtime-build-venv/Scripts/python.exe" -m pip install build
+
+          stage_dir="${RUNNER_TEMP}/openai-codex-cli-bin-${{ matrix.target }}"
+          wheel_dir="${GITHUB_WORKSPACE}/python-runtime-dist/${{ matrix.target }}"
+          python "${GITHUB_WORKSPACE}/sdk/python/scripts/update_sdk_artifacts.py" \
+            stage-runtime \
+            "$stage_dir" \
+            "dist/${{ matrix.target }}/codex-package-${{ matrix.target }}.tar.gz" \
+            --codex-version "${GITHUB_REF_NAME}" \
+            --platform-tag "$platform_tag"
+          "${RUNNER_TEMP}/python-runtime-build-venv/Scripts/python.exe" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
+
+      - name: Upload Python runtime wheel
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-runtime-wheel-${{ matrix.target }}
+          path: python-runtime-dist/${{ matrix.target }}/*.whl
+          if-no-files-found: error
+
+>>>>>>> upstream/main
       - name: Compress artifacts
         shell: bash
         run: |
@@ -213,7 +343,7 @@ jobs:
             base="$(basename "$f")"
             # Skip files that are already archives (shouldn't happen, but be
             # safe).
-            if [[ "$base" == *.tar.gz || "$base" == *.zip || "$base" == *.dmg ]]; then
+            if [[ "$base" == *.tar.gz || "$base" == *.tar.zst || "$base" == *.zip || "$base" == *.dmg ]]; then
               continue
             fi
 

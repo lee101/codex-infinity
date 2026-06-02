@@ -228,6 +228,17 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             default_reasoning_effort: Some(ReasoningEffort::Medium),
             supports_parallel_tool_calls: true,
         )
+    } else if slug.starts_with("gpt-5.5") {
+        model_family!(
+            slug, "gpt-5.5",
+            supports_reasoning_summaries: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
+            base_instructions: GPT_5_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
+        )
     } else if slug.starts_with("gpt-5.4-mini") {
         model_family!(
             slug, "gpt-5.4-mini",
@@ -279,6 +290,15 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             needs_special_apply_patch_instructions: true,
             support_verbosity: true,
         )
+    } else if slug == "auto"
+        || slug == "autothink"
+        || slug.starts_with("auto-")
+        || slug.starts_with("openpaths/auto")
+    {
+        model_family!(
+            slug, "openpaths-auto",
+            needs_special_apply_patch_instructions: true,
+        )
     } else if slug.starts_with("glm-5") || slug.starts_with("GLM-5") {
         model_family!(
             slug, "glm-5",
@@ -292,6 +312,11 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
     } else if slug.contains("grok") {
         model_family!(
             slug, "grok",
+            needs_special_apply_patch_instructions: true,
+        )
+    } else if slug.starts_with("deepseek-") || slug.starts_with("DeepSeek-") {
+        model_family!(
+            slug, "deepseek",
             needs_special_apply_patch_instructions: true,
         )
     } else {

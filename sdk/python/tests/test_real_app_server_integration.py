@@ -135,7 +135,7 @@ def _run_python(
     )
 
 
-def _runtime_compatibility_hint(
+def _runtime_schema_hint(
     runtime_env: PreparedRuntimeEnv,
     *,
     stdout: str,
@@ -144,7 +144,7 @@ def _runtime_compatibility_hint(
     combined = f"{stdout}\n{stderr}"
     if "ThreadStartResponse" in combined and "approvalsReviewer" in combined:
         return (
-            "\nCompatibility hint:\n"
+            "\nSchema hint:\n"
             f"Pinned runtime {runtime_env.runtime_version} returned a thread/start payload "
             "that is older than the current SDK schema and is missing "
             "`approvalsReviewer`. Bump `sdk/python/_runtime_setup.py` to a matching "
@@ -165,7 +165,7 @@ def _run_json_python(
         "Python snippet failed.\n"
         f"STDOUT:\n{result.stdout}\n"
         f"STDERR:\n{result.stderr}"
-        f"{_runtime_compatibility_hint(runtime_env, stdout=result.stdout, stderr=result.stderr)}"
+        f"{_runtime_schema_hint(runtime_env, stdout=result.stdout, stderr=result.stderr)}"
     )
     return json.loads(result.stdout)
 
@@ -241,18 +241,13 @@ def test_real_thread_and_turn_start_smoke(runtime_env: PreparedRuntimeEnv) -> No
                     model="gpt-5.4",
                     config={"model_reasoning_effort": "high"},
                 )
-                result = thread.turn(TextInput("hello")).run()
-                persisted = thread.read(include_turns=True)
-                persisted_turn = next(
-                    (turn for turn in persisted.thread.turns or [] if turn.id == result.id),
-                    None,
-                )
+                result = thread.turn("hello").run()
                 print(json.dumps({
                     "thread_id": thread.id,
                     "turn_id": result.id,
                     "status": result.status.value,
-                    "items_count": len(result.items or []),
-                    "persisted_items_count": 0 if persisted_turn is None else len(persisted_turn.items or []),
+                    "items_count": len(result.items),
+                    "final_response_is_text": isinstance(result.final_response, str) and bool(result.final_response.strip()),
                 }))
             """
         ),
@@ -261,8 +256,8 @@ def test_real_thread_and_turn_start_smoke(runtime_env: PreparedRuntimeEnv) -> No
     assert isinstance(data["thread_id"], str) and data["thread_id"].strip()
     assert isinstance(data["turn_id"], str) and data["turn_id"].strip()
     assert data["status"] == "completed"
-    assert isinstance(data["items_count"], int)
-    assert isinstance(data["persisted_items_count"], int)
+    assert data["items_count"] > 0
+    assert data["final_response_is_text"] is True
 
 
 def test_real_thread_run_convenience_smoke(runtime_env: PreparedRuntimeEnv) -> None:
@@ -312,18 +307,13 @@ def test_real_async_thread_turn_usage_and_ids_smoke(
                         model="gpt-5.4",
                         config={"model_reasoning_effort": "high"},
                     )
-                    result = await (await thread.turn(TextInput("say ok"))).run()
-                    persisted = await thread.read(include_turns=True)
-                    persisted_turn = next(
-                        (turn for turn in persisted.thread.turns or [] if turn.id == result.id),
-                        None,
-                    )
+                    result = await (await thread.turn("say ok")).run()
                     print(json.dumps({
                         "thread_id": thread.id,
                         "turn_id": result.id,
                         "status": result.status.value,
-                        "items_count": len(result.items or []),
-                        "persisted_items_count": 0 if persisted_turn is None else len(persisted_turn.items or []),
+                        "items_count": len(result.items),
+                        "final_response_is_text": isinstance(result.final_response, str) and bool(result.final_response.strip()),
                     }))
 
             asyncio.run(main())
@@ -334,8 +324,8 @@ def test_real_async_thread_turn_usage_and_ids_smoke(
     assert isinstance(data["thread_id"], str) and data["thread_id"].strip()
     assert isinstance(data["turn_id"], str) and data["turn_id"].strip()
     assert data["status"] == "completed"
-    assert isinstance(data["items_count"], int)
-    assert isinstance(data["persisted_items_count"], int)
+    assert data["items_count"] > 0
+    assert data["final_response_is_text"] is True
 
 
 def test_real_async_thread_run_convenience_smoke(
@@ -402,7 +392,7 @@ def test_notebook_sync_cell_smoke(runtime_env: PreparedRuntimeEnv) -> None:
         [
             _notebook_cell_source(1),
             _notebook_cell_source(2),
-            _notebook_cell_source(3),
+            _notebook_cell_source(4),
         ]
     )
     result = _run_python(runtime_env, source, timeout_s=240)
@@ -418,7 +408,7 @@ def test_notebook_advanced_cell_smoke(runtime_env: PreparedRuntimeEnv) -> None:
         [
             _notebook_cell_source(1),
             _notebook_cell_source(2),
-            _notebook_cell_source(7),
+            _notebook_cell_source(8),
         ]
     )
     result = _run_python(runtime_env, source, timeout_s=360)
@@ -443,7 +433,7 @@ def test_real_streaming_smoke_turn_completed(runtime_env: PreparedRuntimeEnv) ->
                     model="gpt-5.4",
                     config={"model_reasoning_effort": "high"},
                 )
-                turn = thread.turn(TextInput("Reply with one short sentence."))
+                turn = thread.turn("Reply with one short sentence.")
                 saw_delta = False
                 saw_completed = False
                 for event in turn.stream():
@@ -476,9 +466,9 @@ def test_real_turn_interrupt_smoke(runtime_env: PreparedRuntimeEnv) -> None:
                     model="gpt-5.4",
                     config={"model_reasoning_effort": "high"},
                 )
-                turn = thread.turn(TextInput("Count from 1 to 200 with commas."))
+                turn = thread.turn("Count from 1 to 200 with commas.")
                 turn.interrupt()
-                follow_up = thread.turn(TextInput("Say 'ok' only.")).run()
+                follow_up = thread.turn("Say 'ok' only.").run()
                 print(json.dumps({"status": follow_up.status.value}))
             """
         ),
@@ -499,7 +489,7 @@ def test_real_examples_run_and_assert(
         f"Example failed: {folder}/{script}\n"
         f"STDOUT:\n{result.stdout}\n"
         f"STDERR:\n{result.stderr}"
-        f"{_runtime_compatibility_hint(runtime_env, stdout=result.stdout, stderr=result.stderr)}"
+        f"{_runtime_schema_hint(runtime_env, stdout=result.stdout, stderr=result.stderr)}"
     )
 
     out = result.stdout
@@ -509,7 +499,7 @@ def test_real_examples_run_and_assert(
         assert "Server: unknown" not in out
     elif folder == "02_turn_run":
         assert "thread_id:" in out and "turn_id:" in out and "status:" in out
-        assert "persisted.items.count:" in out
+        assert "items.count:" in out
     elif folder == "03_turn_stream_events":
         assert "stream.completed:" in out
         assert "assistant>" in out

@@ -14,12 +14,10 @@ from codex_app_server import Codex, TextInput
 with Codex(config=runtime_config()) as codex:
     # Create an initial thread and turn so we have a real thread to resume.
     original = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
-    first = original.turn(TextInput("Tell me one fact about Saturn.")).run()
+    first = original.turn("Tell me one fact about Saturn.").run()
     print("Created thread:", original.id)
 
     # Resume the existing thread by ID.
     resumed = codex.thread_resume(original.id)
-    second = resumed.turn(TextInput("Continue with one more fact.")).run()
-    persisted = resumed.read(include_turns=True)
-    persisted_turn = find_turn_by_id(persisted.thread.turns, second.id)
-    print(assistant_text_from_turn(persisted_turn))
+    second = resumed.turn("Continue with one more fact.").run()
+    print(second.final_response)

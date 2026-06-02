@@ -16,6 +16,8 @@ use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 
@@ -265,6 +267,7 @@ pub(crate) struct ListSelectionView {
 
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     on_cancel: OnCancelCallback,
+    keymap: ListKeymap,
 }
 
 impl ListSelectionView {
@@ -275,7 +278,11 @@ impl ListSelectionView {
     /// When search is enabled, rows without `search_value` will disappear as
     /// soon as the query is non-empty, which can look like dropped data unless
     /// callers intentionally populate that field.
-    pub fn new(params: SelectionViewParams, app_event_tx: AppEventSender) -> Self {
+    pub fn new(
+        params: SelectionViewParams,
+        app_event_tx: AppEventSender,
+        keymap: ListKeymap,
+    ) -> Self {
         let mut header = params.header;
         if params.title.is_some() || params.subtitle.is_some() {
             let title = params.title.map(|title| Line::from(title.bold()));
@@ -330,6 +337,7 @@ impl ListSelectionView {
             preserve_side_content_bg: params.preserve_side_content_bg,
             on_selection_changed: params.on_selection_changed,
             on_cancel: params.on_cancel,
+            keymap,
         };
         s.apply_filter();
         if s.tabs_enabled() && !has_initial_selected_idx && s.state.selected_idx.is_none() {
@@ -388,12 +396,21 @@ impl ListSelectionView {
     fn apply_filter(&mut self) {
         let previously_selected = self
             .selected_actual_idx()
+            .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             .or_else(|| {
                 (!self.is_searchable)
-                    .then(|| self.active_items().iter().position(|item| item.is_current))
+                    .then(|| {
+                        self.active_items()
+                            .iter()
+                            .position(|item| item.is_current && Self::item_is_enabled(item))
+                    })
                     .flatten()
             })
-            .or_else(|| self.initial_selected_idx.take());
+            .or_else(|| {
+                self.initial_selected_idx
+                    .take()
+                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
+            });
 
         if self.is_searchable && !self.search_query.is_empty() {
             let query_lower = self.search_query.to_lowercase();
@@ -411,7 +428,7 @@ impl ListSelectionView {
         }
 
         let len = self.filtered_indices.len();
-        self.state.selected_idx = self
+        let selected_visible_idx = self
             .state
             .selected_idx
             .and_then(|visible_idx| {
@@ -425,7 +442,15 @@ impl ListSelectionView {
                         .iter()
                         .position(|idx| *idx == actual_idx)
                 })
+            });
+        self.state.selected_idx = selected_visible_idx
+            .filter(|visible_idx| {
+                self.filtered_indices
+                    .get(*visible_idx)
+                    .and_then(|actual_idx| self.active_items().get(*actual_idx))
+                    .is_some_and(Self::item_is_enabled)
             })
+            .or_else(|| self.first_enabled_visible_idx())
             .or_else(|| (len > 0).then_some(0));
 
         let visible = Self::max_visible_rows(len);
@@ -441,6 +466,19 @@ impl ListSelectionView {
     }
 
     fn build_rows(&self) -> Vec<GenericDisplayRow> {
+        let enabled_row_number_width = self
+            .filtered_indices
+            .iter()
+            .filter(|actual_idx| {
+                self.active_items()
+                    .get(**actual_idx)
+                    .is_some_and(Self::item_is_enabled)
+            })
+            .count()
+            .max(1)
+            .to_string()
+            .len();
+        let mut enabled_row_number = 0;
         self.filtered_indices
             .iter()
             .enumerate()
@@ -458,14 +496,15 @@ impl ListSelectionView {
                     };
                     let name_with_marker = format!("{name}{marker}");
                     let is_disabled = item.is_disabled || item.disabled_reason.is_some();
-                    let n = visible_idx + 1;
                     let wrap_prefix = if self.is_searchable {
                         // The number keys don't work when search is enabled (since we let the
                         // numbers be used for the search query).
                         format!("{prefix} ")
                     } else if is_disabled {
-                        format!("{prefix} {}", " ".repeat(n.to_string().len() + 2))
+                        format!("{prefix} {}", " ".repeat(enabled_row_number_width + 2))
                     } else {
+                        enabled_row_number += 1;
+                        let n = enabled_row_number;
                         format!("{prefix} {n}. ")
                     };
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
@@ -524,24 +563,35 @@ impl ListSelectionView {
 
     fn select_first_enabled_row(&mut self) {
         let selected_visible_idx = self
-            .filtered_indices
-            .iter()
-            .position(|actual_idx| {
-                self.active_items()
-                    .get(*actual_idx)
-                    .is_some_and(|item| item.disabled_reason.is_none() && !item.is_disabled)
-            })
+            .first_enabled_visible_idx()
             .or_else(|| (!self.filtered_indices.is_empty()).then_some(0));
         self.state.selected_idx = selected_visible_idx;
         self.state.scroll_top = 0;
     }
 
+    fn first_enabled_visible_idx(&self) -> Option<usize> {
+        self.filtered_indices.iter().position(|actual_idx| {
+            self.active_items()
+                .get(*actual_idx)
+                .is_some_and(Self::item_is_enabled)
+        })
+    }
+
+    fn enabled_actual_idx(&self, actual_idx: usize) -> Option<usize> {
+        self.active_items()
+            .get(actual_idx)
+            .is_some_and(Self::item_is_enabled)
+            .then_some(actual_idx)
+    }
+
+    fn item_is_enabled(item: &SelectionItem) -> bool {
+        item.disabled_reason.is_none() && !item.is_disabled
+    }
+
     fn selected_item_has_toggle(&self) -> bool {
         self.selected_actual_idx()
             .and_then(|actual_idx| self.active_items().get(actual_idx))
-            .is_some_and(|item| {
-                item.toggle.is_some() && item.disabled_reason.is_none() && !item.is_disabled
-            })
+            .is_some_and(|item| item.toggle.is_some() && Self::item_is_enabled(item))
     }
 
     fn selected_item_has_toggle_placeholder(&self) -> bool {
@@ -550,9 +600,21 @@ impl ListSelectionView {
             .is_some_and(|item| {
                 item.toggle.is_none()
                     && item.toggle_placeholder.is_some()
-                    && item.disabled_reason.is_none()
-                    && !item.is_disabled
+                    && Self::item_is_enabled(item)
             })
+    }
+
+    fn actual_idx_for_enabled_number(&self, number: usize) -> Option<usize> {
+        if number == 0 {
+            return None;
+        }
+
+        self.active_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| Self::item_is_enabled(item))
+            .nth(number - 1)
+            .map(|(idx, _)| idx)
     }
 
     fn toggle_selected(&mut self) {
@@ -563,7 +625,7 @@ impl ListSelectionView {
         let Some(item) = self.active_items_mut().get_mut(actual_idx) else {
             return;
         };
-        if item.is_disabled || item.disabled_reason.is_some() {
+        if !Self::item_is_enabled(item) {
             return;
         }
         let Some(toggle) = item.toggle.as_mut() else {
@@ -746,23 +808,25 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event {
-            // Some terminals (or configurations) send Control key chords as
-            // C0 control characters without reporting the CONTROL modifier.
-            // Handle fallbacks for Ctrl-P/N here so navigation works everywhere.
+        let is_plain_text_char = matches!(
+            key_event,
             KeyEvent {
-                code: KeyCode::Up, ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Char(ch),
+                modifiers,
                 ..
+            } if !ch.is_ascii_control()
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT)
+        );
+        let allow_plain_char_navigation = !self.is_searchable || !is_plain_text_char;
+
+        match key_event {
+            _ if allow_plain_char_navigation && self.keymap.move_up.is_pressed(key_event) => {
+                self.move_up()
             }
-            | KeyEvent {
-                code: KeyCode::Char('\u{0010}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^P */ => self.move_up(),
+            _ if allow_plain_char_navigation && self.keymap.move_down.is_pressed(key_event) => {
+                self.move_down()
+            }
             KeyEvent {
                 code: KeyCode::Left,
                 ..
@@ -771,30 +835,6 @@ impl BottomPaneView for ListSelectionView {
                 code: KeyCode::Right,
                 ..
             } if self.tabs_enabled() => self.switch_tab(/*step*/ 1),
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if !self.is_searchable => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('\u{000e}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^N */ => self.move_down(),
-            KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if !self.is_searchable => self.move_down(),
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -818,11 +858,14 @@ impl BottomPaneView for ListSelectionView {
             } if self.is_searchable
                 && self.search_query.is_empty()
                 && self.selected_item_has_toggle_placeholder() => {}
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
+            _ if self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
+            _ if self.keymap.accept.is_pressed(key_event) => self.accept(),
+            KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            } if c.is_ascii_control() => {}
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers,
@@ -845,8 +888,7 @@ impl BottomPaneView for ListSelectionView {
                 if let Some(idx) = self.items.iter().position(|item| {
                     item.display_shortcut
                         .is_some_and(|shortcut| shortcut.is_press(key_event))
-                        && item.disabled_reason.is_none()
-                        && !item.is_disabled
+                        && Self::item_is_enabled(item)
                 }) {
                     self.state.selected_idx = Some(idx);
                     self.accept();
@@ -855,22 +897,12 @@ impl BottomPaneView for ListSelectionView {
                 if let Some(idx) = c
                     .to_digit(10)
                     .map(|d| d as usize)
-                    .and_then(|d| d.checked_sub(1))
-                    && idx < self.active_items().len()
-                    && self
-                        .active_items()
-                        .get(idx)
-                        .is_some_and(|item| item.disabled_reason.is_none() && !item.is_disabled)
+                    .and_then(|number| self.actual_idx_for_enabled_number(number))
                 {
                     self.state.selected_idx = Some(idx);
                     self.accept();
                 }
             }
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.accept(),
             _ => {}
         }
     }
@@ -901,6 +933,10 @@ impl BottomPaneView for ListSelectionView {
 
     fn active_tab_id(&self) -> Option<&str> {
         ListSelectionView::active_tab_id(self)
+    }
+
+    fn prefer_esc_to_handle_key_event(&self) -> bool {
+        true
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -1204,6 +1240,8 @@ mod tests {
     use crate::app_event::AppEvent;
     use crate::bottom_pane::popup_consts::standard_popup_hint_line;
     use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
@@ -1255,6 +1293,10 @@ mod tests {
         }
     }
 
+    fn new_view(params: SelectionViewParams, tx: AppEventSender) -> ListSelectionView {
+        ListSelectionView::new(params, tx, crate::keymap::RuntimeKeymap::defaults().list)
+    }
+
     fn make_selection_view(subtitle: Option<&str>) -> ListSelectionView {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
@@ -1274,7 +1316,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        ListSelectionView::new(
+        new_view(
             SelectionViewParams {
                 title: Some("Select Approval Mode".to_string()),
                 subtitle: subtitle.map(str::to_string),
@@ -1354,6 +1396,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let before_scroll = render_lines_with_width(&view, width);
@@ -1391,7 +1434,7 @@ mod tests {
             Some(&codex_home),
             Some(94),
         );
-        let view = ListSelectionView::new(params, tx);
+        let view = new_view(params, tx);
 
         let rendered = render_lines_in_area(&view, /*width*/ 94, /*height*/ 35);
         assert!(rendered.contains("Move up/down to live preview themes"));
@@ -1433,6 +1476,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         let area = Rect::new(0, 0, 120, 35);
         let mut buf = Buffer::empty(area);
@@ -1469,7 +1513,7 @@ mod tests {
             "Use /setup-default-sandbox".cyan(),
             " to allow network access.".dim(),
         ]);
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Select Approval Mode".to_string()),
                 footer_note: Some(footer_note),
@@ -1496,7 +1540,7 @@ mod tests {
             dismiss_on_select: true,
             ..Default::default()
         }];
-        let mut view = ListSelectionView::new(
+        let mut view = new_view(
             SelectionViewParams {
                 title: Some("Select Approval Mode".to_string()),
                 footer_hint: Some(standard_popup_hint_line()),
@@ -1549,6 +1593,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         view.set_search_query("beta".to_string());
 
@@ -1611,6 +1656,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         assert_eq!(view.active_tab_id(), Some("beta"));
@@ -1642,6 +1688,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         view.set_search_query("plugin".to_string());
 
@@ -1681,6 +1728,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         let (wrapped_tx_raw, _wrapped_rx) = unbounded_channel::<AppEvent>();
         let wrapped_tx = AppEventSender::new(wrapped_tx_raw);
@@ -1699,6 +1747,7 @@ mod tests {
                 ..Default::default()
             },
             wrapped_tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let rendered = render_lines_with_width(&single_line_view, /*width*/ 36);
@@ -1754,6 +1803,7 @@ mod tests {
                 ..Default::default()
             },
             auto_tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         let (widened_tx_raw, _widened_rx) = unbounded_channel::<AppEvent>();
         let widened_tx = AppEventSender::new(widened_tx_raw);
@@ -1766,6 +1816,7 @@ mod tests {
                 ..Default::default()
             },
             widened_tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let auto_rendered = render_lines_with_width(&auto_view, /*width*/ 48);
@@ -1797,6 +1848,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
         view.set_search_query("no-matches".to_string());
 
@@ -1827,6 +1879,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         while rx.try_recv().is_ok() {}
@@ -1837,6 +1890,158 @@ mod tests {
             rx.try_recv().is_err(),
             "moving down in a single-item list should not fire on_selection_changed",
         );
+    }
+
+    #[test]
+    fn disabled_current_rows_skip_default_selection_and_number_shortcuts() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "Unavailable".to_string(),
+                        description: Some("Not available right now.".to_string()),
+                        is_current: true,
+                        is_disabled: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Alpha".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Busy".to_string(),
+                        description: Some("Still disabled.".to_string()),
+                        disabled_reason: Some("Try again later.".to_string()),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Beta".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        assert_eq!(view.selected_actual_idx(), Some(1));
+
+        let rendered = render_lines_with_width(&view, /*width*/ 60);
+        assert!(
+            rendered.contains("› 1. Alpha"),
+            "expected first enabled row to be selected and numbered 1, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("  2. Beta"),
+            "expected second enabled row to be numbered 2, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("1. Unavailable") && !rendered.contains("3. Beta"),
+            "expected disabled rows to be skipped by numbering, got:\n{rendered}"
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert_eq!(view.take_last_selected_index(), Some(3));
+    }
+
+    #[test]
+    fn c0_ctrl_p_respects_unbound_list_move_up() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+        keymap.move_up.clear();
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                initial_selected_idx: Some(1),
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+            keymap,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('\u{0010}'), KeyModifiers::NONE));
+
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        assert_eq!(view.search_query, "");
+    }
+
+    #[test]
+    fn c0_ctrl_n_respects_unbound_list_move_down() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+        keymap.move_down.clear();
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+            keymap,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE));
+
+        assert_eq!(view.selected_actual_idx(), Some(0));
+        assert_eq!(view.search_query, "");
+    }
+
+    #[test]
+    fn c0_ctrl_p_respects_remapped_list_move_down() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+        keymap.move_up.clear();
+        keymap.move_down = vec![crate::key_hint::ctrl(KeyCode::Char('p'))];
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+            keymap,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('\u{0010}'), KeyModifiers::NONE));
+
+        assert_eq!(view.selected_actual_idx(), Some(1));
     }
 
     #[test]
@@ -1855,7 +2060,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Approval".to_string()),
                 items,
@@ -1913,7 +2118,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Select Model and Effort".to_string()),
                 items,
@@ -1947,7 +2152,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Debug".to_string()),
                 items,
@@ -1995,7 +2200,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Select Model and Effort".to_string()),
                 items,
@@ -2022,7 +2227,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let view = ListSelectionView::new(
+        let view = new_view(
             SelectionViewParams {
                 title: Some("Debug".to_string()),
                 items,
@@ -2073,6 +2278,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let before_scroll = render_lines_with_width(&view, /*width*/ 96);
@@ -2107,6 +2313,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let before_scroll = render_lines_with_width(&view, width);
@@ -2148,6 +2355,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let content_width: u16 = 120;
@@ -2175,6 +2383,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         assert_eq!(view.side_layout_width(/*content_width*/ 80), None);
@@ -2205,6 +2414,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let rendered = render_lines_with_width(&view, /*width*/ 70);
@@ -2239,6 +2449,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let width = 120;
@@ -2298,6 +2509,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
         );
 
         let width = 120;

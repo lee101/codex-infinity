@@ -250,36 +250,69 @@ args = ["--format=text"]
 fn gemini_provider_normalizes_google_prefix() {
     let provider = ModelProviderInfo::create_gemini_provider();
     assert_eq!(
-        provider.effective_model_name("google/gemini-3.1-pro-preview"),
-        "gemini-3.1-pro-preview"
+        provider.effective_model_name("google/gemini-3.5-flash"),
+        "gemini-3.5-flash"
     );
     assert_eq!(
-        provider.effective_model_name("gemini-3.1-pro-preview"),
-        "gemini-3.1-pro-preview"
+        provider.effective_model_name("gemini-3.5-flash"),
+        "gemini-3.5-flash"
+    );
+}
+
+#[test]
+fn deepseek_provider_normalizes_deepseek_prefix() {
+    let provider = ModelProviderInfo::create_deepseek_provider();
+    assert_eq!(
+        provider.effective_model_name("deepseek/deepseek-v4-flash"),
+        "deepseek-v4-flash"
+    );
+    assert_eq!(
+        provider.effective_model_name("deepseek-v4-flash"),
+        "deepseek-v4-flash"
+    );
+}
+
+#[test]
+fn zhipu_provider_normalizes_zai_prefix() {
+    let provider = ModelProviderInfo::create_zhipu_provider();
+    assert_eq!(provider.effective_model_name("z-ai/glm-5.1"), "glm-5.1");
+    assert_eq!(provider.effective_model_name("zhipu/glm-5.1"), "glm-5.1");
+    assert_eq!(provider.effective_model_name("glm-5.1"), "glm-5.1");
+}
+
+#[test]
+fn openpaths_provider_normalizes_openpaths_prefix() {
+    let provider = ModelProviderInfo::create_openpaths_provider();
+    assert_eq!(
+        provider.effective_model_name("openpaths/auto-medium-task"),
+        "auto-medium-task"
+    );
+    assert_eq!(
+        provider.effective_model_name("auto-medium-task"),
+        "auto-medium-task"
     );
 }
 
 #[test]
 fn infer_builtin_provider_prefers_env_backed_routes() {
-    let gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
-    let openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let _gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
+    let _openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let openpaths_remove_guard = EnvVarGuard::remove("OPENPATHS_API_KEY");
     assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
         None
     );
 
-    drop(gemini_remove_guard);
     let gemini_set_guard = EnvVarGuard::set("GEMINI_API_KEY", "gemini-key");
     assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
         Some(GEMINI_PROVIDER_ID)
     );
 
     drop(gemini_set_guard);
-    drop(openrouter_remove_guard);
     let _openrouter_set_guard = EnvVarGuard::set("OPENROUTER_API_KEY", "openrouter-key");
     assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.1-pro-preview"),
+        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
         Some(OPENROUTER_PROVIDER_ID)
     );
     assert_eq!(
@@ -289,6 +322,27 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     assert_eq!(
         infer_builtin_provider_id_for_model("z-ai/glm-5"),
         Some(OPENROUTER_PROVIDER_ID)
+    );
+
+    let _zai_set_guard = EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("glm-5.1"),
+        Some(ZHIPU_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("z-ai/glm-5.1"),
+        Some(ZHIPU_PROVIDER_ID)
+    );
+
+    drop(openpaths_remove_guard);
+    let _openpaths_set_guard = EnvVarGuard::set("OPENPATHS_API_KEY", "op-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("auto-medium-task"),
+        Some(OPENPATHS_PROVIDER_ID)
+    );
+    assert_eq!(
+        infer_builtin_provider_id_for_model("openpaths/auto-think"),
+        Some(OPENPATHS_PROVIDER_ID)
     );
 }
 
@@ -320,7 +374,7 @@ fn test_create_amazon_bedrock_provider() {
         ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
         ModelProviderInfo {
             name: "Amazon Bedrock".to_string(),
-            base_url: Some("https://bedrock-mantle.us-east-1.api.aws/v1".to_string()),
+            base_url: Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string()),
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,

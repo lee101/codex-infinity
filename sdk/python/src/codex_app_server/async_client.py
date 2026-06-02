@@ -8,7 +8,14 @@ from pydantic import BaseModel
 
 from .client import AppServerClient, AppServerConfig
 from .generated.v2_all import (
+    AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
+    CancelLoginAccountResponse,
+    GetAccountParams as V2GetAccountParams,
+    GetAccountResponse,
+    LoginAccountParams as V2LoginAccountParams,
+    LoginAccountResponse,
+    LogoutAccountResponse,
     ModelListResponse,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,

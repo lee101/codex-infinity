@@ -16,11 +16,14 @@ pub enum SlashCommand {
     Fast,
     Approvals,
     Permissions,
+    Keymap,
     #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
+    #[strum(to_string = "autoreview")]
+    AutoReview,
     Memories,
     Skills,
     Review,
@@ -31,6 +34,7 @@ pub enum SlashCommand {
     Init,
     Compact,
     Plan,
+    Goal,
     Collab,
     Agent,
     Side,
@@ -104,16 +108,19 @@ impl SlashCommand {
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
+            SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
             SlashCommand::Side => "start a side conversation in an ephemeral fork",
             SlashCommand::Approvals => "choose what Codex is allowed to do",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
+            SlashCommand::Keymap => "remap TUI shortcuts",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::SandboxReadRoot => {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
+            SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
             SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list configured MCP tools; use /mcp verbose for details",
             SlashCommand::Apps => "manage apps",
@@ -137,6 +144,7 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
+                | SlashCommand::Goal
                 | SlashCommand::Fast
                 | SlashCommand::Mcp
                 | SlashCommand::Side
@@ -162,9 +170,11 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             // | SlashCommand::Undo
-            | SlashCommand::Model
             | SlashCommand::Fast
             | SlashCommand::Personality
+            | SlashCommand::Approvals
+            | SlashCommand::Permissions
+            | SlashCommand::Keymap
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
@@ -177,6 +187,7 @@ impl SlashCommand {
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
+            | SlashCommand::Model
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
@@ -184,9 +195,13 @@ impl SlashCommand {
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
+            | SlashCommand::Goal
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
+            | SlashCommand::Title
+            | SlashCommand::Statusline
+            | SlashCommand::AutoReview
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit
@@ -197,10 +212,7 @@ impl SlashCommand {
             SlashCommand::Settings => true,
             SlashCommand::Collab => true,
             SlashCommand::Agent | SlashCommand::MultiAgents => true,
-            SlashCommand::Approvals | SlashCommand::Permissions => true,
-            SlashCommand::Statusline => false,
             SlashCommand::Theme => false,
-            SlashCommand::Title => false,
         }
     }
 
@@ -237,5 +249,22 @@ mod tests {
     #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
+    }
+
+    #[test]
+    fn certain_commands_are_available_during_task() {
+        assert!(SlashCommand::Model.available_during_task());
+        assert!(SlashCommand::Goal.available_during_task());
+        assert!(SlashCommand::Title.available_during_task());
+        assert!(SlashCommand::Statusline.available_during_task());
+    }
+
+    #[test]
+    fn auto_review_command_is_autoreview() {
+        assert_eq!(SlashCommand::AutoReview.command(), "autoreview");
+        assert_eq!(
+            SlashCommand::from_str("autoreview"),
+            Ok(SlashCommand::AutoReview)
+        );
     }
 }

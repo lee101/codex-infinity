@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -15,7 +13,16 @@ from pydantic import BaseModel
 from .errors import AppServerError, TransportClosedError, map_jsonrpc_error
 from .generated.notification_registry import NOTIFICATION_MODELS
 from .generated.v2_all import (
+    AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
+    CancelLoginAccountResponse,
+    ChatgptDeviceCodeLoginAccountResponse,
+    ChatgptLoginAccountResponse,
+    GetAccountParams as V2GetAccountParams,
+    GetAccountResponse,
+    LoginAccountParams as V2LoginAccountParams,
+    LoginAccountResponse,
+    LogoutAccountResponse,
     ModelListResponse,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,
@@ -44,6 +51,7 @@ from .models import (
     UnknownNotification,
 )
 from .retry import retry_on_overload
+from ._version import __version__ as SDK_VERSION
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ApprovalHandler = Callable[[str, JsonObject | None], JsonObject]
@@ -57,6 +65,8 @@ def _params_dict(
         | V2ThreadListParams
         | V2ThreadForkParams
         | V2TurnStartParams
+        | V2GetAccountParams
+        | V2LoginAccountParams
         | JsonObject
         | None
     ),
@@ -88,6 +98,45 @@ def _installed_codex_path() -> Path:
         ) from exc
 
     return bundled_codex_path()
+
+
+def _installed_codex_path_dirs() -> tuple[Path, ...]:
+    try:
+        from codex_cli_bin import bundled_path_dir
+    except (ImportError, AttributeError):
+        return ()
+
+    path_dir = bundled_path_dir()
+    return (path_dir,) if path_dir is not None else ()
+
+
+def _prepend_path_dirs(env: dict[str, str], path_dirs: tuple[Path, ...]) -> None:
+    if not path_dirs:
+        return
+
+    path_key = _path_env_key(env)
+    if os.name == "nt":
+        for key in list(env):
+            if key.upper() == "PATH" and key != path_key:
+                env.pop(key)
+
+    path_sep = os.pathsep
+    existing_path = env.get(path_key, "")
+    path_dir_values = [str(path_dir) for path_dir in path_dirs]
+    existing_entries = [
+        entry for entry in existing_path.split(path_sep) if entry and entry not in path_dir_values
+    ]
+    env[path_key] = path_sep.join([*path_dir_values, *existing_entries])
+
+
+def _path_env_key(env: dict[str, str]) -> str:
+    if os.name != "nt":
+        return "PATH"
+
+    matching_keys = [key for key in env if key.upper() == "PATH"]
+    if "Path" in matching_keys:
+        return "Path"
+    return matching_keys[-1] if matching_keys else "PATH"
 
 
 @dataclass(frozen=True)
@@ -129,7 +178,7 @@ class AppServerConfig:
     env: dict[str, str] | None = None
     client_name: str = "codex_python_sdk"
     client_title: str = "Codex Python SDK"
-    client_version: str = "0.2.0"
+    client_version: str = SDK_VERSION
     experimental_api: bool = True
 
 
@@ -162,10 +211,13 @@ class AppServerClient:
         if self._proc is not None:
             return
 
+        path_dirs: tuple[Path, ...] = ()
         if self.config.launch_args_override is not None:
             args = list(self.config.launch_args_override)
         else:
             codex_bin = _resolve_codex_bin(self.config)
+            if self.config.codex_bin is None:
+                path_dirs = _installed_codex_path_dirs()
             args = [str(codex_bin)]
             for kv in self.config.config_overrides:
                 args.extend(["--config", kv])
@@ -174,6 +226,7 @@ class AppServerClient:
         env = os.environ.copy()
         if self.config.env:
             env.update(self.config.env)
+        _prepend_path_dirs(env, path_dirs)
 
         self._proc = subprocess.Popen(
             args,
@@ -428,6 +481,24 @@ class AppServerClient:
             out.append(notification)
             if notification.method in target_methods:
                 return out
+
+    def wait_for_login_completed(
+        self,
+        login_id: str,
+    ) -> AccountLoginCompletedNotification:
+        """Block until the matching interactive login attempt completes."""
+        self.register_login_notifications(login_id)
+        try:
+            while True:
+                notification = self.next_login_notification(login_id)
+                if (
+                    notification.method == "account/login/completed"
+                    and isinstance(notification.payload, AccountLoginCompletedNotification)
+                    and notification.payload.login_id == login_id
+                ):
+                    return notification.payload
+        finally:
+            self.unregister_login_notifications(login_id)
 
     def stream_text(
         self,

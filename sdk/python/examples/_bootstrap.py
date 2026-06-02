@@ -7,7 +7,7 @@ import sys
 import tempfile
 import zlib
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterator
 
 _SDK_PYTHON_DIR = Path(__file__).resolve().parents[1]
 _SDK_PYTHON_STR = str(_SDK_PYTHON_DIR)
@@ -26,8 +26,8 @@ def _ensure_runtime_dependencies(sdk_python_dir: Path) -> None:
         "Missing required dependency: pydantic.\n"
         f"Interpreter: {python}\n"
         "Install dependencies with the same interpreter used to run this example:\n"
-        f"  {python} -m pip install -e {sdk_python_dir}\n"
-        "If you installed with `pip` from another Python, reinstall using the command above."
+        f"  cd {sdk_python_dir} && uv sync\n"
+        "Then activate `.venv`, or reinstall with the Python interpreter above."
     )
 
 

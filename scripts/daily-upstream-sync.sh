@@ -19,12 +19,13 @@ set -e
 
 [ -f "$HOME/.cron-env" ] && source "$HOME/.cron-env"
 
-# unset ANTHROPIC_API_KEY so claude uses its default auth
-unset ANTHROPIC_API_KEY
+CODEX_LOCAL="${CODEX_LOCAL:-$HOME/code/codex/codex-rs/target/release/codex}"
 
-for cmd in claude npm git; do
+# verify required tools
+for cmd in cargo npm git; do
     command -v "$cmd" >/dev/null || { echo "FATAL: $cmd not found in PATH"; exit 1; }
 done
+[ -x "$CODEX_LOCAL" ] || { echo "FATAL: local codex not found at $CODEX_LOCAL"; exit 1; }
 
 export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/codex_agent_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
@@ -45,9 +46,9 @@ if [ "$UPSTREAM_ALREADY_MERGED" = "yes" ]; then
 fi
 
 BEHIND_COUNT=$(git rev-list HEAD..upstream/main --count)
-echo "Upstream has $BEHIND_COUNT new commits. Running Claude to merge..."
+echo "Upstream has $BEHIND_COUNT new commits. Running Codex to merge..."
 
-timeout 3600 claude -p --dangerously-skip-permissions --model sonnet --verbose <<'PROMPT'
+timeout 3600 "$CODEX_LOCAL" exec --yolo3 -m gpt-5.5 --config model_reasoning_effort=medium "$(cat <<'PROMPT'
 You are the automated daily sync bot for Codex Infinity, a fork of openai/codex.
 Your job: merge upstream/main, preserve all customizations, build, verify, version bump, commit, push, and npm publish.
 
@@ -89,10 +90,11 @@ SAFETY:
 - NEVER force push. NEVER rewrite history.
 - If >20 conflicting files, abort and log a summary.
 PROMPT
+)"
 
 EXIT_CODE=$?
 if [ $EXIT_CODE -ne 0 ]; then
-    echo "WARNING: Claude exited with code $EXIT_CODE"
+    echo "WARNING: Codex exited with code $EXIT_CODE"
 fi
 
 echo "=== Sync completed at $(date) (exit: $EXIT_CODE) ==="

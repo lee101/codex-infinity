@@ -366,12 +366,14 @@ pub const ALL_PROXY_ENV_KEYS: &[&str] = &["ALL_PROXY", "all_proxy"];
 pub const PROXY_ACTIVE_ENV_KEY: &str = "CODEX_NETWORK_PROXY_ACTIVE";
 pub const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "CODEX_NETWORK_ALLOW_LOCAL_BINDING";
 const ELECTRON_GET_USE_PROXY_ENV_KEY: &str = "ELECTRON_GET_USE_PROXY";
+const NODE_USE_ENV_PROXY_ENV_KEY: &str = "NODE_USE_ENV_PROXY";
 #[cfg(any(target_os = "macos", test))]
 const GIT_SSH_COMMAND_ENV_KEY: &str = "GIT_SSH_COMMAND";
 pub const PROXY_ENV_KEYS: &[&str] = &[
     PROXY_ACTIVE_ENV_KEY,
     ALLOW_LOCAL_BINDING_ENV_KEY,
     ELECTRON_GET_USE_PROXY_ENV_KEY,
+    NODE_USE_ENV_PROXY_ENV_KEY,
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "http_proxy",
@@ -422,7 +424,6 @@ pub const NO_PROXY_ENV_KEYS: &[&str] = &[
 
 pub const DEFAULT_NO_PROXY_VALUE: &str = concat!(
     "localhost,127.0.0.1,::1,",
-    "169.254.0.0/16,",
     "10.0.0.0/8,",
     "172.16.0.0/12,",
     "192.168.0.0/16"
@@ -526,6 +527,8 @@ fn apply_proxy_env_overrides(
         ELECTRON_GET_USE_PROXY_ENV_KEY.to_string(),
         "true".to_string(),
     );
+    // Node.js built-in HTTP clients only honor proxy environment variables when this is enabled.
+    env.insert(NODE_USE_ENV_PROXY_ENV_KEY.to_string(), "1".to_string());
 
     // Keep HTTP_PROXY/HTTPS_PROXY as HTTP endpoints. A lot of clients break if
     // those vars contain SOCKS URLs. We only switch ALL_PROXY here.
@@ -791,9 +794,16 @@ mod tests {
 
     #[tokio::test]
     async fn managed_proxy_builder_uses_loopback_ports() {
+        let http_listener = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let socks_listener = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        drop(http_listener);
+        drop(socks_listener);
+
         let state = Arc::new(network_proxy_state_for_policy(NetworkProxySettings {
-            proxy_url: "http://127.0.0.1:43128".to_string(),
-            socks_url: "http://127.0.0.1:48081".to_string(),
+            proxy_url: format!("http://{http_addr}"),
+            socks_url: format!("http://{socks_addr}"),
             ..NetworkProxySettings::default()
         }));
         let proxy = match NetworkProxy::builder().state(state).build().await {
@@ -813,14 +823,8 @@ mod tests {
         assert!(proxy.socks_addr.ip().is_loopback());
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(
-                proxy.http_addr,
-                "127.0.0.1:43128".parse::<SocketAddr>().unwrap()
-            );
-            assert_eq!(
-                proxy.socks_addr,
-                "127.0.0.1:48081".parse::<SocketAddr>().unwrap()
-            );
+            assert_eq!(proxy.http_addr, http_addr);
+            assert_eq!(proxy.socks_addr, socks_addr);
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -1009,13 +1013,14 @@ mod tests {
         assert!(no_proxy.contains("10.0.0.0/8"));
         assert!(no_proxy.contains("172.16.0.0/12"));
         assert!(no_proxy.contains("192.168.0.0/16"));
-        assert!(no_proxy.contains("169.254.0.0/16"));
+        assert!(!no_proxy.contains("169.254.0.0/16"));
         assert_eq!(env.get(PROXY_ACTIVE_ENV_KEY), Some(&"1".to_string()));
         assert_eq!(env.get(ALLOW_LOCAL_BINDING_ENV_KEY), Some(&"0".to_string()));
         assert_eq!(
             env.get(ELECTRON_GET_USE_PROXY_ENV_KEY),
             Some(&"true".to_string())
         );
+        assert_eq!(env.get(NODE_USE_ENV_PROXY_ENV_KEY), Some(&"1".to_string()));
         #[cfg(target_os = "macos")]
         assert_eq!(
             env.get(GIT_SSH_COMMAND_ENV_KEY),

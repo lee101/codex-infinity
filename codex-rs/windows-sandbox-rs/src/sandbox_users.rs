@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::ffi::c_void;
-use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -51,7 +51,7 @@ const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 const SID_EVERYONE: &str = "S-1-1-0";
 const SID_SYSTEM: &str = "S-1-5-18";
 
-pub fn ensure_sandbox_users_group(log: &mut File) -> Result<()> {
+pub fn ensure_sandbox_users_group(log: &mut dyn Write) -> Result<()> {
     ensure_local_group(SANDBOX_USERS_GROUP, SANDBOX_USERS_GROUP_COMMENT, log)
 }
 
@@ -65,7 +65,7 @@ pub fn provision_sandbox_users(
     online_username: &str,
     proxy_ports: &[u16],
     allow_local_binding: bool,
-    log: &mut File,
+    log: &mut dyn Write,
 ) -> Result<()> {
     ensure_sandbox_users_group(log)?;
     super::log_line(
@@ -88,13 +88,13 @@ pub fn provision_sandbox_users(
     Ok(())
 }
 
-pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut File) -> Result<()> {
+pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> Result<()> {
     ensure_local_user(username, password, log)?;
     ensure_local_group_member(SANDBOX_USERS_GROUP, username)?;
     Ok(())
 }
 
-pub fn ensure_local_user(name: &str, password: &str, log: &mut File) -> Result<()> {
+pub fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Result<()> {
     let name_w = to_wide(OsStr::new(name));
     let pwd_w = to_wide(OsStr::new(password));
     unsafe {
@@ -158,7 +158,7 @@ pub fn ensure_local_user(name: &str, password: &str, log: &mut File) -> Result<(
     Ok(())
 }
 
-pub fn ensure_local_group(name: &str, comment: &str, log: &mut File) -> Result<()> {
+pub fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Result<()> {
     const ERROR_ALIAS_EXISTS: u32 = 1379;
     const NERR_GROUP_EXISTS: u32 = 2223;
 

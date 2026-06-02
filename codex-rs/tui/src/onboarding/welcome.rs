@@ -1,7 +1,5 @@
-use crate::onboarding::onboarding_screen::KeyboardHandler;
-use crate::onboarding::onboarding_screen::StepStateProvider;
-use crate::tui::FrameRequester;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
@@ -11,39 +9,88 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
+use std::cell::Cell;
+
+use crate::ascii_animation::AsciiAnimation;
+use crate::key_hint::KeyBindingListExt;
+use crate::onboarding::keys;
+use crate::onboarding::onboarding_screen::KeyboardHandler;
+use crate::onboarding::onboarding_screen::StepStateProvider;
+use crate::tui::FrameRequester;
 
 use super::onboarding_screen::StepState;
 
+const MIN_ANIMATION_HEIGHT: u16 = 37;
+const MIN_ANIMATION_WIDTH: u16 = 60;
+
 pub(crate) struct WelcomeWidget {
     pub is_logged_in: bool,
+    animation: AsciiAnimation,
+    animations_enabled: bool,
+    animations_suppressed: Cell<bool>,
+    layout_area: Cell<Option<Rect>>,
 }
 
 impl KeyboardHandler for WelcomeWidget {
+    /// Rotate the welcome animation when the fixed toggle shortcut fires.
+    ///
+    /// The key list includes compatibility variants for terminals that report
+    /// modifier bits differently.
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        let _ = key_event;
+        if !self.animations_enabled {
+            return;
+        }
+        if key_event.kind == KeyEventKind::Press && keys::TOGGLE_ANIMATION.is_pressed(key_event) {
+            tracing::warn!("Welcome background to press '.'");
+            let _ = self.animation.pick_random_variant();
+        }
     }
 }
 
 impl WelcomeWidget {
     pub(crate) fn new(
         is_logged_in: bool,
-        _request_frame: FrameRequester,
-        _animations_enabled: bool,
+        request_frame: FrameRequester,
+        animations_enabled: bool,
     ) -> Self {
-        Self { is_logged_in }
+        Self {
+            is_logged_in,
+            animation: AsciiAnimation::new(request_frame),
+            animations_enabled,
+            animations_suppressed: Cell::new(false),
+            layout_area: Cell::new(None),
+        }
     }
 
     pub(crate) fn update_layout_area(&self, area: Rect) {
-        let _ = area;
+        self.layout_area.set(Some(area));
     }
 
-    pub(crate) fn set_animations_suppressed(&self, _suppressed: bool) {}
+    pub(crate) fn set_animations_suppressed(&self, suppressed: bool) {
+        self.animations_suppressed.set(suppressed);
+    }
 }
 
 impl WidgetRef for &WelcomeWidget {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
+        if self.animations_enabled && !self.animations_suppressed.get() {
+            self.animation.schedule_next_frame();
+        }
+
+        let layout_area = self.layout_area.get().unwrap_or(area);
+        // Skip the animation entirely when the viewport is too small so we don't clip frames.
+        let show_animation = self.animations_enabled
+            && !self.animations_suppressed.get()
+            && layout_area.height >= MIN_ANIMATION_HEIGHT
+            && layout_area.width >= MIN_ANIMATION_WIDTH;
+
         let mut lines: Vec<Line> = Vec::new();
+        if show_animation {
+            let frame = self.animation.current_frame();
+            lines.extend(frame.lines().map(Into::into));
+            lines.push("".into());
+        }
         lines.push(Line::from(vec![
             "  ".into(),
             "Welcome to ".into(),
@@ -69,9 +116,15 @@ impl StepStateProvider for WelcomeWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    static VARIANT_A: [&str; 1] = ["frame-a"];
+    static VARIANT_B: [&str; 1] = ["frame-b"];
+    static VARIANTS: [&[&str]; 2] = [&VARIANT_A, &VARIANT_B];
 
     fn row_containing(buf: &Buffer, needle: &str) -> Option<u16> {
         (0..buf.area.height).find(|&y| {
@@ -92,10 +145,11 @@ mod tests {
         );
         let area = Rect::new(0, 0, MIN_ANIMATION_WIDTH, MIN_ANIMATION_HEIGHT);
         let mut buf = Buffer::empty(area);
+        let frame_lines = widget.animation.current_frame().lines().count() as u16;
         (&widget).render(area, &mut buf);
 
         let welcome_row = row_containing(&buf, "Welcome");
-        assert_eq!(welcome_row, Some(0));
+        assert_eq!(welcome_row, Some(frame_lines + 1));
     }
 
     #[test]
@@ -127,11 +181,40 @@ mod tests {
             layout_area: Cell::new(None),
         };
 
-        widget.handle_key_event(KeyEvent::new(
-            crossterm::event::KeyCode::Char('.'),
-            crossterm::event::KeyModifiers::CONTROL,
-        ));
+        let before = widget.animation.current_frame();
+        widget.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL));
+        let after = widget.animation.current_frame();
 
-        assert!(!widget.is_logged_in);
+        assert_ne!(
+            before, after,
+            "expected ctrl+. to switch welcome animation variant"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_dot_changes_animation_variant() {
+        let mut widget = WelcomeWidget {
+            is_logged_in: false,
+            animation: AsciiAnimation::with_variants(
+                FrameRequester::test_dummy(),
+                &VARIANTS,
+                /*variant_idx*/ 0,
+            ),
+            animations_enabled: true,
+            animations_suppressed: Cell::new(false),
+            layout_area: Cell::new(None),
+        };
+
+        let before = widget.animation.current_frame();
+        widget.handle_key_event(KeyEvent::new(
+            KeyCode::Char('.'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let after = widget.animation.current_frame();
+
+        assert_ne!(
+            before, after,
+            "expected ctrl+shift+. to switch welcome animation variant"
+        );
     }
 }

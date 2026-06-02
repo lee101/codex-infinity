@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_api::SharedAuthProvider;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_config::types::McpServerEnvVar;
 use codex_exec_server::HttpClient;
@@ -66,6 +67,7 @@ use crate::oauth::OAuthPersistor;
 use crate::oauth::StoredOAuthTokens;
 use crate::stdio_server_launcher::StdioServerCommand;
 use crate::stdio_server_launcher::StdioServerLauncher;
+use crate::stdio_server_launcher::StdioServerProcessHandle;
 use crate::stdio_server_launcher::StdioServerTransport;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
@@ -92,6 +94,7 @@ enum ClientState {
         service: Arc<RunningService<RoleClient, ElicitationClientService>>,
         oauth: Option<OAuthPersistor>,
     },
+    Closed,
 }
 
 #[derive(Clone)]
@@ -108,6 +111,7 @@ enum TransportRecipe {
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
         http_client: Arc<dyn HttpClient>,
+        auth_provider: Option<SharedAuthProvider>,
     },
 }
 
@@ -263,6 +267,7 @@ pub struct ListToolsWithConnectorIdResult {
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
     state: Mutex<ClientState>,
+    stdio_process: Option<StdioServerProcessHandle>,
     transport_recipe: TransportRecipe,
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
@@ -285,11 +290,17 @@ impl RmcpClient {
         let transport = Self::create_pending_transport(&transport_recipe)
             .await
             .map_err(io::Error::other)?;
+        let stdio_process = match &transport {
+            PendingTransport::Stdio { transport } => Some(transport.process_handle()),
+            PendingTransport::StreamableHttp { .. }
+            | PendingTransport::StreamableHttpWithOAuth { .. } => None,
+        };
 
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
+            stdio_process,
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
@@ -306,6 +317,7 @@ impl RmcpClient {
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
         http_client: Arc<dyn HttpClient>,
+        auth_provider: Option<SharedAuthProvider>,
     ) -> Result<Self> {
         let transport_recipe = TransportRecipe::StreamableHttp {
             server_name: server_name.to_string(),
@@ -315,12 +327,14 @@ impl RmcpClient {
             env_http_headers,
             store_mode,
             http_client,
+            auth_provider,
         };
         let transport = Self::create_pending_transport(&transport_recipe).await?;
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
+            stdio_process: None,
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
@@ -349,6 +363,7 @@ impl RmcpClient {
                     None => return Err(anyhow!("client already initializing")),
                 },
                 ClientState::Ready { .. } => return Err(anyhow!("client already initialized")),
+                ClientState::Closed => return Err(anyhow!("MCP client is shut down")),
             }
         };
 
@@ -372,6 +387,9 @@ impl RmcpClient {
 
         {
             let mut guard = self.state.lock().await;
+            if matches!(*guard, ClientState::Closed) {
+                return Err(anyhow!("MCP client is shut down"));
+            }
             *guard = ClientState::Ready {
                 service,
                 oauth: oauth_persistor.clone(),
@@ -619,6 +637,7 @@ impl RmcpClient {
         match &*guard {
             ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
             ClientState::Connecting { .. } => Err(anyhow!("MCP client not initialized")),
+            ClientState::Closed => Err(anyhow!("MCP client is shut down")),
         }
     }
 
@@ -631,6 +650,22 @@ impl RmcpClient {
             } => Some(runtime.clone()),
             _ => None,
         }
+    }
+
+    /// Stop the MCP transport and any stdio server process owned by this client.
+    pub async fn shutdown(&self) {
+        let previous_state = {
+            let mut guard = self.state.lock().await;
+            std::mem::replace(&mut *guard, ClientState::Closed)
+        };
+
+        if let Some(process) = &self.stdio_process
+            && let Err(error) = process.terminate().await
+        {
+            warn!("failed to terminate MCP stdio server process: {error}");
+        }
+
+        drop(previous_state);
     }
 
     /// This should be called after every tool call so that if a given tool call triggered
@@ -667,22 +702,25 @@ impl RmcpClient {
                 env_http_headers,
                 store_mode,
                 http_client,
+                auth_provider,
             } => {
                 let default_headers =
                     build_default_headers(http_headers.clone(), env_http_headers.clone())?;
 
-                let initial_oauth_tokens =
-                    if bearer_token.is_none() && !default_headers.contains_key(AUTHORIZATION) {
-                        match load_oauth_tokens(server_name, url, *store_mode) {
-                            Ok(tokens) => tokens,
-                            Err(err) => {
-                                warn!("failed to read tokens for server `{server_name}`: {err}");
-                                None
-                            }
+                let initial_oauth_tokens = if bearer_token.is_none()
+                    && auth_provider.is_none()
+                    && !default_headers.contains_key(AUTHORIZATION)
+                {
+                    match load_oauth_tokens(server_name, url, *store_mode) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            warn!("failed to read tokens for server `{server_name}`: {err}");
+                            None
                         }
-                    } else {
-                        None
-                    };
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(initial_tokens) = initial_oauth_tokens.clone() {
                     match create_oauth_transport_and_runtime(
@@ -722,6 +760,7 @@ impl RmcpClient {
                                 StreamableHttpClientAdapter::new(
                                     Arc::clone(http_client),
                                     default_headers,
+                                    /*auth_provider*/ None,
                                 ),
                                 http_config,
                             );
@@ -737,7 +776,11 @@ impl RmcpClient {
                     }
 
                     let transport = StreamableHttpClientTransport::with_client(
-                        StreamableHttpClientAdapter::new(Arc::clone(http_client), default_headers),
+                        StreamableHttpClientAdapter::new(
+                            Arc::clone(http_client),
+                            default_headers,
+                            auth_provider.clone(),
+                        ),
                         http_config,
                     );
                     Ok(PendingTransport::StreamableHttp { transport })
@@ -888,6 +931,9 @@ impl RmcpClient {
                 ClientState::Connecting { .. } => {
                     return Err(anyhow!("MCP client not initialized"));
                 }
+                ClientState::Closed => {
+                    return Err(anyhow!("MCP client is shut down"));
+                }
             }
         }
 
@@ -907,6 +953,9 @@ impl RmcpClient {
 
         {
             let mut guard = self.state.lock().await;
+            if matches!(*guard, ClientState::Closed) {
+                return Err(anyhow!("MCP client is shut down"));
+            }
             *guard = ClientState::Ready {
                 service,
                 oauth: oauth_persistor.clone(),
@@ -958,7 +1007,7 @@ async fn create_oauth_transport_and_runtime(
     };
 
     let auth_client = AuthClient::new(
-        StreamableHttpClientAdapter::new(http_client, default_headers),
+        StreamableHttpClientAdapter::new(http_client, default_headers, /*auth_provider*/ None),
         manager,
     );
     let auth_manager = auth_client.auth_manager.clone();
