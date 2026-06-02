@@ -556,6 +556,7 @@ pub(crate) struct App {
     remote_app_server_auth_token: Option<String>,
     auto_next_steps: bool,
     auto_next_idea: bool,
+    auto_next_goal: bool,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -657,6 +658,7 @@ impl App {
             session_telemetry: self.session_telemetry.clone(),
             auto_next_steps: self.auto_next_steps,
             auto_next_idea: self.auto_next_idea,
+            auto_next_goal: self.auto_next_goal,
         }
     }
 
@@ -679,6 +681,7 @@ impl App {
         remote_app_server_auth_token: Option<String>,
         auto_next_steps: bool,
         auto_next_idea: bool,
+        auto_next_goal: bool,
         environment_manager: Arc<EnvironmentManager>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
@@ -820,6 +823,7 @@ impl App {
                     session_telemetry: session_telemetry.clone(),
                     auto_next_steps,
                     auto_next_idea,
+                    auto_next_goal,
                 };
                 (ChatWidget::new_with_app_event(init), Some(started))
             }
@@ -856,6 +860,7 @@ impl App {
                     session_telemetry: session_telemetry.clone(),
                     auto_next_steps,
                     auto_next_idea,
+                    auto_next_goal,
                 };
                 (ChatWidget::new_with_app_event(init), Some(resumed))
             }
@@ -897,6 +902,7 @@ impl App {
                     session_telemetry: session_telemetry.clone(),
                     auto_next_steps,
                     auto_next_idea,
+                    auto_next_goal,
                 };
                 (ChatWidget::new_with_app_event(init), Some(forked))
             }
@@ -951,6 +957,7 @@ See the Codex keymap documentation for supported actions and examples."
             remote_app_server_auth_token,
             auto_next_steps,
             auto_next_idea,
+            auto_next_goal,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),

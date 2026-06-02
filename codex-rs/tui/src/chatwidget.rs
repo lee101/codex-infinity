@@ -503,6 +503,18 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
             .all(|parsed| !matches!(parsed, ParsedCommand::Unknown { .. }))
 }
 
+fn sanitize_auto_next_goal_objective(objective: String) -> String {
+    let objective = objective.trim();
+    let objective = objective
+        .strip_prefix("/goal ")
+        .or_else(|| objective.strip_prefix("/goal\t"))
+        .unwrap_or(objective);
+    objective
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim()
+        .to_string()
+}
+
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 
 const AUTO_NEXT_STEPS_META_TEMPLATES: &[&str] = &[
@@ -517,6 +529,13 @@ const AUTO_NEXT_IDEA_META_TEMPLATES: &[&str] = &[
     "Continue: You've been working in this codebase. What patterns, issues, or opportunities have you noticed that haven't been addressed yet? Pick the highest-value one and act on it. Be specific to what you've actually observed.",
     "Continue: Think about what you've learned about this project from the work above. What would make the biggest difference if you tackled it next? Could be a bug you spotted, a feature gap, a performance issue, or an architectural improvement. Go.",
     "Continue: Given your understanding of this project from the work so far, what's something that would genuinely improve it? Not busywork -- something that matters. Explain your reasoning briefly, then implement it.",
+];
+
+const AUTO_NEXT_GOAL_META_TEMPLATES: &[&str] = &[
+    "Create the next /goal objective for this thread. Base it on the completed goal and the recent work. It should be concrete, valuable, and scoped so Codex can make meaningful progress autonomously.",
+    "Choose the most useful next persistent goal for this codebase now that the previous goal is complete. Make it specific to the observed repository state and avoid repeating completed work.",
+    "Draft a concise new /goal objective that follows naturally from the completed work. It should be actionable, verifiable, and high-value for the current project.",
+    "Set the next autonomous objective for Codex. It should continue the most important unfinished or newly revealed opportunity from the session, not generic maintenance.",
 ];
 
 const AUTO_NEXT_REVIEW_PROMPTS: &[&str] = &[
@@ -650,6 +669,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) auto_next_steps: bool,
     pub(crate) auto_next_idea: bool,
+    pub(crate) auto_next_goal: bool,
 }
 
 #[derive(Default)]
@@ -1108,8 +1128,11 @@ pub(crate) struct ChatWidget {
     last_non_retry_error: Option<(String, String)>,
     auto_next_steps: bool,
     auto_next_idea: bool,
+    auto_next_goal: bool,
     auto_next_counter: usize,
     auto_next_generation_in_flight: bool,
+    auto_next_goal_generation_in_flight: bool,
+    last_auto_next_completed_goal: Option<(String, String)>,
     auto_next_done_file: std::path::PathBuf,
     original_human_prompt: Option<String>,
 }
@@ -3003,7 +3026,7 @@ impl ChatWidget {
         }
 
         let is_review_turn =
-            self.auto_next_counter > 0 && self.auto_next_counter % REVIEW_INTERVAL == 0;
+            self.auto_next_counter > 0 && self.auto_next_counter.is_multiple_of(REVIEW_INTERVAL);
         if is_review_turn {
             let review_idx =
                 (self.auto_next_counter / REVIEW_INTERVAL - 1) % AUTO_NEXT_REVIEW_PROMPTS.len();
@@ -3027,11 +3050,12 @@ impl ChatWidget {
 
     fn append_original_task_reminder(&self, prompt: &mut String) {
         if self.auto_next_counter > 0
-            && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
+            && self
+                .auto_next_counter
+                .is_multiple_of(ORIGINAL_TASK_REMINDER_INTERVAL)
+            && let Some(ref original) = self.original_human_prompt
         {
-            if let Some(ref original) = self.original_human_prompt {
-                prompt.push_str(&format!("\n\nReminder of original task: {original}"));
-            }
+            prompt.push_str(&format!("\n\nReminder of original task: {original}"));
         }
     }
 
@@ -3069,18 +3093,20 @@ impl ChatWidget {
             if matches!(mode, codex_core::auto_next_prompt::AutoNextMode::Idea) {
                 AUTO_NEXT_IDEA_META_TEMPLATES
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect()
             } else {
                 AUTO_NEXT_STEPS_META_TEMPLATES
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect()
             };
         let append_done_suffix = self.auto_next_steps;
         let done_path = self.auto_next_done_file.display().to_string();
         let reminder = if self.auto_next_counter > 0
-            && self.auto_next_counter % ORIGINAL_TASK_REMINDER_INTERVAL == 0
+            && self
+                .auto_next_counter
+                .is_multiple_of(ORIGINAL_TASK_REMINDER_INTERVAL)
         {
             self.original_human_prompt.clone()
         } else {
@@ -3109,6 +3135,69 @@ impl ChatWidget {
         });
     }
 
+    fn maybe_auto_next_goal(&mut self, goal: &AppThreadGoal, from_replay: bool) {
+        if from_replay
+            || !self.auto_next_goal
+            || !self.config.features.enabled(Feature::Goals)
+            || goal.status != AppThreadGoalStatus::Complete
+            || self.auto_next_goal_generation_in_flight
+        {
+            return;
+        }
+
+        let completed_goal = (goal.thread_id.clone(), goal.objective.clone());
+        if self.last_auto_next_completed_goal.as_ref() == Some(&completed_goal) {
+            return;
+        }
+
+        let thread_id = match ThreadId::from_string(&goal.thread_id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                tracing::warn!(
+                    thread_id = goal.thread_id,
+                    error = %err,
+                    "cannot auto-generate next goal for invalid thread id"
+                );
+                return;
+            }
+        };
+
+        self.last_auto_next_completed_goal = Some(completed_goal);
+        let fallback_objective = format!(
+            "Identify and implement the highest-value follow-up after completing: {}",
+            goal.objective
+        );
+        self.spawn_auto_next_goal_generation(thread_id, fallback_objective);
+    }
+
+    fn spawn_auto_next_goal_generation(&mut self, thread_id: ThreadId, fallback_objective: String) {
+        self.auto_next_goal_generation_in_flight = true;
+        let app_event_tx = self.app_event_tx.clone();
+        let config = self.config.clone();
+        let rollout_path = self.current_rollout_path.clone();
+        let examples = AUTO_NEXT_GOAL_META_TEMPLATES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        tokio::spawn(async move {
+            let generated = codex_core::auto_next_prompt::generate_auto_next_prompt(
+                config,
+                rollout_path,
+                codex_core::auto_next_prompt::AutoNextMode::Goal,
+                examples,
+            )
+            .await;
+            let objective = generated
+                .map(sanitize_auto_next_goal_objective)
+                .filter(|objective| !objective.is_empty())
+                .unwrap_or(fallback_objective);
+            app_event_tx.send(AppEvent::AutoNextGoalGenerated {
+                thread_id,
+                objective,
+            });
+        });
+    }
+
     pub(crate) fn handle_auto_next_prompt_generated(
         &mut self,
         thread_id: codex_protocol::ThreadId,
@@ -3121,6 +3210,10 @@ impl ChatWidget {
         self.queued_user_messages
             .push_back(UserMessage::from(prompt).into());
         self.maybe_send_next_queued_input();
+    }
+
+    pub(crate) fn handle_auto_next_goal_generated(&mut self) {
+        self.auto_next_goal_generation_in_flight = false;
     }
 
     fn open_plan_implementation_prompt(&mut self) {
@@ -5682,6 +5775,7 @@ impl ChatWidget {
             session_telemetry,
             auto_next_steps,
             auto_next_idea,
+            auto_next_goal,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
@@ -5880,8 +5974,11 @@ impl ChatWidget {
             last_non_retry_error: None,
             auto_next_steps,
             auto_next_idea,
+            auto_next_goal,
             auto_next_counter: 0,
             auto_next_generation_in_flight: false,
+            auto_next_goal_generation_in_flight: false,
+            last_auto_next_completed_goal: None,
             auto_next_done_file: std::env::temp_dir()
                 .join(format!("codex-auto-next-done-{}", std::process::id())),
             original_human_prompt: None,
@@ -6501,7 +6598,9 @@ impl ChatWidget {
             );
             return (false, None);
         }
-        if (self.auto_next_steps || self.auto_next_idea) && self.original_human_prompt.is_none() {
+        if (self.auto_next_steps || self.auto_next_idea || self.auto_next_goal)
+            && self.original_human_prompt.is_none()
+        {
             self.original_human_prompt = Some(user_message.text.clone());
         }
         let UserMessage {
@@ -7262,7 +7361,11 @@ impl ChatWidget {
                 }
             }
             ServerNotification::ThreadGoalUpdated(notification) => {
-                self.on_thread_goal_updated(notification.goal, notification.turn_id);
+                self.on_thread_goal_updated(
+                    notification.goal,
+                    notification.turn_id,
+                    replay_kind.is_some(),
+                );
             }
             ServerNotification::ThreadGoalCleared(notification) => {
                 self.on_thread_goal_cleared(notification.thread_id.as_str());
@@ -7840,6 +7943,7 @@ impl ChatWidget {
                         updated_at: goal.updated_at,
                     },
                     event.turn_id,
+                    replay_kind.is_some(),
                 );
             }
             // NOTE: All three AgentMessage arms feed `record_agent_markdown` even
@@ -11236,7 +11340,12 @@ impl ChatWidget {
             .and_then(|state| state.indicator(now, self.goal_status_active_turn_started_at))
     }
 
-    fn on_thread_goal_updated(&mut self, goal: AppThreadGoal, turn_id: Option<String>) {
+    fn on_thread_goal_updated(
+        &mut self,
+        goal: AppThreadGoal,
+        turn_id: Option<String>,
+        from_replay: bool,
+    ) {
         if let Some(active_thread_id) = self.thread_id
             && active_thread_id.to_string() != goal.thread_id
         {
@@ -11253,8 +11362,10 @@ impl ChatWidget {
         {
             self.budget_limited_turn_ids.insert(turn_id);
         }
+        let goal_for_auto_next = goal.clone();
         self.current_goal_status = Some(GoalStatusState::new(goal, Instant::now()));
         self.update_collaboration_mode_indicator();
+        self.maybe_auto_next_goal(&goal_for_auto_next, from_replay);
     }
 
     fn personality_label(personality: Personality) -> &'static str {

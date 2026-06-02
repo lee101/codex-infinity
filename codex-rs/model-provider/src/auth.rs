@@ -11,7 +11,9 @@ use codex_model_provider_info::ModelProviderInfo;
 use http::HeaderMap;
 use http::HeaderValue;
 
+use crate::basic_auth_provider::BasicAuthProvider;
 use crate::bearer_auth_provider::BearerAuthProvider;
+use codex_model_provider_info::CURSOR_PROVIDER_NAME;
 
 #[derive(Clone, Debug)]
 struct AgentIdentityAuthProvider {
@@ -79,6 +81,12 @@ pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
+    if provider.name == CURSOR_PROVIDER_NAME
+        && let Some(api_key) = provider.api_key()?
+    {
+        return Ok(Arc::new(BasicAuthProvider::new(api_key)));
+    }
+
     if let Some(auth) = bearer_auth_for_provider(provider)? {
         return Ok(Arc::new(auth));
     }
@@ -92,6 +100,10 @@ pub(crate) fn resolve_provider_auth(
 fn bearer_auth_for_provider(
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<Option<BearerAuthProvider>> {
+    if provider.name == CURSOR_PROVIDER_NAME {
+        return Ok(None);
+    }
+
     if let Some(api_key) = provider.api_key()? {
         return Ok(Some(BearerAuthProvider::new(api_key)));
     }

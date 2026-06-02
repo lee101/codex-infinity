@@ -61,8 +61,17 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 codex_cli_root="$(cd "$script_dir/.." && pwd)"
 repo_root="$(cd "$codex_cli_root/.." && pwd)"
 codex_rs_root="$repo_root/codex-rs"
-binary_src="$codex_rs_root/target/release/codex"
 binary_dest="$codex_cli_root/vendor/x86_64-unknown-linux-gnu/codex/codex"
+
+if ! command -v "${CC:-cc}" >/dev/null 2>&1; then
+  if command -v gcc >/dev/null 2>&1; then
+    export CC=gcc
+    export CXX=g++
+  else
+    echo "error: gcc/cc is required to build tree-sitter; install build-essential." >&2
+    exit 1
+  fi
+fi
 
 if ((!dry_run)); then
   if ! (cd "$codex_cli_root" && npm whoami >/dev/null); then
@@ -73,6 +82,8 @@ fi
 
 cd "$codex_rs_root"
 cargo build --release -p codex-cli
+target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c "import json, sys; print(json.load(sys.stdin)['target_directory'])")"
+binary_src="$target_dir/release/codex"
 
 mkdir -p "$(dirname "$binary_dest")"
 install -m 755 "$binary_src" "$binary_dest"

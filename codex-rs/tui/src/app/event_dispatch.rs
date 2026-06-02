@@ -1761,6 +1761,19 @@ impl App {
                 self.chat_widget
                     .handle_auto_next_prompt_generated(thread_id, prompt);
             }
+            AppEvent::AutoNextGoalGenerated {
+                thread_id,
+                objective,
+            } => {
+                self.chat_widget.handle_auto_next_goal_generated();
+                self.set_thread_goal_objective(
+                    app_server,
+                    thread_id,
+                    objective,
+                    crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+                )
+                .await;
+            }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = crate::legacy_core::config::edit::syntax_theme_edit(&name);
                 let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)

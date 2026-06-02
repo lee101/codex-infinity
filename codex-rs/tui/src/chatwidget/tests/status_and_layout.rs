@@ -179,10 +179,23 @@ async fn helpers_are_available_and_do_not_panic() {
         session_telemetry,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
     };
     let mut w = ChatWidget::new_with_app_event(init);
     // Basic construction sanity.
     let _ = &mut w;
+}
+
+#[test]
+fn auto_next_goal_objective_sanitizes_slash_prefix() {
+    assert_eq!(
+        sanitize_auto_next_goal_objective("  /goal improve startup parity  ".to_string()),
+        "improve startup parity"
+    );
+    assert_eq!(
+        sanitize_auto_next_goal_objective("\"reduce flaky tests\"".to_string()),
+        "reduce flaky tests"
+    );
 }
 
 #[tokio::test]

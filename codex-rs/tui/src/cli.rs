@@ -65,6 +65,10 @@ pub struct Cli {
     #[arg(long = "auto-next-idea", default_value_t = false)]
     pub auto_next_idea: bool,
 
+    /// When a thread goal completes, automatically generate and start the next goal.
+    #[arg(long = "auto-next-goal", default_value_t = false)]
+    pub auto_next_goal: bool,
+
     /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
     #[arg(long = "yolo2", default_value_t = false)]
     pub dangerously_disable_timeouts: bool,
@@ -154,4 +158,17 @@ fn mark_tui_args(cmd: clap::Command) -> clap::Command {
     cmd.mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
         arg.conflicts_with("approval_policy")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_auto_next_goal() {
+        let cli = Cli::try_parse_from(["codex", "--auto-next-goal"])
+            .expect("--auto-next-goal should parse");
+
+        assert!(cli.auto_next_goal);
+    }
 }

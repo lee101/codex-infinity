@@ -321,8 +321,11 @@ pub(super) async fn make_chatwidget_manual(
         last_non_retry_error: None,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
         auto_next_counter: 0,
         auto_next_generation_in_flight: false,
+        auto_next_goal_generation_in_flight: false,
+        last_auto_next_completed_goal: None,
         auto_next_done_file: PathBuf::new(),
         original_human_prompt: None,
     };

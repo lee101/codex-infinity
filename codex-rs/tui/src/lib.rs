@@ -741,6 +741,11 @@ pub async fn run_main(
             .raw_overrides
             .push("web_search=\"live\"".to_string());
     }
+    if cli.auto_next_goal {
+        cli.config_overrides
+            .raw_overrides
+            .push("features.goals=true".to_string());
+    }
 
     // When using `--oss`, let the bootstrapper pick the model (defaulting to
     // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
@@ -1470,6 +1475,7 @@ async fn run_ratatui_app(
         no_alt_screen,
         auto_next_steps,
         auto_next_idea,
+        auto_next_goal,
         ..
     } = cli;
     let images = shared.into_inner().images;
@@ -1519,6 +1525,7 @@ async fn run_ratatui_app(
         remote_auth_token,
         auto_next_steps,
         auto_next_idea,
+        auto_next_goal,
         environment_manager,
     )
     .await;

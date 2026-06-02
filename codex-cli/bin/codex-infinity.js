@@ -11,6 +11,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const { platform, arch } = process;
+const isGnuLinuxRuntime = prefersGnu();
+const cliArgs = process.argv.slice(2);
 
 function prefersGnu() {
   if (platform !== "linux") {
@@ -28,15 +30,14 @@ let targetTriples = [];
 switch (platform) {
   case "linux":
   case "android": {
-    const preferGnu = prefersGnu();
     switch (arch) {
       case "x64":
-        targetTriples = preferGnu
+        targetTriples = isGnuLinuxRuntime
           ? ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
           : ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"];
         break;
       case "arm64":
-        targetTriples = preferGnu
+        targetTriples = isGnuLinuxRuntime
           ? ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
           : ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
         break;
@@ -110,7 +111,7 @@ if (!binaryPath) {
 // ENOENT/dynamic-linker error.
 if (
   (platform === "linux" || platform === "android") &&
-  !prefersGnu() &&
+  !isGnuLinuxRuntime &&
   selectedTriple?.includes("-gnu")
 ) {
   throw new Error(
@@ -215,13 +216,13 @@ const packageManagerEnvVar =
 env[packageManagerEnvVar] = "1";
 if (
   !env[DEFAULT_MODEL_ENV_VAR] &&
-  !hasExplicitModelOverride(process.argv.slice(2)) &&
-  !usesLocalModelProvider(process.argv.slice(2))
+  !hasExplicitModelOverride(cliArgs) &&
+  !usesLocalModelProvider(cliArgs)
 ) {
   env[DEFAULT_MODEL_ENV_VAR] = DEFAULT_MODEL;
 }
 
-const child = spawn(binaryPath, process.argv.slice(2), {
+const child = spawn(binaryPath, cliArgs, {
   stdio: "inherit",
   env,
 });

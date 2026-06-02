@@ -46,6 +46,7 @@ pub(super) async fn make_test_app() -> App {
         remote_app_server_auth_token: None,
         auto_next_steps: false,
         auto_next_idea: false,
+        auto_next_goal: false,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
