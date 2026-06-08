@@ -298,6 +298,32 @@ fn openpaths_provider_normalizes_openpaths_prefix() {
 }
 
 #[test]
+fn cerebras_provider_normalizes_cerebras_prefix() {
+    let provider = ModelProviderInfo::create_cerebras_provider();
+    assert_eq!(provider.env_key.as_deref(), Some("CEREBRAS_API_KEY"));
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://api.cerebras.ai/v1")
+    );
+    assert_eq!(
+        provider.effective_model_name("cerebras/gpt-oss-120b"),
+        "gpt-oss-120b"
+    );
+    assert_eq!(provider.effective_model_name("zai-glm-4.7"), "zai-glm-4.7");
+}
+
+#[test]
+fn openpaths_provider_normalizes_cerebras_prefix() {
+    // OpenPaths is a router that also serves the Cerebras-hosted models, so a
+    // `cerebras/` slug routed to OpenPaths must drop the prefix too.
+    let provider = ModelProviderInfo::create_openpaths_provider();
+    assert_eq!(
+        provider.effective_model_name("cerebras/gpt-oss-120b"),
+        "gpt-oss-120b"
+    );
+}
+
+#[test]
 fn cursor_provider_normalizes_cursor_prefix() {
     let provider = ModelProviderInfo::create_cursor_provider();
     assert_eq!(
@@ -315,6 +341,7 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
     let _gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
     let _openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
     let _cursor_remove_guard = EnvVarGuard::remove("CURSOR_API_KEY");
+    let _cerebras_remove_guard = EnvVarGuard::remove("CEREBRAS_API_KEY");
     let openpaths_remove_guard = EnvVarGuard::remove("OPENPATHS_API_KEY");
     assert_eq!(
         infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
@@ -370,6 +397,19 @@ fn infer_builtin_provider_prefers_env_backed_routes() {
         infer_builtin_provider_id_for_model("composer-2.5-fast"),
         Some(OPENPATHS_PROVIDER_ID)
     );
+    // With only an OpenPaths key, Cerebras-hosted models route through OpenPaths.
+    assert_eq!(
+        infer_builtin_provider_id_for_model("cerebras/gpt-oss-120b"),
+        Some(OPENPATHS_PROVIDER_ID)
+    );
+
+    // A direct Cerebras key takes precedence over the OpenPaths fallback.
+    let cerebras_set_guard = EnvVarGuard::set("CEREBRAS_API_KEY", "csk-key");
+    assert_eq!(
+        infer_builtin_provider_id_for_model("cerebras/zai-glm-4.7"),
+        Some(CEREBRAS_PROVIDER_ID)
+    );
+    drop(cerebras_set_guard);
 
     drop(_openpaths_set_guard);
     let _cursor_set_guard = EnvVarGuard::set("CURSOR_API_KEY", "cursor-key");

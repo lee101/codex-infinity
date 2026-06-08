@@ -46,6 +46,8 @@ const ZHIPU_PROVIDER_NAME: &str = "Z.AI (Zhipu)";
 pub const ZHIPU_PROVIDER_ID: &str = "zhipu";
 const DEEPSEEK_PROVIDER_NAME: &str = "DeepSeek";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
+const CEREBRAS_PROVIDER_NAME: &str = "Cerebras";
+pub const CEREBRAS_PROVIDER_ID: &str = "cerebras";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
@@ -477,6 +479,30 @@ impl ModelProviderInfo {
         }
     }
 
+    pub fn create_cerebras_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: CEREBRAS_PROVIDER_NAME.into(),
+            base_url: Some(cerebras_base_url()),
+            env_key: Some("CEREBRAS_API_KEY".into()),
+            env_key_instructions: Some(
+                "Get your API key from https://cloud.cerebras.ai and set CEREBRAS_API_KEY".into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            ..Default::default()
+        }
+    }
+
     pub fn create_deepseek_provider() -> ModelProviderInfo {
         ModelProviderInfo {
             name: DEEPSEEK_PROVIDER_NAME.into(),
@@ -537,7 +563,13 @@ impl ModelProviderInfo {
         if self.name == GEMINI_PROVIDER_NAME {
             slug.strip_prefix("google/").unwrap_or(slug)
         } else if self.name == OPENPATHS_PROVIDER_NAME {
-            slug.strip_prefix("openpaths/").unwrap_or(slug)
+            // OpenPaths is a router that can also serve Cerebras-hosted models,
+            // so accept either the `openpaths/` or `cerebras/` prefix.
+            slug.strip_prefix("openpaths/")
+                .or_else(|| slug.strip_prefix("cerebras/"))
+                .unwrap_or(slug)
+        } else if self.name == CEREBRAS_PROVIDER_NAME {
+            slug.strip_prefix("cerebras/").unwrap_or(slug)
         } else if self.name == CURSOR_PROVIDER_NAME {
             slug.strip_prefix("cursor/").unwrap_or(slug)
         } else if self.name == ZHIPU_PROVIDER_NAME {
@@ -589,6 +621,7 @@ pub fn built_in_model_providers(
         (GEMINI_PROVIDER_ID, P::create_gemini_provider()),
         (ZHIPU_PROVIDER_ID, P::create_zhipu_provider()),
         (DEEPSEEK_PROVIDER_ID, P::create_deepseek_provider()),
+        (CEREBRAS_PROVIDER_ID, P::create_cerebras_provider()),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
@@ -625,6 +658,21 @@ fn openpaths_base_url() -> String {
         .unwrap_or_else(|| "https://openpaths.io/v1".to_string())
 }
 
+fn cerebras_base_url() -> String {
+    std::env::var("CEREBRAS_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let trimmed = value.trim().trim_end_matches('/');
+            if trimmed.ends_with("/v1") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1")
+            }
+        })
+        .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string())
+}
+
 fn cursor_base_url() -> String {
     std::env::var("CURSOR_BASE_URL")
         .ok()
@@ -638,9 +686,7 @@ fn is_composer_model_slug(lower: &str) -> bool {
         .strip_prefix("openpaths/")
         .or_else(|| lower.strip_prefix("cursor/"))
         .unwrap_or(lower);
-    slug == "composer-2.5"
-        || slug == "composer-2.5-fast"
-        || slug.starts_with("composer-2.5-")
+    slug == "composer-2.5" || slug == "composer-2.5-fast" || slug.starts_with("composer-2.5-")
 }
 
 pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
@@ -692,6 +738,14 @@ pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> 
         }
         Some(("zhipu", _)) if non_empty_env_var("ZAI_API_KEY") => Some(ZHIPU_PROVIDER_ID),
         Some(("openpaths", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
+            Some(OPENPATHS_PROVIDER_ID)
+        }
+        // Prefer a direct Cerebras key, but fall back to OpenPaths, which also
+        // serves the Cerebras-hosted open-weight models.
+        Some(("cerebras", _)) if non_empty_env_var("CEREBRAS_API_KEY") => {
+            Some(CEREBRAS_PROVIDER_ID)
+        }
+        Some(("cerebras", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
             Some(OPENPATHS_PROVIDER_ID)
         }
         Some(("cursor", _)) if non_empty_env_var("CURSOR_API_KEY") => Some(CURSOR_PROVIDER_ID),

@@ -54,6 +54,34 @@ export OPENAI_API_KEY=sk-...
 codex-infinity "your prompt"
 ```
 
+### Model providers (auto-detected)
+
+`codex-infinity` auto-detects which provider to use from the model slug and the API keys present in your environment — no `config.toml` edits required. Export a key and select a matching model with `-m`:
+
+| Provider | Env var | Example models |
+|----------|---------|----------------|
+| OpenAI | `OPENAI_API_KEY` | `gpt-5.4`, `o3` |
+| Cerebras | `CEREBRAS_API_KEY` | `cerebras/gpt-oss-120b`, `cerebras/zai-glm-4.7` |
+| OpenPaths | `OPENPATHS_API_KEY` | `openpaths/auto`, `cerebras/gpt-oss-120b`, `composer-2.5` |
+| OpenRouter | `OPENROUTER_API_KEY` | `anthropic/claude-opus-4.6`, `google/gemini-3.5-flash` |
+| Google Gemini | `GEMINI_API_KEY` | `google/gemini-3.5-flash` |
+| Z.AI (Zhipu) | `ZAI_API_KEY` | `glm-4.7`, `z-ai/glm-5` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek/deepseek-v4-flash` |
+| Cursor | `CURSOR_API_KEY` | `cursor/composer-2.5` |
+| Local (OSS) | — (`--oss`) | LM Studio / Ollama models |
+
+**Cerebras** runs the fast open-weight coding models (`gpt-oss-120b`, `zai-glm-4.7`). A `cerebras/*` model prefers a direct Cerebras key (`CEREBRAS_API_KEY`, `https://api.cerebras.ai`) and otherwise falls back to **OpenPaths** ([openpaths.io](https://openpaths.io)), a router that also serves the Cerebras-hosted models — so a single `OPENPATHS_API_KEY` is enough to reach them. Override the endpoints with `CEREBRAS_BASE_URL` / `OPENPATHS_BASE_URL` if needed.
+
+```shell
+# Direct Cerebras
+export CEREBRAS_API_KEY=csk-...
+codex-infinity -m cerebras/gpt-oss-120b "refactor this module"
+
+# Or via OpenPaths (also serves Cerebras models)
+export OPENPATHS_API_KEY=op-...
+codex-infinity -m cerebras/zai-glm-4.7 "explain this bug"
+```
+
 ## CLI flags
 
 | Flag | Description |

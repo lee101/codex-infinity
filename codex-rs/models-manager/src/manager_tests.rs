@@ -842,4 +842,10 @@ fn bundled_models_json_roundtrips() {
             .any(|model| model.slug == "deepseek/deepseek-v4-flash"),
         "bundled models.json should include a DeepSeek model"
     );
+    for slug in ["cerebras/gpt-oss-120b", "cerebras/zai-glm-4.7"] {
+        assert!(
+            response.models.iter().any(|model| model.slug == slug),
+            "bundled models.json should include the Cerebras model {slug}"
+        );
+    }
 }
