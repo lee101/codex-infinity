@@ -6,7 +6,6 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codex_windows_sandbox::LOG_FILE_NAME;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
@@ -14,6 +13,7 @@ use codex_windows_sandbox::SetupFailure;
 use codex_windows_sandbox::add_deny_write_ace;
 use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::convert_string_sid_to_sid;
+use codex_windows_sandbox::current_log_file_path;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
 use codex_windows_sandbox::extract_setup_failure;
@@ -103,7 +103,7 @@ enum SetupMode {
     ReadAclsOnly,
 }
 
-fn log_line(log: &mut File, msg: &str) -> Result<()> {
+fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
     let ts = chrono::Utc::now().to_rfc3339();
     writeln!(log, "[{ts}] {msg}").map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -349,7 +349,7 @@ pub fn main() -> Result<()> {
         if let Ok(codex_home) = std::env::var("CODEX_HOME") {
             let sbx_dir = sandbox_dir(Path::new(&codex_home));
             let _ = std::fs::create_dir_all(&sbx_dir);
-            let log_path = sbx_dir.join(LOG_FILE_NAME);
+            let log_path = current_log_file_path(&sbx_dir);
             if let Ok(mut f) = File::options().create(true).append(true).open(&log_path) {
                 let _ = writeln!(
                     f,
@@ -400,7 +400,7 @@ fn real_main() -> Result<()> {
             format!("failed to create sandbox dir {}: {err}", sbx_dir.display()),
         ))
     })?;
-    let log_path = sbx_dir.join(LOG_FILE_NAME);
+    let log_path = current_log_file_path(&sbx_dir);
     let mut log = File::options()
         .create(true)
         .append(true)

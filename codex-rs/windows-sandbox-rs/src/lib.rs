@@ -143,7 +143,7 @@ pub use ipc_framed::read_frame;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::write_frame;
 #[cfg(target_os = "windows")]
-pub use logging::LOG_FILE_NAME;
+pub use logging::current_log_file_path;
 #[cfg(target_os = "windows")]
 pub use logging::log_note;
 #[cfg(target_os = "windows")]
