@@ -8,8 +8,6 @@ use codex_install_context::StandalonePlatform;
 pub enum UpdateAction {
     /// Update via `npm install -g @openai/codex@latest`.
     NpmGlobalLatest,
-    /// Update via `bun install -g @openai/codex@latest`.
-    BunGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
     /// Update via `curl -fsSL https://chatgpt.com/codex/install.sh | sh`.
@@ -23,7 +21,7 @@ impl UpdateAction {
     pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
         match context {
             InstallContext::Npm => Some(UpdateAction::NpmGlobalLatest),
-            InstallContext::Bun => Some(UpdateAction::BunGlobalLatest),
+            InstallContext::Bun => None,
             InstallContext::Brew => Some(UpdateAction::BrewUpgrade),
             InstallContext::Standalone { platform, .. } => Some(match platform {
                 StandalonePlatform::Unix => UpdateAction::StandaloneUnix,
@@ -38,9 +36,6 @@ impl UpdateAction {
         match self {
             UpdateAction::NpmGlobalLatest => {
                 ("npm", &["install", "-g", "@codex-infinity/codex-infinity"])
-            }
-            UpdateAction::BunGlobalLatest => {
-                ("bun", &["install", "-g", "@codex-infinity/codex-infinity"])
             }
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             UpdateAction::StandaloneUnix => (
@@ -87,7 +82,7 @@ mod tests {
         );
         assert_eq!(
             UpdateAction::from_install_context(&InstallContext::Bun),
-            Some(UpdateAction::BunGlobalLatest)
+            None
         );
         assert_eq!(
             UpdateAction::from_install_context(&InstallContext::Brew),
