@@ -193,71 +193,11 @@ fn openai_manager_for_tests_with_auth(
     endpoint_client: Arc<dyn ModelsEndpointClient>,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> OpenAiModelsManager {
-    OpenAiModelsManager::new(
-        codex_home,
-        endpoint_client,
-        auth_manager,
-        CollaborationModesConfig::default(),
-    )
+    OpenAiModelsManager::new(codex_home, endpoint_client, auth_manager)
 }
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
-    StaticModelsManager::new(
-        /*auth_manager*/ None,
-        model_catalog,
-        CollaborationModesConfig::default(),
-    )
-}
-
-#[tokio::test]
-async fn get_default_model_resolves_latest_to_highest_available_model() {
-    let manager = static_manager_for_tests(ModelsResponse {
-        models: vec![
-            remote_model("gpt-5.5", "GPT-5.5", /*priority*/ 2),
-            remote_model("gpt-5.5-max", "GPT-5.5 Max", /*priority*/ 1),
-            remote_model("gpt-5.6", "GPT-5.6", /*priority*/ 3),
-            remote_model("gpt-5.10", "GPT-5.10", /*priority*/ 4),
-            remote_model("gpt-5.9", "GPT-5.9", /*priority*/ 0),
-        ],
-    });
-
-    let model = manager
-        .get_default_model(&Some("latest".to_string()), RefreshStrategy::Offline)
-        .await;
-
-    assert_eq!(model, "gpt-5.10");
-}
-
-#[tokio::test]
-async fn get_default_model_resolves_latest_to_longest_model_when_numbers_tie() {
-    let manager = static_manager_for_tests(ModelsResponse {
-        models: vec![
-            remote_model("gpt-5.5", "GPT-5.5", /*priority*/ 0),
-            remote_model("gpt-5.5-max", "GPT-5.5 Max", /*priority*/ 1),
-        ],
-    });
-
-    let model = manager
-        .get_default_model(&Some("latest".to_string()), RefreshStrategy::Offline)
-        .await;
-
-    assert_eq!(model, "gpt-5.5-max");
-}
-
-#[tokio::test]
-async fn get_default_model_keeps_explicit_model_without_fetching_catalog() {
-    let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
-        "gpt-5.6", "GPT-5.6", /*priority*/ 0,
-    )]]);
-    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
-
-    let model = manager
-        .get_default_model(&Some("gpt-custom".to_string()), RefreshStrategy::Online)
-        .await;
-
-    assert_eq!(model, "gpt-custom");
-    assert_eq!(endpoint.fetch_count(), 0);
+    StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
 }
 
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
@@ -365,6 +305,21 @@ async fn get_model_info_matches_namespaced_suffix() {
 }
 
 #[tokio::test]
+async fn get_model_info_matches_hyphenated_provider_namespace_suffix() {
+    let config = ModelsManagerConfig::default();
+    let remote = remote_model("gpt-image", "Image", /*priority*/ 0);
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote],
+    });
+    let namespaced_model = "openai-codex/gpt-image".to_string();
+
+    let model_info = manager.get_model_info(&namespaced_model, &config).await;
+
+    assert_eq!(model_info.slug, namespaced_model);
+    assert!(!model_info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
 async fn get_model_info_rejects_multi_segment_namespace_suffix_matching() {
     let codex_home = tempdir().expect("temp dir");
     let config = ModelsManagerConfig::default();
@@ -417,6 +372,160 @@ async fn refresh_available_models_sorts_by_priority() {
         high_idx < low_idx,
         "higher priority should be listed before lower priority"
     );
+    assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+}
+
+#[tokio::test]
+async fn refresh_available_models_uses_remote_only_catalog_for_chatgpt_auth() {
+    let remote_models = vec![remote_model(
+        "chatgpt-visible-source-of-truth",
+        "ChatGPT Visible",
+        /*priority*/ 0,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("refresh succeeds");
+
+    assert_eq!(manager.get_remote_models().await, remote_models);
+    assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+}
+
+#[tokio::test]
+async fn refresh_available_models_uses_cached_remote_only_catalog_for_chatgpt_auth() {
+    let remote_models = vec![remote_model(
+        "chatgpt-cached-source-of-truth",
+        "ChatGPT Cached",
+        /*priority*/ 0,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let fetch_endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+    let fetch_manager =
+        openai_manager_for_tests(codex_home.path().to_path_buf(), fetch_endpoint.clone());
+
+    fetch_manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("initial refresh succeeds");
+
+    let cache_endpoint = TestModelsEndpoint::new(Vec::new());
+    let cache_manager =
+        openai_manager_for_tests(codex_home.path().to_path_buf(), cache_endpoint.clone());
+
+    cache_manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("cached refresh succeeds");
+
+    assert_eq!(cache_manager.get_remote_models().await, remote_models);
+    assert_eq!(
+        cache_endpoint.fetch_count(),
+        0,
+        "fresh cache should avoid a model fetch"
+    );
+}
+
+#[tokio::test]
+async fn get_model_info_uses_fallback_for_bundled_models_when_chatgpt_remote_is_authoritative() {
+    let remote_models = vec![remote_model(
+        "chatgpt-authoritative-model-info",
+        "ChatGPT Model Info",
+        /*priority*/ 0,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![remote_models]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
+    let bundled_slug = load_remote_models_from_file()
+        .expect("bundled models should parse")
+        .first()
+        .expect("bundled models should contain at least one model")
+        .slug
+        .clone();
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("refresh succeeds");
+
+    let model_info = manager
+        .get_model_info(&bundled_slug, &ModelsManagerConfig::default())
+        .await;
+
+    assert_eq!(model_info.slug, bundled_slug);
+    assert!(model_info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
+async fn refresh_available_models_preserves_bundled_catalog_for_empty_chatgpt_remote() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![Vec::new()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
+    let expected = load_remote_models_from_file().expect("bundled models should parse");
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("refresh succeeds");
+
+    assert_eq!(manager.get_remote_models().await, expected);
+}
+
+#[tokio::test]
+async fn refresh_available_models_merges_hidden_only_chatgpt_remote_with_bundled_catalog() {
+    let hidden_remote = remote_model_with_visibility(
+        "chatgpt-hidden-only",
+        "ChatGPT Hidden",
+        /*priority*/ 0,
+        "hide",
+    );
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![vec![hidden_remote.clone()]]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
+    let mut expected = load_remote_models_from_file().expect("bundled models should parse");
+    expected.push(hidden_remote);
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("refresh succeeds");
+
+    assert_eq!(manager.get_remote_models().await, expected);
+}
+
+#[tokio::test]
+async fn refresh_available_models_keeps_merging_for_api_auth() {
+    let remote_models = vec![remote_model(
+        "api-auth-visible-remote",
+        "API Auth Visible",
+        /*priority*/ 0,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = Arc::new(TestModelsEndpoint {
+        has_command_auth: true,
+        uses_codex_backend: false,
+        responses: Mutex::new(vec![remote_models.clone()].into()),
+        fetch_count: AtomicUsize::new(0),
+    });
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+            "test-api-key",
+        ))),
+    );
+    let mut expected = load_remote_models_from_file().expect("bundled models should parse");
+    expected.extend(remote_models);
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("refresh succeeds");
+
+    assert_eq!(manager.get_remote_models().await, expected);
     assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
 }
 
@@ -802,7 +911,6 @@ async fn static_manager_reads_latest_auth_mode() {
         ModelsResponse {
             models: vec![chatgpt_only_model, api_model],
         },
-        CollaborationModesConfig::default(),
     );
 
     let chatgpt_models = manager.list_models(RefreshStrategy::Online).await;
@@ -844,24 +952,4 @@ fn bundled_models_json_roundtrips() {
         !response.models.is_empty(),
         "bundled models.json should contain at least one model"
     );
-    assert!(
-        response
-            .models
-            .iter()
-            .any(|model| model.slug == "google/gemini-3.5-flash"),
-        "bundled models.json should include the current default Gemini model"
-    );
-    assert!(
-        response
-            .models
-            .iter()
-            .any(|model| model.slug == "deepseek/deepseek-v4-flash"),
-        "bundled models.json should include a DeepSeek model"
-    );
-    for slug in ["cerebras/gpt-oss-120b", "cerebras/zai-glm-4.7"] {
-        assert!(
-            response.models.iter().any(|model| model.slug == slug),
-            "bundled models.json should include the Cerebras model {slug}"
-        );
-    }
 }

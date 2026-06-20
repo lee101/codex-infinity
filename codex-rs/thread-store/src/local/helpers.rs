@@ -15,7 +15,9 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::ThreadItem;
+use codex_state::ThreadMetadata;
 
 use crate::StoredThread;
 use crate::ThreadStoreError;
@@ -50,6 +52,13 @@ pub(super) fn scoped_rollout_path(
             ),
         })
     }
+}
+
+pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
+    path.starts_with(codex_home.join(ARCHIVED_SESSIONS_SUBDIR))
+        || path
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
 }
 
 pub(super) fn matching_rollout_file_name(
@@ -97,6 +106,7 @@ pub(super) fn stored_thread_from_rollout_item(
         .or_else(|| thread_id_from_rollout_path(item.path.as_path()))?;
     let created_at = parse_rfc3339(item.created_at.as_deref()).unwrap_or_else(Utc::now);
     let updated_at = parse_rfc3339(item.updated_at.as_deref()).unwrap_or(created_at);
+    let recency_at = parse_rfc3339(item.recency_at.as_deref()).unwrap_or(updated_at);
     let archived_at = archived.then_some(updated_at);
     let git_info = git_info_from_parts(
         item.git_sha.clone(),
@@ -104,7 +114,12 @@ pub(super) fn stored_thread_from_rollout_item(
         item.git_origin_url.clone(),
     );
     let source = item.source.unwrap_or(SessionSource::Unknown);
-    let preview = item.first_user_message.clone().unwrap_or_default();
+    let preview = item
+        .preview
+        .clone()
+        .or_else(|| item.first_user_message.clone())
+        .unwrap_or_default();
+    let rollout_path = codex_rollout::plain_rollout_path(item.path.as_path());
 
     Some(StoredThread {
         thread_id,
@@ -122,10 +137,12 @@ pub(super) fn stored_thread_from_rollout_item(
         reasoning_effort: None,
         created_at,
         updated_at,
+        recency_at,
         archived_at,
         cwd: item.cwd.unwrap_or_default(),
         cli_version: item.cli_version.unwrap_or_default(),
         source,
+        thread_source: None,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,
         agent_path: None,
@@ -136,6 +153,43 @@ pub(super) fn stored_thread_from_rollout_item(
         first_user_message: item.first_user_message,
         history: None,
     })
+}
+
+pub(super) fn permission_profile_from_metadata_value(value: &str, cwd: &Path) -> PermissionProfile {
+    serde_json::from_str::<PermissionProfile>(value)
+        .or_else(|_| {
+            parse_legacy_sandbox_policy(value)
+                .map(|policy| PermissionProfile::from_legacy_sandbox_policy_for_cwd(&policy, cwd))
+        })
+        .unwrap_or_else(|_| PermissionProfile::read_only())
+}
+
+pub(super) fn permission_profile_to_metadata_value(
+    permission_profile: &PermissionProfile,
+) -> String {
+    match serde_json::to_string(permission_profile) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("failed to serialize permission profile metadata: {err}");
+            String::new()
+        }
+    }
+}
+
+pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String> {
+    let title = metadata.title.trim();
+    if title.is_empty() || metadata.first_user_message.as_deref().map(str::trim) == Some(title) {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+pub(super) fn set_thread_name_from_title(thread: &mut StoredThread, title: String) {
+    if title.trim().is_empty() || thread.preview.trim() == title.trim() {
+        return;
+    }
+    thread.name = Some(title);
 }
 
 fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>> {

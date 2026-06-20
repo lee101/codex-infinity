@@ -16,32 +16,12 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    #[arg(long = "strict-config", global = true, default_value_t = false)]
+    pub strict_config: bool,
+
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
-
-    /// Like --yolo but also disables command timeouts. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo2",
-        alias = "dangerously-disable-timeouts",
-        default_value_t = false
-    )]
-    pub dangerously_disable_timeouts: bool,
-
-    /// Like --yolo2 but also passes the full host environment through unchanged. EXTREMELY DANGEROUS.
-    #[arg(
-        long = "yolo3",
-        alias = "dangerously-disable-env-wrapping",
-        default_value_t = false
-    )]
-    pub dangerously_disable_environment_wrapping: bool,
-
-    /// Like --yolo3 but also streams command stdout/stderr directly to your terminal.
-    #[arg(
-        long = "yolo4",
-        alias = "dangerously-passthrough-stdio",
-        default_value_t = false
-    )]
-    pub dangerously_passthrough_stdio: bool,
 
     /// Allow running Codex outside a Git repository.
     #[arg(long = "skip-git-repo-check", global = true, default_value_t = false)]
@@ -70,7 +50,7 @@ pub struct Cli {
     pub removed_full_auto: bool,
 
     /// Path to a JSON Schema file describing the model's final response shape.
-    #[arg(long = "output-schema", value_name = "FILE")]
+    #[arg(long = "output-schema", value_name = "FILE", global = true)]
     pub output_schema: Option<PathBuf>,
 
     #[clap(skip)]
@@ -88,10 +68,6 @@ pub struct Cli {
         global = true
     )]
     pub json: bool,
-
-    /// Whether to include the plan tool in the conversation.
-    #[arg(long = "include-plan-tool", default_value_t = false)]
-    pub include_plan_tool: bool,
 
     /// Specifies file where the last message from the agent should be written.
     #[arg(
@@ -183,6 +159,7 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
         .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
             arg.global(true)
         })
+        .mut_arg("bypass_hook_trust", |arg| arg.global(true))
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -248,7 +225,7 @@ pub struct ResumeArgs {
 impl From<ResumeArgsRaw> for ResumeArgs {
     fn from(raw: ResumeArgsRaw) -> Self {
         // When --last is used without an explicit prompt, treat the positional as the prompt
-        // (clap can't express this conditional positional meaning cleanly).
+        // (clap can’t express this conditional positional meaning cleanly).
         let (session_id, prompt) = if raw.last && raw.prompt.is_none() {
             (None, raw.session_id)
         } else {
@@ -285,7 +262,7 @@ impl FromArgMatches for ResumeArgs {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Args, Debug)]
 pub struct ReviewArgs {
     /// Review staged, unstaged, and untracked changes.
     #[arg(

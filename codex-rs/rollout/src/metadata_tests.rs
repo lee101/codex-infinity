@@ -1,7 +1,6 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
-use crate::config::RolloutConfig;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
@@ -24,16 +23,6 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 use uuid::Uuid;
 
-fn test_config(codex_home: PathBuf) -> RolloutConfig {
-    RolloutConfig {
-        sqlite_home: codex_home.clone(),
-        cwd: codex_home.clone(),
-        codex_home,
-        model_provider_id: "test-provider".to_string(),
-        generate_memories: true,
-    }
-}
-
 #[tokio::test]
 async fn extract_metadata_from_rollout_uses_session_meta() {
     let dir = tempdir().expect("tempdir");
@@ -52,6 +41,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),
+        thread_source: None,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
@@ -81,6 +71,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     let mut expected = builder.build("openai");
     apply_rollout_item(&mut expected, &rollout_line.item, "openai");
     expected.updated_at = file_modified_time_utc(&path).await.expect("mtime");
+    expected.recency_at = expected.updated_at;
 
     assert_eq!(outcome.metadata, expected);
     assert_eq!(outcome.memory_mode, None);
@@ -105,6 +96,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),
+        thread_source: None,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
@@ -162,6 +154,7 @@ fn builder_from_items_falls_back_to_filename() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "noop".to_string(),
         replacement_history: None,
+        window_number: None,
         window_id: None,
     })];
 
@@ -216,8 +209,7 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
     ))
     .await;
 
-    let config = test_config(codex_home.clone());
-    backfill_sessions(runtime.as_ref(), &config).await;
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
 
     let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
     let second_id = ThreadId::from_string(&second_uuid.to_string()).expect("second thread id");
@@ -284,8 +276,7 @@ async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_f
         .await
         .expect("existing metadata upsert");
 
-    let config = test_config(codex_home.clone());
-    backfill_sessions(runtime.as_ref(), &config).await;
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
 
     let persisted = runtime
         .get_thread(thread_id)
@@ -319,8 +310,7 @@ async fn backfill_sessions_normalizes_cwd_before_upsert() {
         .await
         .expect("initialize runtime");
 
-    let config = test_config(codex_home.clone());
-    backfill_sessions(runtime.as_ref(), &config).await;
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
 
     let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
     let stored = runtime
@@ -371,6 +361,7 @@ fn write_rollout_in_sessions_with_cwd(
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),
+        thread_source: None,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,

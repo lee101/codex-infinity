@@ -2,10 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::plugins::PluginsManager;
 use codex_config::McpServerConfig;
+use codex_core_plugins::PluginsManager;
+use codex_extension_api::ExtensionDataInit;
+use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
 use codex_login::CodexAuth;
-use codex_mcp::ToolPluginProvenance;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::EffectiveMcpServer;
+use codex_mcp::McpConfig;
+use codex_mcp::McpPluginAttribution;
+use codex_mcp::McpServerRegistration;
+use codex_mcp::codex_apps_mcp_server_config;
 use codex_mcp::configured_mcp_servers;
 use codex_mcp::effective_mcp_servers;
 
@@ -190,8 +199,8 @@ impl McpManager {
         &self,
         config: &Config,
         auth: Option<&CodexAuth>,
-    ) -> HashMap<String, McpServerConfig> {
-        let mcp_config = config.to_mcp_config(self.plugins_manager.as_ref()).await;
+    ) -> HashMap<String, EffectiveMcpServer> {
+        let mcp_config = self.runtime_config(config).await;
         effective_mcp_servers(&mcp_config, auth)
     }
 }

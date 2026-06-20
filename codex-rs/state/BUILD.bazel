@@ -9,5 +9,4 @@ codex_rust_crate(
         "migrations/**",
     ]),
     crate_name = "codex_state",
-    compile_data = glob(["logs_migrations/**", "migrations/**"]),
 )

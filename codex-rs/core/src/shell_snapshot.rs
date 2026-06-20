@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use crate::StateDbHandle;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
@@ -49,20 +50,16 @@ impl ShellSnapshot {
         codex_home: AbsolutePathBuf,
         session_id: ThreadId,
         session_telemetry: SessionTelemetry,
-    ) -> watch::Sender<Option<Arc<ShellSnapshot>>> {
-        let (shell_snapshot_tx, shell_snapshot_rx) = watch::channel(None);
-        shell.shell_snapshot = shell_snapshot_rx;
-
-        Self::spawn_snapshot_task(
-            codex_home,
-            session_id,
-            session_cwd,
-            shell.clone(),
-            shell_snapshot_tx.clone(),
-            session_telemetry,
-        );
-
-        shell_snapshot_tx
+        state_db: Option<StateDbHandle>,
+    ) -> Self {
+        Self {
+            config: Some(Arc::new(ShellSnapshotConfig {
+                codex_home,
+                session_id,
+                session_telemetry,
+                state_db,
+            })),
+        }
     }
 
     pub(crate) fn disabled() -> Self {
@@ -89,44 +86,25 @@ impl ShellSnapshot {
         config: Arc<ShellSnapshotConfig>,
         cwd: AbsolutePathBuf,
         shell: Shell,
-        shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
-        session_telemetry: SessionTelemetry,
-    ) {
-        Self::spawn_snapshot_task(
-            codex_home,
-            session_id,
-            session_cwd,
-            shell,
-            shell_snapshot_tx,
-            session_telemetry,
-        );
-    }
-
-    fn spawn_snapshot_task(
-        codex_home: AbsolutePathBuf,
-        session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
-        snapshot_shell: Shell,
-        shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
-        session_telemetry: SessionTelemetry,
-    ) {
-        let snapshot_span = info_span!("shell_snapshot", thread_id = %session_id);
-        tokio::spawn(
-            async move {
-                let timer = session_telemetry.start_timer("codex.shell_snapshot.duration_ms", &[]);
-                let snapshot =
-                    ShellSnapshot::try_new(&codex_home, session_id, &session_cwd, &snapshot_shell)
-                        .await
-                        .map(Arc::new);
-                let success = snapshot.is_ok();
-                let success_tag = if success { "true" } else { "false" };
-                let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
-                let mut counter_tags = vec![("success", success_tag)];
-                if let Some(failure_reason) = snapshot.as_ref().err() {
-                    counter_tags.push(("failure_reason", *failure_reason));
-                }
-                session_telemetry.counter("codex.shell_snapshot", /*inc*/ 1, &counter_tags);
-                let _ = shell_snapshot_tx.send(snapshot.ok());
+    ) -> Option<Arc<ShellSnapshotFile>> {
+        let snapshot_span = info_span!("shell_snapshot", thread_id = %config.session_id);
+        async {
+            let timer = config
+                .session_telemetry
+                .start_timer("codex.shell_snapshot.duration_ms", &[]);
+            let snapshot = ShellSnapshot::try_create(
+                &config.codex_home,
+                config.session_id,
+                &cwd,
+                &shell,
+                config.state_db.clone(),
+            )
+            .await;
+            let success_tag = if snapshot.is_ok() { "true" } else { "false" };
+            let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
+            let mut counter_tags = vec![("success", success_tag)];
+            if let Some(failure_reason) = snapshot.as_ref().err() {
+                counter_tags.push(("failure_reason", *failure_reason));
             }
             config
                 .session_telemetry
@@ -142,7 +120,8 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: &AbsolutePathBuf,
         shell: &Shell,
-    ) -> std::result::Result<Self, &'static str> {
+        state_db: Option<StateDbHandle>,
+    ) -> std::result::Result<ShellSnapshotFile, &'static str> {
         // File to store the snapshot
         let extension = match shell.shell_type {
             ShellType::PowerShell => "ps1",
@@ -163,7 +142,9 @@ impl ShellSnapshot {
         let codex_home = codex_home.clone();
         let cleanup_session_id = session_id;
         tokio::spawn(async move {
-            if let Err(err) = cleanup_stale_snapshots(&codex_home, cleanup_session_id).await {
+            if let Err(err) =
+                cleanup_stale_snapshots(&codex_home, cleanup_session_id, state_db).await
+            {
                 tracing::warn!("Failed to clean up shell snapshots: {err:?}");
             }
         });
@@ -519,6 +500,7 @@ $envVars | ForEach-Object {
 pub async fn cleanup_stale_snapshots(
     codex_home: &AbsolutePathBuf,
     active_session_id: ThreadId,
+    state_db: Option<StateDbHandle>,
 ) -> Result<()> {
     let snapshot_dir = codex_home.join(SNAPSHOT_DIR);
 
@@ -548,7 +530,8 @@ pub async fn cleanup_stale_snapshots(
             continue;
         }
 
-        let rollout_path = find_thread_path_by_id_str(codex_home, session_id).await?;
+        let rollout_path =
+            find_thread_path_by_id_str(codex_home, session_id, state_db.as_deref()).await?;
         let Some(rollout_path) = rollout_path else {
             remove_snapshot_file(&path).await;
             continue;

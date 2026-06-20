@@ -24,6 +24,7 @@ use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use serde::Serialize;
+use std::time::Duration;
 
 use crate::AgentThreadId;
 use crate::CodexTurnId;
@@ -120,8 +121,12 @@ impl Serialize for ToolRuntimePayload<'_> {
         S: serde::Serializer,
     {
         match self {
-            ToolRuntimePayload::ExecCommandBegin(event) => event.serialize(serializer),
-            ToolRuntimePayload::ExecCommandEnd(event) => event.serialize(serializer),
+            ToolRuntimePayload::ExecCommandBegin(event) => {
+                ExecCommandBeginTracePayload::from(*event).serialize(serializer)
+            }
+            ToolRuntimePayload::ExecCommandEnd(event) => {
+                ExecCommandEndTracePayload::from(*event).serialize(serializer)
+            }
             ToolRuntimePayload::PatchApplyBegin(event) => event.serialize(serializer),
             ToolRuntimePayload::PatchApplyEnd(event) => event.serialize(serializer),
             ToolRuntimePayload::McpToolCallBegin(event) => event.serialize(serializer),
@@ -135,6 +140,119 @@ impl Serialize for ToolRuntimePayload<'_> {
             ToolRuntimePayload::CollabCloseBegin(event) => event.serialize(serializer),
             ToolRuntimePayload::CollabCloseEnd(event) => event.serialize(serializer),
             ToolRuntimePayload::SubAgentActivity(event) => event.serialize(serializer),
+        }
+    }
+}
+
+/// Rollout-trace representation of an exec begin event.
+///
+/// Rollout traces share the rollout compatibility requirement that paths remain path-flavored
+/// strings on disk, even though live events carry `PathUri` internally.
+#[derive(Serialize)]
+struct ExecCommandBeginTracePayload<'a> {
+    call_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_id: Option<&'a str>,
+    turn_id: &'a str,
+    started_at_ms: i64,
+    command: &'a [String],
+    cwd: String,
+    parsed_cmd: &'a [codex_protocol::parse_command::ParsedCommand],
+    source: ExecCommandSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interaction_input: Option<&'a str>,
+}
+
+impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
+    fn from(event: &'a ExecCommandBeginEvent) -> Self {
+        let ExecCommandBeginEvent {
+            call_id,
+            process_id,
+            turn_id,
+            started_at_ms,
+            command,
+            cwd,
+            parsed_cmd,
+            source,
+            interaction_input,
+        } = event;
+        Self {
+            call_id,
+            process_id: process_id.as_deref(),
+            turn_id,
+            started_at_ms: *started_at_ms,
+            command,
+            cwd: cwd.inferred_native_path_string(),
+            parsed_cmd,
+            source: *source,
+            interaction_input: interaction_input.as_deref(),
+        }
+    }
+}
+
+/// Rollout-trace representation of an exec end event.
+///
+/// Like [`ExecCommandBeginTracePayload`], this renders `cwd` as an inferred native path to preserve
+/// the on-disk format rather than serializing the internal `PathUri`.
+#[derive(Serialize)]
+struct ExecCommandEndTracePayload<'a> {
+    call_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_id: Option<&'a str>,
+    turn_id: &'a str,
+    completed_at_ms: i64,
+    command: &'a [String],
+    cwd: String,
+    parsed_cmd: &'a [codex_protocol::parse_command::ParsedCommand],
+    source: ExecCommandSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interaction_input: Option<&'a str>,
+    stdout: &'a str,
+    stderr: &'a str,
+    aggregated_output: &'a str,
+    exit_code: i32,
+    duration: Duration,
+    formatted_output: &'a str,
+    status: &'a ExecCommandStatus,
+}
+
+impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
+    fn from(event: &'a ExecCommandEndEvent) -> Self {
+        let ExecCommandEndEvent {
+            call_id,
+            process_id,
+            turn_id,
+            completed_at_ms,
+            command,
+            cwd,
+            parsed_cmd,
+            source,
+            interaction_input,
+            stdout,
+            stderr,
+            aggregated_output,
+            exit_code,
+            duration,
+            formatted_output,
+            status,
+        } = event;
+        Self {
+            call_id,
+            process_id: process_id.as_deref(),
+            turn_id,
+            completed_at_ms: *completed_at_ms,
+            command,
+            cwd: cwd.inferred_native_path_string(),
+            parsed_cmd,
+            source: *source,
+            interaction_input: interaction_input.as_deref(),
+            stdout,
+            stderr,
+            aggregated_output,
+            exit_code: *exit_code,
+            duration: *duration,
+            formatted_output,
+            status,
         }
     }
 }
@@ -237,29 +355,26 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::TurnStarted(_)
+        | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::TurnComplete(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::UserMessage(_)
-        | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoning(_)
-        | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContent(_)
-        | EventMsg::AgentReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::SessionConfigured(_)
-        | EventMsg::ThreadNameUpdated(_)
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::WebSearchBegin(_)
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ImageGenerationBegin(_)
         | EventMsg::ImageGenerationEnd(_)
+        | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::ExecCommandOutputDelta(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandEnd(_)
-        | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecApprovalRequest(_)
         | EventMsg::RequestPermissions(_)
         | EventMsg::RequestUserInput(_)
@@ -269,17 +384,10 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)
-        | EventMsg::BackgroundEvent(_)
-        | EventMsg::UndoStarted(_)
-        | EventMsg::UndoCompleted(_)
         | EventMsg::StreamError(_)
         | EventMsg::PatchApplyUpdated(_)
         | EventMsg::TurnDiff(_)
-        | EventMsg::GetHistoryEntryResponse(_)
-        | EventMsg::McpListToolsResponse(_)
-        | EventMsg::ListSkillsResponse(_)
         | EventMsg::RealtimeConversationListVoicesResponse(_)
-        | EventMsg::SkillsUpdateAvailable
         | EventMsg::PlanUpdate(_)
         | EventMsg::TurnAborted(_)
         | EventMsg::ShutdownComplete
@@ -305,7 +413,6 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         EventMsg::TurnStarted(_) => Some("turn_started"),
         EventMsg::TurnComplete(_) => Some("turn_complete"),
         EventMsg::TurnAborted(_) => Some("turn_aborted"),
-        EventMsg::ThreadNameUpdated(_) => Some("thread_name_updated"),
         EventMsg::ThreadRolledBack(_) => Some("thread_rolled_back"),
         EventMsg::Error(_) => Some("error"),
         EventMsg::Warning(_) => Some("warning"),
@@ -319,14 +426,12 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::ContextCompacted(_)
+        | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::UserMessage(_)
-        | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoning(_)
-        | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContent(_)
-        | EventMsg::AgentReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::McpStartupUpdate(_)
@@ -337,11 +442,11 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ImageGenerationBegin(_)
         | EventMsg::ImageGenerationEnd(_)
+        | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::ExecCommandOutputDelta(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandEnd(_)
-        | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecApprovalRequest(_)
         | EventMsg::RequestPermissions(_)
         | EventMsg::RequestUserInput(_)
@@ -351,19 +456,12 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)
-        | EventMsg::BackgroundEvent(_)
-        | EventMsg::UndoStarted(_)
-        | EventMsg::UndoCompleted(_)
         | EventMsg::StreamError(_)
         | EventMsg::PatchApplyBegin(_)
         | EventMsg::PatchApplyUpdated(_)
         | EventMsg::PatchApplyEnd(_)
         | EventMsg::TurnDiff(_)
-        | EventMsg::GetHistoryEntryResponse(_)
-        | EventMsg::McpListToolsResponse(_)
-        | EventMsg::ListSkillsResponse(_)
         | EventMsg::RealtimeConversationListVoicesResponse(_)
-        | EventMsg::SkillsUpdateAvailable
         | EventMsg::PlanUpdate(_)
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)

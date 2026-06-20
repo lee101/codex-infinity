@@ -1,10 +1,7 @@
 use crate::ConversationMessage;
 use crate::ImportedExternalAgentSession;
 use crate::MessageRole;
-use crate::records::conversation_messages;
-use crate::records::custom_title_from_records;
-use crate::records::project_root_from_records;
-use crate::records::read_records;
+use crate::records::read_session_import;
 use crate::summarize_for_label;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -21,9 +18,21 @@ use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use std::io;
 use std::path::Path;
 
-pub fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
-    let records = read_records(path)?;
-    let Some(cwd) = project_root_from_records(&records) else {
+const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+
+#[cfg(test)]
+fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
+    Ok(
+        load_session_for_import_with_content_sha256(path)?
+            .map(|(session, _content_sha256)| session),
+    )
+}
+
+pub(crate) fn load_session_for_import_with_content_sha256(
+    path: &Path,
+) -> io::Result<Option<(ImportedExternalAgentSession, String)>> {
+    let parsed = read_session_import(path)?;
+    let Some(cwd) = parsed.cwd else {
         return Ok(None);
     };
     let messages = parsed.messages;
@@ -36,17 +45,15 @@ pub fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExterna
     if rollout_items.is_empty() {
         return Ok(None);
     }
-    let title = custom_title_from_records(&records).or_else(|| {
-        messages
-            .iter()
-            .find(|message| message.role == MessageRole::User)
-            .map(|message| summarize_for_label(&message.text))
-    });
-    Ok(Some(ImportedExternalAgentSession {
-        cwd,
-        title,
-        rollout_items,
-    }))
+    Ok(Some((
+        ImportedExternalAgentSession {
+            cwd,
+            title,
+            first_user_message,
+            rollout_items,
+        },
+        parsed.content_sha256,
+    )))
 }
 
 fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
@@ -68,6 +75,7 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
                     TurnStartedEvent {
                         turn_id: turn_id.clone(),
+                        trace_id: None,
                         started_at: message.timestamp,
                         model_context_window: None,
                         collaboration_mode_kind: Default::default(),
@@ -75,9 +83,12 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 )));
                 items.push(RolloutItem::EventMsg(EventMsg::UserMessage(
                     UserMessageEvent {
+                        client_id: None,
                         message: message.text.clone(),
                         images: None,
+                        image_details: Vec::new(),
                         local_images: Vec::new(),
+                        local_image_details: Vec::new(),
                         text_elements: Vec::new(),
                     },
                 )));
@@ -105,20 +116,24 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
         }
     }
 
-    if let Some((turn_id, last_agent_message)) = current_turn {
-        items.push(token_count_item(&response_items));
-        let completed_at = messages.last().and_then(|message| message.timestamp);
-        items.push(turn_complete_item(
-            turn_id,
-            last_agent_message,
-            completed_at,
-        ));
+    if let Some(turn_id) = current_turn {
+        items.push(external_session_imported_marker_item());
+        items.push(token_count_item(last_model_visible_tokens));
+        items.push(turn_complete_item(turn_id, completed_at));
     }
 
     items
 }
 
-fn response_item(message: &ConversationMessage) -> ResponseItem {
+fn external_session_imported_marker_item() -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: EXTERNAL_SESSION_IMPORTED_MARKER.to_string(),
+        phase: None,
+        memory_citation: None,
+    }))
+}
+
+fn response_item(message: ConversationMessage) -> ResponseItem {
     let content = match message.role {
         MessageRole::Assistant => ContentItem::OutputText { text: message.text },
         MessageRole::User => ContentItem::InputText { text: message.text },
@@ -167,6 +182,7 @@ fn turn_complete_item(turn_id: String, completed_at: Option<i64>) -> RolloutItem
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::build_turns_from_rollout_items;
     use serde_json::Value as JsonValue;
     use std::path::Path;
@@ -195,7 +211,60 @@ mod tests {
 
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].items.len(), 2);
-        assert_eq!(turns[1].items.len(), 1);
+        assert_eq!(turns[1].items.len(), 2);
+        assert_eq!(
+            turns[1].items[1],
+            ThreadItem::AgentMessage {
+                id: "item-4".into(),
+                text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
+                phase: None,
+                memory_citation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn adds_import_marker_without_copying_last_agent_message() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root = root.path().join("repo");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        let path = root.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                record("user", "first request", &project_root),
+                record("assistant", "first answer", &project_root),
+            ]),
+        )
+        .expect("session");
+
+        let imported = load_session_for_import(&path)
+            .expect("load")
+            .expect("session");
+        let turns = build_turns_from_rollout_items(&imported.rollout_items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items.last(),
+            Some(&ThreadItem::AgentMessage {
+                id: "item-3".into(),
+                text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
+                phase: None,
+                memory_citation: None,
+            })
+        );
+        let last_turn_complete = imported
+            .rollout_items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => Some(event),
+                _ => None,
+            });
+        assert_eq!(
+            last_turn_complete.and_then(|event| event.last_agent_message.as_deref()),
+            None
+        );
     }
 
     #[test]
@@ -265,6 +334,51 @@ mod tests {
     }
 
     #[test]
+    fn loads_ai_title_for_imported_session() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root = root.path().join("repo");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        let path = root.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                record("user", "first request", &project_root),
+                ai_title_record("generated by source app"),
+            ]),
+        )
+        .expect("session");
+
+        let imported = load_session_for_import(&path)
+            .expect("load")
+            .expect("session");
+
+        assert_eq!(imported.title.as_deref(), Some("generated by source app"));
+    }
+
+    #[test]
+    fn loads_custom_title_over_later_ai_title_for_imported_session() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root = root.path().join("repo");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        let path = root.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                record("user", "first request", &project_root),
+                custom_title_record("named by source app"),
+                ai_title_record("generated by source app"),
+            ]),
+        )
+        .expect("session");
+
+        let imported = load_session_for_import(&path)
+            .expect("load")
+            .expect("session");
+
+        assert_eq!(imported.title.as_deref(), Some("named by source app"));
+    }
+
+    #[test]
     fn emits_token_usage_for_imported_history() {
         let root = TempDir::new().expect("tempdir");
         let project_root = root.path().join("repo");
@@ -310,6 +424,13 @@ mod tests {
         serde_json::json!({
             "type": "custom-title",
             "customTitle": title,
+        })
+    }
+
+    fn ai_title_record(title: &str) -> JsonValue {
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": title,
         })
     }
 

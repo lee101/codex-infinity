@@ -14,7 +14,7 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
 use codex_login::ServerOptions;
-use codex_login::login_with_agent_identity;
+use codex_login::login_with_access_token;
 use codex_login::login_with_api_key;
 use codex_login::logout_with_revoke;
 use codex_login::run_device_code_login;
@@ -37,8 +37,8 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
     "ChatGPT login is disabled. Use API key login instead.";
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
-const AGENT_IDENTITY_LOGIN_DISABLED_MESSAGE: &str =
-    "Agent Identity login is disabled. Use API key login instead.";
+const ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE: &str =
+    "Access token login is disabled. Use API key login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
 
 /// Installs a small file-backed tracing layer for direct `codex login` flows.
@@ -133,7 +133,7 @@ async fn clear_existing_auth_before_login(
 
 pub async fn login_with_chatgpt(
     codex_home: PathBuf,
-    forced_chatgpt_workspace_id: Option<String>,
+    forced_chatgpt_workspace_id: Option<Vec<String>>,
     cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     auth_keyring_backend_kind: AuthKeyringBackendKind,
 ) -> std::io::Result<()> {
@@ -219,22 +219,22 @@ pub async fn run_login_with_api_key(
     }
 }
 
-pub async fn run_login_with_agent_identity(
+pub async fn run_login_with_access_token(
     cli_config_overrides: CliConfigOverrides,
-    agent_identity: String,
+    access_token: String,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
     let _login_log_guard = init_login_file_logging(&config);
-    tracing::info!("starting agent identity login flow");
+    tracing::info!("starting access token login flow");
 
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
-        eprintln!("{AGENT_IDENTITY_LOGIN_DISABLED_MESSAGE}");
+        eprintln!("{ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
     }
 
-    match login_with_agent_identity(
+    match login_with_access_token(
         &config.codex_home,
-        &agent_identity,
+        &access_token,
         config.cli_auth_credentials_store_mode,
         config.forced_chatgpt_workspace_id.as_deref(),
         Some(&config.chatgpt_base_url),
@@ -247,7 +247,7 @@ pub async fn run_login_with_agent_identity(
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("Error logging in with Agent Identity: {e}");
+            eprintln!("Error logging in with access token: {e}");
             std::process::exit(1);
         }
     }
@@ -261,11 +261,11 @@ pub fn read_api_key_from_stdin() -> String {
     )
 }
 
-pub fn read_agent_identity_from_stdin() -> String {
+pub fn read_access_token_from_stdin() -> String {
     read_stdin_secret(
-        "--with-agent-identity expects the Agent Identity token on stdin. Try piping it, e.g. `printenv CODEX_AGENT_IDENTITY | codex login --with-agent-identity`.",
-        "Reading Agent Identity token from stdin...",
-        "No Agent Identity token provided via stdin.",
+        "--with-access-token expects the access token on stdin. Try piping it, e.g. `printenv CODEX_ACCESS_TOKEN | codex login --with-access-token`.",
+        "Reading access token from stdin...",
+        "No access token provided via stdin.",
     )
 }
 
@@ -434,7 +434,7 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
                 std::process::exit(0);
             }
             AuthMode::AgentIdentity => {
-                eprintln!("Logged in using Agent Identity");
+                eprintln!("Logged in using access token");
                 std::process::exit(0);
             }
             AuthMode::PersonalAccessToken => {

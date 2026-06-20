@@ -13,6 +13,7 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
         call_id: "call-action-required".into(),
         approval_id: Some("call-action-required".into()),
         turn_id: "turn-action-required".into(),
+        environment_id: None,
         command: vec!["bash".into(), "-lc".into(), "echo hello".into()],
         cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some("need confirmation".into()),
@@ -21,12 +22,8 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
-        parsed_cmd: vec![],
     };
-    chat.handle_codex_event(Event {
-        id: "sub-action-required".into(),
-        msg: EventMsg::ExecApprovalRequest(request),
-    });
+    handle_exec_approval_request(&mut chat, "sub-action-required", request);
 
     chat.pre_draw_tick();
 
@@ -59,6 +56,7 @@ async fn terminal_title_action_required_respects_spinner_setting() {
         call_id: "call-no-spinner".into(),
         approval_id: Some("call-no-spinner".into()),
         turn_id: "turn-no-spinner".into(),
+        environment_id: None,
         command: vec!["bash".into(), "-lc".into(), "echo hello".into()],
         cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some("need confirmation".into()),
@@ -67,12 +65,8 @@ async fn terminal_title_action_required_respects_spinner_setting() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
-        parsed_cmd: vec![],
     };
-    chat.handle_codex_event(Event {
-        id: "sub-no-spinner".into(),
-        msg: EventMsg::ExecApprovalRequest(request),
-    });
+    handle_exec_approval_request(&mut chat, "sub-no-spinner", request);
 
     chat.pre_draw_tick();
 
@@ -91,6 +85,7 @@ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
         call_id: "call-blink".into(),
         approval_id: Some("call-blink".into()),
         turn_id: "turn-blink".into(),
+        environment_id: None,
         command: vec!["bash".into(), "-lc".into(), "echo hello".into()],
         cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some("need confirmation".into()),
@@ -99,12 +94,8 @@ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
-        parsed_cmd: vec![],
     };
-    chat.handle_codex_event(Event {
-        id: "sub-blink".into(),
-        msg: EventMsg::ExecApprovalRequest(request),
-    });
+    handle_exec_approval_request(&mut chat, "sub-blink", request);
 
     chat.pre_draw_tick();
 
@@ -130,6 +121,7 @@ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_d
         call_id: "call-no-animations".into(),
         approval_id: Some("call-no-animations".into()),
         turn_id: "turn-no-animations".into(),
+        environment_id: None,
         command: vec!["bash".into(), "-lc".into(), "echo hello".into()],
         cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some("need confirmation".into()),
@@ -138,12 +130,8 @@ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_d
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
-        parsed_cmd: vec![],
     };
-    chat.handle_codex_event(Event {
-        id: "sub-no-animations".into(),
-        msg: EventMsg::ExecApprovalRequest(request),
-    });
+    handle_exec_approval_request(&mut chat, "sub-no-animations", request);
 
     chat.pre_draw_tick();
 

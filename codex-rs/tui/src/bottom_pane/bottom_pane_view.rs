@@ -2,7 +2,7 @@ use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::render::renderable::Renderable;
-use codex_protocol::request_user_input::RequestUserInputEvent;
+use codex_app_server_protocol::ToolRequestUserInputParams;
 use crossterm::event::KeyEvent;
 use std::time::Instant;
 
@@ -67,6 +67,11 @@ pub(crate) trait BottomPaneView: Renderable {
         false
     }
 
+    /// Return true when this key event will interrupt the active agent turn.
+    fn will_interrupt_turn_on_key_event(&self, _key_event: KeyEvent) -> bool {
+        false
+    }
+
     /// Optional paste handler. Return true if the view modified its state and
     /// needs a redraw.
     fn handle_paste(&mut self, _pasted: String) -> bool {
@@ -110,8 +115,8 @@ pub(crate) trait BottomPaneView: Renderable {
     /// consumed.
     fn try_consume_user_input_request(
         &mut self,
-        request: RequestUserInputEvent,
-    ) -> Option<RequestUserInputEvent> {
+        request: ToolRequestUserInputParams,
+    ) -> Option<ToolRequestUserInputParams> {
         Some(request)
     }
 
@@ -138,5 +143,10 @@ pub(crate) trait BottomPaneView: Renderable {
     /// Codex needs user input.
     fn terminal_title_requires_action(&self) -> bool {
         false
+    }
+
+    /// Return the next time-based redraw this view needs while it is active.
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        None
     }
 }

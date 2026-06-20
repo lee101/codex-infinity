@@ -52,7 +52,7 @@ mod tests {
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
     use codex_protocol::permissions::FileSystemSpecialPath;
-    use codex_protocol::protocol::NetworkSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use pretty_assertions::assert_eq;
     use std::path::Path;
     use std::path::PathBuf;
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_external_sandbox() {
-        let profile = PermissionProfile::External {
+        let profile: PermissionProfile = PermissionProfile::External {
             network: NetworkSandboxPolicy::Enabled,
         };
         let dirs = vec![PathBuf::from("/tmp/example")];
@@ -103,7 +103,8 @@ mod tests {
 
     #[test]
     fn warns_when_profile_can_write_elsewhere_but_not_cwd() {
-        let profile = PermissionProfile::Managed {
+        let profile: PermissionProfile = PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Restricted,
             file_system: ManagedFileSystemPermissions::Restricted {
                 entries: vec![
                     FileSystemSandboxEntry {
@@ -121,7 +122,6 @@ mod tests {
                 ],
                 glob_scan_max_depth: None,
             },
-            network: NetworkSandboxPolicy::Restricted,
         };
         let dirs = vec![PathBuf::from("/tmp/extra")];
 

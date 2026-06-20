@@ -24,6 +24,9 @@ use core_test_support::skip_if_no_network;
 
 // ---------- Small helpers  ----------
 
+const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
+const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
+
 fn make_jwt(payload: serde_json::Value) -> String {
     let header = json!({ "alg": "none", "typ": "JWT" });
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -133,7 +136,7 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
 
     let jwt = make_jwt(json!({
         "https://api.openai.com/auth": {
-            "chatgpt_account_id": "acct_321"
+            "chatgpt_account_id": WORKSPACE_ID_ALLOWED
         }
     }));
 
@@ -158,7 +161,7 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
     assert_eq!(tokens.id_token.raw_jwt, jwt);
-    assert_eq!(tokens.account_id.as_deref(), Some("acct_321"));
+    assert_eq!(tokens.account_id.as_deref(), Some(WORKSPACE_ID_ALLOWED));
     Ok(())
 }
 
@@ -180,8 +183,8 @@ async fn device_code_login_rejects_workspace_mismatch() -> anyhow::Result<()> {
 
     let jwt = make_jwt(json!({
         "https://api.openai.com/auth": {
-            "chatgpt_account_id": "acct_321",
-            "organization_id": "org-actual"
+            "chatgpt_account_id": WORKSPACE_ID_DISALLOWED,
+            "organization_id": WORKSPACE_ID_DISALLOWED
         }
     }));
 
@@ -189,7 +192,7 @@ async fn device_code_login_rejects_workspace_mismatch() -> anyhow::Result<()> {
 
     let issuer = mock_server.uri();
     let mut opts = server_opts(&codex_home, issuer, AuthCredentialsStoreMode::File);
-    opts.forced_chatgpt_workspace_id = Some("org-required".to_string());
+    opts.forced_chatgpt_workspace_id = Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
 
     let err = run_device_code_login(opts)
         .await

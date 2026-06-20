@@ -1,5 +1,4 @@
 use clap::Parser;
-use codex_app_server_client::legacy_core;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_config::LoaderOverrides;
@@ -8,6 +7,7 @@ use codex_tui::Cli;
 use codex_tui::ExitReason;
 use codex_tui::run_main;
 use codex_utils_cli::CliConfigOverrides;
+use std::io::Write;
 use supports_color::Stream;
 
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
@@ -15,17 +15,16 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
     let AppExitInfo {
         token_usage,
         thread_id,
+        resume_hint,
         ..
     } = exit_info;
 
     let mut lines = Vec::new();
     if !token_usage.is_zero() {
-        lines.push(codex_protocol::protocol::FinalOutput::from(token_usage).to_string());
+        lines.push(token_usage.to_string());
     }
 
-    if let Some(resume_cmd) =
-        legacy_core::util::resume_command(/*thread_name*/ None, thread_id)
-    {
+    if let Some(resume_cmd) = resume_hint {
         let command = if color_enabled {
             format!("\u{1b}[36m{resume_cmd}\u{1b}[39m")
         } else {
@@ -60,8 +59,7 @@ fn main() -> anyhow::Result<()> {
             inner,
             arg0_paths,
             LoaderOverrides::default(),
-            /*remote*/ None,
-            /*remote_auth_token*/ None,
+            /*explicit_remote_endpoint*/ None,
         )
         .await?;
         let is_fatal = match &exit_info.exit_reason {

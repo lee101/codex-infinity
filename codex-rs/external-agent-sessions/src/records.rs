@@ -15,6 +15,8 @@ use std::path::PathBuf;
 
 const NOTE_MAX_LEN: usize = 2_000;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
+const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
+const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
 
 pub struct SessionSummary {
     pub latest_timestamp: i64,
@@ -33,6 +35,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let reader = BufReader::new(file);
     let mut cwd = None;
     let mut custom_title = None;
+    let mut ai_title = None;
     let mut title = None;
     let mut latest_timestamp = None;
     let mut saw_message = false;
@@ -55,7 +58,10 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         if let Some(title) = custom_title_from_record(&record) {
             custom_title = Some(title.to_string());
         }
-        let Some(message) = conversation_message_from_record(&record) else {
+        if let Some(title) = ai_title_from_record(&record) {
+            ai_title = Some(title.to_string());
+        }
+        let Some(message) = conversation_message_from_owned_record(&mut record) else {
             continue;
         };
         saw_message = true;
@@ -82,20 +88,12 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         migration: ExternalAgentSessionMigration {
             path: path.to_path_buf(),
             cwd,
-            title: custom_title.or(title),
+            title: custom_title.or(ai_title).or(title),
         },
     }))
 }
 
-pub(super) fn custom_title_from_records(records: &[JsonValue]) -> Option<String> {
-    records
-        .iter()
-        .filter_map(custom_title_from_record)
-        .next_back()
-        .map(ToOwned::to_owned)
-}
-
-pub(super) fn read_records(path: &Path) -> io::Result<Vec<JsonValue>> {
+pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut cwd = None;
@@ -133,26 +131,25 @@ pub(super) fn read_records(path: &Path) -> io::Result<Vec<JsonValue>> {
             messages.push(message);
         }
     }
-    Ok(records)
-}
-
-pub(super) fn project_root_from_records(records: &[JsonValue]) -> Option<PathBuf> {
-    records
-        .iter()
-        .find_map(|record| record.get("cwd").and_then(JsonValue::as_str))
-        .map(PathBuf::from)
-}
-
-pub(super) fn conversation_messages(records: &[JsonValue]) -> Vec<ConversationMessage> {
-    records
-        .iter()
-        .filter_map(conversation_message_from_record)
-        .collect()
+    Ok(ParsedSessionImport {
+        cwd,
+        source_title: custom_title.or(ai_title),
+        messages,
+        content_sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 fn custom_title_from_record(record: &JsonValue) -> Option<&str> {
-    (record.get("type").and_then(JsonValue::as_str) == Some("custom-title"))
-        .then(|| record.get("customTitle").and_then(JsonValue::as_str))
+    title_from_record(record, "custom-title", "customTitle")
+}
+
+fn ai_title_from_record(record: &JsonValue) -> Option<&str> {
+    title_from_record(record, "ai-title", "aiTitle")
+}
+
+fn title_from_record<'a>(record: &'a JsonValue, record_type: &str, field: &str) -> Option<&'a str> {
+    (record.get("type").and_then(JsonValue::as_str) == Some(record_type))
+        .then(|| record.get(field).and_then(JsonValue::as_str))
         .flatten()
         .map(str::trim)
         .filter(|title| !title.is_empty())
@@ -274,7 +271,7 @@ fn tool_call_note(block: &JsonValue) -> String {
         .get("name")
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown");
-    let mut lines = vec![format!("[external tool call: {name}]")];
+    let mut lines = vec![format!("[{EXTERNAL_AGENT_TOOL_CALL_TAG}: {name}]")];
     if let Some(input) = block.get("input").and_then(JsonValue::as_object) {
         if let Some(description) = input.get("description").and_then(JsonValue::as_str) {
             lines.push(format!("description: {description}"));
@@ -301,20 +298,24 @@ fn tool_call_note(block: &JsonValue) -> String {
             truncate(&input.to_string(), NOTE_MAX_LEN)
         ));
     }
+    lines.push(format!("[/{EXTERNAL_AGENT_TOOL_CALL_TAG}]"));
     lines.join("\n")
 }
 
 fn tool_result_note(block: &JsonValue) -> String {
     let label = if block.get("is_error").and_then(JsonValue::as_bool) == Some(true) {
-        "[external tool result: error]"
+        format!("[{EXTERNAL_AGENT_TOOL_RESULT_TAG}: error]")
     } else {
-        "[external tool result]"
+        format!("[{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     };
     let text = tool_result_text(block.get("content"));
     if text.is_empty() {
-        label.to_string()
+        format!("{label}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     } else {
-        format!("{label}\n{}", truncate(&text, TOOL_RESULT_MAX_LEN))
+        format!(
+            "{label}\n{}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]",
+            truncate(&text, TOOL_RESULT_MAX_LEN)
+        )
     }
 }
 
@@ -335,4 +336,100 @@ fn parse_timestamp(timestamp: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .ok()
         .map(|value| value.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn reads_session_import_in_one_pass() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("session.jsonl");
+        let contents = [
+            serde_json::json!({
+                "type": "user",
+                "cwd": root.path(),
+                "timestamp": "2026-06-03T12:00:00Z",
+                "message": { "content": "first request" },
+            })
+            .to_string(),
+            "not json".to_string(),
+            serde_json::json!({
+                "type": "ai-title",
+                "aiTitle": "generated title",
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "custom-title",
+                "customTitle": "custom title",
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, &contents).expect("session");
+
+        let parsed = read_session_import(&path).expect("parse session");
+
+        assert_eq!(parsed.cwd.as_deref(), Some(root.path()));
+        assert_eq!(parsed.source_title.as_deref(), Some("custom title"));
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].text, "first request");
+        assert_eq!(
+            parsed.content_sha256,
+            format!("{:x}", Sha256::digest(contents))
+        );
+    }
+
+    #[test]
+    fn converts_tool_use_blocks_to_bounded_external_agent_tags() {
+        let block = serde_json::json!({
+            "type": "tool_use",
+            "name": "Bash",
+            "input": {
+                "description": "Check repo status",
+                "command": "git status --short"
+            }
+        });
+
+        assert_eq!(
+            tool_call_note(&block),
+            "[external_agent_tool_call: Bash]\n\
+             description: Check repo status\n\
+             command: git status --short\n\
+             [/external_agent_tool_call]"
+        );
+    }
+
+    #[test]
+    fn converts_tool_result_blocks_to_bounded_external_agent_tags() {
+        let block = serde_json::json!({
+            "type": "tool_result",
+            "content": "codex-rs/external-agent-sessions/src/records.rs"
+        });
+
+        assert_eq!(
+            tool_result_note(&block),
+            "[external_agent_tool_result]\n\
+             codex-rs/external-agent-sessions/src/records.rs\n\
+             [/external_agent_tool_result]"
+        );
+    }
+
+    #[test]
+    fn converts_error_tool_result_blocks_to_bounded_external_agent_tags() {
+        let block = serde_json::json!({
+            "type": "tool_result",
+            "is_error": true,
+            "content": "command failed"
+        });
+
+        assert_eq!(
+            tool_result_note(&block),
+            "[external_agent_tool_result: error]\n\
+             command failed\n\
+             [/external_agent_tool_result]"
+        );
+    }
 }

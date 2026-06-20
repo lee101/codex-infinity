@@ -18,6 +18,7 @@ use crate::codex_apps::CodexAppsToolsCacheContext;
 use crate::codex_apps::CodexAppsToolsCacheKey;
 use crate::codex_apps::write_cached_codex_apps_tools_if_needed;
 use crate::elicitation::ElicitationRequestManager;
+use crate::elicitation::ElicitationReviewerHandle;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::rmcp_client::AsyncManagedClient;
@@ -27,23 +28,23 @@ use crate::rmcp_client::MCP_TOOLS_LIST_DURATION_METRIC;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
 use crate::rmcp_client::list_tools_for_client_uncached;
-use crate::runtime::McpRuntimeEnvironment;
+use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
+use crate::server::EffectiveMcpServer;
+use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
-use crate::tools::qualify_tools;
+use crate::tools::normalize_tools_for_model_with_prefix;
 use crate::tools::tool_with_model_visible_input_schema;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use async_channel::Sender;
 use codex_config::Constrained;
-use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_login::CodexAuth;
-use codex_protocol::ToolName;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
@@ -55,6 +56,7 @@ use codex_protocol::protocol::McpStartupFailure;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::ElicitationResponse;
+use rmcp::model::ElicitationCapability;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
@@ -72,7 +74,6 @@ use tracing::instrument;
 use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
-use url::Url;
 
 const MCP_UI_META_KEY: &str = "ui";
 const MCP_UI_VISIBILITY_META_KEY: &str = "visibility";
@@ -105,68 +106,19 @@ pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
 pub struct McpConnectionManager {
     clients: HashMap<String, AsyncManagedClient>,
-    server_origins: HashMap<String, String>,
+    server_metadata: HashMap<String, McpServerMetadata>,
+    required_servers: Vec<String>,
+    tool_plugin_provenance: Arc<ToolPluginProvenance>,
+    host_owned_codex_apps_enabled: bool,
+    prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
     startup_cancellation_token: CancellationToken,
 }
 
 impl McpConnectionManager {
-    pub fn new_uninitialized(
-        approval_policy: &Constrained<AskForApproval>,
-        permission_profile: &Constrained<PermissionProfile>,
-    ) -> Self {
-        Self {
-            clients: HashMap::new(),
-            server_origins: HashMap::new(),
-            elicitation_requests: ElicitationRequestManager::new(
-                approval_policy.value(),
-                permission_profile.get().clone(),
-            ),
-            startup_cancellation_token: CancellationToken::new(),
-        }
-    }
-
-    pub fn has_servers(&self) -> bool {
-        !self.clients.is_empty()
-    }
-
-    /// Drain all MCP clients from this manager and return a future that stops
-    /// them and terminates their stdio server processes.
-    pub fn begin_shutdown(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        self.startup_cancellation_token.cancel();
-        let clients = std::mem::take(&mut self.clients);
-        self.server_origins.clear();
-        async move {
-            for client in clients.into_values() {
-                client.shutdown().await;
-            }
-        }
-    }
-
-    /// Stop all MCP clients owned by this manager and terminate stdio server processes.
-    pub async fn shutdown(&mut self) {
-        self.begin_shutdown().await;
-    }
-
-    pub fn server_origin(&self, server_name: &str) -> Option<&str> {
-        self.server_origins.get(server_name).map(String::as_str)
-    }
-
-    pub fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
-        if let Ok(mut policy) = self.elicitation_requests.approval_policy.lock() {
-            *policy = approval_policy.value();
-        }
-    }
-
-    pub fn set_permission_profile(&self, permission_profile: PermissionProfile) {
-        if let Ok(mut profile) = self.elicitation_requests.permission_profile.lock() {
-            *profile = permission_profile;
-        }
-    }
-
-    #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        mcp_servers: &HashMap<String, McpServerConfig>,
+        mcp_servers: &HashMap<String, EffectiveMcpServer>,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
@@ -175,29 +127,43 @@ impl McpConnectionManager {
         tx_event: Sender<Event>,
         startup_cancellation_token: CancellationToken,
         initial_permission_profile: PermissionProfile,
-        runtime_environment: McpRuntimeEnvironment,
+        runtime_context: McpRuntimeContext,
         codex_home: PathBuf,
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
+        host_owned_codex_apps_enabled: bool,
+        prefix_mcp_tool_names: bool,
+        client_elicitation_capability: ElicitationCapability,
+        supports_openai_form_elicitation: bool,
         tool_plugin_provenance: ToolPluginProvenance,
         auth: Option<&CodexAuth>,
-    ) -> (Self, CancellationToken) {
-        let cancel_token = CancellationToken::new();
+        elicitation_reviewer: Option<ElicitationReviewerHandle>,
+    ) -> Self {
+        let mut required_servers = mcp_servers
+            .iter()
+            .filter(|(_, server)| server.enabled() && server.required())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        required_servers.sort();
         let mut clients = HashMap::new();
-        let mut server_origins = HashMap::new();
+        let mut server_metadata = HashMap::new();
         let mut join_set = JoinSet::new();
-        let elicitation_requests =
-            ElicitationRequestManager::new(approval_policy.value(), initial_permission_profile);
+        let elicitation_requests = ElicitationRequestManager::new(
+            approval_policy.value(),
+            initial_permission_profile,
+            elicitation_reviewer,
+        );
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let startup_submit_id = submit_id.clone();
         let codex_apps_auth_provider = auth
             .filter(|auth| auth.uses_codex_backend())
             .map(codex_model_provider::auth_provider_from_auth);
         let mcp_servers = mcp_servers.clone();
-        for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
-            if let Some(origin) = transport_origin(&cfg.transport) {
-                server_origins.insert(server_name.clone(), origin);
-            }
-            let cancel_token = cancel_token.child_token();
+        for (server_name, server) in mcp_servers
+            .into_iter()
+            .filter(|(_, server)| server.enabled())
+        {
+            server_metadata.insert(server_name.clone(), McpServerMetadata::from(&server));
+            let cancel_token = startup_cancellation_token.child_token();
             let _ = emit_update(
                 startup_submit_id.as_str(),
                 &tx_event,
@@ -215,13 +181,16 @@ impl McpConnectionManager {
             } else {
                 None
             };
-            let uses_env_bearer_token = match &cfg.transport {
-                McpServerTransportConfig::StreamableHttp {
-                    bearer_token_env_var,
-                    ..
-                } => bearer_token_env_var.is_some(),
-                McpServerTransportConfig::Stdio { .. } => false,
-            };
+            let uses_env_bearer_token =
+                server
+                    .configured_config()
+                    .is_some_and(|config| match &config.transport {
+                        McpServerTransportConfig::StreamableHttp {
+                            bearer_token_env_var,
+                            ..
+                        } => bearer_token_env_var.is_some(),
+                        McpServerTransportConfig::Stdio { .. } => false,
+                    });
             let runtime_auth_provider =
                 if server_name == CODEX_APPS_MCP_SERVER_NAME && !uses_env_bearer_token {
                     codex_apps_auth_provider.clone()
@@ -230,7 +199,7 @@ impl McpConnectionManager {
                 };
             let async_managed_client = AsyncManagedClient::new(
                 server_name.clone(),
-                cfg,
+                server,
                 store_mode,
                 keyring_backend_kind,
                 cancel_token.clone(),
@@ -238,8 +207,10 @@ impl McpConnectionManager {
                 elicitation_requests.clone(),
                 codex_apps_tools_cache_context,
                 Arc::clone(&tool_plugin_provenance),
-                runtime_environment.clone(),
+                runtime_context.clone(),
                 runtime_auth_provider,
+                client_elicitation_capability.clone(),
+                supports_openai_form_elicitation,
             );
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
@@ -278,7 +249,11 @@ impl McpConnectionManager {
         }
         let manager = Self {
             clients,
-            server_origins,
+            server_metadata,
+            required_servers,
+            tool_plugin_provenance,
+            host_owned_codex_apps_enabled,
+            prefix_mcp_tool_names,
             elicitation_requests: elicitation_requests.clone(),
             startup_cancellation_token: startup_cancellation_token.clone(),
         };
@@ -397,6 +372,12 @@ impl McpConnectionManager {
             .map(super::server::McpServerOrigin::as_str)
     }
 
+    pub fn server_environment_id(&self, server_name: &str) -> Option<&str> {
+        self.server_metadata
+            .get(server_name)
+            .map(|metadata| metadata.environment_id.as_str())
+    }
+
     pub fn server_pollutes_memory(&self, server_name: &str) -> bool {
         self.server_metadata
             .get(server_name)
@@ -470,35 +451,9 @@ impl McpConnectionManager {
         }
     }
 
-    pub async fn required_startup_failures(
-        &self,
-        required_servers: &[String],
-    ) -> Vec<McpStartupFailure> {
-        let mut failures = Vec::new();
-        for server_name in required_servers {
-            let Some(async_managed_client) = self.clients.get(server_name).cloned() else {
-                failures.push(McpStartupFailure {
-                    server: server_name.clone(),
-                    error: format!("required MCP server `{server_name}` was not initialized"),
-                });
-                continue;
-            };
-
-            match async_managed_client.client().await {
-                Ok(_) => {}
-                Err(error) => failures.push(McpStartupFailure {
-                    server: server_name.clone(),
-                    error: startup_outcome_error_message(error),
-                }),
-            }
-        }
-        failures
-    }
-
-    /// Returns a single map that contains all tools. Each key is the
-    /// fully-qualified name for the tool.
-    #[instrument(level = "trace", skip_all)]
-    pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
+    /// Returns all tools with model-visible names normalized.
+    #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.clients.len()))]
+    pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
         let mut tools = Vec::new();
         for (server_name, managed_client) in &self.clients {
             let has_cached_tool_info_snapshot = managed_client.cached_tool_info_snapshot.is_some();
@@ -523,17 +478,26 @@ impl McpConnectionManager {
             else {
                 continue;
             };
-            tools.extend(server_tools);
+            trace!(
+                server_name = %server_name,
+                tool_count = server_tools.len(),
+                "listed MCP server tools while building tool list"
+            );
+            tools.extend(
+                server_tools
+                    .into_iter()
+                    .map(|tool| self.with_server_metadata(tool)),
+            );
         }
-        qualify_tools(tools)
+        normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names)
     }
 
     /// Force-refresh codex apps tools by bypassing the in-process cache.
     ///
     /// On success, the refreshed tools replace the cache contents and the
-    /// latest filtered tool map is returned directly to the caller. On
+    /// latest filtered tools are returned directly to the caller. On
     /// failure, the existing cache remains unchanged.
-    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<HashMap<String, ToolInfo>> {
+    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<Vec<ToolInfo>> {
         let managed_client = self
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
@@ -575,19 +539,28 @@ impl McpConnectionManager {
             .into_iter()
             .map(|mut tool| {
                 tool.tool = tool_with_model_visible_input_schema(&tool.tool);
-                tool
+                self.with_server_metadata(tool)
             });
-        Ok(qualify_tools(tools))
+        Ok(normalize_tools_for_model_with_prefix(
+            tools,
+            self.prefix_mcp_tool_names,
+        ))
     }
 
-    /// Returns a single map that contains all resources. Each key is the
-    /// server name and the value is a vector of resources.
-    pub async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
+    /// Returns resources from servers selected by `include_server`. Each key
+    /// is the server name and the value is a vector of resources.
+    pub async fn list_all_resources(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> HashMap<String, Vec<Resource>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
 
-        for (server_name, async_managed_client) in clients_snapshot {
+        for (server_name, async_managed_client) in clients_snapshot
+            .iter()
+            .filter(|(server_name, _)| include_server(server_name))
+        {
             let server_name = server_name.clone();
             let Ok(managed_client) = async_managed_client.client().await else {
                 continue;
@@ -645,14 +618,20 @@ impl McpConnectionManager {
         aggregated
     }
 
-    /// Returns a single map that contains all resource templates. Each key is the
-    /// server name and the value is a vector of resource templates.
-    pub async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
+    /// Returns resource templates from servers selected by `include_server`.
+    /// Each key is the server name and the value is a vector of templates.
+    pub async fn list_all_resource_templates(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
 
-        for (server_name, async_managed_client) in clients_snapshot {
+        for (server_name, async_managed_client) in clients_snapshot
+            .iter()
+            .filter(|(server_name, _)| include_server(server_name))
+        {
             let server_name_cloned = server_name.clone();
             let Ok(managed_client) = async_managed_client.client().await else {
                 continue;
@@ -811,11 +790,44 @@ impl McpConnectionManager {
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
     }
 
-    pub async fn resolve_tool_info(&self, tool_name: &ToolName) -> Option<ToolInfo> {
-        let all_tools = self.list_all_tools().await;
-        all_tools
-            .into_values()
-            .find(|tool| tool.canonical_tool_name() == *tool_name)
+    /// Returns presentation metadata without waiting for uncached clients still initializing.
+    /// Cached values will be used if available and the server is still starting up.
+    pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
+        let mut server_infos = HashMap::new();
+        for (server_name, client) in &self.clients {
+            if !client.startup_complete.load(Ordering::Acquire) {
+                if let Some(server_info) = client.cached_server_info.clone() {
+                    server_infos.insert(server_name.clone(), server_info);
+                }
+                continue;
+            }
+            match client.client().await {
+                Ok(managed_client) => {
+                    server_infos.insert(server_name.clone(), managed_client.server_info);
+                }
+                Err(_) => {
+                    if let Some(server_info) = client.cached_server_info.clone() {
+                        server_infos.insert(server_name.clone(), server_info);
+                    }
+                }
+            }
+        }
+        server_infos
+    }
+
+    fn with_server_metadata(&self, mut tool: ToolInfo) -> ToolInfo {
+        let Some(metadata) = self.server_metadata.get(&tool.server_name) else {
+            tool.supports_parallel_tool_calls = false;
+            tool.server_origin = None;
+            return tool;
+        };
+
+        tool.supports_parallel_tool_calls = metadata.supports_parallel_tool_calls;
+        tool.server_origin = metadata
+            .origin
+            .as_ref()
+            .map(|origin| origin.as_str().to_string());
+        tool
     }
 
     async fn client_by_name(&self, name: &str) -> Result<ManagedClient> {
@@ -861,16 +873,6 @@ async fn emit_update(
         .await
 }
 
-fn transport_origin(transport: &McpServerTransportConfig) -> Option<String> {
-    match transport {
-        McpServerTransportConfig::StreamableHttp { url, .. } => {
-            let parsed = Url::parse(url).ok()?;
-            Some(parsed.origin().ascii_serialization())
-        }
-        McpServerTransportConfig::Stdio { .. } => Some("stdio".to_string()),
-    }
-}
-
 fn mcp_init_error_display(
     server_name: &str,
     entry: Option<&McpAuthStatusEntry>,
@@ -881,7 +883,7 @@ fn mcp_init_error_display(
         bearer_token_env_var,
         http_headers,
         ..
-    }) = &entry.map(|entry| &entry.config.transport)
+    }) = entry.and_then(|entry| entry.config.as_ref().map(|config| &config.transport))
         && url == "https://api.githubcopilot.com/mcp/"
         && bearer_token_env_var.is_none()
         && http_headers.as_ref().map(HashMap::is_empty).unwrap_or(true)
@@ -895,7 +897,11 @@ fn mcp_init_error_display(
         )
     } else if is_mcp_client_startup_timeout_error(err) {
         let startup_timeout_secs = match entry {
-            Some(entry) => match entry.config.startup_timeout_sec {
+            Some(entry) => match entry
+                .config
+                .as_ref()
+                .and_then(|config| config.startup_timeout_sec)
+            {
                 Some(timeout) => timeout,
                 None => DEFAULT_STARTUP_TIMEOUT,
             },

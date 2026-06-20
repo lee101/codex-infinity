@@ -1,23 +1,44 @@
 use super::*;
+use crate::session::InputQueueActivity;
+use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
+use crate::turn_timing::now_unix_timestamp_ms;
+use codex_tools::ToolSpec;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
 
-pub(crate) struct Handler;
+#[derive(Default)]
+pub(crate) struct Handler {
+    options: WaitAgentTimeoutOptions,
+}
 
-impl ToolHandler for Handler {
-    type Output = WaitAgentResult;
+impl Handler {
+    pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
+        Self { options }
+    }
+}
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+impl ToolExecutor<ToolInvocation> for Handler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("wait_agent")
     }
 
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
+    fn spec(&self) -> ToolSpec {
+        create_wait_agent_tool_v2(self.options)
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl Handler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -27,28 +48,39 @@ impl ToolHandler for Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-        let min_timeout_ms = turn
-            .config
-            .multi_agent_v2
-            .min_wait_timeout_ms
-            .clamp(1, MAX_WAIT_TIMEOUT_MS);
-        let timeout_ms = match timeout_ms {
-            ms if ms <= 0 => {
-                return Err(FunctionCallError::RespondToModel(
-                    "timeout_ms must be greater than zero".to_owned(),
-                ));
+        let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
+        let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
+        let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
+        let timeout_ms = match args.timeout_ms {
+            Some(ms) if ms < min_timeout_ms => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "timeout_ms must be at least {min_timeout_ms}"
+                )));
             }
-            ms => ms.clamp(min_timeout_ms, MAX_WAIT_TIMEOUT_MS),
+            Some(ms) if ms > max_timeout_ms => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "timeout_ms must be at most {max_timeout_ms}"
+                )));
+            }
+            Some(ms) => ms,
+            None => default_timeout_ms,
         };
 
-        let mut mailbox_seq_rx = session.subscribe_mailbox_seq();
+        let turn_state = session
+            .input_queue
+            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+            .await;
+        let (mut activity_rx, pending_activity) = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
 
         session
             .send_event(
                 &turn,
                 CollabWaitingBeginEvent {
-                    sender_thread_id: session.conversation_id,
+                    started_at_ms: now_unix_timestamp_ms(),
+                    sender_thread_id: session.thread_id,
                     receiver_thread_ids: Vec::new(),
                     receiver_agents: Vec::new(),
                     call_id: call_id.clone(),
@@ -57,13 +89,9 @@ impl ToolHandler for Handler {
             )
             .await;
 
-        let timed_out = if session.has_pending_mailbox_items().await {
-            false
-        } else {
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-            !wait_for_mailbox_change(&mut mailbox_seq_rx, deadline).await
-        };
-        let result = WaitAgentResult::from_timed_out(timed_out);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
+        let result = WaitAgentResult::from_outcome(outcome);
 
         session
             .send_event(
@@ -71,6 +99,7 @@ impl ToolHandler for Handler {
                 CollabWaitingEndEvent {
                     sender_thread_id: session.thread_id,
                     call_id,
+                    completed_at_ms: now_unix_timestamp_ms(),
                     agent_statuses: Vec::new(),
                     statuses: HashMap::new(),
                 }
@@ -78,7 +107,13 @@ impl ToolHandler for Handler {
             )
             .await;
 
-        Ok(result)
+        Ok(boxed_tool_output(result))
+    }
+}
+
+impl CoreToolRuntime for Handler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
     }
 }
 
@@ -126,12 +161,29 @@ impl ToolOutput for WaitAgentResult {
     }
 }
 
-async fn wait_for_mailbox_change(
-    mailbox_seq_rx: &mut tokio::sync::watch::Receiver<u64>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitOutcome {
+    MailboxActivity,
+    Steered,
+    TimedOut,
+}
+
+async fn wait_for_activity(
+    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
+    pending_activity: Option<InputQueueActivity>,
     deadline: Instant,
-) -> bool {
-    match timeout_at(deadline, mailbox_seq_rx.changed()).await {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) | Err(_) => false,
+) -> WaitOutcome {
+    if let Some(activity) = pending_activity {
+        return match activity {
+            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+            InputQueueActivity::Steer => WaitOutcome::Steered,
+        };
+    }
+    match timeout_at(deadline, activity_rx.changed()).await {
+        Ok(Ok(())) => match *activity_rx.borrow_and_update() {
+            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+            InputQueueActivity::Steer => WaitOutcome::Steered,
+        },
+        Ok(Err(_)) | Err(_) => WaitOutcome::TimedOut,
     }
 }

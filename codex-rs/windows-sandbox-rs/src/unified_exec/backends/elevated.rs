@@ -7,15 +7,22 @@ use crate::identity::SandboxCreds;
 use crate::identity::refresh_logon_sandbox_creds;
 use crate::ipc_framed::EmptyPayload;
 use crate::ipc_framed::FramedMessage;
+use crate::ipc_framed::IPC_PROTOCOL_VERSION;
 use crate::ipc_framed::Message;
 use crate::ipc_framed::SpawnRequest;
+use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+use crate::runner_client::RunnerTransport;
+use crate::runner_client::is_stale_sandbox_creds_error;
 use crate::runner_client::spawn_runner_transport;
-use crate::spawn_prep::prepare_elevated_spawn_context;
+use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
 use anyhow::Result;
+use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::ProcessDriver;
 use codex_utils_pty::SpawnedProcess;
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -41,35 +48,58 @@ async fn spawn_runner_transport_task(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn spawn_windows_sandbox_session_elevated(
-    policy_json_or_preset: &str,
-    sandbox_policy_cwd: &Path,
+pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
     command: Vec<String>,
     cwd: &Path,
     mut env_map: HashMap<String, String>,
     proxy_enforced: bool,
     timeout_ms: Option<u64>,
+    read_roots_override: Option<&[PathBuf]>,
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[AbsolutePathBuf],
+    deny_write_paths_override: &[AbsolutePathBuf],
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
 ) -> Result<SpawnedProcess> {
-    let elevated = prepare_elevated_spawn_context(
-        policy_json_or_preset,
-        sandbox_policy_cwd,
+    let deny_read_paths_override = deny_read_paths_override
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .collect::<Vec<_>>();
+    let deny_write_paths_override = deny_write_paths_override
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .collect::<Vec<_>>();
+    let permissions =
+        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
+    let elevated = prepare_elevated_spawn_context_for_permissions(
+        permissions.clone(),
         codex_home,
         cwd,
         &mut env_map,
         &command,
+        read_roots_override,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        &deny_read_paths_override,
+        &deny_write_paths_override,
+        proxy_enforced,
     )?;
 
     let spawn_request = SpawnRequest {
         command: command.clone(),
         cwd: cwd.to_path_buf(),
         env: env_map.clone(),
-        policy_json_or_preset: policy_json_or_preset.to_string(),
-        sandbox_policy_cwd: sandbox_policy_cwd.to_path_buf(),
-        codex_home: elevated.common.sandbox_base.clone(),
+        permission_profile: permission_profile.clone(),
+        workspace_roots: workspace_roots.to_vec(),
+        codex_home: elevated.sandbox_base.clone(),
         real_codex_home: codex_home.to_path_buf(),
         cap_sids: elevated.cap_sids.clone(),
         timeout_ms,
@@ -79,15 +109,15 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated(
     };
     let codex_home = codex_home.to_path_buf();
     let cwd = cwd.to_path_buf();
-    let sandbox_creds = elevated.sandbox_creds.clone();
-    let logs_base_dir = elevated.common.logs_base_dir.clone();
-    let transport = tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut transport =
-            spawn_runner_transport(&codex_home, &cwd, &sandbox_creds, logs_base_dir.as_deref())?;
-        transport.send_spawn_request(spawn_request)?;
-        transport.read_spawn_ready_with_timeout()?;
-        Ok(transport)
-    })
+    let sandbox_creds = elevated.sandbox_creds;
+    let logs_base_dir = elevated.logs_base_dir.clone();
+    let transport = match spawn_runner_transport_task(
+        codex_home.clone(),
+        cwd.clone(),
+        sandbox_creds,
+        logs_base_dir.clone(),
+        spawn_request.clone(),
+    )
     .await
     {
         Ok(transport) => transport,
@@ -132,7 +162,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated(
         let outbound_tx = outbound_tx.clone();
         Some(Box::new(move || {
             let _ = outbound_tx.send(FramedMessage {
-                version: 1,
+                version: IPC_PROTOCOL_VERSION,
                 message: Message::Terminate {
                     payload: EmptyPayload::default(),
                 },

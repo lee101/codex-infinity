@@ -5,6 +5,8 @@
 
 use super::*;
 use crate::tools::context::FunctionToolOutput;
+use crate::turn_timing::now_unix_timestamp_ms;
+use codex_protocol::models::ResponseItemMetadata;
 use codex_protocol::protocol::InterAgentCommunication;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,15 +63,7 @@ pub(crate) async fn handle_message_string_tool(
     target: String,
     message: String,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    handle_message_submission(invocation, mode, target, message_content(message)?).await
-}
-
-async fn handle_message_submission(
-    invocation: ToolInvocation,
-    mode: MessageDeliveryMode,
-    target: String,
-    prompt: String,
-) -> Result<FunctionToolOutput, FunctionCallError> {
+    let message = message_content(message)?;
     let ToolInvocation {
         session,
         turn,
@@ -92,18 +86,6 @@ async fn handle_message_submission(
             "Follow-up tasks can't target the root agent".to_string(),
         ));
     }
-    session
-        .send_event(
-            &turn,
-            CollabAgentInteractionBeginEvent {
-                call_id: call_id.clone(),
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                prompt: prompt.clone(),
-            }
-            .into(),
-        )
-        .await;
     let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
@@ -118,8 +100,12 @@ async fn handle_message_submission(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication =
+    let mut communication =
         communication_from_tool_message(author, receiver_agent_path.clone(), message);
+    communication
+        .metadata
+        .get_or_insert_with(ResponseItemMetadata::default)
+        .source_call_id = Some(call_id.clone());
     let result = session
         .services
         .agent_control
@@ -130,14 +116,12 @@ async fn handle_message_submission(
     session
         .send_event(
             &turn,
-            CollabAgentInteractionEndEvent {
-                call_id,
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname,
-                receiver_agent_role: receiver_agent.agent_role,
-                prompt,
-                status,
+            SubAgentActivityEvent {
+                event_id: call_id,
+                occurred_at_ms: now_unix_timestamp_ms(),
+                agent_thread_id: receiver_thread_id,
+                agent_path: receiver_agent_path,
+                kind: SubAgentActivityKind::Interacted,
             }
             .into(),
         )

@@ -4,6 +4,9 @@ use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 
+use super::auth::BedrockAuthMethod;
+use super::auth::resolve_auth_method;
+
 const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
 const BEDROCK_MANTLE_SUPPORTED_REGIONS: [&str; 12] = [
     "us-east-2",
@@ -43,6 +46,25 @@ pub(super) fn base_url(region: &str) -> Result<String> {
         Err(CodexErr::Fatal(format!(
             "Amazon Bedrock Mantle does not support region `{region}`"
         )))
+    }
+}
+
+pub(super) async fn runtime_base_url(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<String> {
+    let region = resolve_region(managed_auth, aws).await?;
+    base_url(&region)
+}
+
+async fn resolve_region(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<String> {
+    match resolve_auth_method(managed_auth, aws).await? {
+        BedrockAuthMethod::ManagedBearerToken { region, .. }
+        | BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
+        BedrockAuthMethod::AwsSdkAuth { context } => Ok(context.region().to_string()),
     }
 }
 

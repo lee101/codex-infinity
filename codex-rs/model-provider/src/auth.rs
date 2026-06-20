@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use codex_agent_identity::AgentIdentityKey;
-use codex_agent_identity::AgentTaskAuthorizationTarget;
 use codex_agent_identity::authorization_header_for_agent_task;
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
@@ -12,9 +11,7 @@ use codex_protocol::error::CodexErr;
 use http::HeaderMap;
 use http::HeaderValue;
 
-use crate::basic_auth_provider::BasicAuthProvider;
 use crate::bearer_auth_provider::BearerAuthProvider;
-use codex_model_provider_info::CURSOR_PROVIDER_NAME;
 
 const BEDROCK_API_KEY_UNSUPPORTED_MESSAGE: &str =
     "Bedrock API key auth is only supported by the Amazon Bedrock model provider";
@@ -32,10 +29,7 @@ impl AuthProvider for AgentIdentityAuthProvider {
                 agent_runtime_id: &record.agent_runtime_id,
                 private_key_pkcs8_base64: &record.agent_private_key,
             },
-            AgentTaskAuthorizationTarget {
-                agent_runtime_id: &record.agent_runtime_id,
-                task_id: self.auth.process_task_id(),
-            },
+            self.auth.run_task_id(),
         )
         .map_err(std::io::Error::other);
 
@@ -85,10 +79,10 @@ pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
-    if provider.name == CURSOR_PROVIDER_NAME
-        && let Some(api_key) = provider.api_key()?
-    {
-        return Ok(Arc::new(BasicAuthProvider::new(api_key)));
+    if matches!(auth, Some(CodexAuth::BedrockApiKey(_))) {
+        return Err(CodexErr::UnsupportedOperation(
+            BEDROCK_API_KEY_UNSUPPORTED_MESSAGE.to_string(),
+        ));
     }
 
     if let Some(auth) = bearer_auth_for_provider(provider)? {
@@ -104,10 +98,6 @@ pub(crate) fn resolve_provider_auth(
 fn bearer_auth_for_provider(
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<Option<BearerAuthProvider>> {
-    if provider.name == CURSOR_PROVIDER_NAME {
-        return Ok(None);
-    }
-
     if let Some(api_key) = provider.api_key()? {
         return Ok(Some(BearerAuthProvider::new(api_key)));
     }

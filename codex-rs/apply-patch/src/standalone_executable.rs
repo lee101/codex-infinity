@@ -65,6 +65,8 @@ pub fn run_main() -> i32 {
             return 1;
         }
     };
+    // TODO(anp): Discover the standalone executable cwd as PathUri directly.
+    let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
     match runtime.block_on(crate::apply_patch(
         &patch_arg,
         &cwd,
@@ -73,7 +75,7 @@ pub fn run_main() -> i32 {
         codex_exec_server::LOCAL_FS.as_ref(),
         /*sandbox*/ None,
     )) {
-        Ok(()) => {
+        Ok(_) => {
             // Flush to ensure output ordering when used in pipelines.
             let _ = stdout.flush();
             0

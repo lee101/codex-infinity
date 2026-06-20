@@ -6,6 +6,7 @@
 
 pub mod citations;
 mod metrics;
+mod prompts;
 pub mod usage;
 
 use codex_utils_absolute_path::AbsolutePathBuf;

@@ -26,6 +26,7 @@ use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
+use crate::ThreadMetadataPatch;
 use crate::ThreadPage;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
@@ -38,6 +39,123 @@ static IN_MEMORY_THREAD_STORES: OnceLock<Mutex<HashMap<String, Arc<InMemoryThrea
 
 fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>> {
     IN_MEMORY_THREAD_STORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ListItemsParams;
+    use crate::ListTurnsParams;
+    use crate::SortDirection;
+    use crate::StoredTurnItemsView;
+    use crate::ThreadPersistenceMetadata;
+    use crate::ThreadSortKey;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::SessionSource;
+
+    #[tokio::test]
+    async fn default_turn_pagination_methods_return_unsupported() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::default();
+
+        let turns_err = store
+            .list_turns(ListTurnsParams {
+                thread_id,
+                include_archived: true,
+                cursor: None,
+                page_size: 10,
+                sort_direction: SortDirection::Asc,
+                items_view: StoredTurnItemsView::Summary,
+            })
+            .await
+            .expect_err("default list_turns should be unsupported");
+        assert!(matches!(
+            turns_err,
+            ThreadStoreError::Unsupported {
+                operation: "list_turns"
+            }
+        ));
+
+        let items_err = store
+            .list_items(ListItemsParams {
+                thread_id,
+                turn_id: None,
+                include_archived: true,
+                cursor: None,
+                page_size: 10,
+                sort_direction: SortDirection::Asc,
+            })
+            .await
+            .expect_err("default list_items should be unsupported");
+        assert!(matches!(
+            items_err,
+            ThreadStoreError::Unsupported {
+                operation: "list_items"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_threads_filters_by_parent_thread_id() {
+        let store = InMemoryThreadStore::default();
+        let parent_thread_id = ThreadId::default();
+        let child_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
+        let unrelated_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000002").expect("valid thread id");
+
+        for (thread_id, parent_thread_id) in [
+            (child_thread_id, Some(parent_thread_id)),
+            (unrelated_thread_id, None),
+        ] {
+            store
+                .create_thread(CreateThreadParams {
+                    thread_id,
+                    extra_config: None,
+                    forked_from_id: None,
+                    parent_thread_id,
+                    source: SessionSource::Exec,
+                    thread_source: None,
+                    base_instructions: BaseInstructions::default(),
+                    dynamic_tools: Vec::new(),
+                    multi_agent_version: None,
+                    metadata: ThreadPersistenceMetadata {
+                        cwd: None,
+                        model_provider: "test-provider".to_string(),
+                        memory_mode: ThreadMemoryMode::Enabled,
+                    },
+                })
+                .await
+                .expect("create thread");
+        }
+
+        let page = ThreadStore::list_threads(
+            &store,
+            ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                archived: false,
+                search_term: None,
+                parent_thread_id: Some(parent_thread_id),
+                use_state_db_only: false,
+            },
+        )
+        .await
+        .expect("list child threads");
+
+        assert_eq!(
+            page.items
+                .into_iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>(),
+            vec![child_thread_id]
+        );
+    }
 }
 
 fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore>>> {
@@ -68,9 +186,9 @@ pub struct InMemoryThreadStoreCalls {
     pub delete_thread: usize,
 }
 
-/// Test-only in-memory [`ThreadStore`] implementation.
+/// In-memory [`ThreadStore`] implementation for tests and debug configs.
 ///
-/// Debug/test configs can select this store by id, letting tests exercise
+/// Test and debug configs can select this store by id, letting tests exercise
 /// config-driven non-local persistence without requiring the real remote gRPC
 /// service.
 #[derive(Default)]
@@ -83,6 +201,7 @@ struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
+    metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
 }
@@ -236,9 +355,14 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
-        if let Some(name) = params.patch.name {
-            state.names.insert(params.thread_id, Some(name));
+        if let Some(name) = params.patch.name.clone() {
+            state.names.insert(params.thread_id, name);
         }
+        state
+            .metadata_updates
+            .entry(params.thread_id)
+            .or_default()
+            .merge(params.patch);
         stored_thread_from_state(&state, params.thread_id, /*include_history*/ false)
     }
 
@@ -380,30 +504,80 @@ fn stored_thread_from_state(
         items: history_items.clone(),
     });
     let name = state.names.get(&thread_id).cloned().flatten();
+    let metadata = state.metadata_updates.get(&thread_id);
+    let rollout_path = state
+        .rollout_paths
+        .iter()
+        .find_map(|(path, mapped_thread_id)| {
+            (*mapped_thread_id == thread_id).then(|| path.clone())
+        });
 
     Ok(StoredThread {
         thread_id,
-        rollout_path: None,
+        extra_config: created.extra_config.clone(),
+        rollout_path: metadata
+            .and_then(|metadata| metadata.rollout_path.clone())
+            .or(rollout_path),
         forked_from_id: created.forked_from_id,
-        preview: String::new(),
+        parent_thread_id: created.parent_thread_id,
+        preview: metadata
+            .and_then(|metadata| metadata.preview.clone())
+            .unwrap_or_default(),
         name,
-        model_provider: "test".to_string(),
-        model: None,
-        reasoning_effort: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        model_provider: metadata
+            .and_then(|metadata| metadata.model_provider.clone())
+            .unwrap_or_else(|| "test".to_string()),
+        model: metadata.and_then(|metadata| metadata.model.clone()),
+        reasoning_effort: metadata.and_then(|metadata| metadata.reasoning_effort.clone()),
+        created_at: metadata
+            .and_then(|metadata| metadata.created_at)
+            .unwrap_or_else(Utc::now),
+        updated_at: metadata
+            .and_then(|metadata| metadata.updated_at)
+            .unwrap_or_else(Utc::now),
+        recency_at: metadata
+            .and_then(|metadata| metadata.advance_recency_at.or(metadata.updated_at))
+            .unwrap_or_else(Utc::now),
         archived_at: None,
-        cwd: PathBuf::new(),
-        cli_version: "test".to_string(),
-        source: created.source.clone(),
-        agent_nickname: None,
-        agent_role: None,
-        agent_path: None,
-        git_info: None,
-        approval_mode: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        token_usage: None,
-        first_user_message: None,
+        cwd: metadata
+            .and_then(|metadata| metadata.cwd.clone())
+            .unwrap_or_default(),
+        cli_version: metadata
+            .and_then(|metadata| metadata.cli_version.clone())
+            .unwrap_or_else(|| "test".to_string()),
+        source: metadata
+            .and_then(|metadata| metadata.source.clone())
+            .unwrap_or_else(|| created.source.clone()),
+        thread_source: metadata
+            .and_then(|metadata| metadata.thread_source.clone())
+            .unwrap_or_else(|| created.thread_source.clone()),
+        agent_nickname: metadata.and_then(|metadata| metadata.agent_nickname.clone().flatten()),
+        agent_role: metadata.and_then(|metadata| metadata.agent_role.clone().flatten()),
+        agent_path: metadata.and_then(|metadata| metadata.agent_path.clone().flatten()),
+        git_info: metadata.and_then(git_info_from_patch),
+        approval_mode: metadata
+            .and_then(|metadata| metadata.approval_mode)
+            .unwrap_or(AskForApproval::Never),
+        permission_profile: metadata
+            .and_then(|metadata| metadata.permission_profile.clone())
+            .unwrap_or_else(PermissionProfile::read_only),
+        token_usage: metadata.and_then(|metadata| metadata.token_usage.clone()),
+        first_user_message: metadata.and_then(|metadata| metadata.first_user_message.clone()),
         history,
+    })
+}
+
+fn git_info_from_patch(patch: &ThreadMetadataPatch) -> Option<codex_protocol::protocol::GitInfo> {
+    let git_info = patch.git_info.as_ref()?;
+    let sha = git_info.sha.clone().flatten();
+    let branch = git_info.branch.clone().flatten();
+    let origin_url = git_info.origin_url.clone().flatten();
+    if sha.is_none() && branch.is_none() && origin_url.is_none() {
+        return None;
+    }
+    Some(codex_protocol::protocol::GitInfo {
+        commit_hash: sha.as_deref().map(codex_git_utils::GitSha::new),
+        branch,
+        repository_url: origin_url,
     })
 }

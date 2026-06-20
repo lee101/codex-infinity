@@ -2,37 +2,8 @@ use super::*;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use pretty_assertions::assert_eq;
-use std::ffi::OsString;
 use std::num::NonZeroU64;
 use tempfile::tempdir;
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self { key, previous }
-    }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe { std::env::remove_var(key) };
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
 
 #[test]
 fn test_deserialize_ollama_model_provider_toml() {
@@ -256,183 +227,6 @@ args = ["--format=text"]
 }
 
 #[test]
-fn gemini_provider_normalizes_google_prefix() {
-    let provider = ModelProviderInfo::create_gemini_provider();
-    assert_eq!(
-        provider.effective_model_name("google/gemini-3.5-flash"),
-        "gemini-3.5-flash"
-    );
-    assert_eq!(
-        provider.effective_model_name("gemini-3.5-flash"),
-        "gemini-3.5-flash"
-    );
-}
-
-#[test]
-fn deepseek_provider_normalizes_deepseek_prefix() {
-    let provider = ModelProviderInfo::create_deepseek_provider();
-    assert_eq!(
-        provider.effective_model_name("deepseek/deepseek-v4-flash"),
-        "deepseek-v4-flash"
-    );
-    assert_eq!(
-        provider.effective_model_name("deepseek-v4-flash"),
-        "deepseek-v4-flash"
-    );
-}
-
-#[test]
-fn zhipu_provider_normalizes_zai_prefix() {
-    let provider = ModelProviderInfo::create_zhipu_provider();
-    assert_eq!(provider.effective_model_name("z-ai/glm-5.1"), "glm-5.1");
-    assert_eq!(provider.effective_model_name("zhipu/glm-5.1"), "glm-5.1");
-    assert_eq!(provider.effective_model_name("glm-5.1"), "glm-5.1");
-}
-
-#[test]
-fn openpaths_provider_normalizes_openpaths_prefix() {
-    let provider = ModelProviderInfo::create_openpaths_provider();
-    assert_eq!(
-        provider.effective_model_name("openpaths/auto-medium-task"),
-        "auto-medium-task"
-    );
-    assert_eq!(
-        provider.effective_model_name("auto-medium-task"),
-        "auto-medium-task"
-    );
-    assert_eq!(
-        provider.effective_model_name("openpaths/composer-2.5-fast"),
-        "composer-2.5-fast"
-    );
-}
-
-#[test]
-fn cerebras_provider_normalizes_cerebras_prefix() {
-    let provider = ModelProviderInfo::create_cerebras_provider();
-    assert_eq!(provider.env_key.as_deref(), Some("CEREBRAS_API_KEY"));
-    assert_eq!(
-        provider.base_url.as_deref(),
-        Some("https://api.cerebras.ai/v1")
-    );
-    assert_eq!(
-        provider.effective_model_name("cerebras/gpt-oss-120b"),
-        "gpt-oss-120b"
-    );
-    assert_eq!(provider.effective_model_name("zai-glm-4.7"), "zai-glm-4.7");
-}
-
-#[test]
-fn openpaths_provider_normalizes_cerebras_prefix() {
-    // OpenPaths is a router that also serves the Cerebras-hosted models, so a
-    // `cerebras/` slug routed to OpenPaths must drop the prefix too.
-    let provider = ModelProviderInfo::create_openpaths_provider();
-    assert_eq!(
-        provider.effective_model_name("cerebras/gpt-oss-120b"),
-        "gpt-oss-120b"
-    );
-}
-
-#[test]
-fn cursor_provider_normalizes_cursor_prefix() {
-    let provider = ModelProviderInfo::create_cursor_provider();
-    assert_eq!(
-        provider.effective_model_name("cursor/composer-2.5-fast"),
-        "composer-2.5-fast"
-    );
-    assert_eq!(
-        provider.effective_model_name("composer-2.5"),
-        "composer-2.5"
-    );
-}
-
-#[test]
-fn infer_builtin_provider_prefers_env_backed_routes() {
-    let _gemini_remove_guard = EnvVarGuard::remove("GEMINI_API_KEY");
-    let _openrouter_remove_guard = EnvVarGuard::remove("OPENROUTER_API_KEY");
-    let _cursor_remove_guard = EnvVarGuard::remove("CURSOR_API_KEY");
-    let _cerebras_remove_guard = EnvVarGuard::remove("CEREBRAS_API_KEY");
-    let openpaths_remove_guard = EnvVarGuard::remove("OPENPATHS_API_KEY");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
-        None
-    );
-
-    let gemini_set_guard = EnvVarGuard::set("GEMINI_API_KEY", "gemini-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
-        Some(GEMINI_PROVIDER_ID)
-    );
-
-    drop(gemini_set_guard);
-    let _openrouter_set_guard = EnvVarGuard::set("OPENROUTER_API_KEY", "openrouter-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("google/gemini-3.5-flash"),
-        Some(OPENROUTER_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("anthropic/claude-opus-4.6"),
-        Some(OPENROUTER_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("z-ai/glm-5"),
-        Some(OPENROUTER_PROVIDER_ID)
-    );
-
-    let _zai_set_guard = EnvVarGuard::set("ZAI_API_KEY", "zai-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("glm-5.1"),
-        Some(ZHIPU_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("z-ai/glm-5.1"),
-        Some(ZHIPU_PROVIDER_ID)
-    );
-
-    drop(openpaths_remove_guard);
-    let _openpaths_set_guard = EnvVarGuard::set("OPENPATHS_API_KEY", "op-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("auto-medium-task"),
-        Some(OPENPATHS_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("openpaths/auto-think"),
-        Some(OPENPATHS_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("composer-2.5"),
-        Some(OPENPATHS_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("composer-2.5-fast"),
-        Some(OPENPATHS_PROVIDER_ID)
-    );
-    // With only an OpenPaths key, Cerebras-hosted models route through OpenPaths.
-    assert_eq!(
-        infer_builtin_provider_id_for_model("cerebras/gpt-oss-120b"),
-        Some(OPENPATHS_PROVIDER_ID)
-    );
-
-    // A direct Cerebras key takes precedence over the OpenPaths fallback.
-    let cerebras_set_guard = EnvVarGuard::set("CEREBRAS_API_KEY", "csk-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("cerebras/zai-glm-4.7"),
-        Some(CEREBRAS_PROVIDER_ID)
-    );
-    drop(cerebras_set_guard);
-
-    drop(_openpaths_set_guard);
-    let _cursor_set_guard = EnvVarGuard::set("CURSOR_API_KEY", "cursor-key");
-    assert_eq!(
-        infer_builtin_provider_id_for_model("composer-2.5"),
-        Some(CURSOR_PROVIDER_ID)
-    );
-    assert_eq!(
-        infer_builtin_provider_id_for_model("cursor/composer-2.5-fast"),
-        Some(CURSOR_PROVIDER_ID)
-    );
-}
-
-#[test]
 fn test_deserialize_provider_aws_config() {
     let provider_toml = r#"
 name = "Amazon Bedrock"
@@ -471,7 +265,10 @@ fn test_create_amazon_bedrock_provider() {
             }),
             wire_api: WireApi::Responses,
             query_params: None,
-            http_headers: None,
+            http_headers: Some(maplit::hashmap! {
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+                    AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+            }),
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
@@ -480,6 +277,21 @@ fn test_create_amazon_bedrock_provider() {
             requires_openai_auth: false,
             supports_websockets: false,
         }
+    );
+}
+
+#[test]
+fn test_amazon_bedrock_provider_adds_mantle_client_agent_header() {
+    let api_provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None)
+        .to_api_provider(/*auth_mode*/ None)
+        .expect("Amazon Bedrock provider should build API provider");
+
+    assert_eq!(
+        api_provider
+            .headers
+            .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
     );
 }
 

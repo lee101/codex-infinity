@@ -1661,12 +1661,14 @@ impl CodexClient {
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api,
+                    request_attestation: false,
                     opt_out_notification_methods: Some(
                         NOTIFICATIONS_TO_OPT_OUT
                             .iter()
                             .map(|method| (*method).to_string())
                             .collect(),
                     ),
+                    mcp_server_openai_form_elicitation: false,
                 }),
             },
         };
@@ -1717,7 +1719,9 @@ impl CodexClient {
         let request_id = self.request_id();
         let request = ClientRequest::LoginAccount {
             request_id: request_id.clone(),
-            params: codex_app_server_protocol::LoginAccountParams::Chatgpt,
+            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
+                codex_streamlined_login: false,
+            },
         };
 
         self.send_request(request, request_id, "account/login/start")
@@ -2053,7 +2057,9 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
+            started_at_ms: _,
             approval_id,
+            environment_id,
             reason,
             network_approval_context,
             command,
@@ -2071,6 +2077,9 @@ impl CodexClient {
         );
         self.command_approval_count += 1;
         self.command_approval_item_ids.push(item_id.clone());
+        if let Some(environment_id) = environment_id.as_deref() {
+            println!("< environment: {environment_id}");
+        }
         if let Some(reason) = reason.as_deref() {
             println!("< reason: {reason}");
         }
@@ -2084,7 +2093,7 @@ impl CodexClient {
             println!("< command: {command}");
         }
         if let Some(cwd) = cwd.as_ref() {
-            println!("< cwd: {}", cwd.display());
+            println!("< cwd: {cwd}");
         }
         if let Some(command_actions) = command_actions.as_ref()
             && !command_actions.is_empty()
@@ -2128,6 +2137,7 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
+            started_at_ms: _,
             reason,
             grant_root,
         } = params;

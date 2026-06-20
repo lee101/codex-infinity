@@ -105,25 +105,7 @@ async fn build_uploaded_argument_value(
     index: Option<usize>,
     file_path: &str,
 ) -> Result<JsonValue, String> {
-    let resolved_path = turn_context.resolve_path(Some(file_path.to_string()));
-    let Some(auth) = auth else {
-        return Err(
-            "ChatGPT auth is required to upload local files for Codex Apps tools".to_string(),
-        );
-    };
-    if !auth.uses_codex_backend() {
-        return Err(
-            "ChatGPT auth is required to upload local files for Codex Apps tools".to_string(),
-        );
-    }
-    let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
-    let uploaded = upload_local_file(
-        turn_context.config.chatgpt_base_url.trim_end_matches('/'),
-        upload_auth.as_ref(),
-        &resolved_path,
-    )
-    .await
-    .map_err(|error| match index {
+    let contextualize_error = |error: String| match index {
         Some(index) => {
             format!("failed to upload `{file_path}` for `{field_name}[{index}]`: {error}")
         }
@@ -295,7 +277,7 @@ mod tests {
         tokio::fs::write(&local_path, b"hello")
             .await
             .expect("write local file");
-        turn_context.cwd = AbsolutePathBuf::try_from(dir.path()).expect("absolute path");
+        set_primary_environment_cwd(&mut turn_context, dir.path());
 
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
@@ -401,7 +383,7 @@ mod tests {
         tokio::fs::write(&local_path, b"hello")
             .await
             .expect("write local file");
-        turn_context.cwd = AbsolutePathBuf::try_from(dir.path()).expect("absolute path");
+        set_primary_environment_cwd(&mut turn_context, dir.path());
 
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
@@ -515,7 +497,7 @@ mod tests {
         tokio::fs::write(dir.path().join("two.csv"), b"two")
             .await
             .expect("write second local file");
-        turn_context.cwd = AbsolutePathBuf::try_from(dir.path()).expect("absolute path");
+        set_primary_environment_cwd(&mut turn_context, dir.path());
 
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());

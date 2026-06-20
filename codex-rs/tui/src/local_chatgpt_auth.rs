@@ -17,7 +17,7 @@ pub(crate) struct LocalChatgptAuth {
 pub(crate) fn load_local_chatgpt_auth(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
-    forced_chatgpt_workspace_id: Option<&str>,
+    forced_chatgpt_workspace_id: Option<&[String]>,
 ) -> Result<LocalChatgptAuth, String> {
     let auth = load_auth_dot_json(
         codex_home,
@@ -38,11 +38,11 @@ pub(crate) fn load_local_chatgpt_auth(
         .account_id
         .or(tokens.id_token.chatgpt_account_id.clone())
         .ok_or_else(|| "local ChatGPT auth is missing chatgpt account id".to_string())?;
-    if let Some(expected_workspace) = forced_chatgpt_workspace_id
-        && chatgpt_account_id != expected_workspace
+    if let Some(expected_workspaces) = forced_chatgpt_workspace_id
+        && !expected_workspaces.contains(&chatgpt_account_id)
     {
         return Err(format!(
-            "local ChatGPT auth must use workspace {expected_workspace}, but found {chatgpt_account_id:?}"
+            "local ChatGPT auth must use one of workspace(s) {expected_workspaces:?}, but found {chatgpt_account_id:?}",
         ));
     }
 
@@ -134,7 +134,7 @@ mod tests {
         let auth = load_local_chatgpt_auth(
             codex_home.path(),
             AuthCredentialsStoreMode::File,
-            Some("workspace-1"),
+            Some(&["workspace-1".to_string()]),
         )
         .expect("chatgpt auth should load");
 
@@ -201,7 +201,7 @@ mod tests {
         let auth = load_local_chatgpt_auth(
             codex_home.path(),
             AuthCredentialsStoreMode::File,
-            Some("workspace-1"),
+            Some(&["workspace-1".to_string(), "workspace-2".to_string()]),
         )
         .expect("managed auth should win");
 
@@ -217,7 +217,7 @@ mod tests {
         let auth = load_local_chatgpt_auth(
             codex_home.path(),
             AuthCredentialsStoreMode::File,
-            Some("workspace-1"),
+            Some(&["workspace-1".to_string()]),
         )
         .expect("chatgpt auth should load");
 

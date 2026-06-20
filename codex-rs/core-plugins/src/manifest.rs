@@ -12,6 +12,8 @@ const MAX_DEFAULT_PROMPT_LEN: usize = 128;
 pub type PluginManifest = codex_plugin::manifest::PluginManifest<AbsolutePathBuf>;
 pub type PluginManifestHooks = codex_plugin::manifest::PluginManifestHooks<AbsolutePathBuf>;
 pub type PluginManifestInterface = codex_plugin::manifest::PluginManifestInterface<AbsolutePathBuf>;
+pub type PluginManifestMcpServers =
+    codex_plugin::manifest::PluginManifestMcpServers<AbsolutePathBuf>;
 pub type PluginManifestPaths = codex_plugin::manifest::PluginManifestPaths<AbsolutePathBuf>;
 
 #[derive(Debug, Default, Deserialize)]
@@ -23,59 +25,20 @@ struct RawPluginManifest {
     version: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
     // Keep manifest paths as raw strings so we can validate the required `./...` syntax before
     // resolving them under the plugin root.
     #[serde(default)]
-    skills: Option<RawPluginManifestPath>,
+    skills: Option<RawPluginManifestPaths>,
     #[serde(default)]
-    mcp_servers: Option<String>,
+    mcp_servers: Option<RawPluginManifestMcpServers>,
     #[serde(default)]
     apps: Option<String>,
     #[serde(default)]
     hooks: Option<RawPluginManifestHooks>,
     #[serde(default)]
     interface: Option<RawPluginManifestInterface>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginManifest {
-    pub name: String,
-    pub version: Option<String>,
-    pub description: Option<String>,
-    pub paths: PluginManifestPaths,
-    pub interface: Option<PluginManifestInterface>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginManifestPaths {
-    pub skills: Option<AbsolutePathBuf>,
-    pub mcp_servers: Option<AbsolutePathBuf>,
-    pub apps: Option<AbsolutePathBuf>,
-    pub hooks: Option<PluginManifestHooks>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginManifestHooks {
-    Paths(Vec<AbsolutePathBuf>),
-    Inline(Vec<HooksFile>),
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PluginManifestInterface {
-    pub display_name: Option<String>,
-    pub short_description: Option<String>,
-    pub long_description: Option<String>,
-    pub developer_name: Option<String>,
-    pub category: Option<String>,
-    pub capabilities: Vec<String>,
-    pub website_url: Option<String>,
-    pub privacy_policy_url: Option<String>,
-    pub terms_of_service_url: Option<String>,
-    pub default_prompt: Option<Vec<String>>,
-    pub brand_color: Option<String>,
-    pub composer_icon: Option<AbsolutePathBuf>,
-    pub logo: Option<AbsolutePathBuf>,
-    pub screenshots: Vec<AbsolutePathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -131,8 +94,17 @@ enum RawPluginManifestDefaultPromptEntry {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum RawPluginManifestPath {
+enum RawPluginManifestPaths {
     Path(String),
+    Paths(Vec<String>),
+    Invalid(JsonValue),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPluginManifestMcpServers {
+    Path(String),
+    Object(std::collections::BTreeMap<String, JsonValue>),
     Invalid(JsonValue),
 }
 
@@ -150,114 +122,8 @@ enum RawPluginManifestHooks {
 pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
     let manifest_path = find_plugin_manifest_path(plugin_root)?;
     let contents = fs::read_to_string(&manifest_path).ok()?;
-    match serde_json::from_str::<RawPluginManifest>(&contents) {
-        Ok(manifest) => {
-            let RawPluginManifest {
-                name: raw_name,
-                version,
-                description,
-                skills,
-                mcp_servers,
-                apps,
-                hooks,
-                interface,
-            } = manifest;
-            let name = plugin_root
-                .file_name()
-                .and_then(|entry| entry.to_str())
-                .filter(|_| raw_name.trim().is_empty())
-                .unwrap_or(&raw_name)
-                .to_string();
-            let version = version.and_then(|version| {
-                let version = version.trim();
-                (!version.is_empty()).then(|| version.to_string())
-            });
-            let interface = interface.and_then(|interface| {
-                let RawPluginManifestInterface {
-                    display_name,
-                    short_description,
-                    long_description,
-                    developer_name,
-                    category,
-                    capabilities,
-                    website_url,
-                    privacy_policy_url,
-                    terms_of_service_url,
-                    default_prompt,
-                    brand_color,
-                    composer_icon,
-                    logo,
-                    screenshots,
-                } = interface;
-
-                let interface = PluginManifestInterface {
-                    display_name,
-                    short_description,
-                    long_description,
-                    developer_name,
-                    category,
-                    capabilities,
-                    website_url,
-                    privacy_policy_url,
-                    terms_of_service_url,
-                    default_prompt: resolve_default_prompts(plugin_root, default_prompt.as_ref()),
-                    brand_color,
-                    composer_icon: resolve_interface_asset_path(
-                        plugin_root,
-                        "interface.composerIcon",
-                        composer_icon.as_deref(),
-                    ),
-                    logo: resolve_interface_asset_path(
-                        plugin_root,
-                        "interface.logo",
-                        logo.as_deref(),
-                    ),
-                    screenshots: screenshots
-                        .iter()
-                        .filter_map(|screenshot| {
-                            resolve_interface_asset_path(
-                                plugin_root,
-                                "interface.screenshots",
-                                Some(screenshot),
-                            )
-                        })
-                        .collect(),
-                };
-
-                let has_fields = interface.display_name.is_some()
-                    || interface.short_description.is_some()
-                    || interface.long_description.is_some()
-                    || interface.developer_name.is_some()
-                    || interface.category.is_some()
-                    || !interface.capabilities.is_empty()
-                    || interface.website_url.is_some()
-                    || interface.privacy_policy_url.is_some()
-                    || interface.terms_of_service_url.is_some()
-                    || interface.default_prompt.is_some()
-                    || interface.brand_color.is_some()
-                    || interface.composer_icon.is_some()
-                    || interface.logo.is_some()
-                    || !interface.screenshots.is_empty();
-
-                has_fields.then_some(interface)
-            });
-            Some(PluginManifest {
-                name,
-                version,
-                description,
-                paths: PluginManifestPaths {
-                    skills: resolve_manifest_path(plugin_root, "skills", skills.as_deref()),
-                    mcp_servers: resolve_manifest_path(
-                        plugin_root,
-                        "mcpServers",
-                        mcp_servers.as_deref(),
-                    ),
-                    apps: resolve_manifest_path(plugin_root, "apps", apps.as_deref()),
-                    hooks: resolve_manifest_hooks(plugin_root, hooks),
-                },
-                interface,
-            })
-        }
+    match parse_plugin_manifest(plugin_root, &manifest_path, &contents) {
+        Ok(manifest) => Some(manifest),
         Err(err) => {
             tracing::warn!(
                 path = %manifest_path.display(),
@@ -365,8 +231,8 @@ pub(crate) fn parse_plugin_manifest(
         description,
         keywords,
         paths: PluginManifestPaths {
-            skills: resolve_manifest_path_value(plugin_root, "skills", skills.as_ref()),
-            mcp_servers: resolve_manifest_path(plugin_root, "mcpServers", mcp_servers.as_deref()),
+            skills: resolve_manifest_paths(plugin_root, "skills", skills.as_ref()),
+            mcp_servers: resolve_manifest_mcp_servers(plugin_root, mcp_servers),
             apps: resolve_manifest_path(plugin_root, "apps", apps.as_deref()),
             hooks: resolve_manifest_hooks(plugin_root, hooks),
         },
@@ -397,6 +263,32 @@ fn resolve_manifest_hooks(
         RawPluginManifestHooks::Invalid(value) => {
             tracing::warn!(
                 "ignoring hooks: expected a string, string array, object, or object array; found {}",
+                json_value_type(&value)
+            );
+            None
+        }
+    }
+}
+
+fn resolve_manifest_mcp_servers(
+    plugin_root: &Path,
+    mcp_servers: Option<RawPluginManifestMcpServers>,
+) -> Option<PluginManifestMcpServers> {
+    match mcp_servers? {
+        RawPluginManifestMcpServers::Path(path) => {
+            resolve_manifest_path(plugin_root, "mcpServers", Some(&path))
+                .map(PluginManifestMcpServers::Path)
+        }
+        RawPluginManifestMcpServers::Object(servers) => match serde_json::to_string(&servers) {
+            Ok(servers) => Some(PluginManifestMcpServers::Object(servers)),
+            Err(err) => {
+                tracing::warn!("ignoring mcpServers: failed to serialize object: {err}");
+                None
+            }
+        },
+        RawPluginManifestMcpServers::Invalid(value) => {
+            tracing::warn!(
+                "ignoring mcpServers: expected a string or object; found {}",
                 json_value_type(&value)
             );
             None
@@ -504,20 +396,29 @@ fn json_value_type(value: &JsonValue) -> &'static str {
     }
 }
 
-fn resolve_manifest_path_value(
+fn resolve_manifest_paths(
     plugin_root: &Path,
     field: &'static str,
-    path: Option<&RawPluginManifestPath>,
-) -> Option<AbsolutePathBuf> {
-    match path? {
-        RawPluginManifestPath::Path(path) => resolve_manifest_path(plugin_root, field, Some(path)),
-        RawPluginManifestPath::Invalid(value) => {
+    paths: Option<&RawPluginManifestPaths>,
+) -> Vec<AbsolutePathBuf> {
+    match paths {
+        Some(RawPluginManifestPaths::Path(path)) => {
+            resolve_manifest_path(plugin_root, field, Some(path))
+                .map(|path| vec![path])
+                .unwrap_or_default()
+        }
+        Some(RawPluginManifestPaths::Paths(paths)) => paths
+            .iter()
+            .filter_map(|path| resolve_manifest_path(plugin_root, field, Some(path)))
+            .collect(),
+        Some(RawPluginManifestPaths::Invalid(value)) => {
             tracing::warn!(
-                "ignoring {field}: expected a string; found {}",
+                "ignoring {field}: expected a string or string array; found {}",
                 json_value_type(value)
             );
-            None
+            Vec::new()
         }
+        None => Vec::new(),
     }
 }
 
@@ -708,6 +609,28 @@ mod tests {
         let manifest = load_manifest(&plugin_root);
 
         assert_eq!(manifest.version, Some("1.2.3-beta+7".to_string()));
+    }
+
+    #[test]
+    fn plugin_manifest_reads_keywords() {
+        let tmp = tempdir().expect("tempdir");
+        let plugin_root = tmp.path().join("demo-plugin");
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest dir");
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{
+  "name": "demo-plugin",
+  "keywords": ["api-key", "developer tools"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let manifest = load_manifest(&plugin_root);
+
+        assert_eq!(
+            manifest.keywords,
+            vec!["api-key".to_string(), "developer tools".to_string()]
+        );
     }
 
     #[test]

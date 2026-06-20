@@ -7,11 +7,17 @@ mod session_registry;
 mod transport;
 
 pub(crate) use handler::ExecServerHandler;
+pub(crate) use processor::ConnectionProcessor;
 pub use transport::DEFAULT_LISTEN_URL;
 pub use transport::ExecServerListenUrlParseError;
 
 use crate::ExecServerRuntimePaths;
 
+#[tracing::instrument(
+    name = "codex.exec_server",
+    skip_all,
+    fields(otel.kind = "internal")
+)]
 pub async fn run_main(
     listen_url: &str,
     runtime_paths: ExecServerRuntimePaths,

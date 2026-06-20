@@ -1,5 +1,7 @@
 use crate::history_cell::PlainHistoryCell;
 use crate::legacy_core::config::Config;
+use crate::legacy_core::config::Permissions;
+use crate::session_state::SessionNetworkProxyRuntime;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -13,7 +15,9 @@ use codex_config::RequirementSource;
 use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::WebSearchModeRequirement;
-use codex_protocol::protocol::SessionNetworkProxyRuntime;
+use codex_config::format_config_layer_source;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use toml::Value as TomlValue;
@@ -167,6 +171,39 @@ fn render_debug_config_lines(
             "allowed_web_search_modes",
             value,
             requirements.web_search_mode.source.as_ref(),
+        ));
+    }
+
+    if let Some(allow_managed_hooks_only) = requirements_toml.allow_managed_hooks_only {
+        requirement_lines.push(requirement_line(
+            "allow_managed_hooks_only",
+            allow_managed_hooks_only.to_string(),
+            requirements
+                .allow_managed_hooks_only
+                .as_ref()
+                .map(|sourced| &sourced.source),
+        ));
+    }
+
+    if let Some(allow_appshots) = requirements_toml.allow_appshots {
+        requirement_lines.push(requirement_line(
+            "allow_appshots",
+            allow_appshots.to_string(),
+            requirements
+                .allow_appshots
+                .as_ref()
+                .map(|sourced| &sourced.source),
+        ));
+    }
+
+    if let Some(allow_remote_control) = requirements_toml.allow_remote_control {
+        requirement_lines.push(requirement_line(
+            "allow_remote_control",
+            allow_remote_control.to_string(),
+            requirements
+                .allow_remote_control
+                .as_ref()
+                .map(|sourced| &sourced.source),
         ));
     }
 
@@ -406,33 +443,6 @@ fn normalize_allowed_web_search_modes(
     normalized
 }
 
-fn format_config_layer_source(source: &ConfigLayerSource) -> String {
-    match source {
-        ConfigLayerSource::Mdm { domain, key } => {
-            format!("MDM ({domain}:{key})")
-        }
-        ConfigLayerSource::System { file } => {
-            format!("system ({})", file.as_path().display())
-        }
-        ConfigLayerSource::User { file } => {
-            format!("user ({})", file.as_path().display())
-        }
-        ConfigLayerSource::Project { dot_codex_folder } => {
-            format!(
-                "project ({}/config.toml)",
-                dot_codex_folder.as_path().display()
-            )
-        }
-        ConfigLayerSource::SessionFlags => "session-flags".to_string(),
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
-            format!("legacy managed_config.toml ({})", file.as_path().display())
-        }
-        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
-            "legacy managed_config.toml (MDM)".to_string()
-        }
-    }
-}
-
 fn format_sandbox_mode_requirement(mode: SandboxModeRequirement) -> String {
     match mode {
         SandboxModeRequirement::ReadOnly => "read-only".to_string(),
@@ -545,7 +555,8 @@ mod tests {
     use super::render_debug_config_lines;
     use super::sandbox_mode_is_allowed_by_permissions;
     use super::session_all_proxy_url;
-    use crate::legacy_core::config::Constrained;
+    use crate::legacy_core::config::Permissions;
+    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ConfigLayerSource;
     use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerStack;
@@ -576,7 +587,6 @@ mod tests {
     use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::WebSearchMode;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::protocol::AskForApproval;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use ratatui::text::Line;
     use std::collections::BTreeMap;
@@ -673,8 +683,8 @@ mod tests {
 
         let requirements = ConfigRequirements {
             approval_policy: ConstrainedWithSource::new(
-                Constrained::allow_any(AskForApproval::OnRequest),
-                Some(RequirementSource::CloudRequirements),
+                Constrained::allow_any(AskForApproval::OnRequest.to_core()),
+                Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ),
             approvals_reviewer: ConstrainedWithSource::new(
                 Constrained::allow_any(ApprovalsReviewer::AutoReview),
@@ -705,6 +715,18 @@ mod tests {
                 Constrained::allow_any(WebSearchMode::Cached),
                 Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ),
+            allow_managed_hooks_only: Some(Sourced::new(
+                /*value*/ true,
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+            )),
+            allow_appshots: Some(Sourced::new(
+                /*value*/ false,
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+            )),
+            allow_remote_control: Some(Sourced::new(
+                /*value*/ false,
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+            )),
             feature_requirements: Some(Sourced::new(
                 FeatureRequirementsToml {
                     entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
@@ -737,11 +759,18 @@ mod tests {
         };
 
         let requirements_toml = ConfigRequirementsToml {
-            allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+            allowed_approval_policies: Some(vec![AskForApproval::OnRequest.to_core()]),
             allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
             allowed_sandbox_modes: Some(vec![SandboxModeRequirement::ReadOnly]),
+            allowed_permission_profiles: None,
+            default_permissions: None,
             remote_sandbox_config: None,
             allowed_web_search_modes: Some(vec![WebSearchModeRequirement::Cached]),
+            allow_managed_hooks_only: Some(true),
+            allow_appshots: Some(false),
+            allow_remote_control: Some(false),
+            computer_use: None,
+            windows: None,
             guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
             feature_requirements: Some(FeatureRequirementsToml {
                 entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
@@ -755,6 +784,7 @@ mod tests {
                     },
                 },
             )])),
+            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: Some(ResidencyRequirement::Us),
@@ -769,7 +799,10 @@ mod tests {
         };
         let stack = ConfigLayerStack::new(
             vec![ConfigLayerEntry::new(
-                ConfigLayerSource::User { file: user_file },
+                ConfigLayerSource::User {
+                    file: user_file,
+                    profile: None,
+                },
                 empty_toml_table(),
             )],
             requirements,
@@ -797,15 +830,24 @@ mod tests {
                 .as_str(),
             )
         );
-        assert!(
-            rendered.contains(
-                "allowed_web_search_modes: cached, disabled (source: cloud requirements)"
-            )
-        );
-        assert!(
-            rendered.contains("guardian_policy_config: configured (source: cloud requirements)")
-        );
-        assert!(rendered.contains("features: guardian_approval=true (source: cloud requirements)"));
+        assert!(rendered.contains(&format!(
+            "allowed_web_search_modes: cached, disabled (source: {requirements_source})"
+        )));
+        assert!(rendered.contains(&format!(
+            "allow_managed_hooks_only: true (source: {requirements_source})"
+        )));
+        assert!(rendered.contains(&format!(
+            "allow_appshots: false (source: {requirements_source})"
+        )));
+        assert!(rendered.contains(&format!(
+            "allow_remote_control: false (source: {requirements_source})"
+        )));
+        assert!(rendered.contains(&format!(
+            "guardian_policy_config: configured (source: {requirements_source})"
+        )));
+        assert!(rendered.contains(&format!(
+            "features: guardian_approval=true (source: {requirements_source})"
+        )));
         assert!(rendered.contains("mcp_servers: docs (source: MDM managed_config.toml (legacy))"));
         assert!(rendered.contains(&format!(
             "enforce_residency: us (source: {requirements_source})"
@@ -1086,12 +1128,20 @@ approval_policy = "never"
             allowed_approval_policies: None,
             allowed_approvals_reviewers: None,
             allowed_sandbox_modes: None,
+            allowed_permission_profiles: None,
+            default_permissions: None,
             remote_sandbox_config: None,
             allowed_web_search_modes: Some(Vec::new()),
+            allow_managed_hooks_only: None,
+            allow_appshots: None,
+            allow_remote_control: None,
+            computer_use: None,
+            windows: None,
             guardian_policy_config: None,
             feature_requirements: None,
             hooks: None,
             mcp_servers: None,
+            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: None,
@@ -1125,6 +1175,7 @@ approval_policy = "never"
                             matcher: Some("^Bash$".to_string()),
                             hooks: vec![HookHandlerConfig::Command {
                                 command: "python3 /enterprise/hooks/pre.py".to_string(),
+                                command_windows: None,
                                 timeout_sec: Some(10),
                                 r#async: false,
                                 status_message: Some("checking".to_string()),

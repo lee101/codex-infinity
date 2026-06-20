@@ -33,6 +33,8 @@ use crate::client_common::ResponseEvent;
 use crate::compact::content_items_to_text;
 use crate::config::Config;
 use crate::installation_id::resolve_installation_id;
+use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 
 const GENERATOR_MODEL: &str = "gpt-5.4";
 const TRANSCRIPT_CHARS: usize = 12_000;
@@ -91,13 +93,14 @@ pub async fn generate_auto_next_prompt(
     let client = ModelClient::new(
         Some(auth_manager),
         conversation_id,
-        installation_id,
         provider,
         SessionSource::Cli,
         /*model_verbosity*/ None,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*attestation_provider*/ None,
     );
     let session_telemetry = SessionTelemetry::new(
         conversation_id,
@@ -112,24 +115,37 @@ pub async fn generate_auto_next_prompt(
         SessionSource::Cli,
     );
 
-    let mut prompt = Prompt::default();
-    prompt.input = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText { text: user_message }],
-        phase: None,
-    }];
-    prompt.base_instructions = BaseInstructions {
-        text: INSTRUCTIONS.to_string(),
-    };
-    prompt.output_schema = Some(json!({
-        "type": "object",
-        "properties": {
-            "prompt": { "type": "string" }
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text: user_message }],
+            phase: None,
+            metadata: None,
+        }],
+        base_instructions: BaseInstructions {
+            text: INSTRUCTIONS.to_string(),
         },
-        "required": ["prompt"],
-        "additionalProperties": false
-    }));
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string" }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        })),
+        ..Default::default()
+    };
+
+    let responses_metadata = CodexResponsesMetadata {
+        request_kind: Some(CodexResponsesRequestKind::Turn),
+        ..CodexResponsesMetadata::new(
+            installation_id,
+            conversation_id.to_string(),
+            conversation_id.to_string(),
+            /*window_id*/ String::new(),
+        )
+    };
 
     let mut client_session = client.new_session();
     let mut stream = client_session
@@ -140,7 +156,7 @@ pub async fn generate_auto_next_prompt(
             Some(ReasoningEffortConfig::Low),
             ReasoningSummaryConfig::None,
             config.service_tier,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
             &InferenceTraceContext::disabled(),
         )
         .await
@@ -209,7 +225,9 @@ fn format_response_item(item: &ResponseItem) -> Option<String> {
             "tool_call {name}: {}",
             truncate(arguments, ITEM_CHARS)
         )),
-        ResponseItem::FunctionCallOutput { call_id, output } => Some(format!(
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } => Some(format!(
             "tool_output {call_id}: {}",
             truncate(&output.to_string(), ITEM_CHARS)
         )),
@@ -226,6 +244,7 @@ fn format_response_item(item: &ResponseItem) -> Option<String> {
             call_id,
             name,
             output,
+            ..
         } => Some(format!(
             "custom_tool_output {} {call_id}: {}",
             name.as_deref().unwrap_or("tool"),

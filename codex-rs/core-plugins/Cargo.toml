@@ -13,11 +13,14 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+codex-analytics = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-config = { workspace = true }
 codex-core-skills = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-hooks = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp = { workspace = true }
 codex-model-provider = { workspace = true }
@@ -33,6 +36,7 @@ dirs = { workspace = true }
 flate2 = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tar = { workspace = true }
@@ -45,7 +49,6 @@ url = { workspace = true }
 zip = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 libc = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

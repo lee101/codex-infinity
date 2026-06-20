@@ -1,11 +1,10 @@
-//! Codex Apps support for the built-in apps MCP server.
+//! Codex Apps support for the host-owned apps MCP server.
 //!
 //! This module owns the pieces that are unique to ChatGPT-hosted app
 //! connectors: cache scoping by authenticated user, disk cache reads/writes,
 //! connector allow-list filtering, and the normalization that turns app
 //! connector/tool metadata into model-visible MCP callable names.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -16,7 +15,6 @@ use crate::tools::ToolInfo;
 use anyhow::Context;
 use codex_login::CodexAuth;
 use codex_protocol::mcp::McpServerInfo;
-use codex_utils_plugins::mcp_connector::is_connector_id_allowed;
 use codex_utils_plugins::mcp_connector::sanitize_name;
 use serde::Deserialize;
 use serde::Serialize;
@@ -36,16 +34,6 @@ pub fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCac
         chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
         is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
     }
-}
-
-pub fn filter_non_codex_apps_mcp_tools_only(
-    mcp_tools: &HashMap<String, ToolInfo>,
-) -> HashMap<String, ToolInfo> {
-    mcp_tools
-        .iter()
-        .filter(|(_, tool)| tool.server_name != CODEX_APPS_MCP_SERVER_NAME)
-        .map(|(name, tool)| (name.clone(), tool.clone()))
-        .collect()
 }
 
 #[derive(Clone)]
@@ -231,7 +219,7 @@ pub(crate) fn load_cached_codex_apps_tools(
     if cache.schema_version != CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION {
         return CachedCodexAppsToolsLoad::Invalid;
     }
-    CachedCodexAppsToolsLoad::Hit(filter_disallowed_codex_apps_tools(cache.tools))
+    CachedCodexAppsToolsLoad::Hit(cache.tools)
 }
 
 pub(crate) fn write_cached_codex_apps_tools(
@@ -244,10 +232,9 @@ pub(crate) fn write_cached_codex_apps_tools(
     {
         return;
     }
-    let tools = filter_disallowed_codex_apps_tools(tools.to_vec());
     let Ok(bytes) = serde_json::to_vec_pretty(&CodexAppsToolsDiskCache {
         schema_version: CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION,
-        tools,
+        tools: tools.to_vec(),
     }) else {
         return;
     };
@@ -290,17 +277,6 @@ fn write_cached_codex_apps_server_info(
     Ok(())
 }
 
-pub(crate) fn filter_disallowed_codex_apps_tools(tools: Vec<ToolInfo>) -> Vec<ToolInfo> {
-    tools
-        .into_iter()
-        .filter(|tool| {
-            tool.connector_id
-                .as_deref()
-                .is_none_or(is_connector_id_allowed)
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexAppsToolsDiskCache {
     schema_version: u8,
@@ -314,7 +290,7 @@ struct CodexAppsServerInfoDiskCache {
 }
 
 const CODEX_APPS_TOOLS_CACHE_DIR: &str = "cache/codex_apps_tools";
-pub(crate) const CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION: u8 = 3;
+pub(crate) const CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION: u8 = 4;
 
 const CODEX_APPS_SERVER_INFO_CACHE_DIR: &str = "cache/codex_apps_server_info";
 const CODEX_APPS_SERVER_INFO_CACHE_SCHEMA_VERSION: u8 = 1;

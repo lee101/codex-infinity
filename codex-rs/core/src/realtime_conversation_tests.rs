@@ -1,9 +1,11 @@
 use super::RealtimeHandoffState;
 use super::RealtimeSessionKind;
 use super::realtime_delegation_from_handoff;
+use super::realtime_request_headers;
 use super::realtime_text_from_handoff_request;
 use super::wrap_realtime_delegation_input;
 use async_channel::bounded;
+use codex_config::config_toml::RealtimeWsVersion;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
@@ -128,8 +130,10 @@ async fn clears_active_handoff_explicitly() {
     let (tx, _rx) = bounded(1);
     let state = RealtimeHandoffState::new(
         tx,
+        /*client_managed_handoffs*/ false,
         /*codex_responses_as_items*/ false,
         /*codex_response_item_prefix*/ None,
+        /*codex_response_handoff_prefix*/ None,
         RealtimeSessionKind::V1,
     );
 
@@ -141,4 +145,29 @@ async fn clears_active_handoff_explicitly() {
 
     *state.active_handoff.lock().await = None;
     assert_eq!(state.active_handoff.lock().await.clone(), None);
+}
+
+#[test]
+fn uses_quicksilver_alpha_header_for_realtime_v1() {
+    let headers =
+        realtime_request_headers(Some("session_1"), Some("sk-test"), RealtimeWsVersion::V1)
+            .expect("headers")
+            .expect("headers");
+
+    assert_eq!(
+        headers
+            .get("openai-alpha")
+            .and_then(|value| value.to_str().ok()),
+        Some("quicksilver=v1")
+    );
+}
+
+#[test]
+fn omits_quicksilver_alpha_header_for_realtime_v2() {
+    let headers =
+        realtime_request_headers(Some("session_1"), Some("sk-test"), RealtimeWsVersion::V2)
+            .expect("headers")
+            .expect("headers");
+
+    assert!(headers.get("openai-alpha").is_none());
 }

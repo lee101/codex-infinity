@@ -10,6 +10,7 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
 use codex_features::Feature;
+use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
@@ -82,6 +83,50 @@ print(json.dumps({{
     Ok(())
 }
 
+fn write_updating_pre_tool_use_hook(home: &Path, updated_message: &str) -> Result<()> {
+    let script_path = home.join("pre_tool_use_hook.py");
+    let log_path = home.join("pre_tool_use_hook_log.jsonl");
+    let updated_message_json =
+        serde_json::to_string(updated_message).context("serialize updated MCP message")?;
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+
+payload = json.load(sys.stdin)
+
+with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+print(json.dumps({{
+    "hookSpecificOutput": {{
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {{ "message": {updated_message_json} }}
+    }}
+}}))
+"#,
+        log_path = log_path.display(),
+        updated_message_json = updated_message_json,
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": RMCP_HOOK_MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                    "statusMessage": "rewriting MCP pre tool input",
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write updating pre tool use hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
 fn write_post_tool_use_hook(home: &Path, additional_context: &str) -> Result<()> {
     let script_path = home.join("post_tool_use_hook.py");
     let log_path = home.join("post_tool_use_hook_log.jsonl");
@@ -146,7 +191,7 @@ fn insert_rmcp_test_server(config: &mut Config, command: String, approval_mode: 
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
@@ -157,6 +202,7 @@ fn insert_rmcp_test_server(config: &mut Config, command: String, approval_mode: 
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
@@ -173,9 +219,8 @@ fn enable_hooks_and_rmcp_server(
     approval_mode: AppToolApproval,
     prefix_mcp_tool_names: bool,
 ) {
-    if let Err(err) = config.features.enable(Feature::CodexHooks) {
-        panic!("test config should allow feature update: {err}");
-    }
+    trust_discovered_hooks(config);
+    enable_mcp_tool_name_features(config, prefix_mcp_tool_names);
     insert_rmcp_test_server(config, rmcp_test_server_bin, approval_mode);
 }
 
@@ -287,7 +332,104 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_tool_use_records_mcp_tool_payload_and_context() -> Result<()> {
+async fn pre_tool_use_rewrites_mcp_tool_before_execution() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let call_id = "pretooluse-rmcp-echo-rewrite";
+    let rewritten_message = "rewritten mcp hook input";
+    let arguments = json!({ "message": RMCP_ECHO_MESSAGE }).to_string();
+    let call_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call_with_namespace(call_id, RMCP_PREFIXED_NAMESPACE, "echo", &arguments),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-1", "mcp pre hook rewrote it"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let rmcp_test_server_bin = stdio_server_bin()?;
+    let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            write_updating_pre_tool_use_hook(home, rewritten_message)
+                .expect("failed to write MCP updating pre tool use hook fixture");
+        })
+        .with_config(move |config| {
+            enable_hooks_and_rmcp_server(
+                config,
+                rmcp_test_server_bin,
+                AppToolApproval::Approve,
+                /*prefix_mcp_tool_names*/ true,
+            );
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, RMCP_SERVER).await?;
+
+    test.submit_turn("call the rmcp echo tool with the MCP pre hook rewrite")
+        .await?;
+
+    let final_request = final_mock.single_request();
+    let output_item = final_request.function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("MCP tool output should be a string");
+    assert!(
+        output.contains(&format!("ECHOING: {rewritten_message}")),
+        "MCP tool should execute the rewritten input",
+    );
+    assert!(
+        !output.contains(RMCP_ECHO_MESSAGE),
+        "MCP tool should not execute the original input",
+    );
+
+    let hook_inputs = read_hook_inputs(test.codex_home_path(), "pre_tool_use_hook_log.jsonl")?;
+    assert_eq!(hook_inputs.len(), 1);
+    assert_eq!(
+        hook_inputs[0]["tool_input"],
+        json!({ "message": RMCP_ECHO_MESSAGE }),
+    );
+
+    call_mock.single_request();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_tool_use_records_mcp_tool_payload_and_context_with_legacy_prefixed_names()
+-> Result<()> {
+    post_tool_use_records_mcp_tool_payload_and_context(
+        /*prefix_mcp_tool_names*/ true,
+        RMCP_PREFIXED_NAMESPACE,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_tool_use_records_mcp_tool_payload_and_context_with_non_prefixed_names() -> Result<()>
+{
+    post_tool_use_records_mcp_tool_payload_and_context(
+        /*prefix_mcp_tool_names*/ false,
+        RMCP_UNPREFIXED_NAMESPACE,
+    )
+    .await
+}
+
+async fn post_tool_use_records_mcp_tool_payload_and_context(
+    prefix_mcp_tool_names: bool,
+    mcp_namespace: &'static str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;

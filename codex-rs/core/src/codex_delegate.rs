@@ -17,6 +17,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
@@ -50,7 +51,6 @@ use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::emit_subagent_session_started;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
 use codex_login::AuthManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
@@ -86,18 +86,23 @@ pub(crate) async fn run_codex_thread_interactive(
     };
     let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
+        user_instructions,
+        installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
         environment_manager: parent_session
             .services
             .turn_environments
             .environment_manager(),
-        skills_manager: Arc::clone(&parent_session.services.skills_manager),
+        skills_service: Arc::clone(&parent_session.services.skills_service),
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
-        skills_watcher: Arc::clone(&parent_session.services.skills_watcher),
-        conversation_history: initial_history.unwrap_or(InitialHistory::New),
+        extensions: Arc::clone(&parent_session.services.extensions),
+        conversation_history,
         session_source: SessionSource::SubAgent(subagent_source.clone()),
+        forked_from_thread_id,
+        parent_thread_id: Some(parent_session.thread_id),
+        thread_source: Some(ThreadSource::Subagent),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
         metrics_service_name: None,
@@ -106,13 +111,18 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
-        environments: parent_ctx
-            .environments
-            .iter()
-            .map(TurnEnvironment::selection)
-            .collect(),
+        environment_selections: parent_ctx.environments.to_selections(),
+        thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
+        supports_openai_form_elicitation: parent_session
+            .services
+            .supports_openai_form_elicitation
+            .load(std::sync::atomic::Ordering::Relaxed),
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         thread_store: Arc::clone(&parent_session.services.thread_store),
+        attestation_provider: parent_session.services.attestation_provider.clone(),
+        external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
+        inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
+        initial_multi_agent_mode: None,
     }))
     .or_cancel(&cancel_token)
     .await??;
@@ -205,6 +215,8 @@ pub(crate) async fn run_codex_thread_one_shot(
         items: input,
         final_output_json_schema,
         responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
     })
     .await?;
 
@@ -275,11 +287,6 @@ async fn forward_events(
                     Err(_) => break,
                 };
                 match event {
-                    // ignore all legacy delta events
-                    Event {
-                        id: _,
-                        msg: EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_),
-                    } => {}
                     Event {
                         id: _,
                         msg: EventMsg::TokenCount(_),
@@ -287,10 +294,6 @@ async fn forward_events(
                     Event {
                         id: _,
                         msg: EventMsg::SessionConfigured(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::ThreadNameUpdated(_),
                     } => {}
                     Event {
                         id,
@@ -463,6 +466,7 @@ async fn handle_exec_approval(
     let ExecApprovalRequestEvent {
         call_id,
         approval_id,
+        environment_id,
         command,
         cwd,
         reason,
@@ -508,6 +512,7 @@ async fn handle_exec_approval(
                 parent_ctx,
                 call_id,
                 approval_id,
+                environment_id,
                 command,
                 cwd,
                 reason,
@@ -553,7 +558,10 @@ async fn handle_patch_approval(
     let guardian_decision = if routes_approval_to_guardian(parent_ctx) {
         let files = changes
             .keys()
-            .map(|path| parent_ctx.cwd.join(path))
+            .map(|path| {
+                #[allow(deprecated)]
+                parent_ctx.cwd.join(path)
+            })
             .collect::<Vec<_>>();
         let review_cancel = cancel_token.child_token();
         let patch = changes
@@ -589,6 +597,7 @@ async fn handle_patch_approval(
             new_guardian_review_id(),
             GuardianApprovalRequest::ApplyPatch {
                 id: approval_id.clone(),
+                #[allow(deprecated)]
                 cwd: parent_ctx.cwd.clone(),
                 files,
                 patch,
@@ -768,7 +777,10 @@ async fn handle_request_permissions(
         reason: event.reason,
         permissions: event.permissions,
     };
-    let cwd = event.cwd.unwrap_or_else(|| parent_ctx.cwd.clone());
+    let cwd = event.cwd.unwrap_or_else(|| {
+        #[allow(deprecated)]
+        parent_ctx.cwd.clone()
+    });
     let response_fut = parent_session.request_permissions_for_cwd(
         parent_ctx,
         call_id.clone(),

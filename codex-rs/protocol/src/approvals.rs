@@ -187,6 +187,12 @@ pub struct GuardianAssessmentEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub completed_at_ms: Option<i64>,
     pub status: GuardianAssessmentStatus,
     /// Coarse risk label. Omitted while the assessment is in progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +229,18 @@ pub struct ExecApprovalRequestEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
+    /// Environment in which the command will run.
+    #[serde(
+        default,
+        rename = "environmentId",
+        alias = "environment_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    #[ts(rename = "environmentId")]
+    pub environment_id: Option<String>,
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory.
@@ -324,6 +342,15 @@ pub enum ElicitationRequest {
         message: String,
         requested_schema: JsonValue,
     },
+    #[serde(rename = "openai/form")]
+    #[ts(rename = "openai/form")]
+    OpenAiForm {
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, rename = "_meta")]
+        meta: Option<JsonValue>,
+        message: String,
+        requested_schema: JsonValue,
+    },
     Url {
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         #[ts(optional, rename = "_meta")]
@@ -337,7 +364,9 @@ pub enum ElicitationRequest {
 impl ElicitationRequest {
     pub fn message(&self) -> &str {
         match self {
-            Self::Form { message, .. } | Self::Url { message, .. } => message,
+            Self::Form { message, .. }
+            | Self::OpenAiForm { message, .. }
+            | Self::Url { message, .. } => message,
         }
     }
 }
@@ -370,6 +399,8 @@ pub struct ApplyPatchApprovalRequestEvent {
     /// Uses `#[serde(default)]` for backwards compatibility with older senders.
     #[serde(default)]
     pub turn_id: String,
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
     pub changes: HashMap<PathBuf, FileChange>,
     /// Optional explanatory reason (e.g. request for extra write access).
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -42,62 +42,17 @@ pub struct PendingSessionImport {
     pub session: ImportedExternalAgentSession,
 }
 
-#[derive(Debug)]
-pub enum PrepareSessionImportsError {
-    SessionNotDetected(PathBuf),
-}
-
-impl std::fmt::Display for PrepareSessionImportsError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PrepareSessionImportsError::SessionNotDetected(path) => {
-                write!(
-                    formatter,
-                    "external agent session was not detected for import: {}",
-                    path.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for PrepareSessionImportsError {}
-
-pub fn prepare_pending_session_imports(
+pub fn prepare_validated_session_import(
     codex_home: &Path,
-    requested_sessions: Vec<ExternalAgentSessionMigration>,
-    detected_sessions: Vec<ExternalAgentSessionMigration>,
-) -> Result<Vec<PendingSessionImport>, PrepareSessionImportsError> {
-    let detected_session_paths = detected_sessions
-        .into_iter()
-        .map(|session| session.path)
-        .collect::<HashSet<_>>();
-    let mut pending_session_imports = Vec::new();
-    for session in requested_sessions {
-        let has_been_imported = match has_current_session_been_imported(codex_home, &session.path) {
-            Ok(has_been_imported) => has_been_imported,
-            Err(_) => continue,
-        };
-        if !detected_session_paths.contains(&session.path) && !has_been_imported {
-            return Err(PrepareSessionImportsError::SessionNotDetected(session.path));
-        }
-        if has_been_imported {
-            continue;
-        }
-        let imported_session = match load_importable_session(&session.path) {
-            Ok(Some(imported_session)) => imported_session,
-            Ok(None) | Err(_) => continue,
-        };
-        pending_session_imports.push(PendingSessionImport {
-            source_path: session.path,
-            session: imported_session,
-        });
+    session: ExternalAgentSessionMigration,
+) -> io::Result<Option<PendingSessionImport>> {
+    let has_been_imported = has_current_session_been_imported(codex_home, &session.path)?;
+    if has_been_imported {
+        return Ok(None);
     }
-    Ok(pending_session_imports)
-}
-
-fn load_importable_session(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
-    let Some(imported_session) = load_session_for_import(path)? else {
+    let Some((source_path, imported_session, source_content_sha256)) =
+        load_importable_session(&session.path)?
+    else {
         return Ok(None);
     };
     Ok(Some(PendingSessionImport {

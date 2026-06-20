@@ -135,6 +135,46 @@ async fn remote_write_closed_stdin_marks_process_exited() {
 }
 
 #[tokio::test]
+async fn fail_and_terminate_preserves_failure_message() {
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+
+    process.fail_and_terminate("network denied".to_string());
+    process.fail_and_terminate("second failure".to_string());
+
+    assert!(process.has_exited());
+    assert_eq!(
+        process.failure_message(),
+        Some("network denied".to_string())
+    );
+}
+
+#[tokio::test]
+async fn remote_terminate_confirmed_updates_state_on_success_only() {
+    let process = remote_process(
+        WriteStatus::Accepted,
+        Some("terminate unavailable".to_string()),
+    )
+    .await;
+
+    let err = process
+        .terminate_confirmed()
+        .await
+        .expect_err("expected terminate failure");
+
+    assert!(matches!(err, UnifiedExecError::ProcessFailed { .. }));
+    assert!(!process.has_exited());
+
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+
+    process
+        .terminate_confirmed()
+        .await
+        .expect("terminate should succeed");
+
+    assert!(process.has_exited());
+}
+
+#[tokio::test]
 async fn remote_process_waits_for_early_exit_event() {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {

@@ -27,6 +27,10 @@ pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
 
+/// Filename used for the redacted `codex doctor --json` feedback attachment.
+pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
+/// Filename used for the Windows sandbox log feedback attachment.
+pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
@@ -338,12 +342,44 @@ pub struct FeedbackSnapshot {
     pub thread_id: String,
 }
 
+pub struct FeedbackAttachmentPath {
+    pub path: PathBuf,
+    /// Optional filename to use for the uploaded attachment instead of `path`'s basename.
+    pub attachment_filename_override: Option<String>,
+}
+
+/// In-memory attachment to include in a feedback upload.
+///
+/// Use this for generated diagnostics that should not be materialized on disk,
+/// such as the redacted doctor report. File-backed artifacts should use
+/// `FeedbackAttachmentPath` so upload-time read failures can be logged and
+/// skipped independently.
+pub struct FeedbackAttachment {
+    /// Attachment filename shown in Sentry and in the feedback consent UI.
+    pub filename: String,
+    /// Optional MIME type for consumers that render or classify attachments.
+    pub content_type: Option<String>,
+    /// Attachment bytes captured before the upload starts.
+    pub buffer: Vec<u8>,
+}
+
+/// Inputs that control one feedback upload to Sentry.
+///
+/// The caller is responsible for applying any user-consent gate before setting
+/// `include_logs` or passing diagnostic attachments. This type only describes
+/// what to upload once that decision has been made.
 pub struct FeedbackUploadOptions<'a> {
     pub classification: &'a str,
     pub reason: Option<&'a str>,
     pub tags: Option<&'a BTreeMap<String, String>>,
     pub include_logs: bool,
-    pub extra_attachment_paths: &'a [PathBuf],
+    /// Generated attachments that are already buffered and safe to upload.
+    ///
+    /// These are included after `codex-logs.log` and before path-backed rollout
+    /// attachments. They are only passed by the caller after any user consent
+    /// gate has decided logs and diagnostics should be uploaded.
+    pub extra_attachments: &'a [FeedbackAttachment],
+    pub extra_attachment_paths: &'a [FeedbackAttachmentPath],
     pub session_source: Option<SessionSource>,
     pub logs_override: Option<Vec<u8>>,
 }
@@ -438,6 +474,7 @@ impl FeedbackSnapshot {
 
         for attachment in self.feedback_attachments(
             options.include_logs,
+            options.extra_attachments,
             options.extra_attachment_paths,
             options.logs_override,
         ) {
@@ -501,7 +538,8 @@ impl FeedbackSnapshot {
     fn feedback_attachments(
         &self,
         include_logs: bool,
-        extra_attachment_paths: &[PathBuf],
+        extra_attachments: &[FeedbackAttachment],
+        extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
     ) -> Vec<sentry::protocol::Attachment> {
         use sentry::protocol::Attachment;
@@ -517,6 +555,13 @@ impl FeedbackSnapshot {
             });
         }
 
+        attachments.extend(extra_attachments.iter().map(|attachment| Attachment {
+            buffer: attachment.buffer.clone(),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            ty: None,
+        }));
+
         if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs) {
             attachments.push(Attachment {
                 buffer: text.into_bytes(),
@@ -526,22 +571,28 @@ impl FeedbackSnapshot {
             });
         }
 
-        for path in extra_attachment_paths {
-            let data = match fs::read(path) {
+        for attachment_path in extra_attachment_paths {
+            let data = match fs::read(&attachment_path.path) {
                 Ok(data) => data,
                 Err(err) => {
                     tracing::warn!(
-                        path = %path.display(),
+                        path = %attachment_path.path.display(),
                         error = %err,
                         "failed to read log attachment; skipping"
                     );
                     continue;
                 }
             };
-            let filename = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "extra-log.log".to_string());
+            let filename = attachment_path
+                .attachment_filename_override
+                .clone()
+                .unwrap_or_else(|| {
+                    attachment_path
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "extra-log.log".to_string())
+                });
             attachments.push(Attachment {
                 buffer: data,
                 filename,
@@ -676,6 +727,10 @@ mod tests {
     fn feedback_attachments_gate_connectivity_diagnostics() {
         let extra_filename = format!("codex-feedback-extra-{}.jsonl", ThreadId::new());
         let extra_path = std::env::temp_dir().join(&extra_filename);
+        let extra_attachment_path = FeedbackAttachmentPath {
+            path: extra_path.clone(),
+            attachment_filename_override: None,
+        };
         fs::write(&extra_path, "rollout").expect("extra attachment should be written");
 
         let snapshot_with_diagnostics = CodexFeedback::new()
@@ -688,7 +743,12 @@ mod tests {
 
         let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
             /*include_logs*/ true,
-            std::slice::from_ref(&extra_path),
+            &[FeedbackAttachment {
+                filename: DOCTOR_REPORT_ATTACHMENT_FILENAME.to_string(),
+                content_type: Some("application/json".to_string()),
+                buffer: b"{\"overallStatus\":\"ok\"}".to_vec(),
+            }],
+            std::slice::from_ref(&extra_attachment_path),
             Some(vec![1]),
         );
 
@@ -699,6 +759,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "codex-logs.log",
+                DOCTOR_REPORT_ATTACHMENT_FILENAME,
                 FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
                 extra_filename.as_str()
             ]
@@ -706,16 +767,21 @@ mod tests {
         assert_eq!(attachments_with_diagnostics[0].buffer, vec![1]);
         assert_eq!(
             attachments_with_diagnostics[1].buffer,
+            b"{\"overallStatus\":\"ok\"}".to_vec()
+        );
+        assert_eq!(
+            attachments_with_diagnostics[2].buffer,
             b"Connectivity diagnostics\n\n- Proxy environment variables are set and may affect connectivity.\n  - HTTPS_PROXY = https://example.com:443".to_vec()
         );
-        assert_eq!(attachments_with_diagnostics[2].buffer, b"rollout".to_vec());
+        assert_eq!(attachments_with_diagnostics[3].buffer, b"rollout".to_vec());
         assert_eq!(
-            OsStr::new(attachments_with_diagnostics[2].filename.as_str()),
+            OsStr::new(attachments_with_diagnostics[3].filename.as_str()),
             OsStr::new(extra_filename.as_str())
         );
         let attachments_without_diagnostics = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
-            .feedback_attachments(/*include_logs*/ true, &[], Some(vec![1]));
+            .with_feedback_diagnostics(FeedbackDiagnostics::default())
+            .feedback_attachments(/*include_logs*/ true, &[], &[], Some(vec![1]));
 
         assert_eq!(
             attachments_without_diagnostics
@@ -740,6 +806,7 @@ mod tests {
         tags.insert("cli_version".to_string(), "wrong-version".to_string());
         tags.insert("session_source".to_string(), "wrong-source".to_string());
         tags.insert("reason".to_string(), "wrong-reason".to_string());
+        tags.insert("account_id".to_string(), "actual-account".to_string());
         tags.insert("model".to_string(), "gpt-5".to_string());
         let snapshot = FeedbackSnapshot {
             bytes: Vec::new(),
@@ -791,6 +858,10 @@ mod tests {
         assert_eq!(
             upload_tags.get("reason").map(String::as_str),
             Some("actual reason")
+        );
+        assert_eq!(
+            upload_tags.get("account_id").map(String::as_str),
+            Some("actual-account")
         );
         assert_eq!(
             upload_tags.get("client_tag").map(String::as_str),

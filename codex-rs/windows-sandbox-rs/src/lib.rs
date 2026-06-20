@@ -5,6 +5,46 @@
 #[cfg(any(target_os = "windows", test))]
 mod ssh_config_dependencies;
 
+use std::fmt;
+use std::sync::Arc;
+
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
+
+/// Cancellation hook used by Windows sandbox capture backends.
+#[derive(Clone)]
+pub struct WindowsSandboxCancellationToken {
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl WindowsSandboxCancellationToken {
+    /// Creates a token backed by a cancellation predicate.
+    pub fn new(is_cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            is_cancelled: Arc::new(is_cancelled),
+        }
+    }
+
+    /// Returns whether the caller has requested cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        (self.is_cancelled)()
+    }
+}
+
+impl fmt::Debug for WindowsSandboxCancellationToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowsSandboxCancellationToken")
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn resolve_windows_deny_read_paths(
+    _policy: &FileSystemSandboxPolicy,
+    _cwd: &AbsolutePathBuf,
+) -> Result<Vec<AbsolutePathBuf>, String> {
+    Ok(Vec::new())
+}
+
 macro_rules! windows_modules {
     ($($name:ident),+ $(,)?) => {
         $(#[cfg(target_os = "windows")] mod $name;)+
@@ -108,6 +148,8 @@ pub use elevated_impl::ElevatedSandboxCaptureRequest;
 pub use elevated_impl::run_windows_sandbox_capture as run_windows_sandbox_capture_elevated;
 #[cfg(target_os = "windows")]
 pub use helper_materialization::resolve_current_exe_for_launch;
+#[cfg(target_os = "windows")]
+pub use helper_materialization::resolve_exe_for_launch;
 #[cfg(target_os = "windows")]
 pub use hide_users::hide_current_user_profile_dir;
 #[cfg(target_os = "windows")]

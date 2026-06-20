@@ -25,8 +25,7 @@ use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
-use codex_features::Feature;
-use codex_prompts::HIERARCHICAL_AGENTS_MESSAGE;
+use codex_extension_api::UserInstructions;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::io;
@@ -42,111 +41,34 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
-/// Resolves AGENTS.md files into model-visible user instructions and source
-/// paths.
-pub struct AgentsMdManager<'a> {
-    config: &'a Config,
-}
-
-pub(crate) struct LoadedAgentsMd {
-    pub(crate) contents: String,
-    pub(crate) path: AbsolutePathBuf,
-}
-
-impl<'a> AgentsMdManager<'a> {
-    pub fn new(config: &'a Config) -> Self {
-        Self { config }
-    }
-
-    pub(crate) fn load_global_instructions(
-        codex_dir: Option<&AbsolutePathBuf>,
-    ) -> Option<LoadedAgentsMd> {
-        let base = codex_dir?;
-        for candidate in [LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME] {
-            let path = base.join(candidate);
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    return Some(LoadedAgentsMd {
-                        contents: trimmed.to_string(),
-                        path,
-                    });
-                }
-            }
-        }
-        None
-    }
-
-    /// Combines configured user instructions and AGENTS.md content into a
-    /// single model-visible instruction string.
-    pub(crate) async fn user_instructions(
-        &self,
-        environment: Option<&Environment>,
-    ) -> Option<String> {
-        let fs = environment?.get_filesystem();
-        self.user_instructions_with_fs(fs.as_ref()).await
-    }
-
-    pub(crate) async fn user_instructions_with_fs(
-        &self,
-        fs: &dyn ExecutorFileSystem,
-    ) -> Option<String> {
-        let agents_md_docs = self.read_agents_md(fs).await;
-
-        let mut output = String::new();
-
-        if let Some(instructions) = self.config.user_instructions.clone() {
-            output.push_str(&instructions);
-        }
-
-        match agents_md_docs {
-            Ok(Some(docs)) => {
-                if !output.is_empty() {
-                    output.push_str(AGENTS_MD_SEPARATOR);
-                }
-                output.push_str(&docs);
-            }
+/// Loads project AGENTS.md content and combines it with host-provided user
+/// instructions.
+pub(crate) async fn load_project_instructions(
+    config: &Config,
+    user_instructions: Option<UserInstructions>,
+    environments: &TurnEnvironmentSnapshot,
+) -> Option<LoadedAgentsMd> {
+    let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
+    for turn_environment in &environments.turn_environments {
+        let filesystem = turn_environment.environment.get_filesystem();
+        match read_agents_md(
+            config,
+            filesystem.as_ref(),
+            &turn_environment.environment_id,
+            turn_environment.cwd(),
+        )
+        .await
+        {
+            Ok(Some(docs)) => loaded.entries.extend(docs.entries),
             Ok(None) => {}
             Err(e) => {
-                error!("error trying to find AGENTS.md docs: {e:#}");
-            }
-        };
-
-        if self.config.features.enabled(Feature::ChildAgentsMd) {
-            if !output.is_empty() {
-                output.push_str("\n\n");
-            }
-            output.push_str(HIERARCHICAL_AGENTS_MESSAGE);
-        }
-
-        if !output.is_empty() {
-            Some(output)
-        } else {
-            None
-        }
-    }
-
-    /// Returns all instruction source files included in the current config.
-    pub async fn instruction_sources(&self, fs: &dyn ExecutorFileSystem) -> Vec<AbsolutePathBuf> {
-        let mut paths = Self::load_global_instructions(Some(&self.config.codex_home))
-            .map(|loaded| vec![loaded.path])
-            .unwrap_or_default();
-        match self.agents_md_paths(fs).await {
-            Ok(agents_md_paths) => paths.extend(agents_md_paths),
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to discover AGENTS.md docs for instruction sources");
+                error!(
+                    environment_id = turn_environment.environment_id,
+                    "error trying to find AGENTS.md docs: {e:#}"
+                );
             }
         }
     }
-
-    /// Attempt to locate and load AGENTS.md documentation.
-    ///
-    /// On success returns `Ok(Some(contents))` where `contents` is the
-    /// concatenation of all discovered docs. If no documentation file is found
-    /// the function returns `Ok(None)`. Unexpected I/O failures bubble up as
-    /// `Err` so callers can decide how to handle them.
-    async fn read_agents_md(&self, fs: &dyn ExecutorFileSystem) -> io::Result<Option<String>> {
-        let max_total = self.config.project_doc_max_bytes;
 
     (!loaded.is_empty()).then_some(loaded)
 }
@@ -161,7 +83,7 @@ async fn read_agents_md(
     config: &Config,
     fs: &dyn ExecutorFileSystem,
     environment_id: &str,
-    cwd: &AbsolutePathBuf,
+    cwd: &PathUri,
 ) -> io::Result<Option<LoadedAgentsMd>> {
     let max_total = config.project_doc_max_bytes;
 
@@ -182,15 +104,14 @@ async fn read_agents_md(
             break;
         }
 
-        let path_uri = PathUri::from_abs_path(&p);
-        match fs.get_metadata(&path_uri, /*sandbox*/ None).await {
+        match fs.get_metadata(&p, /*sandbox*/ None).await {
             Ok(metadata) if !metadata.is_file => continue,
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         }
 
-        let mut data = match fs.read_file(&path_uri, /*sandbox*/ None).await {
+        let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
             Ok(data) => data,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
@@ -202,9 +123,9 @@ async fn read_agents_md(
 
         if size > remaining {
             tracing::warn!(
-                "Project doc `{}` exceeds remaining budget ({} bytes) - truncating.",
-                p.display(),
-                remaining,
+                path = %p,
+                remaining_bytes = remaining,
+                "project doc exceeds remaining budget; truncating"
             );
         }
 
@@ -233,9 +154,9 @@ async fn read_agents_md(
 /// directory, inclusive. Symlinks are allowed.
 async fn agents_md_paths(
     config: &Config,
-    cwd: &AbsolutePathBuf,
+    cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
-) -> io::Result<Vec<AbsolutePathBuf>> {
+) -> io::Result<Vec<PathUri>> {
     let dir = cwd.clone();
 
     let mut merged = TomlValue::Table(toml::map::Map::new());
@@ -258,18 +179,18 @@ async fn agents_md_paths(
     };
     let mut project_root = None;
     if !project_root_markers.is_empty() {
-        for ancestor in dir.ancestors() {
+        for current in dir.ancestors() {
             for marker in &project_root_markers {
-                let marker_path = ancestor.join(marker);
-                let marker_path_uri = PathUri::from_abs_path(&marker_path);
-                let marker_exists = match fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await
-                {
+                let marker_path = current
+                    .join(marker)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                let marker_exists = match fs.get_metadata(&marker_path, /*sandbox*/ None).await {
                     Ok(_) => true,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => false,
                     Err(err) => return Err(err),
                 };
                 if marker_exists {
-                    project_root = Some(ancestor.clone());
+                    project_root = Some(current.clone());
                     break;
                 }
             }
@@ -279,7 +200,7 @@ async fn agents_md_paths(
         }
     }
 
-    let search_dirs: Vec<AbsolutePathBuf> = if let Some(root) = project_root {
+    let search_dirs: Vec<PathUri> = if let Some(root) = project_root {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
         loop {
@@ -298,13 +219,14 @@ async fn agents_md_paths(
         vec![dir]
     };
 
-    let mut found: Vec<AbsolutePathBuf> = Vec::new();
+    let mut found: Vec<PathUri> = Vec::new();
     let candidate_filenames = candidate_filenames(config);
     for d in search_dirs {
         for name in &candidate_filenames {
-            let candidate = d.join(name);
-            let candidate_uri = PathUri::from_abs_path(&candidate);
-            match fs.get_metadata(&candidate_uri, /*sandbox*/ None).await {
+            let candidate = d
+                .join(name)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
                 Ok(md) if md.is_file => {
                     found.push(candidate);
                     break;
@@ -313,36 +235,6 @@ async fn agents_md_paths(
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
             }
-
-            let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
-                Ok(data) => data,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err),
-            };
-            let size = data.len() as u64;
-            if size > remaining {
-                data.truncate(remaining as usize);
-            }
-
-            if size > remaining {
-                tracing::warn!(
-                    "Project doc `{}` exceeds remaining budget ({} bytes) - truncating.",
-                    p.display(),
-                    remaining,
-                );
-            }
-
-            let text = String::from_utf8_lossy(&data).to_string();
-            if !text.trim().is_empty() {
-                parts.push(text);
-                remaining = remaining.saturating_sub(data.len() as u64);
-            }
-        }
-
-        if parts.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(parts.join("\n\n")))
         }
     }
 
@@ -465,7 +357,7 @@ impl LoadedAgentsMd {
     fn environment_labeled_text(&self) -> String {
         let mut output = String::new();
         let mut has_previous = false;
-        let mut previous_environment: Option<(&str, &AbsolutePathBuf)> = None;
+        let mut previous_environment: Option<(&str, &PathUri)> = None;
         if let Some(instructions) = &self.user_instructions {
             output.push_str(&instructions.text);
             has_previous = true;
@@ -488,7 +380,7 @@ impl LoadedAgentsMd {
                         output.push_str(&format!(
                             "for `{}` with root {}\n\n",
                             environment_id,
-                            cwd.display()
+                            cwd.inferred_native_path_string()
                         ));
                     }
                     output.push_str(&entry.contents);
@@ -515,7 +407,7 @@ impl LoadedAgentsMd {
             None
         } else {
             self.single_project_cwd()
-                .map(|cwd| cwd.to_string_lossy().into_owned())
+                .map(PathUri::inferred_native_path_string)
         };
         ContextUserInstructions {
             directory,
@@ -530,10 +422,10 @@ impl LoadedAgentsMd {
     }
 
     /// Returns the AGENTS.md files that supplied instruction entries.
-    pub fn sources(&self) -> impl Iterator<Item = &AbsolutePathBuf> {
+    pub fn sources(&self) -> impl Iterator<Item = PathUri> + '_ {
         self.user_instructions
             .iter()
-            .map(|instructions| &instructions.source)
+            .map(|instructions| PathUri::from_abs_path(&instructions.source))
             .chain(
                 self.entries
                     .iter()
@@ -557,13 +449,46 @@ impl LoadedAgentsMd {
         })
     }
 
-    fn single_project_cwd(&self) -> Option<&AbsolutePathBuf> {
+    fn single_project_cwd(&self) -> Option<&PathUri> {
         self.entries
             .iter()
             .find_map(|entry| match &entry.provenance {
                 InstructionProvenance::Project { cwd, .. } => Some(cwd),
                 InstructionProvenance::Internal => None,
             })
+    }
+}
+
+/// One model-visible instruction and its provenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstructionEntry {
+    /// Model-visible instruction text.
+    contents: String,
+
+    /// Origin of the instruction.
+    provenance: InstructionProvenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstructionProvenance {
+    /// Workspace instructions discovered from project AGENTS.md files.
+    Project {
+        /// Exact AGENTS.md file, distinct from the environment's selected cwd.
+        source_path: PathUri,
+        environment_id: String,
+        cwd: PathUri,
+    },
+
+    /// Instructions without a file source, including internally defined guidance.
+    Internal,
+}
+
+impl InstructionProvenance {
+    fn path(&self) -> Option<PathUri> {
+        match self {
+            Self::Project { source_path, .. } => Some(source_path.clone()),
+            Self::Internal => None,
+        }
     }
 }
 

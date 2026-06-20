@@ -46,30 +46,28 @@ use std::path::PathBuf;
 
 fn disabled_plan_turn(
     text: &str,
-    model: String,
+    _model: String,
     collaboration_mode: CollaborationMode,
 ) -> anyhow::Result<Op> {
     let cwd = std::env::current_dir()?.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-    Ok(Op::UserTurn {
-        environments: None,
+    Ok(Op::UserInput {
         items: vec![UserInput::Text {
             text: text.into(),
             text_elements: Vec::new(),
         }],
         final_output_json_schema: None,
-        cwd,
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
-        permission_profile,
-        model,
-        effort: None,
-        summary: None,
-        service_tier: None,
-        collaboration_mode: Some(collaboration_mode),
-        personality: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(local_selections(cwd)),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile,
+            collaboration_mode: Some(collaboration_mode),
+            ..Default::default()
+        },
     })
 }
 
@@ -122,6 +120,8 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
             items: vec![expected_input.clone()],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -179,6 +179,8 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -238,6 +240,8 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -298,9 +302,20 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
+    let started = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::WebSearch(item),
+            started_at_ms,
+            ..
+        }) => Some((item.clone(), *started_at_ms)),
+        _ => None,
+    })
+    .await;
     let begin = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::WebSearchBegin(event) => Some(event.clone()),
         _ => None,
@@ -309,16 +324,20 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     let completed = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::ItemCompleted(ItemCompletedEvent {
             item: TurnItem::WebSearch(item),
+            completed_at_ms,
             ..
-        }) => Some(item.clone()),
+        }) => Some((item.clone(), *completed_at_ms)),
         _ => None,
     })
     .await;
 
     assert_eq!(begin.call_id, "web-search-1");
-    assert_eq!(completed.id, begin.call_id);
+    assert_eq!(started.0.id, begin.call_id);
+    assert!(started.1 > 0);
+    assert_eq!(completed.0.id, begin.call_id);
+    assert!(completed.1 > 0);
     assert_eq!(
-        completed.action,
+        completed.0.action,
         WebSearchAction::Search {
             query: Some("weather seattle".to_string()),
             queries: None,
@@ -329,7 +348,7 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
+async fn builtin_image_generation_call_persisted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -343,14 +362,14 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
     let call_id = "ig_image_saved_to_temp_dir_default";
     let expected_saved_path = image_generation_artifact_path(
         config.codex_home.as_path(),
-        &session_configured.session_id.to_string(),
+        &session_configured.thread_id.to_string(),
         call_id,
     );
     let _ = std::fs::remove_file(&expected_saved_path);
 
     let first_response = sse(vec![
         ev_response_created("resp-1"),
-        ev_image_generation_call(call_id, "completed", "A tiny blue square", "Zm9v"),
+        ev_image_generation_call(call_id, "generating", "A tiny blue square", "Zm9v"),
         ev_completed("resp-1"),
     ]);
     mount_sse_once(&server, first_response).await;
@@ -363,11 +382,31 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
+    let started = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::ImageGeneration(item),
+            started_at_ms,
+            ..
+        }) => Some((item.clone(), *started_at_ms)),
+        _ => None,
+    })
+    .await;
     let begin = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::ImageGenerationBegin(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    let completed = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::ImageGeneration(item),
+            completed_at_ms,
+            ..
+        }) => Some((item.clone(), *completed_at_ms)),
         _ => None,
     })
     .await;
@@ -378,8 +417,12 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
     .await;
 
     assert_eq!(begin.call_id, call_id);
+    assert_eq!(started.0.id, call_id);
+    assert!(started.1 > 0);
+    assert_eq!(completed.0.id, call_id);
+    assert!(completed.1 > 0);
     assert_eq!(end.call_id, call_id);
-    assert_eq!(end.status, "completed");
+    assert_eq!(end.status, "generating");
     assert_eq!(end.revised_prompt, Some("A tiny blue square".to_string()));
     assert_eq!(end.result, "Zm9v");
     assert_eq!(
@@ -406,7 +449,7 @@ async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyho
     } = test_codex().build(&server).await?;
     let expected_saved_path = image_generation_artifact_path(
         config.codex_home.as_path(),
-        &session_configured.session_id.to_string(),
+        &session_configured.thread_id.to_string(),
         "ig_invalid",
     );
     let _ = std::fs::remove_file(&expected_saved_path);
@@ -426,6 +469,8 @@ async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyho
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -480,6 +525,8 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -498,11 +545,6 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
         _ => None,
     })
     .await;
-    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::AgentMessageDelta(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
     let completed_item = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::ItemCompleted(ItemCompletedEvent {
             item: TurnItem::AgentMessage(item),
@@ -512,12 +554,11 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
     })
     .await;
 
-    let session_id = session_configured.session_id.to_string();
-    assert_eq!(delta_event.thread_id, session_id);
+    let thread_id = session_configured.thread_id.to_string();
+    assert_eq!(delta_event.thread_id, thread_id);
     assert_eq!(delta_event.turn_id, started_turn_id);
     assert_eq!(delta_event.item_id, started_item.id);
     assert_eq!(delta_event.delta, "streamed response");
-    assert_eq!(legacy_delta.delta, "streamed response");
     assert_eq!(completed_item.id, started_item.id);
 
     Ok(())
@@ -580,7 +621,7 @@ async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<
 
     assert_eq!(
         plan_delta.thread_id,
-        session_configured.session_id.to_string()
+        session_configured.thread_id.to_string()
     );
     assert_eq!(plan_delta.delta, "- Step 1\n- Step 2\n");
     assert_eq!(plan_completed.text, "- Step 1\n- Step 2\n");
@@ -1068,6 +1109,8 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -1085,15 +1128,8 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
         _ => None,
     })
     .await;
-    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::AgentReasoningDelta(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "step one");
-    assert_eq!(legacy_delta.delta, "step one");
 
     Ok(())
 }
@@ -1128,6 +1164,8 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -1145,15 +1183,8 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
         _ => None,
     })
     .await;
-    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::AgentReasoningRawContentDelta(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "raw detail");
-    assert_eq!(legacy_delta.delta, "raw detail");
 
     Ok(())
 }

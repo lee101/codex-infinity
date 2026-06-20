@@ -21,16 +21,28 @@ use super::mantle::aws_auth_config;
 use super::mantle::region_from_config;
 
 const AWS_BEARER_TOKEN_BEDROCK_ENV_VAR: &str = "AWS_BEARER_TOKEN_BEDROCK";
-const LEGACY_SESSION_ID_HEADER: &str = "session_id";
+const AWS_REGION_ENV_VAR: &str = "AWS_REGION";
+const AWS_DEFAULT_REGION_ENV_VAR: &str = "AWS_DEFAULT_REGION";
 
-enum BedrockAuthMethod {
+pub(super) enum BedrockAuthMethod {
+    ManagedBearerToken { token: String, region: String },
     EnvBearerToken { token: String, region: String },
     AwsSdkAuth { context: AwsAuthContext },
 }
 
-async fn resolve_auth_method(aws: &ModelProviderAwsAuthInfo) -> Result<BedrockAuthMethod> {
-    if let Some(token) = bearer_token_from_env() {
-        let region = bearer_token_region_from_config(aws)?;
+pub(super) async fn resolve_auth_method(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<BedrockAuthMethod> {
+    if let Some(managed_auth) = managed_auth {
+        return Ok(BedrockAuthMethod::ManagedBearerToken {
+            token: managed_auth.api_key.clone(),
+            region: managed_auth.region.clone(),
+        });
+    }
+
+    if let Some(token) = non_empty_env_var_from(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, std::env::var) {
+        let region = bearer_token_region(aws, std::env::var)?;
         return Ok(BedrockAuthMethod::EnvBearerToken { token, region });
     }
 
@@ -58,15 +70,11 @@ pub(super) async fn resolve_provider_auth(
     }
 }
 
-pub(super) async fn resolve_region(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
-    match resolve_auth_method(aws).await? {
-        BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
-        BedrockAuthMethod::AwsSdkAuth { context, .. } => Ok(context.region().to_string()),
-    }
-}
-
-fn bearer_token_from_env() -> Option<String> {
-    std::env::var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR)
+fn non_empty_env_var_from(
+    name: &'static str,
+    env_var: impl Fn(&'static str) -> std::result::Result<String, std::env::VarError>,
+) -> Option<String> {
+    env_var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -101,10 +109,18 @@ fn aws_auth_error_to_auth_error(error: AwsAuthError) -> AuthError {
 }
 
 fn remove_headers_not_preserved_by_bedrock_mantle(headers: &mut HeaderMap) {
-    // The Bedrock Mantle front door does not preserve this legacy OpenAI header
-    // for SigV4 verification. Signing it makes the richer Codex agent request
-    // fail even though raw Responses requests work.
-    headers.remove(LEGACY_SESSION_ID_HEADER);
+    // The Bedrock Mantle front door does not preserve legacy OpenAI
+    // compatibility headers that use snake_case, such as `session_id` and
+    // `thread_id`, before SigV4 verification. Signing that header class makes
+    // richer Codex agent requests fail even though raw Responses requests work.
+    let headers_to_remove = headers
+        .keys()
+        .filter(|name| name.as_str().contains('_'))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in headers_to_remove {
+        headers.remove(name);
+    }
 }
 
 /// AWS SigV4 auth provider for Bedrock Mantle OpenAI-compatible requests.
@@ -246,10 +262,18 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_mantle_sigv4_strips_legacy_session_id_header() {
+    fn bedrock_mantle_sigv4_strips_headers_not_preserved_by_mantle() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            LEGACY_SESSION_ID_HEADER,
+            "session_id",
+            HeaderValue::from_static("019dae79-15c3-70c3-8736-3219b8602b37"),
+        );
+        headers.insert(
+            "thread_id",
+            HeaderValue::from_static("019dae79-15c3-70c3-8736-3219b8602b37"),
+        );
+        headers.insert(
+            "future_identity_header",
             HeaderValue::from_static("019dae79-15c3-70c3-8736-3219b8602b37"),
         );
         headers.insert(
@@ -259,7 +283,9 @@ mod tests {
 
         remove_headers_not_preserved_by_bedrock_mantle(&mut headers);
 
-        assert!(!headers.contains_key(LEGACY_SESSION_ID_HEADER));
+        assert!(!headers.contains_key("session_id"));
+        assert!(!headers.contains_key("thread_id"));
+        assert!(!headers.contains_key("future_identity_header"));
         assert_eq!(
             headers
                 .get("x-client-request-id")

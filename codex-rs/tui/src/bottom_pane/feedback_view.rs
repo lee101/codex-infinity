@@ -1,3 +1,4 @@
+use codex_feedback::DOCTOR_REPORT_ATTACHMENT_FILENAME;
 use codex_feedback::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackDiagnostics;
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
@@ -27,7 +28,8 @@ use super::popup_consts::standard_popup_hint_line;
 use super::textarea::TextArea;
 use super::textarea::TextAreaState;
 
-const BASE_CLI_BUG_ISSUE_URL: &str = "https://github.com/lee101/codex-infinity/issues/new";
+const BASE_CLI_BUG_ISSUE_URL: &str =
+    "https://github.com/openai/codex/issues/new?template=3-cli.yml";
 /// Internal routing link for employee feedback follow-ups. This must not be shown to external users.
 const CODEX_FEEDBACK_INTERNAL_URL: &str = "http://go/codex-feedback-internal";
 
@@ -470,6 +472,8 @@ pub(crate) fn feedback_upload_consent_params(
     app_event_tx: AppEventSender,
     category: FeedbackCategory,
     rollout_path: Option<std::path::PathBuf>,
+    auto_review_rollout_filename: Option<String>,
+    include_windows_sandbox_log: bool,
     feedback_diagnostics: &FeedbackDiagnostics,
 ) -> super::SelectionViewParams {
     use super::popup_consts::standard_popup_hint_line;
@@ -501,6 +505,11 @@ pub(crate) fn feedback_upload_consent_params(
         Line::from("").into(),
         Line::from("The following files will be sent:".dim()).into(),
         Line::from(vec!["  • ".into(), "codex-logs.log".into()]).into(),
+        Line::from(vec![
+            "  • ".into(),
+            DOCTOR_REPORT_ATTACHMENT_FILENAME.into(),
+        ])
+        .into(),
     ];
     if include_windows_sandbox_log {
         header_lines.push(
@@ -515,6 +524,9 @@ pub(crate) fn feedback_upload_consent_params(
         && let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string())
     {
         header_lines.push(Line::from(vec!["  • ".into(), name.into()]).into());
+    }
+    if let Some(filename) = auto_review_rollout_filename {
+        header_lines.push(Line::from(vec!["  • ".into(), filename.into()]).into());
     }
     if !feedback_diagnostics.is_empty() {
         header_lines.push(
@@ -543,7 +555,7 @@ pub(crate) fn feedback_upload_consent_params(
             super::SelectionItem {
                 name: "Yes".to_string(),
                 description: Some(
-                    "Share the current Codex session logs with the team for troubleshooting."
+                    "Share the current Codex session logs and diagnostics with the team for troubleshooting."
                         .to_string(),
                 ),
                 actions: vec![yes_action],
@@ -577,7 +589,18 @@ mod tests {
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
+        render_buffer(area, &buf)
+    }
 
+    fn render_renderable(renderable: &dyn Renderable, width: u16) -> String {
+        let height = renderable.desired_height(width);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        renderable.render(area, &mut buf);
+        render_buffer(area, &buf)
+    }
+
+    fn render_buffer(area: Rect, buf: &Buffer) -> String {
         let mut lines: Vec<String> = (0..area.height)
             .map(|row| {
                 let mut line = String::new();
@@ -673,6 +696,45 @@ mod tests {
         let rendered = render(&view, /*width*/ 60);
 
         insta::assert_snapshot!("feedback_view_with_connectivity_diagnostics", rendered);
+    }
+
+    #[test]
+    fn feedback_upload_consent_lists_doctor_report() {
+        let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let params = feedback_upload_consent_params(
+            tx,
+            FeedbackCategory::Bug,
+            Some(std::path::PathBuf::from("rollout.jsonl")),
+            Some("auto-review-rollout.jsonl".to_string()),
+            /*include_windows_sandbox_log*/ false,
+            &FeedbackDiagnostics::default(),
+        );
+
+        let rendered = render_renderable(params.header.as_ref(), /*width*/ 60);
+
+        insta::assert_snapshot!("feedback_upload_consent_lists_doctor_report", rendered);
+    }
+
+    #[test]
+    fn feedback_upload_consent_lists_windows_sandbox_log_when_included() {
+        let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let params = feedback_upload_consent_params(
+            tx,
+            FeedbackCategory::Bug,
+            Some(std::path::PathBuf::from("rollout.jsonl")),
+            Some("auto-review-rollout.jsonl".to_string()),
+            /*include_windows_sandbox_log*/ true,
+            &FeedbackDiagnostics::default(),
+        );
+
+        let rendered = render_renderable(params.header.as_ref(), /*width*/ 60);
+
+        insta::assert_snapshot!(
+            "feedback_upload_consent_lists_windows_sandbox_log_when_included",
+            rendered
+        );
     }
 
     #[test]

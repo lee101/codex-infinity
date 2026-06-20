@@ -67,6 +67,7 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
             originator: "test_originator".to_string(),
             cli_version: "test_version".to_string(),
             source: SessionSource::Cli,
+            thread_source: None,
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
@@ -90,6 +91,7 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
             images: None,
             local_images: Vec::new(),
             text_elements: Vec::new(),
+            ..Default::default()
         })),
     };
 
@@ -115,6 +117,7 @@ async fn write_rollout_with_meta_only(dir: &Path, thread_id: ThreadId) -> io::Re
             originator: "test_originator".to_string(),
             cli_version: "test_version".to_string(),
             source: SessionSource::Cli,
+            thread_source: None,
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
@@ -146,7 +149,8 @@ async fn migration_marker_exists_no_sessions_no_change() -> io::Result<()> {
     let marker_path = temp.path().join(PERSONALITY_MIGRATION_FILENAME);
     tokio::fs::write(&marker_path, "v1\n").await?;
 
-    let status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::SkippedMarker);
     assert_eq!(
@@ -160,7 +164,8 @@ async fn migration_marker_exists_no_sessions_no_change() -> io::Result<()> {
 async fn no_marker_no_sessions_no_change() -> io::Result<()> {
     let temp = TempDir::new()?;
 
-    let status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
     assert_eq!(
@@ -179,7 +184,8 @@ async fn no_marker_sessions_sets_personality() -> io::Result<()> {
     let temp = TempDir::new()?;
     write_session_with_user_event(temp.path()).await?;
 
-    let status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::Applied);
     assert_eq!(
@@ -199,7 +205,7 @@ async fn no_marker_sessions_preserves_existing_config_fields() -> io::Result<()>
     tokio::fs::write(temp.path().join("config.toml"), "model = \"gpt-5.4\"\n").await?;
     let config_toml = read_config_toml(temp.path()).await?;
 
-    let status = maybe_migrate_personality(temp.path(), &config_toml).await?;
+    let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::Applied);
     let persisted = read_config_toml(temp.path()).await?;
@@ -213,7 +219,8 @@ async fn no_marker_meta_only_rollout_is_treated_as_no_sessions() -> io::Result<(
     let temp = TempDir::new()?;
     write_session_with_meta_only(temp.path()).await?;
 
-    let status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
     assert_eq!(
@@ -233,7 +240,7 @@ async fn no_marker_explicit_global_personality_skips_migration() -> io::Result<(
     write_session_with_user_event(temp.path()).await?;
     let config_toml = parse_config_toml("personality = \"friendly\"\n")?;
 
-    let status = maybe_migrate_personality(temp.path(), &config_toml).await?;
+    let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
 
     assert_eq!(
         status,
@@ -263,7 +270,7 @@ personality = "friendly"
 "#,
     )?;
 
-    let status = maybe_migrate_personality(temp.path(), &config_toml).await?;
+    let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::Applied);
     assert_eq!(
@@ -285,7 +292,7 @@ async fn marker_short_circuits_migration_with_legacy_profile() -> io::Result<()>
     tokio::fs::write(temp.path().join(PERSONALITY_MIGRATION_FILENAME), "v1\n").await?;
     let config_toml = parse_config_toml("profile = \"missing\"\n")?;
 
-    let status = maybe_migrate_personality(temp.path(), &config_toml).await?;
+    let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::SkippedMarker);
     Ok(())
@@ -296,9 +303,7 @@ async fn missing_legacy_profile_does_not_block_migration() -> io::Result<()> {
     let temp = TempDir::new()?;
     let config_toml = parse_config_toml("profile = \"missing\"\n")?;
 
-    let err = maybe_migrate_personality(temp.path(), &config_toml)
-        .await
-        .expect_err("missing profile should fail");
+    let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
     assert_eq!(
@@ -313,8 +318,10 @@ async fn applied_migration_is_idempotent_on_second_run() -> io::Result<()> {
     let temp = TempDir::new()?;
     write_session_with_user_event(temp.path()).await?;
 
-    let first_status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
-    let second_status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let first_status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+    let second_status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(first_status, PersonalityMigrationStatus::Applied);
     assert_eq!(second_status, PersonalityMigrationStatus::SkippedMarker);
@@ -328,7 +335,8 @@ async fn no_marker_archived_sessions_sets_personality() -> io::Result<()> {
     let temp = TempDir::new()?;
     write_archived_session_with_user_event(temp.path()).await?;
 
-    let status = maybe_migrate_personality(temp.path(), &ConfigToml::default()).await?;
+    let status =
+        maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
 
     assert_eq!(status, PersonalityMigrationStatus::Applied);
     assert_eq!(

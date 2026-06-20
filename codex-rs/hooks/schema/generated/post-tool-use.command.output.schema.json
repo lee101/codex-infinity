@@ -8,17 +8,6 @@
       ],
       "type": "string"
     },
-    "HookEventNameWire": {
-      "enum": [
-        "PreToolUse",
-        "PermissionRequest",
-        "PostToolUse",
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop"
-      ],
-      "type": "string"
-    },
     "PostToolUseHookSpecificOutputWire": {
       "additionalProperties": false,
       "properties": {

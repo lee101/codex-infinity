@@ -7,6 +7,7 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
+use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -40,7 +41,7 @@ pub(crate) async fn apply_patch(
         turn_context.approval_policy.value(),
         &turn_context.permission_profile(),
         file_system_sandbox_policy,
-        &turn_context.cwd,
+        &action.cwd,
         turn_context.windows_sandbox_level,
     ) {
         SafetyCheck::AutoApprove {
@@ -76,11 +77,10 @@ pub(crate) async fn apply_patch(
 pub(crate) fn convert_apply_patch_to_protocol(
     action: &ApplyPatchAction,
 ) -> HashMap<PathBuf, FileChange> {
-    let changes = action.changes();
-    let mut result = HashMap::with_capacity(changes.len());
-    for (path, change) in changes {
+    let mut result = HashMap::with_capacity(action.changes().len());
+    for (path, change) in action.changes() {
         let protocol_change = match change {
-            ApplyPatchFileChange::Add { content } => FileChange::Add {
+            ApplyPatchFileChange::Add { content, .. } => FileChange::Add {
                 content: content.clone(),
             },
             ApplyPatchFileChange::Delete { content } => FileChange::Delete {
@@ -92,10 +92,12 @@ pub(crate) fn convert_apply_patch_to_protocol(
                 new_content: _new_content,
             } => FileChange::Update {
                 unified_diff: unified_diff.clone(),
-                move_path: move_path.clone(),
+                move_path: move_path.as_ref().map(PathUri::to_path_buf),
             },
         };
-        result.insert(path.clone(), protocol_change);
+        // TODO(anp): Carry PathUri through patch protocol events once app-server and rollout
+        // compatibility no longer require path-flavored strings.
+        result.insert(path.to_path_buf(), protocol_change);
     }
     result
 }

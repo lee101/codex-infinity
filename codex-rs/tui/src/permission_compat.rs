@@ -2,8 +2,6 @@
 //! legacy shapes still required by older or remote app-server APIs.
 
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
 
@@ -16,18 +14,7 @@ pub(crate) fn legacy_compatible_permission_profile(
     }
 
     let file_system_policy = permission_profile.file_system_sandbox_policy();
-    compatibility_workspace_write_profile(
-        &file_system_policy,
-        permission_profile.network_sandbox_policy(),
-        cwd,
-    )
-}
-
-fn compatibility_workspace_write_profile(
-    file_system_policy: &FileSystemSandboxPolicy,
-    network_policy: NetworkSandboxPolicy,
-    cwd: &Path,
-) -> PermissionProfile {
+    let network_policy = permission_profile.network_sandbox_policy();
     let cwd_abs = AbsolutePathBuf::from_absolute_path(cwd).ok();
     let writable_roots = file_system_policy
         .get_writable_roots_with_cwd(cwd)
@@ -62,13 +49,15 @@ mod tests {
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
     use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use pretty_assertions::assert_eq;
 
     #[test]
     fn compatibility_profile_preserves_unbridgeable_write_roots() {
         let cwd = AbsolutePathBuf::try_from("/workspace/project").expect("absolute cwd");
         let extra_root = AbsolutePathBuf::try_from("/workspace/extra").expect("absolute root");
-        let permission_profile = PermissionProfile::Managed {
+        let permission_profile: PermissionProfile = PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Restricted,
             file_system: ManagedFileSystemPermissions::Restricted {
                 entries: vec![
                     FileSystemSandboxEntry {
@@ -86,7 +75,6 @@ mod tests {
                 ],
                 glob_scan_max_depth: None,
             },
-            network: NetworkSandboxPolicy::Restricted,
         };
 
         let compatibility_profile =

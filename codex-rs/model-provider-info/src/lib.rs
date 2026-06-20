@@ -34,24 +34,15 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
-const GEMINI_PROVIDER_NAME: &str = "Google Gemini";
-pub const GEMINI_PROVIDER_ID: &str = "gemini";
-const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
-pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
-const OPENPATHS_PROVIDER_NAME: &str = "OpenPaths";
-pub const OPENPATHS_PROVIDER_ID: &str = "openpaths";
-pub const CURSOR_PROVIDER_NAME: &str = "Cursor";
-pub const CURSOR_PROVIDER_ID: &str = "cursor";
-const ZHIPU_PROVIDER_NAME: &str = "Z.AI (Zhipu)";
-pub const ZHIPU_PROVIDER_ID: &str = "zhipu";
-const DEEPSEEK_PROVIDER_NAME: &str = "DeepSeek";
-pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
-const CEREBRAS_PROVIDER_NAME: &str = "Cerebras";
-pub const CEREBRAS_PROVIDER_ID: &str = "cerebras";
+pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
+pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -253,7 +244,7 @@ impl ModelProviderInfo {
                     | AuthMode::PersonalAccessToken
             )
         ) {
-            "https://chatgpt.com/backend-api/codex"
+            CHATGPT_CODEX_BASE_URL
         } else {
             "https://api.openai.com/v1"
         };
@@ -367,172 +358,6 @@ impl ModelProviderInfo {
         }
     }
 
-    pub fn create_gemini_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: GEMINI_PROVIDER_NAME.into(),
-            base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
-            env_key: Some("GEMINI_API_KEY".into()),
-            env_key_instructions: None,
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_openrouter_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: OPENROUTER_PROVIDER_NAME.into(),
-            base_url: Some("https://openrouter.ai/api/v1".into()),
-            env_key: Some("OPENROUTER_API_KEY".into()),
-            env_key_instructions: None,
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_openpaths_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: OPENPATHS_PROVIDER_NAME.into(),
-            base_url: Some(openpaths_base_url()),
-            env_key: Some("OPENPATHS_API_KEY".into()),
-            env_key_instructions: Some(
-                "Get your API key from https://openpaths.io and set OPENPATHS_API_KEY".into(),
-            ),
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_cursor_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: CURSOR_PROVIDER_NAME.into(),
-            base_url: Some(cursor_base_url()),
-            env_key: Some("CURSOR_API_KEY".into()),
-            env_key_instructions: Some(
-                "Get your API key from https://cursor.com/dashboard/integrations and set CURSOR_API_KEY"
-                    .into(),
-            ),
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_zhipu_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: ZHIPU_PROVIDER_NAME.into(),
-            base_url: Some("https://api.z.ai/api/coding/paas/v4".into()),
-            env_key: Some("ZAI_API_KEY".into()),
-            env_key_instructions: Some(
-                "Get your API key from https://z.ai and set ZAI_API_KEY".into(),
-            ),
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_cerebras_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: CEREBRAS_PROVIDER_NAME.into(),
-            base_url: Some(cerebras_base_url()),
-            env_key: Some("CEREBRAS_API_KEY".into()),
-            env_key_instructions: Some(
-                "Get your API key from https://cloud.cerebras.ai and set CEREBRAS_API_KEY".into(),
-            ),
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn create_deepseek_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: DEEPSEEK_PROVIDER_NAME.into(),
-            base_url: Some("https://api.deepseek.com/v1".into()),
-            env_key: Some("DEEPSEEK_API_KEY".into()),
-            env_key_instructions: Some(
-                "Get your API key from https://platform.deepseek.com and set DEEPSEEK_API_KEY"
-                    .into(),
-            ),
-            experimental_bearer_token: None,
-            auth: None,
-            wire_api: WireApi::Responses,
-            query_params: None,
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: None,
-            stream_max_retries: None,
-            stream_idle_timeout_ms: None,
-            websocket_connect_timeout_ms: None,
-            requires_openai_auth: false,
-            supports_websockets: false,
-            ..Default::default()
-        }
-    }
-
     pub fn create_amazon_bedrock_provider(
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
@@ -549,7 +374,10 @@ impl ModelProviderInfo {
             })),
             wire_api: WireApi::Responses,
             query_params: None,
-            http_headers: None,
+            http_headers: Some(HashMap::from([(
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+            )])),
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
@@ -562,30 +390,6 @@ impl ModelProviderInfo {
 
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
-    }
-
-    pub fn effective_model_name<'a>(&self, slug: &'a str) -> &'a str {
-        if self.name == GEMINI_PROVIDER_NAME {
-            slug.strip_prefix("google/").unwrap_or(slug)
-        } else if self.name == OPENPATHS_PROVIDER_NAME {
-            // OpenPaths is a router that can also serve Cerebras-hosted models,
-            // so accept either the `openpaths/` or `cerebras/` prefix.
-            slug.strip_prefix("openpaths/")
-                .or_else(|| slug.strip_prefix("cerebras/"))
-                .unwrap_or(slug)
-        } else if self.name == CEREBRAS_PROVIDER_NAME {
-            slug.strip_prefix("cerebras/").unwrap_or(slug)
-        } else if self.name == CURSOR_PROVIDER_NAME {
-            slug.strip_prefix("cursor/").unwrap_or(slug)
-        } else if self.name == ZHIPU_PROVIDER_NAME {
-            slug.strip_prefix("zhipu/")
-                .or_else(|| slug.strip_prefix("z-ai/"))
-                .unwrap_or(slug)
-        } else if self.name == DEEPSEEK_PROVIDER_NAME {
-            slug.strip_prefix("deepseek/").unwrap_or(slug)
-        } else {
-            slug
-        }
     }
 
     pub fn is_amazon_bedrock(&self) -> bool {
@@ -615,18 +419,12 @@ pub fn built_in_model_providers(
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
 
-    // Keep the bundled list intentionally small. These providers cover the
-    // built-in model catalog plus local OSS backends; users can still extend
-    // `model_providers` in config.toml for anything else.
+    // We do not want to be in the business of adjucating which third-party
+    // providers are bundled with Codex CLI, so we only include the OpenAI and
+    // open source ("oss") providers by default. Users are encouraged to add to
+    // `model_providers` in config.toml to add their own providers.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
-        (OPENROUTER_PROVIDER_ID, P::create_openrouter_provider()),
-        (OPENPATHS_PROVIDER_ID, P::create_openpaths_provider()),
-        (CURSOR_PROVIDER_ID, P::create_cursor_provider()),
-        (GEMINI_PROVIDER_ID, P::create_gemini_provider()),
-        (ZHIPU_PROVIDER_ID, P::create_zhipu_provider()),
-        (DEEPSEEK_PROVIDER_ID, P::create_deepseek_provider()),
-        (CEREBRAS_PROVIDER_ID, P::create_cerebras_provider()),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
@@ -640,125 +438,6 @@ pub fn built_in_model_providers(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect()
-}
-
-fn non_empty_env_var(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn openpaths_base_url() -> String {
-    std::env::var("OPENPATHS_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            let trimmed = value.trim().trim_end_matches('/');
-            if trimmed.ends_with("/v1") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/v1")
-            }
-        })
-        .unwrap_or_else(|| "https://openpaths.io/v1".to_string())
-}
-
-fn cerebras_base_url() -> String {
-    std::env::var("CEREBRAS_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            let trimmed = value.trim().trim_end_matches('/');
-            if trimmed.ends_with("/v1") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/v1")
-            }
-        })
-        .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string())
-}
-
-fn cursor_base_url() -> String {
-    std::env::var("CURSOR_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "https://api.cursor.com".to_string())
-}
-
-fn is_composer_model_slug(lower: &str) -> bool {
-    let slug = lower
-        .strip_prefix("openpaths/")
-        .or_else(|| lower.strip_prefix("cursor/"))
-        .unwrap_or(lower);
-    slug == "composer-2.5" || slug == "composer-2.5-fast" || slug.starts_with("composer-2.5-")
-}
-
-pub fn infer_builtin_provider_id_for_model(model: &str) -> Option<&'static str> {
-    let lower = model.to_lowercase();
-    if (lower.starts_with("glm-")
-        || lower
-            .strip_prefix("z-ai/")
-            .is_some_and(|slug| slug.starts_with("glm-"))
-        || lower
-            .strip_prefix("zhipu/")
-            .is_some_and(|slug| slug.starts_with("glm-")))
-        && non_empty_env_var("ZAI_API_KEY")
-    {
-        return Some(ZHIPU_PROVIDER_ID);
-    }
-    if (lower.starts_with("deepseek-")
-        || lower
-            .strip_prefix("deepseek/")
-            .is_some_and(|slug| slug.starts_with("deepseek-") || !slug.is_empty()))
-        && non_empty_env_var("DEEPSEEK_API_KEY")
-    {
-        return Some(DEEPSEEK_PROVIDER_ID);
-    }
-    if (lower == "auto"
-        || lower == "autothink"
-        || lower.starts_with("auto-")
-        || lower
-            .strip_prefix("openpaths/")
-            .is_some_and(|slug| slug == "auto" || slug == "autothink" || slug.starts_with("auto-")))
-        && non_empty_env_var("OPENPATHS_API_KEY")
-    {
-        return Some(OPENPATHS_PROVIDER_ID);
-    }
-    if is_composer_model_slug(&lower) {
-        if non_empty_env_var("OPENPATHS_API_KEY") {
-            return Some(OPENPATHS_PROVIDER_ID);
-        }
-        if non_empty_env_var("CURSOR_API_KEY") {
-            return Some(CURSOR_PROVIDER_ID);
-        }
-    }
-    match model.split_once('/') {
-        Some(("google", _)) if non_empty_env_var("GEMINI_API_KEY") => Some(GEMINI_PROVIDER_ID),
-        Some(("google", _)) if non_empty_env_var("OPENROUTER_API_KEY") => {
-            Some(OPENROUTER_PROVIDER_ID)
-        }
-        Some(("anthropic" | "z-ai" | "x-ai", _)) if non_empty_env_var("OPENROUTER_API_KEY") => {
-            Some(OPENROUTER_PROVIDER_ID)
-        }
-        Some(("zhipu", _)) if non_empty_env_var("ZAI_API_KEY") => Some(ZHIPU_PROVIDER_ID),
-        Some(("openpaths", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
-            Some(OPENPATHS_PROVIDER_ID)
-        }
-        // Prefer a direct Cerebras key, but fall back to OpenPaths, which also
-        // serves the Cerebras-hosted open-weight models.
-        Some(("cerebras", _)) if non_empty_env_var("CEREBRAS_API_KEY") => {
-            Some(CEREBRAS_PROVIDER_ID)
-        }
-        Some(("cerebras", _)) if non_empty_env_var("OPENPATHS_API_KEY") => {
-            Some(OPENPATHS_PROVIDER_ID)
-        }
-        Some(("cursor", _)) if non_empty_env_var("CURSOR_API_KEY") => Some(CURSOR_PROVIDER_ID),
-        Some(("deepseek", _)) if non_empty_env_var("DEEPSEEK_API_KEY") => {
-            Some(DEEPSEEK_PROVIDER_ID)
-        }
-        _ => None,
-    }
 }
 
 /// Merge configured providers into the built-in provider catalog.

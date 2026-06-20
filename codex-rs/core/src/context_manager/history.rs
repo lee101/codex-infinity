@@ -118,6 +118,11 @@ impl ContextManager {
         &self.items
     }
 
+    /// Returns raw items in the history and consumes the snapshot.
+    pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
+        self.items
+    }
+
     pub(crate) fn history_version(&self) -> u64 {
         self.history_version
     }
@@ -158,52 +163,6 @@ impl ContextManager {
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
             normalize::remove_corresponding_for(&mut self.items, &removed);
-        }
-    }
-
-    /// Remove items from the middle of history, keeping the oldest and newest
-    /// quarters intact. This "middle-out" strategy preserves the original task
-    /// context (head) and the most recent work (tail) while shedding the bulk
-    /// of intermediate history.
-    ///
-    /// On successive calls the middle section shrinks further — each call
-    /// removes 50% of whatever is currently in the middle — giving recursive
-    /// middle-out behaviour without requiring the caller to track state.
-    ///
-    /// Returns the number of items removed, or 0 if the history is too small
-    /// to trim further.
-    pub(crate) fn remove_middle_chunk(&mut self) -> usize {
-        let n = self.items.len();
-        if n < 4 {
-            // Too small to middle-out; remove the first item as a last resort.
-            if n > 0 {
-                self.remove_first_item();
-                return 1;
-            }
-            return 0;
-        }
-        let keep_head = n / 4;
-        let keep_tail = n / 4;
-        let drain_start = keep_head;
-        let drain_end = n.saturating_sub(keep_tail);
-        if drain_start >= drain_end {
-            return 0;
-        }
-        let removed = drain_end - drain_start;
-        self.items.drain(drain_start..drain_end);
-        // Repair any broken call/output pairs introduced by the drain.
-        normalize::remove_orphan_outputs(&mut self.items);
-        normalize::ensure_call_outputs_present(&mut self.items);
-        removed
-    }
-
-    pub(crate) fn remove_last_item(&mut self) -> bool {
-        if let Some(removed) = self.items.pop() {
-            normalize::remove_corresponding_for(&mut self.items, &removed);
-            self.history_version = self.history_version.saturating_add(1);
-            true
-        } else {
-            false
         }
     }
 
@@ -380,20 +339,24 @@ impl ContextManager {
         let policy_with_serialization_budget = policy * 1.2;
         match item {
             ResponseItem::FunctionCallOutput {
+                id,
                 call_id,
                 output,
                 metadata,
             } => ResponseItem::FunctionCallOutput {
+                id: id.clone(),
                 call_id: call_id.clone(),
                 output: truncate_function_output_payload(output, policy_with_serialization_budget),
                 metadata: metadata.clone(),
             },
             ResponseItem::CustomToolCallOutput {
+                id,
                 call_id,
                 name,
                 output,
                 metadata,
             } => ResponseItem::CustomToolCallOutput {
+                id: id.clone(),
                 call_id: call_id.clone(),
                 name: name.clone(),
                 output: truncate_function_output_payload(output, policy_with_serialization_budget),
@@ -410,6 +373,8 @@ impl ContextManager {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
         }
     }
@@ -462,7 +427,7 @@ impl ContextManager {
     }
 }
 
-fn truncate_function_output_payload(
+pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
@@ -498,7 +463,9 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::Reasoning { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. } => true,
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::Other => false,
     }
 }
@@ -509,6 +476,10 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
         .checked_div(4)
         .unwrap_or(0)
         .saturating_sub(650)
+}
+
+fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
+    encoded_len.saturating_mul(9).div_ceil(16)
 }
 
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
@@ -546,21 +517,28 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         }
         | ResponseItem::Compaction {
             encrypted_content: content,
+            ..
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(content),
+            ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
             let raw = serde_json::to_string(item)
                 .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
                 .unwrap_or_default();
-            let (payload_bytes, replacement_bytes) = image_data_url_estimate_adjustment(item);
-            if payload_bytes == 0 || replacement_bytes == 0 {
-                raw
-            } else {
-                // Replace raw base64 payload bytes with a per-image estimate.
-                // We intentionally preserve the data URL prefix and JSON
-                // wrapper bytes already included in `raw`.
-                raw.saturating_sub(payload_bytes)
-                    .saturating_add(replacement_bytes)
-            }
+            let (image_payload_bytes, image_replacement_bytes) =
+                image_data_url_estimate_adjustment(item);
+            let (encrypted_payload_bytes, encrypted_replacement_bytes) =
+                encrypted_function_output_estimate_adjustment(item);
+            // Replace raw base64 payload bytes with a per-image estimate.
+            // We intentionally preserve the data URL prefix and JSON
+            // wrapper bytes already included in `raw`.
+            let raw = raw
+                .saturating_sub(image_payload_bytes)
+                .saturating_add(image_replacement_bytes);
+            raw.saturating_sub(encrypted_payload_bytes)
+                .saturating_add(encrypted_replacement_bytes)
         }
     }
 }
@@ -682,6 +660,31 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     (payload_bytes, replacement_bytes)
 }
 
+fn encrypted_function_output_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
+    let ResponseItem::FunctionCallOutput { output, .. } = item else {
+        return (0, 0);
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        return (0, 0);
+    };
+
+    items.iter().fold((0i64, 0i64), |acc, item| {
+        let FunctionCallOutputContentItem::EncryptedContent { encrypted_content } = item else {
+            return acc;
+        };
+        let payload_bytes = acc
+            .0
+            .saturating_add(i64::try_from(encrypted_content.len()).unwrap_or(i64::MAX));
+        let replacement_bytes = acc.1.saturating_add(
+            i64::try_from(estimate_encrypted_function_output_length(
+                encrypted_content.len(),
+            ))
+            .unwrap_or(i64::MAX),
+        );
+        (payload_bytes, replacement_bytes)
+    })
+}
+
 fn is_model_generated_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } => role == "assistant",
@@ -692,7 +695,9 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::Compaction { .. } => true,
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }

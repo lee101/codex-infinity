@@ -1,5 +1,7 @@
+use crate::mcp::CallToolResult;
 use crate::memory_citation::MemoryCitation;
 use crate::models::ContentItem;
+use crate::models::ImageDetail;
 use crate::models::MessagePhase;
 use crate::models::ResponseItem;
 use crate::models::WebSearchAction;
@@ -8,8 +10,16 @@ use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
 use crate::protocol::ContextCompactedEvent;
 use crate::protocol::EventMsg;
+use crate::protocol::FileChange;
 use crate::protocol::ImageGenerationEndEvent;
+use crate::protocol::McpInvocation;
+use crate::protocol::McpToolCallBeginEvent;
+use crate::protocol::McpToolCallEndEvent;
+use crate::protocol::PatchApplyBeginEvent;
+use crate::protocol::PatchApplyEndEvent;
+use crate::protocol::PatchApplyStatus;
 use crate::protocol::UserMessageEvent;
+use crate::protocol::ViewImageToolCallEvent;
 use crate::protocol::WebSearchEndEvent;
 use crate::user_input::ByteRange;
 use crate::user_input::TextElement;
@@ -20,8 +30,12 @@ use quick_xml::se::to_string as to_xml_string;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 use ts_rs::TS;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 #[serde(tag = "type")]
 #[ts(tag = "type")]
@@ -32,7 +46,11 @@ pub enum TurnItem {
     Plan(PlanItem),
     Reasoning(ReasoningItem),
     WebSearch(WebSearchItem),
+    ImageView(ImageViewItem),
+    Sleep(SleepItem),
     ImageGeneration(ImageGenerationItem),
+    FileChange(FileChangeItem),
+    McpToolCall(McpToolCallItem),
     ContextCompaction(ContextCompactionItem),
 }
 
@@ -118,6 +136,18 @@ pub struct WebSearchItem {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+pub struct ImageViewItem {
+    pub id: String,
+    pub path: AbsolutePathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+pub struct SleepItem {
+    pub id: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct ImageGenerationItem {
     pub id: String,
     pub status: String,
@@ -128,6 +158,72 @@ pub struct ImageGenerationItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+pub struct FileChangeItem {
+    pub id: String,
+    pub changes: HashMap<PathBuf, FileChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub status: Option<PatchApplyStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub auto_approved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stderr: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct McpToolCallItem {
+    pub id: String,
+    pub server: String,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub connector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_resource_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub link_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    pub status: McpToolCallStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub result: Option<CallToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<McpToolCallError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string", optional)]
+    pub duration: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub enum McpToolCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct McpToolCallError {
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -169,7 +265,9 @@ impl UserMessageItem {
             client_id: self.client_id.clone(),
             message: self.message(),
             images: Some(self.image_urls()),
+            image_details: self.image_details(),
             local_images: self.local_image_paths(),
+            local_image_details: self.local_image_details(),
             text_elements: self.text_elements(),
         })
     }
@@ -217,21 +315,54 @@ impl UserMessageItem {
         self.content
             .iter()
             .filter_map(|c| match c {
-                UserInput::Image { image_url } => Some(image_url.clone()),
+                UserInput::Image { image_url, .. } => Some(image_url.clone()),
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn image_details(&self) -> Vec<Option<ImageDetail>> {
+        trim_trailing_default_image_details(
+            self.content
+                .iter()
+                .filter_map(|c| match c {
+                    UserInput::Image { detail, .. } => Some(*detail),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     pub fn local_image_paths(&self) -> Vec<std::path::PathBuf> {
         self.content
             .iter()
             .filter_map(|c| match c {
-                UserInput::LocalImage { path } => Some(path.clone()),
+                UserInput::LocalImage { path, .. } => Some(path.clone()),
                 _ => None,
             })
             .collect()
     }
+
+    pub fn local_image_details(&self) -> Vec<Option<ImageDetail>> {
+        trim_trailing_default_image_details(
+            self.content
+                .iter()
+                .filter_map(|c| match c {
+                    UserInput::LocalImage { detail, .. } => Some(*detail),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+}
+
+fn trim_trailing_default_image_details(
+    mut details: Vec<Option<ImageDetail>>,
+) -> Vec<Option<ImageDetail>> {
+    while matches!(details.last(), Some(None)) {
+        details.pop();
+    }
+    details
 }
 
 impl HookPromptItem {
@@ -388,6 +519,70 @@ impl ImageGenerationItem {
     }
 }
 
+impl FileChangeItem {
+    pub fn as_legacy_begin_event(&self, turn_id: String) -> EventMsg {
+        EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+            call_id: self.id.clone(),
+            turn_id,
+            auto_approved: self.auto_approved.unwrap_or(false),
+            changes: self.changes.clone(),
+        })
+    }
+
+    pub fn as_legacy_end_event(&self, turn_id: String) -> Option<EventMsg> {
+        let status = self.status.clone()?;
+        Some(EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+            call_id: self.id.clone(),
+            turn_id,
+            stdout: self.stdout.clone().unwrap_or_default(),
+            stderr: self.stderr.clone().unwrap_or_default(),
+            success: status == PatchApplyStatus::Completed,
+            changes: self.changes.clone(),
+            status,
+        }))
+    }
+}
+
+impl McpToolCallItem {
+    pub fn as_legacy_begin_event(&self) -> EventMsg {
+        EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+            call_id: self.id.clone(),
+            invocation: McpInvocation {
+                server: self.server.clone(),
+                tool: self.tool.clone(),
+                arguments: (!self.arguments.is_null()).then(|| self.arguments.clone()),
+            },
+            connector_id: self.connector_id.clone(),
+            mcp_app_resource_uri: self.mcp_app_resource_uri.clone(),
+            link_id: self.link_id.clone(),
+            plugin_id: self.plugin_id.clone(),
+        })
+    }
+
+    pub fn as_legacy_end_event(&self) -> Option<EventMsg> {
+        let result = match (&self.result, &self.error) {
+            (Some(result), _) => Ok(result.clone()),
+            (None, Some(error)) => Err(error.message.clone()),
+            (None, None) => return None,
+        };
+
+        Some(EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+            call_id: self.id.clone(),
+            invocation: McpInvocation {
+                server: self.server.clone(),
+                tool: self.tool.clone(),
+                arguments: (!self.arguments.is_null()).then(|| self.arguments.clone()),
+            },
+            mcp_app_resource_uri: self.mcp_app_resource_uri.clone(),
+            connector_id: self.connector_id.clone(),
+            link_id: self.link_id.clone(),
+            plugin_id: self.plugin_id.clone(),
+            duration: self.duration?,
+            result,
+        }))
+    }
+}
+
 impl TurnItem {
     pub fn id(&self) -> String {
         match self {
@@ -397,7 +592,11 @@ impl TurnItem {
             TurnItem::Plan(item) => item.id.clone(),
             TurnItem::Reasoning(item) => item.id.clone(),
             TurnItem::WebSearch(item) => item.id.clone(),
+            TurnItem::ImageView(item) => item.id.clone(),
+            TurnItem::Sleep(item) => item.id.clone(),
             TurnItem::ImageGeneration(item) => item.id.clone(),
+            TurnItem::FileChange(item) => item.id.clone(),
+            TurnItem::McpToolCall(item) => item.id.clone(),
             TurnItem::ContextCompaction(item) => item.id.clone(),
         }
     }
@@ -409,7 +608,19 @@ impl TurnItem {
             TurnItem::AgentMessage(item) => item.as_legacy_events(),
             TurnItem::Plan(_) => Vec::new(),
             TurnItem::WebSearch(item) => vec![item.as_legacy_event()],
+            TurnItem::ImageView(item) => {
+                vec![EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
+                    call_id: item.id.clone(),
+                    path: item.path.clone(),
+                })]
+            }
+            TurnItem::Sleep(_) => Vec::new(),
             TurnItem::ImageGeneration(item) => vec![item.as_legacy_event()],
+            TurnItem::FileChange(item) => item
+                .as_legacy_end_event(String::new())
+                .into_iter()
+                .collect(),
+            TurnItem::McpToolCall(item) => item.as_legacy_end_event().into_iter().collect(),
             TurnItem::Reasoning(item) => item.as_legacy_events(show_raw_agent_reasoning),
             TurnItem::ContextCompaction(item) => vec![item.as_legacy_event()],
         }

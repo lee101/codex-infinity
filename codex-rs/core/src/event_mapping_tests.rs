@@ -1,6 +1,9 @@
 use super::has_non_contextual_dev_message_content;
 use super::is_contextual_dev_message_content;
 use super::parse_turn_item;
+use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::TurnItem;
@@ -70,8 +73,14 @@ fn parses_user_message_with_text_and_two_images() {
                     text: "Hello world".to_string(),
                     text_elements: Vec::new(),
                 },
-                UserInput::Image { image_url: img1 },
-                UserInput::Image { image_url: img2 },
+                UserInput::Image {
+                    image_url: img1,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+                UserInput::Image {
+                    image_url: img2,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
             ];
             assert_eq!(user.content, expected_content);
         }
@@ -110,7 +119,10 @@ fn skips_local_image_label_text() {
     match turn_item {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
-                UserInput::Image { image_url },
+                UserInput::Image {
+                    image_url,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
                 UserInput::Text {
                     text: user_text,
                     text_elements: Vec::new(),
@@ -190,7 +202,10 @@ fn skips_unnamed_image_label_text() {
     match turn_item {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
-                UserInput::Image { image_url },
+                UserInput::Image {
+                    image_url,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
                 UserInput::Text {
                     text: user_text,
                     text_elements: Vec::new(),
@@ -330,6 +345,25 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
 }
 
 #[test]
+fn internal_model_context_does_not_parse_as_visible_turn_item() {
+    let item = ResponseItem::Message {
+        id: Some("msg-1".to_string()),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: InternalModelContextFragment::new(
+                InternalContextSource::from_static("extension"),
+                "Internal steering.",
+            )
+            .render(),
+        }],
+        phase: None,
+        metadata: None,
+    };
+
+    assert!(parse_turn_item(&item).is_none());
+}
+
+#[test]
 fn parses_agent_message() {
     let item = ResponseItem::Message {
         id: Some("msg-1".to_string()),
@@ -357,7 +391,7 @@ fn parses_agent_message() {
 #[test]
 fn parses_reasoning_summary_and_raw_content() {
     let item = ResponseItem::Reasoning {
-        id: "reasoning_1".to_string(),
+        id: Some("reasoning_1".to_string()),
         summary: vec![
             ReasoningItemReasoningSummary::SummaryText {
                 text: "Step 1".to_string(),
@@ -390,7 +424,7 @@ fn parses_reasoning_summary_and_raw_content() {
 #[test]
 fn parses_reasoning_including_raw_content() {
     let item = ResponseItem::Reasoning {
-        id: "reasoning_2".to_string(),
+        id: Some("reasoning_2".to_string()),
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
             text: "Summarized step".to_string(),
         }],

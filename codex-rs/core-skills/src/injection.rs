@@ -55,6 +55,11 @@ impl InjectedHostSkillPrompts {
     }
 }
 
+#[tracing::instrument(
+    level = "trace",
+    skip_all,
+    fields(mentioned_skill_count = mentioned_skills.len())
+)]
 pub async fn build_skill_injections(
     mentioned_skills: &[SkillMetadata],
     loaded_skills: Option<&SkillLoadOutcome>,
@@ -84,6 +89,7 @@ pub async fn build_skill_injections(
                     skill_name: skill.name.clone(),
                     skill_scope: skill.scope,
                     skill_path: skill.path_to_skills_md.to_path_buf(),
+                    plugin_id: skill.plugin_id.clone(),
                     invocation_type: InvocationType::Explicit,
                 });
                 result.items.push(SkillInjection {

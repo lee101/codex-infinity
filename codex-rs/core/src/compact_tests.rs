@@ -24,6 +24,25 @@ async fn process_compacted_history_with_test_session(
     (refreshed, initial_context)
 }
 
+fn user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        metadata: None,
+    }
+}
+
+fn compacted_user_message(text: &str) -> CompactedUserMessage {
+    CompactedUserMessage {
+        message: text.to_string(),
+        metadata: None,
+    }
+}
+
 #[test]
 fn content_items_to_text_joins_non_empty_segments() {
     let items = vec![
@@ -127,6 +146,26 @@ do things
 }
 
 #[test]
+fn collect_user_messages_filters_legacy_warnings() {
+    let items = vec![
+        user_message(
+            "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        ),
+        user_message(
+            "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
+        ),
+        user_message(
+            "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
+        ),
+        user_message("real user message"),
+    ];
+
+    let collected = collect_user_messages(&items);
+
+    assert_eq!(vec![compacted_user_message("real user message")], collected);
+}
+
+#[test]
 fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // Use a small truncation limit so the test remains fast while still validating
     // that oversized user content is truncated.
@@ -199,6 +238,7 @@ fn build_compacted_history_preserves_user_message_metadata() {
             message: "first user message".to_string(),
             metadata: Some(ResponseItemMetadata {
                 turn_id: Some("turn-1".to_string()),
+                ..Default::default()
             }),
         }],
         "summary text",
@@ -232,7 +272,6 @@ fn should_use_remote_compact_task_for_azure_provider() {
 
     assert!(should_use_remote_compact_task(&provider));
 }
-
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
     let compacted_history = vec![
@@ -385,6 +424,31 @@ keep me updated
         phase: None,
         metadata: None,
     });
+    assert_eq!(refreshed, expected);
+}
+
+#[tokio::test]
+async fn process_compacted_history_drops_legacy_warnings() {
+    let latest_user = user_message("latest user");
+    let compacted_history = vec![
+        user_message(
+            "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        ),
+        user_message(
+            "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
+        ),
+        user_message(
+            "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
+        ),
+        latest_user.clone(),
+    ];
+    let (refreshed, initial_context) = process_compacted_history_with_test_session(
+        compacted_history,
+        /*previous_turn_settings*/ None,
+    )
+    .await;
+    let mut expected = initial_context;
+    expected.push(latest_user);
     assert_eq!(refreshed, expected);
 }
 
@@ -590,6 +654,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
     let compacted_history = vec![ResponseItem::Compaction {
+        id: None,
         encrypted_content: "encrypted".to_string(),
         metadata: None,
     }];
@@ -616,6 +681,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             metadata: None,
         },
         ResponseItem::Compaction {
+            id: None,
             encrypted_content: "encrypted".to_string(),
             metadata: None,
         },

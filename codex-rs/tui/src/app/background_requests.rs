@@ -4,9 +4,27 @@
 //! limits, add-credit nudges, and feedback uploads. Results are routed back through `AppEvent` so
 //! the main event loop remains single-threaded.
 
+use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
+use crate::app_event::ConnectorsSnapshot;
+use crate::config_update::format_config_error;
+use codex_app_server_protocol::AppsListParams;
+use codex_app_server_protocol::AppsListResponse;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceAddResponse;
+use codex_app_server_protocol::MarketplaceRemoveParams;
+use codex_app_server_protocol::MarketplaceRemoveResponse;
+use codex_app_server_protocol::MarketplaceUpgradeParams;
+use codex_app_server_protocol::MarketplaceUpgradeResponse;
+
+use codex_app_server_protocol::RateLimitResetCreditsSummary;
+use codex_app_server_protocol::RequestId;
+
+use crate::hooks_rpc::fetch_hooks_list;
+use crate::hooks_rpc::write_hook_trust;
+use crate::hooks_rpc::write_hook_trusts;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 const TOKEN_ACTIVITY_FETCH_TIMEOUT: std::time::Duration =
@@ -174,6 +192,27 @@ impl App {
         });
     }
 
+    pub(super) fn fetch_connectors_list(
+        &mut self,
+        app_server: &AppServerSession,
+        force_refetch: bool,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        let thread_id = self
+            .current_displayed_thread_id()
+            .map(|thread_id| thread_id.to_string());
+        tokio::spawn(async move {
+            let result = fetch_connectors_list(request_handle, force_refetch, thread_id)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::ConnectorsLoaded {
+                result,
+                is_final: true,
+            });
+        });
+    }
+
     pub(super) fn fetch_plugins_list(&mut self, app_server: &AppServerSession, cwd: PathBuf) {
         self.chat_widget.on_plugins_list_fetch_started(cwd.clone());
         let request_handle = app_server.request_handle();
@@ -203,6 +242,17 @@ impl App {
                     section_errors,
                 });
             }
+        });
+    }
+
+    pub(super) fn fetch_hooks_list(&mut self, app_server: &AppServerSession, cwd: PathBuf) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_hooks_list(request_handle, cwd.clone())
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::HooksLoaded { cwd, result });
         });
     }
 
@@ -239,6 +289,50 @@ impl App {
             app_event_tx.send(AppEvent::MarketplaceAddLoaded {
                 cwd: cwd_for_event,
                 source: source_for_event,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn fetch_marketplace_remove(
+        &mut self,
+        app_server: &AppServerSession,
+        cwd: PathBuf,
+        marketplace_name: String,
+        marketplace_display_name: String,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let cwd_for_event = cwd.clone();
+            let marketplace_name_for_event = marketplace_name.clone();
+            let result = fetch_marketplace_remove(request_handle, marketplace_name)
+                .await
+                .map_err(|err| format!("Failed to remove marketplace: {err}"));
+            app_event_tx.send(AppEvent::MarketplaceRemoveLoaded {
+                cwd: cwd_for_event,
+                marketplace_name: marketplace_name_for_event,
+                marketplace_display_name,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn fetch_marketplace_upgrade(
+        &mut self,
+        app_server: &AppServerSession,
+        cwd: PathBuf,
+        marketplace_name: Option<String>,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let cwd_for_event = cwd.clone();
+            let result = fetch_marketplace_upgrade(request_handle, marketplace_name)
+                .await
+                .map_err(|err| format!("Failed to upgrade marketplace: {err}"));
+            app_event_tx.send(AppEvent::MarketplaceUpgradeLoaded {
+                cwd: cwd_for_event,
                 result,
             });
         });
@@ -337,8 +431,84 @@ impl App {
         });
     }
 
-    pub(super) fn refresh_plugin_mentions(&mut self) {
-        let config = self.config.clone();
+    pub(super) fn set_hook_enabled(
+        &mut self,
+        app_server: &AppServerSession,
+        key: String,
+        enabled: bool,
+    ) {
+        if let Some(queued_enabled) = self.pending_hook_enabled_writes.get_mut(&key) {
+            *queued_enabled = Some(enabled);
+            return;
+        }
+
+        self.pending_hook_enabled_writes.insert(key.clone(), None);
+        self.spawn_hook_enabled_write(app_server, key, enabled);
+    }
+
+    pub(super) fn spawn_hook_enabled_write(
+        &mut self,
+        app_server: &AppServerSession,
+        key: String,
+        enabled: bool,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let key_for_event = key.clone();
+            let result = write_hook_enabled(request_handle, key, enabled)
+                .await
+                .map(|_| ())
+                .map_err(|err| {
+                    format!(
+                        "Failed to update hook config: {}",
+                        format_config_error(&err)
+                    )
+                });
+            app_event_tx.send(AppEvent::HookEnabledSet {
+                key: key_for_event,
+                enabled,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn trust_hook(
+        &mut self,
+        app_server: &AppServerSession,
+        key: String,
+        current_hash: String,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = write_hook_trust(request_handle, key, current_hash)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("Failed to trust hook: {}", format_config_error(&err)));
+            app_event_tx.send(AppEvent::HookTrusted { result });
+        });
+    }
+
+    pub(super) fn trust_hooks(
+        &mut self,
+        app_server: &AppServerSession,
+        updates: Vec<HookTrustUpdate>,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = write_hook_trusts(request_handle, updates)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("Failed to trust hooks: {}", format_config_error(&err)));
+            app_event_tx.send(AppEvent::HookTrusted { result });
+        });
+    }
+
+    pub(super) fn refresh_plugin_mentions(&mut self, app_server: &AppServerSession) {
+        let cwd = self.config.cwd.to_path_buf();
+        let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         if !self.config.features.enabled(Feature::Plugins) {
             app_event_tx.send(AppEvent::PluginMentionsLoaded { plugins: None });
@@ -346,14 +516,16 @@ impl App {
         }
 
         tokio::spawn(async move {
-            let plugins = PluginsManager::new(config.codex_home.to_path_buf())
-                .plugins_for_config(&config)
-                .await
-                .capability_summaries()
-                .to_vec();
-            app_event_tx.send(AppEvent::PluginMentionsLoaded {
-                plugins: Some(plugins),
-            });
+            match fetch_plugin_mentions(request_handle, cwd).await {
+                Ok(plugins) => {
+                    app_event_tx.send(AppEvent::PluginMentionsLoaded {
+                        plugins: Some(plugins),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "plugin/list failed while refreshing plugin mention candidates");
+                }
+            }
         });
     }
 
@@ -610,7 +782,18 @@ pub(super) async fn fetch_rate_limit_reset_credits(
     })
 }
 
-    Ok(app_server_rate_limit_snapshots_to_core(response))
+pub(super) async fn consume_rate_limit_reset_credit_request(
+    request_handle: AppServerRequestHandle,
+    idempotency_key: String,
+) -> Result<ConsumeAccountRateLimitResetCreditResponse> {
+    let request_id = RequestId::String(format!("consume-rate-limit-reset-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::ConsumeAccountRateLimitResetCredit {
+            request_id,
+            params: ConsumeAccountRateLimitResetCreditParams { idempotency_key },
+        })
+        .await
+        .wrap_err("account/rateLimitResetCredit/consume failed in TUI")
 }
 
 pub(super) async fn send_add_credits_nudge_email(
@@ -642,28 +825,42 @@ pub(super) async fn fetch_skills_list(
             params: SkillsListParams {
                 cwds: vec![cwd],
                 force_reload: true,
-                per_cwd_extra_user_roots: None,
             },
         })
         .await
         .wrap_err("skills/list failed in TUI")
 }
 
+pub(super) async fn fetch_connectors_list(
+    request_handle: AppServerRequestHandle,
+    force_refetch: bool,
+    thread_id: Option<String>,
+) -> Result<ConnectorsSnapshot> {
+    let request_id = RequestId::String(format!("apps-list-{}", Uuid::new_v4()));
+    let response: AppsListResponse = request_handle
+        .request_typed(ClientRequest::AppsList {
+            request_id,
+            params: AppsListParams {
+                cursor: None,
+                limit: None,
+                thread_id,
+                force_refetch,
+            },
+        })
+        .await
+        .wrap_err("app/list failed in TUI")?;
+    Ok(ConnectorsSnapshot {
+        connectors: response.data,
+    })
+}
+
 pub(super) async fn fetch_plugins_list(
     request_handle: AppServerRequestHandle,
     cwd: PathBuf,
 ) -> Result<PluginListResponse> {
-    let cwd = AbsolutePathBuf::try_from(cwd).wrap_err("plugin list cwd must be absolute")?;
-    let request_id = RequestId::String(format!("plugin-list-{}", Uuid::new_v4()));
-    let mut response = request_handle
-        .request_typed(ClientRequest::PluginList {
-            request_id,
-            params: PluginListParams {
-                cwds: Some(vec![cwd]),
-            },
-        })
+    let mut response = request_plugin_list(request_handle, cwd)
         .await
-        .wrap_err("plugin/list failed in TUI")?;
+        .wrap_err("plugin/list failed while loading the plugins menu")?;
     hide_cli_only_plugin_marketplaces(&mut response);
     Ok(response)
 }
@@ -784,6 +981,41 @@ pub(super) fn hide_cli_only_plugin_marketplaces(response: &mut PluginListRespons
         .retain(|marketplace| !CLI_HIDDEN_PLUGIN_MARKETPLACES.contains(&marketplace.name.as_str()));
 }
 
+pub(super) async fn request_plugin_list(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+) -> Result<PluginListResponse> {
+    request_plugin_list_with_marketplace_kinds(request_handle, cwd, /*marketplace_kinds*/ None)
+        .await
+}
+
+pub(super) async fn request_plugin_list_for_kinds(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+    marketplace_kinds: Vec<PluginListMarketplaceKind>,
+) -> Result<PluginListResponse> {
+    request_plugin_list_with_marketplace_kinds(request_handle, cwd, Some(marketplace_kinds)).await
+}
+
+async fn request_plugin_list_with_marketplace_kinds(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+    marketplace_kinds: Option<Vec<PluginListMarketplaceKind>>,
+) -> Result<PluginListResponse> {
+    let cwd = AbsolutePathBuf::try_from(cwd).wrap_err("plugin list cwd must be absolute")?;
+    let request_id = RequestId::String(format!("plugin-list-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::PluginList {
+            request_id,
+            params: PluginListParams {
+                cwds: Some(vec![cwd]),
+                marketplace_kinds,
+            },
+        })
+        .await
+        .wrap_err("plugin/list failed in TUI")
+}
+
 pub(super) async fn fetch_plugin_detail(
     request_handle: AppServerRequestHandle,
     params: PluginReadParams,
@@ -843,6 +1075,33 @@ fn marketplace_add_source_for_request(cwd: &std::path::Path, source: String) -> 
     source
 }
 
+pub(super) async fn fetch_marketplace_remove(
+    request_handle: AppServerRequestHandle,
+    marketplace_name: String,
+) -> Result<MarketplaceRemoveResponse> {
+    let request_id = RequestId::String(format!("marketplace-remove-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::MarketplaceRemove {
+            request_id,
+            params: MarketplaceRemoveParams { marketplace_name },
+        })
+        .await
+        .wrap_err("marketplace/remove failed in TUI")
+}
+
+pub(super) async fn fetch_marketplace_upgrade(
+    request_handle: AppServerRequestHandle,
+    marketplace_name: Option<String>,
+) -> Result<MarketplaceUpgradeResponse> {
+    let request_id = RequestId::String(format!("marketplace-upgrade-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::MarketplaceUpgrade {
+            request_id,
+            params: MarketplaceUpgradeParams { marketplace_name },
+        })
+        .await
+        .wrap_err("marketplace/upgrade failed in TUI")
+}
 pub(super) async fn fetch_plugin_install(
     request_handle: AppServerRequestHandle,
     location: PluginLocation,
@@ -896,6 +1155,34 @@ pub(super) async fn write_plugin_enabled(
         })
         .await
         .wrap_err("config/value/write failed while updating plugin enablement in TUI")
+}
+
+pub(super) async fn write_hook_enabled(
+    request_handle: AppServerRequestHandle,
+    key: String,
+    enabled: bool,
+) -> Result<ConfigWriteResponse> {
+    let request_id = RequestId::String(format!("hooks-config-write-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::ConfigBatchWrite {
+            request_id,
+            params: ConfigBatchWriteParams {
+                edits: vec![codex_app_server_protocol::ConfigEdit {
+                    key_path: "hooks.state".to_string(),
+                    value: serde_json::json!({
+                        key: {
+                            "enabled": enabled,
+                        }
+                    }),
+                    merge_strategy: MergeStrategy::Upsert,
+                }],
+                file_path: None,
+                expected_version: None,
+                reload_user_config: true,
+            },
+        })
+        .await
+        .wrap_err("config/batchWrite failed while updating hook enablement in TUI")
 }
 
 pub(super) fn build_feedback_upload_params(

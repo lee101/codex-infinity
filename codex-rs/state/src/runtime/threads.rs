@@ -1,6 +1,7 @@
 use super::*;
 use crate::SortDirection;
 use codex_protocol::protocol::SessionSource;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 impl StateRuntime {
@@ -12,7 +13,9 @@ SELECT
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
+    threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.thread_source,
     threads.agent_nickname,
     threads.agent_role,
     threads.agent_path,
@@ -22,6 +25,7 @@ SELECT
     threads.cwd,
     threads.cli_version,
     threads.title,
+    threads.preview,
     threads.sandbox_policy,
     threads.approval_mode,
     threads.tokens_used,
@@ -49,38 +53,27 @@ WHERE threads.id = ?
         Ok(row.and_then(|row| row.try_get("memory_mode").ok()))
     }
 
-    /// Get dynamic tools for a thread, if present.
-    pub async fn get_dynamic_tools(
+    pub async fn set_thread_preview_if_empty(
         &self,
         thread_id: ThreadId,
-    ) -> anyhow::Result<Option<Vec<DynamicToolSpec>>> {
-        let rows = sqlx::query(
+        preview: &str,
+    ) -> anyhow::Result<bool> {
+        let preview = preview.trim();
+        if preview.is_empty() {
+            return Ok(false);
+        }
+        let result = sqlx::query(
             r#"
-SELECT namespace, name, description, input_schema, defer_loading
-FROM thread_dynamic_tools
-WHERE thread_id = ?
-ORDER BY position ASC
+UPDATE threads
+SET preview = ?
+WHERE id = ? AND preview = ''
             "#,
         )
+        .bind(preview)
         .bind(thread_id.to_string())
-        .fetch_all(self.pool.as_ref())
+        .execute(self.pool.as_ref())
         .await?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let mut tools = Vec::with_capacity(rows.len());
-        for row in rows {
-            let input_schema: String = row.try_get("input_schema")?;
-            let input_schema = serde_json::from_str::<Value>(input_schema.as_str())?;
-            tools.push(DynamicToolSpec {
-                namespace: row.try_get("namespace")?,
-                name: row.try_get("name")?,
-                description: row.try_get("description")?,
-                input_schema,
-                defer_loading: row.try_get("defer_loading")?,
-            });
-        }
-        Ok(Some(tools))
+        Ok(result.rows_affected() > 0)
     }
 
     /// Persist or replace the directional parent-child edge for a spawned thread.
@@ -131,6 +124,15 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<Vec<ThreadId>> {
         self.list_thread_spawn_children_matching(parent_thread_id, Some(status))
+            .await
+    }
+
+    /// List all direct spawned children of `parent_thread_id`.
+    pub async fn list_thread_spawn_children(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<ThreadId>> {
+        self.list_thread_spawn_children_matching(parent_thread_id, /*status*/ None)
             .await
     }
 
@@ -498,6 +500,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
         metadata: &crate::ThreadMetadata,
     ) -> anyhow::Result<bool> {
         let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
+        let recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
+        let preview = metadata_preview(metadata);
         let result = sqlx::query(
             r#"
 INSERT INTO threads (
@@ -505,9 +509,12 @@ INSERT INTO threads (
     rollout_path,
     created_at,
     updated_at,
+    recency_at,
     created_at_ms,
     updated_at_ms,
+    recency_at_ms,
     source,
+    thread_source,
     agent_nickname,
     agent_role,
     agent_path,
@@ -517,6 +524,7 @@ INSERT INTO threads (
     cwd,
     cli_version,
     title,
+    preview,
     sandbox_policy,
     approval_mode,
     tokens_used,
@@ -527,7 +535,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -535,9 +543,17 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.rollout_path.display().to_string())
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(updated_at))
+        .bind(datetime_to_epoch_seconds(recency_at))
         .bind(datetime_to_epoch_millis(metadata.created_at))
         .bind(datetime_to_epoch_millis(updated_at))
+        .bind(datetime_to_epoch_millis(recency_at))
         .bind(metadata.source.as_str())
+        .bind(
+            metadata
+                .thread_source
+                .as_ref()
+                .map(codex_protocol::protocol::ThreadSource::as_str),
+        )
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.agent_path.as_deref())
@@ -552,6 +568,7 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
+        .bind(preview)
         .bind(metadata.sandbox_policy.as_str())
         .bind(metadata.approval_mode.as_str())
         .bind(metadata.tokens_used)
@@ -611,6 +628,32 @@ ON CONFLICT(id) DO NOTHING
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn touch_thread_recency_at(
+        &self,
+        thread_id: ThreadId,
+        recency_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let recency_at = self.allocate_thread_recency_at(recency_at)?;
+        let recency_at_seconds = datetime_to_epoch_seconds(recency_at);
+        let recency_at_millis = datetime_to_epoch_millis(recency_at);
+        let result = sqlx::query(
+            r#"
+UPDATE threads
+SET
+    recency_at = MAX(?, MAX(?, recency_at_ms + 1) / 1000),
+    recency_at_ms = MAX(?, recency_at_ms + 1)
+WHERE id = ?
+            "#,
+        )
+        .bind(recency_at_seconds)
+        .bind(recency_at_millis)
+        .bind(recency_at_millis)
+        .bind(thread_id.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Allocate a persisted `updated_at` value for thread-list cursor ordering.
     ///
     /// We keep a process-local high-water mark so hot rollout writes can get unique,
@@ -621,42 +664,56 @@ ON CONFLICT(id) DO NOTHING
         &self,
         updated_at: DateTime<Utc>,
     ) -> anyhow::Result<DateTime<Utc>> {
-        let candidate = datetime_to_epoch_millis(updated_at);
-        let allocated = loop {
-            let current = self.thread_updated_at_millis.load(Ordering::Relaxed);
-
-            // New wall-clock time: advance the process-local high-water mark and use it as-is.
-            if candidate > current {
-                if self
-                    .thread_updated_at_millis
-                    .compare_exchange(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break candidate;
-                }
-                continue;
-            }
-
-            // Older timestamps come from backfill/repair paths that preserve rollout mtimes.
-            // Do not drag historical rows forward just because this process has seen newer writes.
-            if candidate.saturating_add(1000) <= current {
-                break candidate;
-            }
-
-            // Same hot one-second bucket as the current high-water mark. Allocate the next
-            // millisecond so updated_at remains unique and cursor-orderable inside the process.
-            let bumped = current.saturating_add(1);
-            if self
-                .thread_updated_at_millis
-                .compare_exchange(current, bumped, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break bumped;
-            }
-        };
-        epoch_millis_to_datetime(allocated)
+        allocate_thread_timestamp(self.thread_updated_at_millis.as_ref(), updated_at)
     }
 
+    fn allocate_thread_recency_at(
+        &self,
+        recency_at: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        allocate_thread_timestamp(self.thread_recency_at_millis.as_ref(), recency_at)
+    }
+}
+
+fn allocate_thread_timestamp(
+    high_water_mark: &AtomicI64,
+    timestamp: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let candidate = datetime_to_epoch_millis(timestamp);
+    let allocated = loop {
+        let current = high_water_mark.load(Ordering::Relaxed);
+
+        // New wall-clock time: advance the process-local high-water mark and use it as-is.
+        if candidate > current {
+            if high_water_mark
+                .compare_exchange(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break candidate;
+            }
+            continue;
+        }
+
+        // Older timestamps come from backfill/repair paths that preserve rollout mtimes.
+        // Do not drag historical rows forward just because this process has seen newer writes.
+        if candidate.saturating_add(1000) <= current {
+            break candidate;
+        }
+
+        // Same hot one-second bucket as the current high-water mark. Allocate the next
+        // millisecond so the timestamp remains unique and cursor-orderable inside the process.
+        let bumped = current.saturating_add(1);
+        if high_water_mark
+            .compare_exchange(current, bumped, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break bumped;
+        }
+    };
+    epoch_millis_to_datetime(allocated)
+}
+
+impl StateRuntime {
     pub async fn update_thread_git_info(
         &self,
         thread_id: ThreadId,
@@ -692,6 +749,11 @@ WHERE id = ?
         creation_memory_mode: Option<&str>,
     ) -> anyhow::Result<()> {
         let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
+        let insert_recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
+        let preview = metadata_preview(metadata);
+        // Backfill/reconcile callers merge existing git info before upserting, but that
+        // read/modify/write is not atomic. Preserve non-null SQLite git fields here so
+        // an explicit metadata update cannot be lost if a stale rollout upsert lands later.
         sqlx::query(
             r#"
 INSERT INTO threads (
@@ -699,9 +761,12 @@ INSERT INTO threads (
     rollout_path,
     created_at,
     updated_at,
+    recency_at,
     created_at_ms,
     updated_at_ms,
+    recency_at_ms,
     source,
+    thread_source,
     agent_nickname,
     agent_role,
     agent_path,
@@ -711,6 +776,7 @@ INSERT INTO threads (
     cwd,
     cli_version,
     title,
+    preview,
     sandbox_policy,
     approval_mode,
     tokens_used,
@@ -721,14 +787,17 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
+    recency_at = threads.recency_at,
     created_at_ms = excluded.created_at_ms,
     updated_at_ms = excluded.updated_at_ms,
+    recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
+    thread_source = excluded.thread_source,
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
     agent_path = excluded.agent_path,
@@ -738,24 +807,33 @@ ON CONFLICT(id) DO UPDATE SET
     cwd = excluded.cwd,
     cli_version = excluded.cli_version,
     title = excluded.title,
+    preview = COALESCE(NULLIF(excluded.preview, ''), threads.preview),
     sandbox_policy = excluded.sandbox_policy,
     approval_mode = excluded.approval_mode,
     tokens_used = excluded.tokens_used,
     first_user_message = excluded.first_user_message,
     archived = excluded.archived,
     archived_at = excluded.archived_at,
-    git_sha = excluded.git_sha,
-    git_branch = excluded.git_branch,
-    git_origin_url = excluded.git_origin_url
+    git_sha = COALESCE(threads.git_sha, excluded.git_sha),
+    git_branch = COALESCE(threads.git_branch, excluded.git_branch),
+    git_origin_url = COALESCE(threads.git_origin_url, excluded.git_origin_url)
             "#,
         )
         .bind(metadata.id.to_string())
         .bind(metadata.rollout_path.display().to_string())
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(updated_at))
+        .bind(datetime_to_epoch_seconds(insert_recency_at))
         .bind(datetime_to_epoch_millis(metadata.created_at))
         .bind(datetime_to_epoch_millis(updated_at))
+        .bind(datetime_to_epoch_millis(insert_recency_at))
         .bind(metadata.source.as_str())
+        .bind(
+            metadata
+                .thread_source
+                .as_ref()
+                .map(codex_protocol::protocol::ThreadSource::as_str),
+        )
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.agent_path.as_deref())
@@ -770,6 +848,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
+        .bind(preview)
         .bind(metadata.sandbox_policy.as_str())
         .bind(metadata.approval_mode.as_str())
         .bind(metadata.tokens_used)
@@ -882,11 +961,116 @@ ON CONFLICT(id) DO UPDATE SET
 
     /// Delete a thread and all associated state by id.
     pub async fn delete_thread(&self, thread_id: ThreadId) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM threads WHERE id = ?")
-            .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+        self.delete_threads_strict(&[thread_id]).await
+    }
+
+    /// Delete a set of threads and all associated state.
+    ///
+    /// Spawn edges and thread rows are deleted last so a failed delete can be retried with enough
+    /// state left to rediscover the same spawned subtree.
+    pub async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64> {
+        if thread_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let thread_id_strings = thread_ids
+            .iter()
+            .map(ThreadId::to_string)
+            .collect::<Vec<_>>();
+        for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
+            sqlx::query("DELETE FROM logs WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(self.logs_pool.as_ref())
+                .await?;
+            self.memories.delete_thread_memory(*thread_id).await?;
+            self.thread_goals.delete_thread_goal(*thread_id).await?;
+        }
+
+        let now = Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        for thread_id_string in &thread_id_strings {
+            for parent_thread_id_string in &thread_id_strings {
+                // If both the job runner and worker are being deleted, requeueing
+                // the worker item would leave a running job with no loop to consume it.
+                sqlx::query(
+                    r#"
+UPDATE agent_jobs
+SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
+WHERE status IN (?, ?)
+  AND id IN (
+    SELECT item.job_id
+    FROM agent_job_items AS item
+    JOIN thread_spawn_edges AS edge ON edge.child_thread_id = item.assigned_thread_id
+    WHERE item.status = ? AND item.assigned_thread_id = ? AND edge.parent_thread_id = ?
+  )
+                    "#,
+                )
+                .bind(AgentJobStatus::Cancelled.as_str())
+                .bind(now)
+                .bind(now)
+                .bind("agent job runner thread was deleted")
+                .bind(AgentJobStatus::Pending.as_str())
+                .bind(AgentJobStatus::Running.as_str())
+                .bind(AgentJobItemStatus::Running.as_str())
+                .bind(thread_id_string)
+                .bind(parent_thread_id_string)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                r#"
+UPDATE agent_job_items
+SET
+    status = ?,
+    assigned_thread_id = NULL,
+    updated_at = ?,
+    last_error = ?
+WHERE assigned_thread_id = ? AND status = ?
+            "#,
+            )
+            .bind(AgentJobItemStatus::Pending.as_str())
+            .bind(now)
+            .bind("assigned thread was deleted")
+            .bind(thread_id_string)
+            .bind(AgentJobItemStatus::Running.as_str())
+            .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected())
+            sqlx::query(
+                r#"
+UPDATE agent_job_items
+SET assigned_thread_id = NULL, updated_at = ?
+WHERE assigned_thread_id = ?
+            "#,
+            )
+            .bind(now)
+            .bind(thread_id_string)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for thread_id_string in &thread_id_strings {
+            sqlx::query(
+                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?",
+            )
+            .bind(thread_id_string)
+            .bind(thread_id_string)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let mut rows_affected = 0;
+        for thread_id_string in &thread_id_strings {
+            rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+
+        Ok(rows_affected)
     }
 }
 
@@ -949,7 +1133,9 @@ SELECT
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
+    threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.thread_source,
     threads.agent_nickname,
     threads.agent_role,
     threads.agent_path,
@@ -959,6 +1145,7 @@ SELECT
     threads.cwd,
     threads.cli_version,
     threads.title,
+    threads.preview,
     threads.sandbox_policy,
     threads.approval_mode,
     threads.tokens_used,
@@ -1020,7 +1207,7 @@ pub(super) fn push_thread_filters<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    builder.push(" AND threads.first_user_message <> ''");
+    builder.push(" AND threads.preview <> ''");
     if !allowed_sources.is_empty() {
         builder.push(" AND threads.source IN (");
         let mut separated = builder.separated(", ");
@@ -1054,15 +1241,18 @@ pub(super) fn push_thread_filters<'a>(
         None => {}
     }
     if let Some(search_term) = search_term {
-        builder.push(" AND instr(threads.title, ");
+        builder.push(" AND (instr(threads.title, ");
         builder.push_bind(search_term);
-        builder.push(") > 0");
+        builder.push(") > 0 OR instr(threads.preview, ");
+        builder.push_bind(search_term);
+        builder.push(") > 0)");
     }
     if let Some(anchor) = anchor {
         let anchor_ts = datetime_to_epoch_millis(anchor.ts);
         let column = match sort_key {
             SortKey::CreatedAt => "threads.created_at_ms",
             SortKey::UpdatedAt => "threads.updated_at_ms",
+            SortKey::RecencyAt => "threads.recency_at_ms",
         };
         let operator = match sort_direction {
             SortDirection::Asc => ">",
@@ -1074,6 +1264,19 @@ pub(super) fn push_thread_filters<'a>(
         builder.push(operator);
         builder.push(" ");
         builder.push_bind(anchor_ts);
+        if sort_key == SortKey::RecencyAt
+            && let Some(anchor_id) = anchor.id
+        {
+            builder.push(" OR (");
+            builder.push(column);
+            builder.push(" = ");
+            builder.push_bind(anchor_ts);
+            builder.push(" AND threads.id ");
+            builder.push(operator);
+            builder.push(" ");
+            builder.push_bind(anchor_id.to_string());
+            builder.push(")");
+        }
         builder.push(")");
     }
 }
@@ -1098,6 +1301,7 @@ pub(super) fn push_thread_order_and_limit(
     let order_column = match sort_key {
         SortKey::CreatedAt => "threads.created_at_ms",
         SortKey::UpdatedAt => "threads.updated_at_ms",
+        SortKey::RecencyAt => "threads.recency_at_ms",
     };
     let order_direction = match sort_direction {
         SortDirection::Asc => "ASC",
@@ -1113,8 +1317,20 @@ pub(super) fn push_thread_order_and_limit(
     builder.push(order_column);
     builder.push(" ");
     builder.push(order_direction);
+    if sort_key == SortKey::RecencyAt {
+        builder.push(", threads.id ");
+        builder.push(order_direction);
+    }
     builder.push(" LIMIT ");
     builder.push_bind(limit as i64);
+}
+
+fn metadata_preview(metadata: &crate::ThreadMetadata) -> &str {
+    metadata
+        .preview
+        .as_deref()
+        .or(metadata.first_user_message.as_deref())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1379,6 +1595,7 @@ mod tests {
 
         let anchor = Anchor {
             ts: older_updated_at,
+            id: None,
         };
         let model_providers = ["test-provider".to_string()];
         let page = runtime
@@ -1405,6 +1622,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_200_000)
                     .expect("valid timestamp"),
+                id: None,
             })
         );
 
@@ -1489,6 +1707,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_300_000)
                     .expect("valid timestamp"),
+                id: None,
             })
         );
 
@@ -1551,6 +1770,7 @@ mod tests {
         ];
         let anchor = Anchor {
             ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            id: None,
         };
         for (sort_key, visible_index, cwd_index) in [
             (
@@ -1562,6 +1782,11 @@ mod tests {
                 SortKey::UpdatedAt,
                 "idx_threads_visible_updated_at_ms",
                 "idx_threads_archived_cwd_updated_at_ms",
+            ),
+            (
+                SortKey::RecencyAt,
+                "idx_threads_visible_recency_at_ms",
+                "idx_threads_archived_cwd_recency_at_ms",
             ),
         ] {
             for (cwd_filters, anchor, expected_index, expect_temp_sort) in [
@@ -1740,6 +1965,7 @@ mod tests {
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
+                thread_source: None,
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -1800,6 +2026,7 @@ mod tests {
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
+                thread_source: None,
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -1838,6 +2065,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_thread_preserves_existing_git_fields_atomically() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000458").expect("valid thread id");
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        metadata.git_sha = Some("sqlite-sha".to_string());
+        metadata.git_branch = Some("sqlite-branch".to_string());
+        metadata.git_origin_url = Some("git@example.com:openai/codex.git".to_string());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        let mut rollout_metadata = metadata.clone();
+        rollout_metadata.git_sha = Some("rollout-sha".to_string());
+        rollout_metadata.git_branch = Some("rollout-branch".to_string());
+        rollout_metadata.git_origin_url = Some("https://example.com/repo.git".to_string());
+
+        runtime
+            .upsert_thread(&rollout_metadata)
+            .await
+            .expect("rollout upsert should succeed");
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.git_sha.as_deref(), Some("sqlite-sha"));
+        assert_eq!(persisted.git_branch.as_deref(), Some("sqlite-branch"));
+        assert_eq!(
+            persisted.git_origin_url.as_deref(),
+            Some("git@example.com:openai/codex.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_thread_preserves_existing_preview_when_incoming_preview_is_empty() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000459").expect("valid thread id");
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        metadata.first_user_message = None;
+        metadata.preview = Some("migrated goal preview".to_string());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        let mut rollout_metadata = metadata.clone();
+        rollout_metadata.preview = None;
+
+        runtime
+            .upsert_thread(&rollout_metadata)
+            .await
+            .expect("rollout upsert should succeed");
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.preview.as_deref(), Some("migrated goal preview"));
+    }
+
+    #[tokio::test]
+    async fn set_thread_preview_if_empty_only_fills_blank_preview() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000460").expect("valid thread id");
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        metadata.first_user_message = None;
+        metadata.preview = None;
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        let empty_updated = runtime
+            .set_thread_preview_if_empty(thread_id, "  ")
+            .await
+            .expect("empty preview update should succeed");
+        assert!(!empty_updated);
+        let goal_updated = runtime
+            .set_thread_preview_if_empty(thread_id, "  goal preview  ")
+            .await
+            .expect("goal preview update should succeed");
+        assert!(goal_updated);
+        let overwrite_updated = runtime
+            .set_thread_preview_if_empty(thread_id, "new preview")
+            .await
+            .expect("overwrite preview update should succeed");
+        assert!(!overwrite_updated);
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.preview.as_deref(), Some("goal preview"));
+    }
+
+    #[tokio::test]
     async fn update_thread_git_info_preserves_newer_non_git_metadata() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -1856,11 +2198,12 @@ mod tests {
             DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp"),
         );
         sqlx::query(
-            "UPDATE threads SET updated_at = ?, updated_at_ms = ?, tokens_used = ?, first_user_message = ? WHERE id = ?",
+            "UPDATE threads SET updated_at = ?, updated_at_ms = ?, tokens_used = ?, first_user_message = ?, preview = ? WHERE id = ?",
         )
         .bind(updated_at / 1000)
         .bind(updated_at)
         .bind(123_i64)
+        .bind("newer preview")
         .bind("newer preview")
         .bind(thread_id.to_string())
         .execute(runtime.pool.as_ref())
@@ -1888,6 +2231,7 @@ mod tests {
             persisted.first_user_message.as_deref(),
             Some("newer preview")
         );
+        assert_eq!(persisted.preview.as_deref(), Some("newer preview"));
         assert_eq!(datetime_to_epoch_millis(persisted.updated_at), updated_at);
         assert_eq!(persisted.git_sha.as_deref(), Some("abc123"));
         assert_eq!(persisted.git_branch.as_deref(), Some("feature/branch"));
@@ -1909,6 +2253,7 @@ mod tests {
         let mut existing = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
         existing.tokens_used = 123;
         existing.first_user_message = Some("newer preview".to_string());
+        existing.preview = Some("newer preview".to_string());
         existing.updated_at = DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp");
         runtime
             .upsert_thread(&existing)
@@ -1918,6 +2263,7 @@ mod tests {
         let mut fallback = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
         fallback.tokens_used = 0;
         fallback.first_user_message = None;
+        fallback.preview = None;
         fallback.updated_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp");
 
         let inserted = runtime
@@ -1936,6 +2282,7 @@ mod tests {
             persisted.first_user_message.as_deref(),
             Some("newer preview")
         );
+        assert_eq!(persisted.preview.as_deref(), Some("newer preview"));
         assert_eq!(
             datetime_to_epoch_millis(persisted.updated_at),
             datetime_to_epoch_millis(existing.updated_at)
@@ -1987,6 +2334,7 @@ mod tests {
         let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
         metadata.title = "original title".to_string();
         metadata.first_user_message = Some("first-user-message".to_string());
+        metadata.preview = None;
 
         runtime
             .upsert_thread(&metadata)
@@ -2011,6 +2359,187 @@ mod tests {
             persisted.first_user_message.as_deref(),
             Some("first-user-message")
         );
+        assert_eq!(persisted.preview.as_deref(), Some("first-user-message"));
+    }
+
+    #[tokio::test]
+    async fn touch_thread_recency_at_is_monotonic_and_survives_stale_upsert() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000792").expect("valid thread id");
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        let original_recency_at = metadata.recency_at;
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        let touched_at =
+            DateTime::<Utc>::from_timestamp_millis(1_700_001_111_123).expect("timestamp");
+        assert!(
+            runtime
+                .touch_thread_recency_at(thread_id, touched_at)
+                .await
+                .expect("touch should succeed")
+        );
+
+        metadata.updated_at =
+            DateTime::<Utc>::from_timestamp_millis(1_700_001_222_456).expect("timestamp");
+        metadata.title = "updated metadata".to_string();
+        assert_eq!(metadata.recency_at, original_recency_at);
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("stale metadata upsert should succeed");
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.recency_at, touched_at);
+        assert_eq!(persisted.updated_at, metadata.updated_at);
+        assert_eq!(persisted.title, "updated metadata");
+
+        assert!(
+            runtime
+                .touch_thread_recency_at(thread_id, original_recency_at)
+                .await
+                .expect("older touch should succeed")
+        );
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(
+            datetime_to_epoch_millis(persisted.recency_at),
+            datetime_to_epoch_millis(touched_at) + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_threads_orders_and_pages_by_recency_at() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let first_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000793").expect("valid thread id");
+        let second_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000794").expect("valid thread id");
+        let third_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000795").expect("valid thread id");
+        let recency_at =
+            DateTime::<Utc>::from_timestamp_millis(1_700_002_000_456).expect("timestamp");
+
+        for thread_id in [first_id, second_id, third_id] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.recency_at = recency_at;
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread insert should succeed");
+        }
+        sqlx::query("UPDATE threads SET recency_at = ?, recency_at_ms = ?")
+            .bind(datetime_to_epoch_seconds(recency_at))
+            .bind(datetime_to_epoch_millis(recency_at))
+            .execute(runtime.pool.as_ref())
+            .await
+            .expect("recency timestamps should match");
+
+        let first_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                ThreadFilterOptions {
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: None,
+                    anchor: None,
+                    sort_key: SortKey::RecencyAt,
+                    sort_direction: SortDirection::Desc,
+                    search_term: None,
+                },
+            )
+            .await
+            .expect("list should succeed");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![third_id]
+        );
+        assert_eq!(
+            first_page.next_anchor,
+            Some(Anchor {
+                ts: recency_at,
+                id: Some(third_id),
+            })
+        );
+
+        let second_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                ThreadFilterOptions {
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: None,
+                    anchor: first_page.next_anchor.as_ref(),
+                    sort_key: SortKey::RecencyAt,
+                    sort_direction: SortDirection::Desc,
+                    search_term: None,
+                },
+            )
+            .await
+            .expect("second list should succeed");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![second_id]
+        );
+        assert_eq!(
+            second_page.next_anchor,
+            Some(Anchor {
+                ts: recency_at,
+                id: Some(second_id),
+            })
+        );
+
+        let third_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                ThreadFilterOptions {
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: None,
+                    anchor: second_page.next_anchor.as_ref(),
+                    sort_key: SortKey::RecencyAt,
+                    sort_direction: SortDirection::Desc,
+                    search_term: None,
+                },
+            )
+            .await
+            .expect("third list should succeed");
+        assert_eq!(
+            third_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![first_id]
+        );
+        assert_eq!(third_page.next_anchor, None);
     }
 
     #[tokio::test]
@@ -2029,8 +2558,10 @@ mod tests {
             DateTime::<Utc>::from_timestamp_millis(1_700_001_111_123).expect("timestamp millis");
         let mut first = test_thread_metadata(&codex_home, first_id, codex_home.clone());
         first.updated_at = updated_at;
+        first.recency_at = updated_at;
         let mut second = test_thread_metadata(&codex_home, second_id, codex_home.clone());
         second.updated_at = updated_at;
+        second.recency_at = updated_at;
 
         runtime
             .upsert_thread(&first)
@@ -2057,6 +2588,14 @@ mod tests {
         );
         assert_eq!(
             datetime_to_epoch_millis(second.updated_at),
+            1_700_001_111_124
+        );
+        assert_eq!(
+            datetime_to_epoch_millis(first.recency_at),
+            1_700_001_111_123
+        );
+        assert_eq!(
+            datetime_to_epoch_millis(second.recency_at),
             1_700_001_111_124
         );
         let second_row: (i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
@@ -2264,5 +2803,66 @@ mod tests {
             .await
             .expect("all descendants should load");
         assert_eq!(all_descendants, vec![child_thread_id, grandchild_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn thread_spawn_children_without_status_filter_lists_all_statuses() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home, "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let parent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000910").expect("valid thread id");
+        let open_child_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000911").expect("valid thread id");
+        let closed_child_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000912").expect("valid thread id");
+        let future_child_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000913").expect("valid thread id");
+
+        runtime
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                open_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("open child edge insert should succeed");
+        runtime
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                closed_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed child edge insert should succeed");
+        sqlx::query(
+            r#"
+INSERT INTO thread_spawn_edges (
+    parent_thread_id,
+    child_thread_id,
+    status
+) VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(parent_thread_id.to_string())
+        .bind(future_child_thread_id.to_string())
+        .bind("future")
+        .execute(runtime.pool.as_ref())
+        .await
+        .expect("future-status child edge insert should succeed");
+
+        let children = runtime
+            .list_thread_spawn_children(parent_thread_id)
+            .await
+            .expect("all children should load");
+        assert_eq!(
+            children,
+            vec![
+                open_child_thread_id,
+                closed_child_thread_id,
+                future_child_thread_id,
+            ]
+        );
     }
 }

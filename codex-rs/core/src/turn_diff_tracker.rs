@@ -1,45 +1,80 @@
 use std::collections::HashMap;
-use std::fs;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::time::Duration;
 
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::anyhow;
 use sha1::digest::Output;
-use uuid::Uuid;
 
-use codex_protocol::protocol::FileChange;
+use codex_apply_patch::AppliedPatchChange;
+use codex_apply_patch::AppliedPatchDelta;
+use codex_apply_patch::AppliedPatchFileChange;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
+const REGULAR_FILE_MODE: &str = "100644";
+// Normal edits finish well within 100 ms; pathological inputs fall back to a coarse,
+// content-exact diff without stalling tool completion.
+const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
-struct BaselineFileInfo {
-    path: PathBuf,
-    content: Vec<u8>,
-    mode: FileMode,
-    oid: String,
+struct TrackedContent {
+    content: String,
+    revision: u64,
 }
 
-/// Tracks sets of changes to files and exposes the overall unified diff.
-/// Internally, the way this works is now:
-/// 1. Maintain an in-memory baseline snapshot of files when they are first seen.
-///    For new additions, do not create a baseline so that diffs are shown as proper additions (using /dev/null).
-/// 2. Keep a stable internal filename (uuid) per external path for rename tracking.
-/// 3. To compute the aggregated unified diff, compare each baseline snapshot to the current file on disk entirely in-memory
-///    using the `similar` crate and emit unified diffs with rewritten external paths.
-#[derive(Default)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TrackedPath {
+    environment_id: String,
+    path: PathBuf,
+}
+
+impl TrackedPath {
+    fn new(environment_id: &str, path: &Path) -> Self {
+        Self {
+            environment_id: environment_id.to_string(),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct DiffCacheKey {
+    left_path: TrackedPath,
+    left_revision: Option<u64>,
+    right_path: TrackedPath,
+    right_revision: Option<u64>,
+}
+
+/// Tracks the net text diff for the current turn from committed apply_patch
+/// mutations, without rereading the workspace filesystem.
 pub struct TurnDiffTracker {
-    /// Map external path -> internal filename (uuid).
-    external_to_temp_name: HashMap<PathBuf, String>,
-    /// Internal filename -> baseline file info.
-    baseline_file_info: HashMap<String, BaselineFileInfo>,
-    /// Internal filename -> external path as of current accumulated state (after applying all changes).
-    /// This is where renames are tracked.
-    temp_name_to_current_path: HashMap<String, PathBuf>,
-    /// Cache of known git worktree roots to avoid repeated filesystem walks.
-    git_root_cache: Vec<PathBuf>,
+    valid: bool,
+    display_roots_by_environment: HashMap<String, PathBuf>,
+    baseline_by_path: HashMap<TrackedPath, TrackedContent>,
+    current_by_path: HashMap<TrackedPath, TrackedContent>,
+    origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
+    next_revision: u64,
+    rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
+    unified_diff: Option<String>,
+    #[cfg(test)]
+    rendered_diff_count: std::cell::Cell<usize>,
+}
+
+impl Default for TurnDiffTracker {
+    fn default() -> Self {
+        Self {
+            valid: true,
+            display_roots_by_environment: HashMap::new(),
+            baseline_by_path: HashMap::new(),
+            current_by_path: HashMap::new(),
+            origin_by_current_path: HashMap::new(),
+            next_revision: 0,
+            rendered_diffs: HashMap::new(),
+            unified_diff: None,
+            #[cfg(test)]
+            rendered_diff_count: std::cell::Cell::new(0),
+        }
+    }
 }
 
 impl TurnDiffTracker {
@@ -47,421 +82,321 @@ impl TurnDiffTracker {
         Self::default()
     }
 
-    /// Front-run apply patch calls to track the starting contents of any modified files.
-    /// - Creates an in-memory baseline snapshot for files that already exist on disk when first seen.
-    /// - For additions, we intentionally do not create a baseline snapshot so that diffs are proper additions.
-    /// - Also updates internal mappings for move/rename events.
-    pub fn on_patch_begin(&mut self, changes: &HashMap<PathBuf, FileChange>) {
-        for (path, change) in changes.iter() {
-            // Ensure a stable internal filename exists for this external path.
-            if !self.external_to_temp_name.contains_key(path) {
-                let internal = Uuid::new_v4().to_string();
-                self.external_to_temp_name
-                    .insert(path.clone(), internal.clone());
-                self.temp_name_to_current_path
-                    .insert(internal.clone(), path.clone());
+    pub fn with_environment_display_roots(
+        display_roots: impl IntoIterator<Item = (String, PathBuf)>,
+    ) -> Self {
+        let mut tracker = Self::new();
+        tracker.display_roots_by_environment = display_roots.into_iter().collect();
+        tracker
+    }
 
-                // If the file exists on disk now, snapshot as baseline; else leave missing to represent /dev/null.
-                let baseline_file_info = if path.exists() {
-                    let mode = file_mode_for_path(path);
-                    let mode_val = mode.unwrap_or(FileMode::Regular);
-                    let content = blob_bytes(path, mode_val).unwrap_or_default();
-                    let oid = if mode == Some(FileMode::Symlink) {
-                        format!("{:x}", git_blob_sha1_hex_bytes(&content))
-                    } else {
-                        self.git_blob_oid_for_path(path)
-                            .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(&content)))
-                    };
-                    Some(BaselineFileInfo {
-                        path: path.clone(),
-                        content,
-                        mode: mode_val,
-                        oid,
-                    })
-                } else {
-                    Some(BaselineFileInfo {
-                        path: path.clone(),
-                        content: vec![],
-                        mode: FileMode::Regular,
-                        oid: ZERO_OID.to_string(),
-                    })
-                };
+    pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
+        if !self.valid {
+            return;
+        }
 
-                if let Some(baseline_file_info) = baseline_file_info {
-                    self.baseline_file_info
-                        .insert(internal.clone(), baseline_file_info);
-                }
+        if !delta.is_exact() {
+            self.invalidate();
+            return;
+        }
+
+        for change in delta.changes() {
+            self.apply_change(environment_id, change);
+        }
+        self.refresh_unified_diff();
+    }
+
+    pub fn invalidate(&mut self) {
+        self.valid = false;
+        self.rendered_diffs.clear();
+        self.unified_diff = None;
+    }
+
+    pub fn get_unified_diff(&self) -> Option<String> {
+        self.unified_diff.clone()
+    }
+
+    pub(crate) fn has_unified_diff(&self) -> bool {
+        self.unified_diff.is_some()
+    }
+
+    fn refresh_unified_diff(&mut self) {
+        let rename_pairs = self.rename_pairs();
+        let paired_destinations = rename_pairs.values().cloned().collect::<HashSet<_>>();
+        let mut handled = HashSet::new();
+        let mut paths = self
+            .baseline_by_path
+            .keys()
+            .chain(self.current_by_path.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| self.display_path(path));
+        paths.dedup();
+
+        let mut previous_diffs = std::mem::take(&mut self.rendered_diffs);
+        let mut rendered_diffs = HashMap::new();
+        let mut aggregated = String::new();
+        for path in paths {
+            if !handled.insert(path.clone()) {
+                continue;
             }
 
-            // Track rename/move in current mapping if provided in an Update.
-            if let FileChange::Update {
-                move_path: Some(dest),
-                ..
-            } = change
-            {
-                let uuid_filename = match self.external_to_temp_name.get(path) {
-                    Some(i) => i.clone(),
-                    None => {
-                        // This should be rare, but if we haven't mapped the source, create it with no baseline.
-                        let i = Uuid::new_v4().to_string();
-                        self.baseline_file_info.insert(
-                            i.clone(),
-                            BaselineFileInfo {
-                                path: path.clone(),
-                                content: vec![],
-                                mode: FileMode::Regular,
-                                oid: ZERO_OID.to_string(),
-                            },
-                        );
-                        i
-                    }
-                };
-                // Update current external mapping for temp file name.
-                self.temp_name_to_current_path
-                    .insert(uuid_filename.clone(), dest.clone());
-                // Update forward file_mapping: external current -> internal name.
-                self.external_to_temp_name.remove(path);
-                self.external_to_temp_name
-                    .insert(dest.clone(), uuid_filename);
+            if paired_destinations.contains(&path) {
+                continue;
+            }
+
+            let (left_path, right_path) = if let Some(dest) = rename_pairs.get(&path) {
+                handled.insert(dest.clone());
+                (&path, dest)
+            } else {
+                (&path, &path)
             };
-        }
-    }
 
-    fn get_path_for_internal(&self, internal: &str) -> Option<PathBuf> {
-        self.temp_name_to_current_path
-            .get(internal)
-            .cloned()
-            .or_else(|| {
-                self.baseline_file_info
-                    .get(internal)
-                    .map(|info| info.path.clone())
-            })
-    }
+            let left_content = self.baseline_by_path.get(left_path);
+            let right_content = self.current_by_path.get(right_path);
+            let key = DiffCacheKey {
+                left_path: left_path.clone(),
+                left_revision: left_content.map(|content| content.revision),
+                right_path: right_path.clone(),
+                right_revision: right_content.map(|content| content.revision),
+            };
+            let rendered = previous_diffs.remove(&key).unwrap_or_else(|| {
+                self.render_diff(
+                    left_path,
+                    left_content.map(|content| content.content.as_str()),
+                    right_path,
+                    right_content.map(|content| content.content.as_str()),
+                )
+            });
 
-    /// Find the git worktree root for a file/directory by walking up to the first ancestor containing a `.git` entry.
-    /// Uses a simple cache of known roots and avoids negative-result caching for simplicity.
-    fn find_git_root_cached(&mut self, start: &Path) -> Option<PathBuf> {
-        let dir = if start.is_dir() {
-            start
-        } else {
-            start.parent()?
-        };
-
-        // Fast path: if any cached root is an ancestor of this path, use it.
-        if let Some(root) = self
-            .git_root_cache
-            .iter()
-            .find(|r| dir.starts_with(r))
-            .cloned()
-        {
-            return Some(root);
-        }
-
-        // Walk up to find a `.git` marker.
-        let mut cur = dir.to_path_buf();
-        loop {
-            let git_marker = cur.join(".git");
-            if git_marker.is_dir() || git_marker.is_file() {
-                if !self.git_root_cache.iter().any(|r| r == &cur) {
-                    self.git_root_cache.push(cur.clone());
+            if let Some(diff) = rendered.as_deref() {
+                aggregated.push_str(diff);
+                if !aggregated.ends_with('\n') {
+                    aggregated.push('\n');
                 }
-                return Some(cur);
             }
+            rendered_diffs.insert(key, rendered);
+        }
 
-            // On Windows, avoid walking above the drive or UNC share root.
-            #[cfg(windows)]
-            {
-                if is_windows_drive_or_unc_root(&cur) {
+        self.rendered_diffs = rendered_diffs;
+        self.unified_diff = (!aggregated.is_empty()).then_some(aggregated);
+    }
+
+    fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
+        let source_path = TrackedPath::new(environment_id, change.path.as_path());
+        match &change.change {
+            AppliedPatchFileChange::Add {
+                content,
+                overwritten_content,
+            } => self.apply_add(source_path, content, overwritten_content.as_deref()),
+            AppliedPatchFileChange::Delete { content } => self.apply_delete(source_path, content),
+            AppliedPatchFileChange::Update {
+                move_path,
+                old_content,
+                overwritten_move_content,
+                new_content,
+            } => {
+                let move_path = move_path
+                    .as_deref()
+                    .map(|path| TrackedPath::new(environment_id, path));
+                self.apply_update(
+                    source_path,
+                    move_path,
+                    old_content,
+                    overwritten_move_content.as_deref(),
+                    new_content,
+                )
+            }
+        }
+    }
+
+    fn apply_add(&mut self, path: TrackedPath, content: &str, overwritten_content: Option<&str>) {
+        self.origin_by_current_path.remove(&path);
+        if !self.current_by_path.contains_key(&path)
+            && !self.baseline_by_path.contains_key(&path)
+            && let Some(overwritten_content) = overwritten_content
+        {
+            let overwritten_content = self.tracked_content(overwritten_content);
+            self.baseline_by_path
+                .insert(path.clone(), overwritten_content);
+        }
+        let content = self.tracked_content(content);
+        self.current_by_path.insert(path, content);
+    }
+
+    fn apply_delete(&mut self, path: TrackedPath, content: &str) {
+        if self.current_by_path.remove(&path).is_none()
+            && !self.baseline_by_path.contains_key(&path)
+        {
+            let content = self.tracked_content(content);
+            self.baseline_by_path.insert(path.clone(), content);
+        }
+        self.origin_by_current_path.remove(&path);
+    }
+
+    fn apply_update(
+        &mut self,
+        source_path: TrackedPath,
+        move_path: Option<TrackedPath>,
+        old_content: &str,
+        overwritten_move_content: Option<&str>,
+        new_content: &str,
+    ) {
+        if !self.current_by_path.contains_key(&source_path)
+            && !self.baseline_by_path.contains_key(&source_path)
+        {
+            let old_content = self.tracked_content(old_content);
+            self.baseline_by_path
+                .insert(source_path.clone(), old_content);
+        }
+
+        match move_path {
+            Some(dest_path) => {
+                if !self.current_by_path.contains_key(&dest_path)
+                    && !self.baseline_by_path.contains_key(&dest_path)
+                    && let Some(overwritten_move_content) = overwritten_move_content
+                {
+                    let overwritten_move_content = self.tracked_content(overwritten_move_content);
+                    self.baseline_by_path
+                        .insert(dest_path.clone(), overwritten_move_content);
+                }
+                let origin = self
+                    .origin_by_current_path
+                    .remove(&source_path)
+                    .unwrap_or_else(|| source_path.clone());
+                self.current_by_path.remove(&source_path);
+                let new_content = self.tracked_content(new_content);
+                self.current_by_path.insert(dest_path.clone(), new_content);
+                self.origin_by_current_path.remove(&dest_path);
+                if dest_path != origin {
+                    self.origin_by_current_path.insert(dest_path, origin);
+                }
+            }
+            None => {
+                let new_content = self.tracked_content(new_content);
+                self.current_by_path.insert(source_path, new_content);
+            }
+        }
+    }
+
+    fn tracked_content(&mut self, content: &str) -> TrackedContent {
+        let revision = self.next_revision;
+        self.next_revision += 1;
+        TrackedContent {
+            content: content.to_string(),
+            revision,
+        }
+    }
+
+    fn rename_pairs(&self) -> HashMap<TrackedPath, TrackedPath> {
+        self.origin_by_current_path
+            .iter()
+            .filter_map(|(dest_path, origin_path)| {
+                if dest_path == origin_path
+                    || self.current_by_path.contains_key(origin_path)
+                    || !self.current_by_path.contains_key(dest_path)
+                    || !self.baseline_by_path.contains_key(origin_path)
+                    || self.baseline_by_path.contains_key(dest_path)
+                {
                     return None;
                 }
-            }
 
-            if let Some(parent) = cur.parent() {
-                cur = parent.to_path_buf();
-            } else {
-                return None;
-            }
-        }
+                Some((origin_path.clone(), dest_path.clone()))
+            })
+            .collect()
     }
 
-    /// Return a display string for `path` relative to its git root if found, else absolute.
-    fn relative_to_git_root_str(&mut self, path: &Path) -> String {
-        let s = if let Some(root) = self.find_git_root_cached(path) {
-            if let Ok(rel) = path.strip_prefix(&root) {
-                rel.display().to_string()
-            } else {
-                path.display().to_string()
-            }
-        } else {
-            path.display().to_string()
-        };
-        s.replace('\\', "/")
-    }
-
-    /// Ask git to compute the blob SHA-1 for the file at `path` within its repository.
-    /// Returns None if no repository is found or git invocation fails.
-    fn git_blob_oid_for_path(&mut self, path: &Path) -> Option<String> {
-        let root = self.find_git_root_cached(path)?;
-        // Compute a path relative to the repo root for better portability across platforms.
-        let rel = path.strip_prefix(&root).unwrap_or(path);
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("hash-object")
-            .arg("--")
-            .arg(rel)
-            .output()
-            .ok()?;
-        if !output.status.success() {
+    fn render_diff(
+        &self,
+        left_path: &TrackedPath,
+        left_content: Option<&str>,
+        right_path: &TrackedPath,
+        right_content: Option<&str>,
+    ) -> Option<String> {
+        if left_content == right_content {
             return None;
         }
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if s.len() == 40 { Some(s) } else { None }
-    }
 
-    /// Recompute the aggregated unified diff by comparing all of the in-memory snapshots that were
-    /// collected before the first time they were touched by apply_patch during this turn with
-    /// the current repo state.
-    pub fn get_unified_diff(&mut self) -> Result<Option<String>> {
-        let mut aggregated = String::new();
+        #[cfg(test)]
+        self.rendered_diff_count
+            .set(self.rendered_diff_count.get() + 1);
 
-        // Compute diffs per tracked internal file in a stable order by external path.
-        let mut baseline_file_names: Vec<String> =
-            self.baseline_file_info.keys().cloned().collect();
-        // Sort lexicographically by full repo-relative path to match git behavior.
-        baseline_file_names.sort_by_key(|internal| {
-            self.get_path_for_internal(internal)
-                .map(|p| self.relative_to_git_root_str(&p))
-                .unwrap_or_default()
-        });
-
-        for internal in baseline_file_names {
-            aggregated.push_str(self.get_file_diff(&internal).as_str());
-            if !aggregated.ends_with('\n') {
-                aggregated.push('\n');
-            }
-        }
-
-        if aggregated.trim().is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(aggregated))
-        }
-    }
-
-    fn get_file_diff(&mut self, internal_file_name: &str) -> String {
-        let mut aggregated = String::new();
-
-        // Snapshot lightweight fields only.
-        let (baseline_external_path, baseline_mode, left_oid) = {
-            if let Some(info) = self.baseline_file_info.get(internal_file_name) {
-                (info.path.clone(), info.mode, info.oid.clone())
-            } else {
-                (PathBuf::new(), FileMode::Regular, ZERO_OID.to_string())
-            }
-        };
-        let current_external_path = match self.get_path_for_internal(internal_file_name) {
-            Some(p) => p,
-            None => return aggregated,
-        };
-
-        let current_mode = file_mode_for_path(&current_external_path).unwrap_or(FileMode::Regular);
-        let right_bytes = blob_bytes(&current_external_path, current_mode);
-
-        // Compute displays with &mut self before borrowing any baseline content.
-        let left_display = self.relative_to_git_root_str(&baseline_external_path);
-        let right_display = self.relative_to_git_root_str(&current_external_path);
-
-        // Compute right oid before borrowing baseline content.
-        let right_oid = if let Some(b) = right_bytes.as_ref() {
-            if current_mode == FileMode::Symlink {
-                format!("{:x}", git_blob_sha1_hex_bytes(b))
-            } else {
-                self.git_blob_oid_for_path(&current_external_path)
-                    .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(b)))
-            }
-        } else {
-            ZERO_OID.to_string()
-        };
-
-        // Borrow baseline content only after all &mut self uses are done.
-        let left_present = left_oid.as_str() != ZERO_OID;
-        let left_bytes: Option<&[u8]> = if left_present {
-            self.baseline_file_info
-                .get(internal_file_name)
-                .map(|i| i.content.as_slice())
-        } else {
-            None
-        };
-
-        // Fast path: identical bytes or both missing.
-        if left_bytes == right_bytes.as_deref() {
-            return aggregated;
-        }
-
-        aggregated.push_str(&format!("diff --git a/{left_display} b/{right_display}\n"));
-
-        let is_add = !left_present && right_bytes.is_some();
-        let is_delete = left_present && right_bytes.is_none();
-
-        if is_add {
-            aggregated.push_str(&format!("new file mode {current_mode}\n"));
-        } else if is_delete {
-            aggregated.push_str(&format!("deleted file mode {baseline_mode}\n"));
-        } else if baseline_mode != current_mode {
-            aggregated.push_str(&format!("old mode {baseline_mode}\n"));
-            aggregated.push_str(&format!("new mode {current_mode}\n"));
-        }
-
-        let left_text = left_bytes.and_then(|b| std::str::from_utf8(b).ok());
-        let right_text = right_bytes
-            .as_deref()
-            .and_then(|b| std::str::from_utf8(b).ok());
-
-        let can_text_diff = matches!(
-            (left_text, right_text, is_add, is_delete),
-            (Some(_), Some(_), _, _) | (_, Some(_), true, _) | (Some(_), _, _, true)
+        let left_display = self.display_path(left_path);
+        let right_display = self.display_path(right_path);
+        let left_oid = left_content.map_or_else(
+            || ZERO_OID.to_string(),
+            |content| git_blob_oid(content.as_bytes()),
+        );
+        let right_oid = right_content.map_or_else(
+            || ZERO_OID.to_string(),
+            |content| git_blob_oid(content.as_bytes()),
         );
 
-        if can_text_diff {
-            let l = left_text.unwrap_or("");
-            let r = right_text.unwrap_or("");
-
-            aggregated.push_str(&format!("index {left_oid}..{right_oid}\n"));
-
-            let old_header = if left_present {
-                format!("a/{left_display}")
-            } else {
-                DEV_NULL.to_string()
-            };
-            let new_header = if right_bytes.is_some() {
-                format!("b/{right_display}")
-            } else {
-                DEV_NULL.to_string()
-            };
-
-            let diff = similar::TextDiff::from_lines(l, r);
-            let unified = diff
-                .unified_diff()
-                .context_radius(3)
-                .header(&old_header, &new_header)
-                .to_string();
-
-            aggregated.push_str(&unified);
-        } else {
-            aggregated.push_str(&format!("index {left_oid}..{right_oid}\n"));
-            let old_header = if left_present {
-                format!("a/{left_display}")
-            } else {
-                DEV_NULL.to_string()
-            };
-            let new_header = if right_bytes.is_some() {
-                format!("b/{right_display}")
-            } else {
-                DEV_NULL.to_string()
-            };
-            aggregated.push_str(&format!("--- {old_header}\n"));
-            aggregated.push_str(&format!("+++ {new_header}\n"));
-            aggregated.push_str("Binary files differ\n");
+        let mut diff = format!("diff --git a/{left_display} b/{right_display}\n");
+        match (left_content, right_content) {
+            (None, Some(_)) => diff.push_str(&format!("new file mode {REGULAR_FILE_MODE}\n")),
+            (Some(_), None) => diff.push_str(&format!("deleted file mode {REGULAR_FILE_MODE}\n")),
+            (Some(_), Some(_)) => {}
+            (None, None) => return None,
         }
-        aggregated
+
+        diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
+
+        let old_header = if left_content.is_some() {
+            format!("a/{left_display}")
+        } else {
+            DEV_NULL.to_string()
+        };
+        let new_header = if right_content.is_some() {
+            format!("b/{right_display}")
+        } else {
+            DEV_NULL.to_string()
+        };
+
+        let mut config = similar::TextDiff::configure();
+        config.timeout(DIFF_TIMEOUT);
+        let unified = config
+            .diff_lines(left_content.unwrap_or(""), right_content.unwrap_or(""))
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_header, &new_header)
+            .to_string();
+        diff.push_str(&unified);
+        Some(diff)
     }
+
+    #[cfg(test)]
+    fn rendered_diff_count(&self) -> usize {
+        self.rendered_diff_count.get()
+    }
+
+    fn display_path(&self, path: &TrackedPath) -> String {
+        let display = self
+            .display_roots_by_environment
+            .get(&path.environment_id)
+            .and_then(|root| path.path.strip_prefix(root).ok())
+            .unwrap_or(path.path.as_path());
+        let display = display.display().to_string().replace('\\', "/");
+        if self.display_roots_by_environment.len() > 1 && !path.environment_id.is_empty() {
+            format!("{}/{display}", path.environment_id)
+        } else {
+            display
+        }
+    }
+}
+
+fn git_blob_oid(data: &[u8]) -> String {
+    format!("{:x}", git_blob_sha1_hex_bytes(data))
 }
 
 /// Compute the Git SHA-1 blob object ID for the given content (bytes).
 fn git_blob_sha1_hex_bytes(data: &[u8]) -> Output<sha1::Sha1> {
-    // Git blob hash is sha1 of: "blob <len>\0<data>"
     let header = format!("blob {}\0", data.len());
     use sha1::Digest;
     let mut hasher = sha1::Sha1::new();
     hasher.update(header.as_bytes());
     hasher.update(data);
     hasher.finalize()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileMode {
-    Regular,
-    #[cfg(unix)]
-    Executable,
-    Symlink,
-}
-
-impl FileMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            FileMode::Regular => "100644",
-            #[cfg(unix)]
-            FileMode::Executable => "100755",
-            FileMode::Symlink => "120000",
-        }
-    }
-}
-
-impl std::fmt::Display for FileMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[cfg(unix)]
-fn file_mode_for_path(path: &Path) -> Option<FileMode> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = fs::symlink_metadata(path).ok()?;
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        return Some(FileMode::Symlink);
-    }
-    let mode = meta.permissions().mode();
-    let is_exec = (mode & 0o111) != 0;
-    Some(if is_exec {
-        FileMode::Executable
-    } else {
-        FileMode::Regular
-    })
-}
-
-#[cfg(not(unix))]
-fn file_mode_for_path(_path: &Path) -> Option<FileMode> {
-    // Default to non-executable on non-unix.
-    Some(FileMode::Regular)
-}
-
-fn blob_bytes(path: &Path, mode: FileMode) -> Option<Vec<u8>> {
-    if path.exists() {
-        let contents = if mode == FileMode::Symlink {
-            symlink_blob_bytes(path)
-                .ok_or_else(|| anyhow!("failed to read symlink target for {}", path.display()))
-        } else {
-            fs::read(path)
-                .with_context(|| format!("failed to read current file for diff {}", path.display()))
-        };
-        contents.ok()
-    } else {
-        None
-    }
-}
-
-#[cfg(unix)]
-fn symlink_blob_bytes(path: &Path) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    let target = std::fs::read_link(path).ok()?;
-    Some(target.as_os_str().as_bytes().to_vec())
-}
-
-#[cfg(not(unix))]
-fn symlink_blob_bytes(_path: &Path) -> Option<Vec<u8>> {
-    None
-}
-
-#[cfg(windows)]
-fn is_windows_drive_or_unc_root(p: &std::path::Path) -> bool {
-    use std::path::Component;
-    let mut comps = p.components();
-    matches!(
-        (comps.next(), comps.next(), comps.next()),
-        (Some(Component::Prefix(_)), Some(Component::RootDir), None)
-    )
 }
 
 #[cfg(test)]

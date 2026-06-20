@@ -122,6 +122,7 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Ok(runtime) => runtime,
                     Err(_) => std::process::exit(1),
                 };
+                let cwd = cwd.into();
                 match runtime.block_on(codex_apply_patch::apply_patch(
                     &patch_arg,
                     &cwd,
@@ -130,7 +131,7 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     codex_exec_server::LOCAL_FS.as_ref(),
                     /*sandbox*/ None,
                 )) {
-                    Ok(()) => 0,
+                    Ok(_) => 0,
                     Err(_) => 1,
                 }
             }
@@ -284,28 +285,13 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 
 const ILLEGAL_ENV_VAR_PREFIX: &str = "CODEX_";
 
-/// Load env vars from ~/.codex/.env and optional sibling `openpaths/.env`.
+/// Load env vars from ~/.codex/.env.
 ///
 /// Security: Do not allow `.env` files to create or modify any variables
 /// with names starting with `CODEX_`.
 fn load_dotenv() {
-    if let Ok(codex_home) = find_codex_home() {
-        load_dotenv_file(&codex_home.join(".env"));
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        for candidate in [
-            cwd.join("openpaths").join(".env"),
-            cwd.join("../openpaths").join(".env"),
-        ] {
-            load_dotenv_file(&candidate);
-        }
-    }
-}
-
-fn load_dotenv_file(path: &std::path::Path) {
-    if path.is_file()
-        && let Ok(iter) = dotenvy::from_path_iter(path)
+    if let Ok(codex_home) = find_codex_home()
+        && let Ok(iter) = dotenvy::from_path_iter(codex_home.join(".env"))
     {
         set_filtered(iter);
     }

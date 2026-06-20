@@ -10,6 +10,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use uuid::Uuid;
 
+use crate::motion::MotionMode;
+use crate::motion::shimmer_text;
+
 use super::AuthModeWidget;
 use super::ContinueWithDeviceCodeState;
 use super::SignInState;
@@ -92,7 +95,14 @@ pub(super) fn render_device_code_login(
     };
 
     let mut spans = vec!["  ".into()];
-    spans.push(banner.into());
+    if widget.animations_enabled && !widget.animations_suppressed.get() {
+        widget
+            .request_frame
+            .schedule_frame_in(std::time::Duration::from_millis(100));
+        spans.extend(shimmer_text(banner, MotionMode::Animated));
+    } else {
+        spans.push(banner.into());
+    }
 
     let mut lines = vec![spans.into(), "".into()];
 

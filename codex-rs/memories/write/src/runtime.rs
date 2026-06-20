@@ -19,15 +19,16 @@ use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
@@ -48,8 +49,7 @@ pub(crate) struct StageOneRequestContext {
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) reasoning_summary: ReasoningSummary,
-    pub(crate) service_tier: Option<ServiceTier>,
-    pub(crate) turn_metadata_header: Option<String>,
+    pub(crate) service_tier: Option<String>,
 }
 
 impl StageOneRequestContext {
@@ -235,6 +235,8 @@ impl MemoryStartupContext {
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
+            config.features.enabled(Feature::ItemIds),
+            /*attestation_provider*/ None,
         );
 
         let mut client_session = model_client.new_session();
@@ -256,8 +258,8 @@ impl MemoryStartupContext {
                 &context.session_telemetry,
                 context.reasoning_effort.clone(),
                 context.reasoning_summary,
-                context.service_tier,
-                context.turn_metadata_header.as_deref(),
+                context.service_tier.clone(),
+                &responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
             .await?;
@@ -306,11 +308,14 @@ impl MemoryStartupContext {
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
+                thread_source: Some(ThreadSource::MemoryConsolidation),
                 dynamic_tools: Vec::new(),
                 metrics_service_name: None,
+                multi_agent_mode: None,
                 parent_trace: None,
                 environments,
                 thread_extension_init: Default::default(),
+                supports_openai_form_elicitation: false,
             })
             .await?;
 
@@ -321,6 +326,8 @@ impl MemoryStartupContext {
                 items: prompt,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             })
             .await
         {

@@ -6,15 +6,23 @@ use std::pin::Pin;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
+use crate::DeleteThreadParams;
+use crate::ItemPage;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
+use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
+use crate::SearchThreadsParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadPage;
+use crate::ThreadSearchPage;
+use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
 
 /// Future returned by [`ThreadStore`] operations.
@@ -31,8 +39,11 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Reopens an existing thread for live appends.
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>;
 
-    /// Appends items to a live thread.
-    async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()>;
+    /// Appends raw rollout items to a live thread.
+    ///
+    /// Implementations should apply the shared rollout persistence policy before writing durable
+    /// replay history and before updating any implementation-owned projections.
+    fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
@@ -70,8 +81,41 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Lists stored threads matching the supplied filters.
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;
 
-    /// Applies a mutable metadata patch and returns the updated thread.
-    async fn update_thread_metadata(
+    /// Searches stored threads and returns search-only preview metadata.
+    fn search_threads(
+        &self,
+        _params: SearchThreadsParams,
+    ) -> ThreadStoreFuture<'_, ThreadSearchPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/search",
+            })
+        })
+    }
+
+    /// Lists turns within a stored thread.
+    fn list_turns(&self, _params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "list_turns",
+            })
+        })
+    }
+
+    /// Lists persisted items within a stored thread, optionally filtered to a turn.
+    fn list_items(&self, _params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "list_items",
+            })
+        })
+    }
+
+    /// Applies a literal metadata patch and returns the updated thread.
+    ///
+    /// Implementations should apply the supplied fields directly. Policy such as deciding whether
+    /// an append-derived preview should be emitted belongs above the store.
+    fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, StoredThread>;

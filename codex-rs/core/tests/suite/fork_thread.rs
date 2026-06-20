@@ -56,6 +56,8 @@ async fn fork_thread_twice_drops_to_first_message() {
                 }],
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             })
             .await
             .unwrap();
@@ -100,7 +102,7 @@ async fn fork_thread_twice_drops_to_first_message() {
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
             config_for_fork.clone(),
             base_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
@@ -124,7 +126,7 @@ async fn fork_thread_twice_drops_to_first_message() {
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
             config_for_fork.clone(),
             fork1_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
@@ -176,6 +178,8 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -189,14 +193,15 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
     } = thread_manager
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
-            test.config,
+            test.config.clone(),
             InitialHistory::Resumed(ResumedHistory {
-                conversation_id: test.session_configured.session_id,
+                conversation_id: test.session_configured.thread_id,
                 history: source_items.clone(),
                 rollout_path: None,
             }),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("fork from stored history");

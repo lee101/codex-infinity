@@ -27,8 +27,7 @@ fn resume_history(
     let turn_id = "resume-warning-seed-turn".to_string();
     let turn_ctx = TurnContextItem {
         turn_id: Some(turn_id.clone()),
-        trace_id: None,
-        cwd: config.cwd.to_path_buf(),
+        cwd: config.cwd.clone(),
         workspace_roots: None,
         current_date: None,
         timezone: None,
@@ -42,15 +41,12 @@ fn resume_history(
         personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
+        multi_agent_mode: None,
         realtime_active: None,
         effort: config.model_reasoning_effort.clone(),
         summary: config
             .model_reasoning_summary
             .unwrap_or(ReasoningSummary::Auto),
-        user_instructions: None,
-        developer_instructions: None,
-        final_output_json_schema: None,
-        truncation_policy: None,
     };
 
     InitialHistory::Resumed(ResumedHistory {
@@ -58,6 +54,7 @@ fn resume_history(
         history: vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                trace_id: None,
                 started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: ModeKind::Default,
@@ -68,6 +65,7 @@ fn resume_history(
                 images: None,
                 local_images: vec![],
                 text_elements: vec![],
+                ..Default::default()
             })),
             RolloutItem::TurnContext(turn_ctx),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -109,10 +107,11 @@ async fn emits_warning_when_resumed_model_differs() {
         ..
     } = thread_manager
         .resume_thread_with_history(
-            config,
+            config.clone(),
             initial_history,
             auth_manager,
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("resume conversation");

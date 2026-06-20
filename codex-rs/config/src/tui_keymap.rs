@@ -105,6 +105,12 @@ pub struct TuiGlobalKeymap {
     pub queue: Option<KeybindingsSpec>,
     /// Toggle the composer shortcut overlay.
     pub toggle_shortcuts: Option<KeybindingsSpec>,
+    /// Toggle Vim mode for the composer input.
+    pub toggle_vim_mode: Option<KeybindingsSpec>,
+    /// Toggle Fast mode.
+    pub toggle_fast_mode: Option<KeybindingsSpec>,
+    /// Toggle raw scrollback mode for copy-friendly transcript selection.
+    pub toggle_raw_output: Option<KeybindingsSpec>,
 }
 
 /// Chat context keybindings.
@@ -172,10 +178,136 @@ pub struct TuiEditorKeymap {
     pub delete_forward_word: Option<KeybindingsSpec>,
     /// Kill text from cursor to line start.
     pub kill_line_start: Option<KeybindingsSpec>,
+    /// Kill the current line.
+    pub kill_whole_line: Option<KeybindingsSpec>,
     /// Kill text from cursor to line end.
     pub kill_line_end: Option<KeybindingsSpec>,
     /// Yank the kill buffer.
     pub yank: Option<KeybindingsSpec>,
+}
+
+/// Vim normal-mode keybindings for modal editing inside text areas.
+///
+/// Actions that use uppercase letters (like `A` for append-line-end) should
+/// be specified as `shift-a` in config; the runtime matcher handles
+/// cross-terminal shift-reporting differences automatically.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiVimNormalKeymap {
+    /// Enter insert mode at cursor (`i`).
+    pub enter_insert: Option<KeybindingsSpec>,
+    /// Enter insert mode after cursor (`a`).
+    pub append_after_cursor: Option<KeybindingsSpec>,
+    /// Enter insert mode at end of line (`A`).
+    pub append_line_end: Option<KeybindingsSpec>,
+    /// Enter insert mode at first non-blank of line (`I`).
+    pub insert_line_start: Option<KeybindingsSpec>,
+    /// Open a new line below and enter insert mode (`o`).
+    pub open_line_below: Option<KeybindingsSpec>,
+    /// Open a new line above and enter insert mode (`O`).
+    pub open_line_above: Option<KeybindingsSpec>,
+    /// Move cursor left (`h`).
+    pub move_left: Option<KeybindingsSpec>,
+    /// Move cursor right (`l`).
+    pub move_right: Option<KeybindingsSpec>,
+    /// Move cursor up (`k`), or recall older composer history at history boundaries.
+    pub move_up: Option<KeybindingsSpec>,
+    /// Move cursor down (`j`), or recall newer composer history at history boundaries.
+    pub move_down: Option<KeybindingsSpec>,
+    /// Move cursor to start of next word (`w`).
+    pub move_word_forward: Option<KeybindingsSpec>,
+    /// Move cursor to start of previous word (`b`).
+    pub move_word_backward: Option<KeybindingsSpec>,
+    /// Move cursor to end of current/next word (`e`).
+    pub move_word_end: Option<KeybindingsSpec>,
+    /// Move cursor to start of line (`0`).
+    pub move_line_start: Option<KeybindingsSpec>,
+    /// Move cursor to end of line (`$`).
+    pub move_line_end: Option<KeybindingsSpec>,
+    /// Delete character under cursor (`x`).
+    pub delete_char: Option<KeybindingsSpec>,
+    /// Delete character under cursor and enter insert mode (`s`).
+    pub substitute_char: Option<KeybindingsSpec>,
+    /// Delete from cursor to end of line (`D`).
+    pub delete_to_line_end: Option<KeybindingsSpec>,
+    /// Change from cursor to end of line and enter insert mode (`C`).
+    pub change_to_line_end: Option<KeybindingsSpec>,
+    /// Yank the entire line (`Y`).
+    pub yank_line: Option<KeybindingsSpec>,
+    /// Paste after cursor (`p`).
+    pub paste_after: Option<KeybindingsSpec>,
+    /// Begin delete operator; next key selects motion (`d`).
+    pub start_delete_operator: Option<KeybindingsSpec>,
+    /// Begin yank operator; next key selects motion (`y`).
+    pub start_yank_operator: Option<KeybindingsSpec>,
+    /// Begin change operator; next keys select a text object.
+    pub start_change_operator: Option<KeybindingsSpec>,
+    /// Cancel a pending operator and return to normal mode.
+    pub cancel_operator: Option<KeybindingsSpec>,
+}
+
+/// Vim operator-pending keybindings for modal editing inside text areas.
+///
+/// This context is active only while waiting for a motion after `d` or `y`.
+/// Repeating the operator key (`dd`, `yy`) targets the entire line. Pressing
+/// `Esc` cancels the pending operator and returns to normal mode without
+/// modifying text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiVimOperatorKeymap {
+    /// Repeat delete operator to delete the whole line (`dd`).
+    pub delete_line: Option<KeybindingsSpec>,
+    /// Repeat yank operator to yank the whole line (`yy`).
+    pub yank_line: Option<KeybindingsSpec>,
+    /// Motion: left (`h`).
+    pub motion_left: Option<KeybindingsSpec>,
+    /// Motion: right (`l`).
+    pub motion_right: Option<KeybindingsSpec>,
+    /// Motion: up one line (`k`).
+    pub motion_up: Option<KeybindingsSpec>,
+    /// Motion: down one line (`j`).
+    pub motion_down: Option<KeybindingsSpec>,
+    /// Motion: to start of next word (`w`).
+    pub motion_word_forward: Option<KeybindingsSpec>,
+    /// Motion: to start of previous word (`b`).
+    pub motion_word_backward: Option<KeybindingsSpec>,
+    /// Motion: to end of current/next word (`e`).
+    pub motion_word_end: Option<KeybindingsSpec>,
+    /// Motion: to start of line (`0`).
+    pub motion_line_start: Option<KeybindingsSpec>,
+    /// Motion: to end of line (`$`).
+    pub motion_line_end: Option<KeybindingsSpec>,
+    /// Select an inner text object after an operator.
+    pub select_inner_text_object: Option<KeybindingsSpec>,
+    /// Select an around text object after an operator.
+    pub select_around_text_object: Option<KeybindingsSpec>,
+    /// Cancel the pending operator and return to normal mode.
+    pub cancel: Option<KeybindingsSpec>,
+}
+
+/// Vim text-object keybindings for modal editing inside text areas.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiVimTextObjectKeymap {
+    /// Text object: word.
+    pub word: Option<KeybindingsSpec>,
+    /// Text object: whitespace-delimited WORD.
+    pub big_word: Option<KeybindingsSpec>,
+    /// Text object: parentheses.
+    pub parentheses: Option<KeybindingsSpec>,
+    /// Text object: brackets.
+    pub brackets: Option<KeybindingsSpec>,
+    /// Text object: braces.
+    pub braces: Option<KeybindingsSpec>,
+    /// Text object: double quotes.
+    pub double_quote: Option<KeybindingsSpec>,
+    /// Text object: single quotes.
+    pub single_quote: Option<KeybindingsSpec>,
+    /// Text object: backticks.
+    pub backtick: Option<KeybindingsSpec>,
+    /// Cancel the pending text-object command.
+    pub cancel: Option<KeybindingsSpec>,
 }
 
 /// Pager context keybindings for transcript and static overlays.
@@ -214,6 +346,18 @@ pub struct TuiListKeymap {
     pub move_up: Option<KeybindingsSpec>,
     /// Move list selection down.
     pub move_down: Option<KeybindingsSpec>,
+    /// Move horizontally left in list pickers that support horizontal actions.
+    pub move_left: Option<KeybindingsSpec>,
+    /// Move horizontally right in list pickers that support horizontal actions.
+    pub move_right: Option<KeybindingsSpec>,
+    /// Move list selection up by one page.
+    pub page_up: Option<KeybindingsSpec>,
+    /// Move list selection down by one page.
+    pub page_down: Option<KeybindingsSpec>,
+    /// Jump to the first list item.
+    pub jump_top: Option<KeybindingsSpec>,
+    /// Jump to the last list item.
+    pub jump_bottom: Option<KeybindingsSpec>,
     /// Accept current selection.
     pub accept: Option<KeybindingsSpec>,
     /// Cancel and close selection view.
@@ -265,6 +409,12 @@ pub struct TuiKeymap {
     pub composer: TuiComposerKeymap,
     #[serde(default)]
     pub editor: TuiEditorKeymap,
+    #[serde(default)]
+    pub vim_normal: TuiVimNormalKeymap,
+    #[serde(default)]
+    pub vim_operator: TuiVimOperatorKeymap,
+    #[serde(default)]
+    pub vim_text_object: TuiVimTextObjectKeymap,
     #[serde(default)]
     pub pager: TuiPagerKeymap,
     #[serde(default)]
@@ -398,6 +548,7 @@ fn normalize_key_name(key: &str, original: &str) -> Result<String, String> {
             | "page-up"
             | "page-down"
             | "space"
+            | "minus"
     ) {
         return Ok(alias.to_string());
     }
@@ -411,8 +562,8 @@ fn normalize_key_name(key: &str, original: &str) -> Result<String, String> {
 
     Err(format!(
         "unknown key `{key}` in keybinding `{original}`. \
-Use a printable character (for example `a`), function keys (`f1`-`f12`), \
-or one of: enter, tab, backspace, esc, delete, arrows, home/end, page-up/page-down, space.\n\
+Use a printable character (for example `a`), function keys (`f1`-`f{MAX_FUNCTION_KEY}`), \
+or one of: enter, tab, backspace, esc, delete, arrows, home/end, page-up/page-down, space, minus.\n\
 See the Codex keymap documentation for supported actions and examples."
     ))
 }
@@ -420,6 +571,7 @@ See the Codex keymap documentation for supported actions and examples."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn misplaced_action_at_keymap_root_is_rejected() {
@@ -498,5 +650,38 @@ mod tests {
         "#;
         let keymap: TuiKeymap = toml::from_str(toml_input).expect("valid config");
         assert!(keymap.global.open_transcript.is_some());
+    }
+
+    #[test]
+    fn minus_bindings_under_global_context_are_accepted() {
+        for (spec, expected) in [
+            (
+                "minus",
+                KeybindingsSpec::One(KeybindingSpec("minus".to_string())),
+            ),
+            (
+                "alt-minus",
+                KeybindingsSpec::One(KeybindingSpec("alt-minus".to_string())),
+            ),
+        ] {
+            let toml_input = format!(
+                r#"
+                [global]
+                open_transcript = "{spec}"
+                "#
+            );
+            let keymap: TuiKeymap = toml::from_str(&toml_input).expect("valid config");
+            let mut expected_keymap = TuiKeymap::default();
+            expected_keymap.global.open_transcript = Some(expected);
+
+            assert_eq!(keymap, expected_keymap);
+        }
+    }
+
+    #[test]
+    fn function_keys_through_f24_are_accepted() {
+        assert_eq!(normalize_keybinding_spec("F13"), Ok("f13".to_string()));
+        assert_eq!(normalize_keybinding_spec("f24"), Ok("f24".to_string()));
+        assert!(normalize_keybinding_spec("f25").is_err());
     }
 }

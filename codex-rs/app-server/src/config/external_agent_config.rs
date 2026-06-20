@@ -1,9 +1,8 @@
 use codex_config::types::PluginConfig;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
-use codex_core::plugins::PluginId;
-use codex_core::plugins::PluginInstallRequest;
-use codex_core::plugins::PluginsManager;
+use codex_core_plugins::PluginInstallRequest;
+use codex_core_plugins::PluginsManager;
 use codex_core_plugins::marketplace::MarketplacePluginInstallPolicy;
 use codex_core_plugins::marketplace::find_marketplace_manifest_path;
 use codex_core_plugins::marketplace_add::MarketplaceAddRequest;
@@ -20,6 +19,7 @@ use codex_external_agent_migration::missing_command_names;
 use codex_external_agent_migration::missing_subagent_names;
 use codex_external_agent_sessions::ExternalAgentSessionMigration;
 use codex_external_agent_sessions::detect_recent_sessions;
+use codex_plugin::PluginId;
 use codex_protocol::protocol::Product;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -214,14 +214,30 @@ impl ExternalAgentConfigService {
         Ok(items)
     }
 
-    pub(crate) fn detect_recent_sessions(&self) -> io::Result<Vec<ExternalAgentSessionMigration>> {
-        detect_recent_sessions(&self.external_agent_home, &self.codex_home)
+    pub(crate) fn external_agent_session_source_path(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<PathBuf>> {
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            return Ok(None);
+        }
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let projects_root = match fs::canonicalize(self.external_agent_home.join("projects")) {
+            Ok(projects_root) => projects_root,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        Ok(path.starts_with(projects_root).then_some(path))
     }
 
     pub(crate) async fn import(
         &self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
-    ) -> io::Result<ExternalAgentConfigImportOutcome> {
+    ) -> ExternalAgentConfigImportOutcome {
         let mut outcome = ExternalAgentConfigImportOutcome::default();
         for migration_item in migration_items {
             let item_type = migration_item.item_type;
@@ -397,17 +413,28 @@ impl ExternalAgentConfigService {
                 })(),
                 ExternalAgentConfigMigrationItemType::Sessions => Ok(()),
             };
-            if let Err(err) = import_result {
-                if item_type == ExternalAgentConfigMigrationItemType::Plugins {
-                    outcome.item_results.push(item_result);
-                    continue;
-                }
-                return Err(err);
+            if let Err(err) = import_result
+                && item_type != ExternalAgentConfigMigrationItemType::Plugins
+            {
+                let message = err.to_string();
+                let error_type = if message.contains("invalid existing config.toml") {
+                    "invalid_existing_config"
+                } else {
+                    "external_agent_config_import_error"
+                };
+                item_result.record_error(ExternalAgentConfigImportRawError {
+                    item_type,
+                    error_type: Some(error_type.to_string()),
+                    failure_stage: "import_request_failed".to_string(),
+                    message,
+                    cwd: item_result.cwd.clone(),
+                    source: None,
+                });
             }
             outcome.item_results.push(item_result);
         }
 
-        Ok(outcome)
+        outcome
     }
 
     async fn detect_migrations(
@@ -658,7 +685,7 @@ impl ExternalAgentConfigService {
                 Ok(config) => {
                     let configured_plugin_ids = config
                         .config_layer_stack
-                        .get_user_layer()
+                        .get_active_user_layer()
                         .and_then(|user_layer| user_layer.config.get("plugins"))
                         .and_then(|plugins| {
                             match plugins.clone().try_into::<HashMap<String, PluginConfig>>() {
@@ -1347,8 +1374,9 @@ fn configured_marketplace_plugins(
     config: &Config,
     plugins_manager: &PluginsManager,
 ) -> io::Result<BTreeMap<String, HashSet<String>>> {
+    let plugins_input = config.plugins_config_input();
     let marketplaces = plugins_manager
-        .list_marketplaces_for_config(config, &[])
+        .list_marketplaces_for_config(&plugins_input, &[], /*include_openai_curated*/ true)
         .map_err(|err| {
             invalid_data_error(format!("failed to list configured marketplaces: {err}"))
         })?;

@@ -1,101 +1,6 @@
 {
   "models": [
-    {
-      "slug": "google/gemini-3.5-flash",
-      "display_name": "Google Gemini 3.5 Flash",
-      "description": "Stable Gemini 3.5 model for sustained frontier performance on agentic and coding tasks.",
-      "default_reasoning_level": "medium",
-      "supported_reasoning_levels": [
-        {
-          "effort": "low",
-          "description": "Fast responses with lighter reasoning"
-        },
-        {
-          "effort": "medium",
-          "description": "Balances speed and reasoning depth"
-        },
-        {
-          "effort": "high",
-          "description": "Greater reasoning depth for complex problems"
-        }
-      ],
-      "shell_type": "shell_command",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 40,
-      "upgrade": null,
-      "base_instructions": "You are Codex, a coding agent. Follow the user's instructions and use available tools to complete software engineering tasks.",
-      "supports_reasoning_summaries": false,
-      "support_verbosity": false,
-      "default_verbosity": null,
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text",
-      "truncation_policy": {
-        "mode": "tokens",
-        "limit": 10000
-      },
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": true,
-      "context_window": 1048576,
-      "max_context_window": 1048576,
-      "auto_compact_token_limit": null,
-      "experimental_supported_tools": [],
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "availability_nux": null,
-      "additional_speed_tiers": [],
-      "supports_search_tool": false
-    },
-    {
-      "slug": "deepseek/deepseek-v4-flash",
-      "display_name": "DeepSeek V4 Flash",
-      "description": "DeepSeek's default OpenAI-compatible model for fast coding and general agentic work.",
-      "default_reasoning_level": "medium",
-      "supported_reasoning_levels": [
-        {
-          "effort": "low",
-          "description": "Fast responses with lighter reasoning"
-        },
-        {
-          "effort": "medium",
-          "description": "Balances speed and reasoning depth"
-        },
-        {
-          "effort": "high",
-          "description": "Greater reasoning depth for complex problems"
-        }
-      ],
-      "shell_type": "shell_command",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 41,
-      "upgrade": null,
-      "base_instructions": "You are Codex, a coding agent. Follow the user's instructions and use available tools to complete software engineering tasks.",
-      "supports_reasoning_summaries": false,
-      "support_verbosity": false,
-      "default_verbosity": null,
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text",
-      "truncation_policy": {
-        "mode": "tokens",
-        "limit": 10000
-      },
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": false,
-      "context_window": 128000,
-      "max_context_window": 128000,
-      "auto_compact_token_limit": null,
-      "experimental_supported_tools": [],
-      "input_modalities": [
-        "text"
-      ],
-      "availability_nux": null,
-      "additional_speed_tiers": [],
-      "supports_search_tool": false
-    },
-    {
+    { 
       "prefer_websockets": true,
       "support_verbosity": true,
       "default_verbosity": "low",
@@ -177,6 +82,13 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage"
+        }
+      ],
       "additional_speed_tiers": [
         "fast"
       ],
@@ -206,7 +118,7 @@
       "slug": "gpt-5.4",
       "display_name": "gpt-5.4",
       "description": "Strong model for everyday coding.",
-      "default_reasoning_level": "xhigh",
+      "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
           "effort": "low",
@@ -259,6 +171,13 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage"
+        }
+      ],
       "additional_speed_tiers": [
         "fast"
       ],
@@ -344,6 +263,7 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [],
       "additional_speed_tiers": [],
       "supports_reasoning_summaries": true
     },
@@ -427,6 +347,7 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [],
       "additional_speed_tiers": [],
       "supports_reasoning_summaries": true
     },
@@ -506,6 +427,7 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [],
       "additional_speed_tiers": [],
       "supports_reasoning_summaries": true
     },
@@ -586,102 +508,9 @@
         "team"
       ],
       "supports_search_tool": true,
+      "service_tiers": [],
       "additional_speed_tiers": [],
       "supports_reasoning_summaries": true
-    },
-    {
-      "slug": "cerebras/gpt-oss-120b",
-      "display_name": "GPT-OSS 120B (Cerebras)",
-      "description": "OpenAI gpt-oss-120b on Cerebras (~3000 tok/s open-weight coding model). Auto-routes to a direct Cerebras key (CEREBRAS_API_KEY) or falls back to OpenPaths (OPENPATHS_API_KEY).",
-      "default_reasoning_level": "medium",
-      "supported_reasoning_levels": [
-        {
-          "effort": "low",
-          "description": "Fast responses with lighter reasoning"
-        },
-        {
-          "effort": "medium",
-          "description": "Balances speed and reasoning depth"
-        },
-        {
-          "effort": "high",
-          "description": "Greater reasoning depth for complex problems"
-        }
-      ],
-      "shell_type": "shell_command",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 42,
-      "upgrade": null,
-      "base_instructions": "You are Codex, a coding agent. Follow the user's instructions and use available tools to complete software engineering tasks.",
-      "supports_reasoning_summaries": false,
-      "support_verbosity": false,
-      "default_verbosity": null,
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text",
-      "truncation_policy": {
-        "mode": "tokens",
-        "limit": 10000
-      },
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": false,
-      "context_window": 131072,
-      "max_context_window": 131072,
-      "auto_compact_token_limit": null,
-      "experimental_supported_tools": [],
-      "input_modalities": [
-        "text"
-      ],
-      "availability_nux": null,
-      "additional_speed_tiers": [],
-      "supports_search_tool": false
-    },
-    {
-      "slug": "cerebras/zai-glm-4.7",
-      "display_name": "GLM-4.7 (Cerebras)",
-      "description": "Zhipu GLM-4.7 on Cerebras — strong reasoning and coding. Auto-routes to a direct Cerebras key (CEREBRAS_API_KEY) or falls back to OpenPaths (OPENPATHS_API_KEY).",
-      "default_reasoning_level": "medium",
-      "supported_reasoning_levels": [
-        {
-          "effort": "low",
-          "description": "Fast responses with lighter reasoning"
-        },
-        {
-          "effort": "medium",
-          "description": "Balances speed and reasoning depth"
-        },
-        {
-          "effort": "high",
-          "description": "Greater reasoning depth for complex problems"
-        }
-      ],
-      "shell_type": "shell_command",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 43,
-      "upgrade": null,
-      "base_instructions": "You are Codex, a coding agent. Follow the user's instructions and use available tools to complete software engineering tasks.",
-      "supports_reasoning_summaries": false,
-      "support_verbosity": false,
-      "default_verbosity": null,
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text",
-      "truncation_policy": {
-        "mode": "tokens",
-        "limit": 10000
-      },
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": false,
-      "context_window": 131072,
-      "max_context_window": 131072,
-      "auto_compact_token_limit": null,
-      "experimental_supported_tools": [],
-      "input_modalities": [
-        "text"
-      ],
-      "availability_nux": null,
-      "additional_speed_tiers": [],
-      "supports_search_tool": false
     }
   ]
 }

@@ -277,7 +277,7 @@
       "enum": [
         "read",
         "write",
-        "none"
+        "deny"
       ],
       "type": "string"
     },
@@ -547,13 +547,21 @@
     "cwd": {
       "anyOf": [
         {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "$ref": "#/definitions/LegacyAppPathString"
         },
         {
           "type": "null"
         }
       ],
       "description": "The command's working directory."
+    },
+    "environmentId": {
+      "default": null,
+      "description": "Environment in which the command will run.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "itemId": {
       "type": "string"
@@ -596,6 +604,11 @@
         "null"
       ]
     },
+    "startedAtMs": {
+      "description": "Unix timestamp (in milliseconds) when this approval request started.",
+      "format": "int64",
+      "type": "integer"
+    },
     "threadId": {
       "type": "string"
     },
@@ -605,6 +618,7 @@
   },
   "required": [
     "itemId",
+    "startedAtMs",
     "threadId",
     "turnId"
   ],
