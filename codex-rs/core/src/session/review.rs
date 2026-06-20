@@ -1,5 +1,7 @@
 use super::turn_context::image_generation_tool_auth_allowed;
 use super::*;
+use codex_core_skills::HostLoadedSkills;
+use codex_protocol::openai_models::ToolMode;
 use std::sync::atomic::AtomicBool;
 
 /// Spawn a review thread using the given prompt.
@@ -76,6 +78,15 @@ pub(super) async fn spawn_review_thread(
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
+    let tool_mode = model_info.tool_mode.unwrap_or_else(|| {
+        if per_turn_config.features.enabled(Feature::CodeModeOnly) {
+            ToolMode::CodeModeOnly
+        } else if per_turn_config.features.enabled(Feature::CodeMode) {
+            ToolMode::CodeMode
+        } else {
+            ToolMode::Direct
+        }
+    });
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();
         tracing::warn!(
@@ -93,11 +104,15 @@ pub(super) async fn spawn_review_thread(
     let auth_manager_for_context = auth_manager.clone();
     let provider_for_context = provider.clone();
     let session_telemetry_for_context = session_telemetry.clone();
-    let reasoning_effort = per_turn_config.model_reasoning_effort;
+    let reasoning_effort = per_turn_config.model_reasoning_effort.clone();
     let reasoning_summary = per_turn_config
         .model_reasoning_summary
         .unwrap_or(model_info.default_reasoning_summary);
     let session_source = parent_turn_context.session_source.clone();
+    let forked_from_thread_id = {
+        let state = sess.state.lock().await;
+        state.session_configuration.forked_from_thread_id
+    };
 
     let per_turn_config = Arc::new(per_turn_config);
     let review_turn_id = sub_id.to_string();
@@ -111,6 +126,13 @@ pub(super) async fn spawn_review_thread(
         parent_turn_context.network.is_some(),
     ));
 
+    let extension_data = Arc::new(codex_extension_api::ExtensionData::new(
+        review_turn_id.clone(),
+    ));
+    extension_data.insert(HostLoadedSkills::new(
+        parent_turn_context.turn_skills.outcome.clone(),
+    ));
+
     let review_turn_context = TurnContext {
         sub_id: review_turn_id,
         trace_id: current_span_trace_id(),
@@ -118,6 +140,8 @@ pub(super) async fn spawn_review_thread(
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
+        comp_hash: model_info.comp_hash.clone(),
+        tool_mode,
         session_telemetry: session_telemetry_for_context,
         provider: provider_for_context,
         reasoning_effort,
@@ -135,6 +159,7 @@ pub(super) async fn spawn_review_thread(
         user_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
+        multi_agent_version: MultiAgentVersion::Disabled,
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
         permission_profile: parent_turn_context.permission_profile(),
@@ -151,18 +176,24 @@ pub(super) async fn spawn_review_thread(
         turn_metadata_state,
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.outcome.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
+        terminal_error: Arc::new(Mutex::new(None)),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
     };
 
     // Seed the child task with the review prompt as the initial user message.
-    let input: Vec<UserInput> = vec![UserInput::Text {
-        text: review_prompt,
-        // Review prompt is synthesized; no UI element ranges to preserve.
-        text_elements: Vec::new(),
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: review_prompt,
+            // Review prompt is synthesized; no UI element ranges to preserve.
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
     }];
     let tc = Arc::new(review_turn_context);
-    tc.turn_metadata_state.spawn_git_enrichment_task();
+    if tc.environments.single_local_environment_cwd().is_some() {
+        tc.turn_metadata_state.spawn_git_enrichment_task();
+    }
     // TODO(ccunningham): Review turns currently rely on `spawn_task` for TurnComplete but do not
     // emit a parent TurnStarted. Consider giving review a full parent turn lifecycle
     // (TurnStarted + TurnComplete) for consistency with other standalone tasks.

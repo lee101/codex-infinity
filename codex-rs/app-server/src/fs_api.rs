@@ -22,6 +22,7 @@ use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
+use codex_utils_path_uri::PathUri;
 use std::io;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ impl FsApi {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
+        let path = PathUri::from_abs_path(&params.path);
         let bytes = self
             .file_system
             .read_file(&params.path, /*sandbox*/ None)
@@ -71,7 +73,7 @@ impl FsApi {
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError> {
         self.file_system
             .create_directory(
-                &params.path,
+                &path,
                 CreateDirectoryOptions {
                     recursive: params.recursive.unwrap_or(true),
                 },
@@ -86,6 +88,7 @@ impl FsApi {
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
+        let path = PathUri::from_abs_path(&params.path);
         let metadata = self
             .file_system
             .get_metadata(&params.path, /*sandbox*/ None)
@@ -104,6 +107,7 @@ impl FsApi {
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
+        let path = PathUri::from_abs_path(&params.path);
         let entries = self
             .file_system
             .read_directory(&params.path, /*sandbox*/ None)
@@ -127,7 +131,7 @@ impl FsApi {
     ) -> Result<FsRemoveResponse, JSONRPCErrorError> {
         self.file_system
             .remove(
-                &params.path,
+                &path,
                 RemoveOptions {
                     recursive: params.recursive.unwrap_or(true),
                     force: params.force.unwrap_or(true),
@@ -145,8 +149,8 @@ impl FsApi {
     ) -> Result<FsCopyResponse, JSONRPCErrorError> {
         self.file_system
             .copy(
-                &params.source_path,
-                &params.destination_path,
+                &source_path,
+                &destination_path,
                 CopyOptions {
                     recursive: params.recursive,
                 },

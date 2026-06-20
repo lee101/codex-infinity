@@ -26,6 +26,7 @@ use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -602,11 +603,16 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
     };
 
     let _models_mock = mount_models_once(
@@ -710,11 +716,16 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
     };
 
     let _models_mock = mount_models_once(

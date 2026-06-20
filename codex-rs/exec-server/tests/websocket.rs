@@ -9,6 +9,12 @@ use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use common::exec_server::exec_server;
 use pretty_assertions::assert_eq;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

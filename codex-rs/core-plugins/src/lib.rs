@@ -1,3 +1,5 @@
+mod app_mcp_routing;
+mod discoverable;
 pub mod installed_marketplaces;
 pub mod loader;
 pub mod manifest;
@@ -6,6 +8,7 @@ pub mod marketplace_add;
 pub mod marketplace_remove;
 pub mod marketplace_upgrade;
 mod plugin_bundle_archive;
+mod provider;
 pub mod remote;
 pub mod remote_bundle;
 pub mod remote_legacy;
@@ -14,4 +17,5 @@ pub mod store;
 pub mod toggles;
 
 pub const OPENAI_CURATED_MARKETPLACE_NAME: &str = "openai-curated";
+pub const OPENAI_API_CURATED_MARKETPLACE_NAME: &str = "openai-api-curated";
 pub const OPENAI_BUNDLED_MARKETPLACE_NAME: &str = "openai-bundled";

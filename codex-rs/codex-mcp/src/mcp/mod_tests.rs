@@ -1,4 +1,6 @@
 use super::*;
+use crate::McpPluginAttribution;
+use crate::McpServerRegistration;
 use codex_config::Constrained;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
@@ -9,6 +11,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
@@ -16,6 +19,7 @@ fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         chatgpt_base_url: "https://chatgpt.com".to_string(),
         codex_home,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
+        auth_keyring_backend_kind: AuthKeyringBackendKind::default(),
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         skill_mcp_dependency_install_enabled: true,
@@ -69,12 +73,14 @@ fn mcp_prompt_auto_approval_honors_unrestricted_managed_profiles() {
 fn tool_plugin_provenance_collects_app_and_mcp_sources() {
     let provenance = ToolPluginProvenance::from_capability_summaries(&[
         PluginCapabilitySummary {
+            config_name: "alpha@test".to_string(),
             display_name: "alpha-plugin".to_string(),
             app_connector_ids: vec![AppConnectorId("connector_example".to_string())],
             mcp_server_names: vec!["alpha".to_string()],
             ..PluginCapabilitySummary::default()
         },
         PluginCapabilitySummary {
+            config_name: "beta@test".to_string(),
             display_name: "beta-plugin".to_string(),
             app_connector_ids: vec![
                 AppConnectorId("connector_example".to_string()),
@@ -124,15 +130,26 @@ fn codex_apps_mcp_url_for_base_url_keeps_existing_paths() {
         codex_apps_mcp_url_for_base_url("http://localhost:8080"),
         "http://localhost:8080/api/codex/apps"
     );
+    assert!(provenance.is_selected_plugin_mcp_server("github"));
 }
 
 #[test]
-fn codex_apps_mcp_url_uses_legacy_codex_apps_path() {
-    let config = test_mcp_config(PathBuf::from("/tmp"));
-
+fn codex_apps_mcp_url_for_base_url_keeps_existing_paths() {
     assert_eq!(
-        codex_apps_mcp_url(&config),
+        codex_apps_mcp_url_for_base_url("https://chatgpt.com/backend-api"),
         "https://chatgpt.com/backend-api/wham/apps"
+    );
+    assert_eq!(
+        codex_apps_mcp_url_for_base_url("https://chat.openai.com"),
+        "https://chat.openai.com/backend-api/wham/apps"
+    );
+    assert_eq!(
+        codex_apps_mcp_url_for_base_url("http://localhost:8080/api/codex"),
+        "http://localhost:8080/api/codex/apps"
+    );
+    assert_eq!(
+        codex_apps_mcp_url_for_base_url("http://localhost:8080"),
+        "http://localhost:8080/api/codex/apps"
     );
 }
 
@@ -159,13 +176,14 @@ fn codex_apps_server_config_uses_legacy_codex_apps_path() {
 }
 
 #[tokio::test]
-async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
+async fn effective_mcp_servers_preserve_runtime_servers() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let mut config = test_mcp_config(codex_home.path().to_path_buf());
     config.apps_enabled = true;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
-    config.configured_mcp_servers.insert(
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
         "sample".to_string(),
         McpServerConfig {
             transport: McpServerTransportConfig::StreamableHttp {
@@ -188,8 +206,8 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
             oauth_resource: None,
             tools: HashMap::new(),
         },
-    );
-    config.configured_mcp_servers.insert(
+    ));
+    catalog.register(McpServerRegistration::from_config(
         "docs".to_string(),
         McpServerConfig {
             transport: McpServerTransportConfig::StreamableHttp {
@@ -212,7 +230,15 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
             oauth_resource: None,
             tools: HashMap::new(),
         },
-    );
+    ));
+    catalog.register(McpServerRegistration::from_config(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        codex_apps_mcp_server_config(
+            &config.chatgpt_base_url,
+            config.apps_mcp_product_sku.as_deref(),
+        ),
+    ));
+    config.mcp_server_catalog = catalog.build();
 
     let effective = effective_mcp_servers(&config, Some(&auth));
 

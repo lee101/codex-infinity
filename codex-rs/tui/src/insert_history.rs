@@ -8,6 +8,11 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::render::line_utils::line_to_static;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::decorate_spans;
+use crate::terminal_hyperlinks::plain_hyperlink_lines;
+use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::line_contains_url_like;
@@ -57,6 +62,17 @@ impl InsertHistoryMode {
     }
 }
 
+/// Selects the terminal escape strategy used when writing history above the viewport.
+///
+/// Raw lines intentionally remain unbroken so terminal selection copies their source faithfully.
+/// Zellij does not constrain soft-wrapped continuation rows to Codex's scroll region, so its raw
+/// path appends history through the terminal and reserves blank rows for the next viewport draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertHistoryMode {
+    Standard,
+    ZellijRaw,
+}
+
 /// Insert `lines` above the viewport using the terminal's backend writer
 /// (avoids direct stdout references).
 pub fn insert_history_lines<B>(
@@ -86,12 +102,45 @@ pub fn insert_history_lines_with_mode<B>(
 where
     B: Backend + Write,
 {
+    insert_history_lines_with_mode_and_wrap_policy(
+        terminal,
+        lines,
+        InsertHistoryMode::Standard,
+        wrap_policy,
+    )
+}
+
+pub(crate) fn insert_history_lines_with_mode_and_wrap_policy<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    lines: Vec<Line>,
+    mode: InsertHistoryMode,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> io::Result<()>
+where
+    B: Backend + Write,
+{
+    insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+        terminal,
+        plain_hyperlink_lines(lines.iter().map(line_to_static).collect()),
+        mode,
+        wrap_policy,
+    )
+}
+
+pub(crate) fn insert_history_hyperlink_lines_with_mode_and_wrap_policy<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    lines: Vec<HyperlinkLine>,
+    mode: InsertHistoryMode,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> io::Result<()>
+where
+    B: Backend + Write,
+{
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
 
     let mut area = terminal.viewport_area;
     let mut should_update_area = false;
     let last_cursor_pos = terminal.last_known_cursor_pos;
-    let writer = terminal.backend_mut();
 
     // Pre-wrap lines for terminal scrollback. Three paths:
     //
@@ -223,7 +272,11 @@ where
 /// Render a single wrapped history line: clear continuation rows for wide lines,
 /// set foreground/background colors, and write styled spans. Caller is responsible
 /// for cursor positioning and any leading `\r\n`.
-fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) -> io::Result<()> {
+fn write_history_line<W: Write>(
+    writer: &mut W,
+    line: &HyperlinkLine,
+    wrap_width: usize,
+) -> io::Result<()> {
     let physical_rows = line.width().max(1).div_ceil(wrap_width) as u16;
     if physical_rows > 1 {
         queue!(writer, SavePosition)?;
@@ -236,11 +289,13 @@ fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) 
     queue!(
         writer,
         SetColors(Colors::new(
-            line.style
+            line.line
+                .style
                 .fg
                 .map(std::convert::Into::into)
                 .unwrap_or(CColor::Reset),
-            line.style
+            line.line
+                .style
                 .bg
                 .map(std::convert::Into::into)
                 .unwrap_or(CColor::Reset)
@@ -250,14 +305,20 @@ fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) 
     // Merge line-level style into each span so that ANSI colors reflect
     // line styles (e.g., blockquotes with green fg).
     let merged_spans: Vec<Span> = line
+        .line
         .spans
         .iter()
         .map(|s| Span {
-            style: s.style.patch(line.style),
+            style: s.style.patch(line.line.style),
             content: s.content.clone(),
         })
         .collect();
-    write_spans(writer, merged_spans.iter())
+    let merged_line = HyperlinkLine {
+        line: Line::from(merged_spans),
+        hyperlinks: line.hyperlinks.clone(),
+    };
+    let decorated = decorate_spans(&merged_line);
+    write_spans(writer, decorated.iter())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +503,19 @@ mod tests {
             String::from_utf8(actual).unwrap(),
             String::from_utf8(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn writes_semantic_web_link_without_changing_visible_text() {
+        let destination = "https://example.com/long/path";
+        let line = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(destination));
+        let mut actual = Vec::new();
+
+        write_history_line(&mut actual, &line, /*wrap_width*/ 80).expect("write history line");
+
+        let output = String::from_utf8(actual).expect("UTF-8 terminal output");
+        assert!(output.contains("\x1b]8;;https://example.com/long/path\x07"));
+        assert_eq!(line.line.spans[0].content, destination);
     }
 
     #[test]

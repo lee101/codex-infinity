@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use codex_app_server_protocol::AppInfo;
 use codex_config::types::ToolSuggestDisabledTool;
+use codex_core_plugins::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
@@ -83,13 +84,9 @@ impl ToolHandler for ToolSuggestHandler {
             ));
         }
 
-        let auth = session.services.auth_manager.auth().await;
-        let manager = session.services.mcp_connection_manager.read().await;
-        let mcp_tools = manager.list_all_tools().await;
-        drop(manager);
-        let accessible_connectors = connectors::with_app_enabled_state(
-            connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
-            &turn.config,
+        let discoverable_tools = filter_request_plugin_install_discoverable_tools_for_client(
+            self.discoverable_tools.clone(),
+            turn.app_server_client_name.as_deref(),
         );
         let discoverable_tools = connectors::list_tool_suggest_discoverable_tools_with_auth(
             &turn.config,
@@ -113,6 +110,14 @@ impl ToolHandler for ToolSuggestHandler {
             .into_iter()
             .find(|tool| tool.tool_type() == args.tool_type && tool.id() == args.tool_id)
             .ok_or_else(|| {
+                let source = match self.presentation {
+                    ToolSuggestPresentation::ListTool => format!(
+                        "the discoverable tools returned by {LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME}"
+                    ),
+                    ToolSuggestPresentation::RecommendationContext => {
+                        "the <recommended_plugins> list".to_string()
+                    }
+                };
                 FunctionCallError::RespondToModel(format!(
                     "tool_id must match one of the discoverable tools exposed by {TOOL_SUGGEST_TOOL_NAME}"
                 ))
@@ -121,7 +126,7 @@ impl ToolHandler for ToolSuggestHandler {
         let request_id = RequestId::String(format!("tool_suggestion_{call_id}").into());
         let params = build_tool_suggestion_elicitation_request(
             CODEX_APPS_MCP_SERVER_NAME,
-            session.conversation_id.to_string(),
+            session.thread_id.to_string(),
             turn.sub_id.clone(),
             &args,
             suggest_reason,
@@ -137,6 +142,7 @@ impl ToolHandler for ToolSuggestHandler {
             .as_ref()
             .is_some_and(|response| response.action == ElicitationAction::Accept);
 
+        let auth = session.services.auth_manager.auth().await;
         let completed = if user_confirmed {
             verify_tool_suggestion_completed(&session, &turn, &tool, auth.as_ref()).await
         } else {
@@ -244,6 +250,10 @@ async fn verify_tool_suggestion_completed(
             verified_connector_suggestion_completed(connector.id.as_str(), &accessible_connectors)
         }),
         DiscoverableTool::Plugin(plugin) => {
+            if is_remote_plugin_install_suggestion(&plugin.id) {
+                return true;
+            }
+
             session.reload_user_config_layer().await;
             let config = session.get_config().await;
             let completed = verified_plugin_suggestion_completed(
@@ -279,7 +289,7 @@ async fn refresh_missing_suggested_connectors(
         return Some(Vec::new());
     }
 
-    let manager = session.services.mcp_connection_manager.read().await;
+    let manager = session.services.mcp_connection_manager.load_full();
     let mcp_tools = manager.list_all_tools().await;
     let accessible_connectors = connectors::with_app_enabled_state(
         connectors::accessible_connectors_from_mcp_tools(&mcp_tools),

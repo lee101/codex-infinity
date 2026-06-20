@@ -30,6 +30,7 @@ use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -104,6 +105,10 @@ fn test_model_info(
         input_modalities,
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         upgrade: None,
@@ -122,6 +127,7 @@ fn test_model_info(
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     }
@@ -429,19 +435,6 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             .any(|text| text == "image content omitted because you do not support image input"),
         "second request should include the image-omitted placeholder text"
     );
-    assert!(
-        second_user_texts
-            .iter()
-            .any(|text| text == &codex_protocol::models::image_open_tag_text()),
-        "second request should preserve the image open tag text"
-    );
-    assert!(
-        second_user_texts
-            .iter()
-            .any(|text| text == &codex_protocol::models::image_close_tag_text()),
-        "second request should preserve the image close tag text"
-    );
-
     Ok(())
 }
 
@@ -816,6 +809,10 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         upgrade: None,
@@ -834,6 +831,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         context_window: Some(large_context_window),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent,
         experimental_supported_tools: Vec::new(),
     };

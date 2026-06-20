@@ -7,8 +7,9 @@ use crate::shell_detect::detect_shell_type;
 
 const POWERSHELL_FLAGS: &[&str] = &["-nologo", "-noprofile", "-command", "-c"];
 
-/// Prefixed command for powershell shell calls to force UTF-8 console output.
-pub const UTF8_OUTPUT_PREFIX: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\n";
+/// Prefixed command for powershell shell calls to request UTF-8 console output.
+pub const UTF8_OUTPUT_PREFIX: &str =
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
 pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
     let Some((_, script)) = extract_powershell_command(command) else {
@@ -45,7 +46,7 @@ pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
 
     let shell = &command[0];
     if !matches!(
-        detect_shell_type(&PathBuf::from(shell)),
+        detect_shell_type(PathBuf::from(shell)),
         Some(ShellType::PowerShell)
     ) {
         return None;
@@ -138,6 +139,7 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 
 #[cfg(test)]
 mod tests {
+    use super::UTF8_OUTPUT_PREFIX;
     use super::extract_powershell_command;
 
     #[test]

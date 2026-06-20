@@ -1014,15 +1014,8 @@
       "type": "object"
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
+      "description": "A non-empty reasoning effort value advertised by the model.",
+      "minLength": 1,
       "type": "string"
     },
     "SandboxPolicy": {
@@ -1170,6 +1163,14 @@
           "type": "object"
         }
       ]
+    },
+    "SubAgentActivityKind": {
+      "enum": [
+        "started",
+        "interacted",
+        "interrupted"
+      ],
+      "type": "string"
     },
     "SubAgentSource": {
       "oneOf": [
@@ -1339,6 +1340,13 @@
             "null"
           ]
         },
+        "parentThreadId": {
+          "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "[UNSTABLE] Path to the thread on disk.",
           "type": [
@@ -1408,6 +1416,12 @@
       "oneOf": [
         {
           "properties": {
+            "clientId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "content": {
               "items": {
                 "$ref": "#/definitions/UserInput"
@@ -1900,6 +1914,38 @@
         },
         {
           "properties": {
+            "agentPath": {
+              "type": "string"
+            },
+            "agentThreadId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/definitions/SubAgentActivityKind"
+            },
+            "type": {
+              "enum": [
+                "subAgentActivity"
+              ],
+              "title": "SubAgentActivityThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentPath",
+            "agentThreadId",
+            "id",
+            "kind",
+            "type"
+          ],
+          "title": "SubAgentActivityThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
             "action": {
               "anyOf": [
                 {
@@ -1954,6 +2000,32 @@
             "type"
           ],
           "title": "ImageViewThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "durationMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "sleep"
+              ],
+              "title": "SleepThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "durationMs",
+            "id",
+            "type"
+          ],
+          "title": "SleepThreadItem",
           "type": "object"
         },
         {
@@ -2239,6 +2311,32 @@
         "inProgress"
       ],
       "type": "string"
+    },
+    "TurnsPage": {
+      "properties": {
+        "backwardsCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "items": {
+            "$ref": "#/definitions/Turn"
+          },
+          "type": "array"
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "type": "object"
     },
     "UserInput": {
       "oneOf": [

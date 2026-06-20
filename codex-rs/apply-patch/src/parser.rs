@@ -23,6 +23,7 @@
 //! The parser below is a little more lenient than the explicit spec and allows for
 //! leading/trailing whitespace around patch markers.
 use crate::ApplyPatchArgs;
+use crate::streaming_parser::StreamingPatchParser;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use codex_utils_absolute_path::test_support::PathBufExt;
@@ -105,6 +106,7 @@ impl Hunk {
     }
 }
 
+#[cfg(test)]
 use Hunk::*;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -187,7 +189,7 @@ enum ParseMode {
 
 fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, ParseError> {
     let lines: Vec<&str> = patch.trim().lines().collect();
-    let (patch_lines, hunk_lines) = match mode {
+    let patch_lines = match mode {
         ParseMode::Strict => check_patch_boundaries_strict(&lines)?,
         ParseMode::Lenient => check_patch_boundaries_lenient(&lines)?,
         ParseMode::Streaming => check_patch_boundaries_streaming(&lines)?,
@@ -204,6 +206,10 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
         remaining_lines = &remaining_lines[hunk_lines..]
     }
     let patch = patch_lines.join("\n");
+    let mut parser = StreamingPatchParser::default();
+    parser.push_delta(&patch)?;
+    let hunks = parser.finish()?;
+    let environment_id = parser.environment_id().map(str::to_owned);
     Ok(ApplyPatchArgs {
         hunks,
         patch,
@@ -232,16 +238,14 @@ fn check_patch_boundaries_streaming<'a>(
 
 /// Checks the start and end lines of the patch text for `apply_patch`,
 /// returning an error if they do not match the expected markers.
-fn check_patch_boundaries_strict<'a>(
-    lines: &'a [&'a str],
-) -> Result<(&'a [&'a str], &'a [&'a str]), ParseError> {
+fn check_patch_boundaries_strict<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a str], ParseError> {
     let (first_line, last_line) = match lines {
         [] => (None, None),
         [first] => (Some(first), Some(first)),
         [first, .., last] => (Some(first), Some(last)),
     };
     check_start_and_end_lines_strict(first_line, last_line)?;
-    Ok((lines, &lines[1..lines.len() - 1]))
+    Ok(lines)
 }
 
 /// If we are in lenient mode, we check if the first line starts with `<<EOF`
@@ -253,7 +257,7 @@ fn check_patch_boundaries_strict<'a>(
 /// contents, excluding the heredoc markers.
 fn check_patch_boundaries_lenient<'a>(
     original_lines: &'a [&'a str],
-) -> Result<(&'a [&'a str], &'a [&'a str]), ParseError> {
+) -> Result<&'a [&'a str], ParseError> {
     let original_parse_error = match check_patch_boundaries_strict(original_lines) {
         Ok(lines) => return Ok(lines),
         Err(e) => e,
@@ -807,6 +811,30 @@ fn test_parse_patch() {
                 is_end_of_file: false,
             }],
         }]
+    );
+}
+
+#[test]
+fn test_parse_patch_preserves_end_of_file_marker() {
+    let patch =
+        "*** Begin Patch\n*** Update File: file.txt\n@@\n+quux\n*** End of File\n\n*** End Patch";
+    assert_eq!(
+        parse_patch(patch),
+        Ok(ApplyPatchArgs {
+            hunks: vec![UpdateFile {
+                path: PathBuf::from("file.txt"),
+                move_path: None,
+                chunks: vec![UpdateFileChunk {
+                    change_context: None,
+                    old_lines: Vec::new(),
+                    new_lines: vec!["quux".to_string()],
+                    is_end_of_file: true,
+                }],
+            }],
+            patch: patch.to_string(),
+            workdir: None,
+            environment_id: None,
+        })
     );
 }
 

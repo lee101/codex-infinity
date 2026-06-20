@@ -12,6 +12,72 @@
       ],
       "type": "string"
     },
+    "AdditionalContextEntry": {
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/AdditionalContextKind"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "type": "object"
+    },
+    "AdditionalContextKind": {
+      "enum": [
+        "untrusted",
+        "application"
+      ],
+      "type": "string"
+    },
+    "AgentMessageInputContent": {
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_text"
+              ],
+              "title": "InputTextAgentMessageInputContentType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "title": "InputTextAgentMessageInputContent",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "encrypted_content"
+              ],
+              "title": "EncryptedContentAgentMessageInputContentType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "encrypted_content",
+            "type"
+          ],
+          "title": "EncryptedContentAgentMessageInputContent",
+          "type": "object"
+        }
+      ]
+    },
     "ApprovalsReviewer": {
       "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
       "enum": [
@@ -133,6 +199,36 @@
         "loginId"
       ],
       "type": "object"
+    },
+    "CapabilityRootLocation": {
+      "description": "Location used to resolve a selected capability root.",
+      "oneOf": [
+        {
+          "description": "A path owned by an execution environment.",
+          "properties": {
+            "environmentId": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "environment"
+              ],
+              "title": "EnvironmentCapabilityRootLocationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "environmentId",
+            "path",
+            "type"
+          ],
+          "title": "EnvironmentCapabilityRootLocation",
+          "type": "object"
+        }
+      ]
     },
     "ClientInfo": {
       "properties": {
@@ -459,6 +555,18 @@
       ],
       "type": "object"
     },
+    "ConsumeAccountRateLimitResetCreditParams": {
+      "properties": {
+        "idempotencyKey": {
+          "description": "Identifies one logical reset attempt. A UUID is recommended; reuse the same value when retrying that attempt.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "idempotencyKey"
+      ],
+      "type": "object"
+    },
     "ContentItem": {
       "oneOf": [
         {
@@ -751,7 +859,104 @@
         "inputSchema",
         "name"
       ],
-      "type": "object"
+      "type": "string"
+    },
+    "DynamicToolNamespaceTool": {
+      "oneOf": [
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "inputSchema": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "function"
+              ],
+              "title": "FunctionDynamicToolNamespaceToolType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "inputSchema",
+            "name",
+            "type"
+          ],
+          "title": "FunctionDynamicToolNamespaceTool",
+          "type": "object"
+        }
+      ]
+    },
+    "DynamicToolSpec": {
+      "oneOf": [
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "inputSchema": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "function"
+              ],
+              "title": "FunctionDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "inputSchema",
+            "name",
+            "type"
+          ],
+          "title": "FunctionDynamicToolSpec",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tools": {
+              "items": {
+                "$ref": "#/definitions/DynamicToolNamespaceTool"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "namespace"
+              ],
+              "title": "NamespaceDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "tools",
+            "type"
+          ],
+          "title": "NamespaceDynamicToolSpec",
+          "type": "object"
+        }
+      ]
     },
     "ExperimentalFeatureEnablementSetParams": {
       "properties": {
@@ -1466,6 +1671,9 @@
       ],
       "type": "object"
     },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
     "ListMcpServerStatusParams": {
       "properties": {
         "cursor": {
@@ -1492,6 +1700,12 @@
           "minimum": 0.0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": [
+            "string",
             "null"
           ]
         }
@@ -2173,15 +2387,8 @@
       "type": "string"
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
+      "description": "A non-empty reasoning effort value advertised by the model.",
+      "minLength": 1,
       "type": "string"
     },
     "ReasoningItemContent": {
@@ -2314,6 +2521,16 @@
               ],
               "writeOnly": true
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "phase": {
               "anyOf": [
                 {
@@ -2345,6 +2562,47 @@
         },
         {
           "properties": {
+            "author": {
+              "type": "string"
+            },
+            "content": {
+              "items": {
+                "$ref": "#/definitions/AgentMessageInputContent"
+              },
+              "type": "array"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recipient": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "agent_message"
+              ],
+              "title": "AgentMessageResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "author",
+            "content",
+            "recipient",
+            "type"
+          ],
+          "title": "AgentMessageResponseItem",
+          "type": "object"
+        },
+        {
+          "properties": {
             "content": {
               "default": null,
               "items": {
@@ -2359,6 +2617,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "summary": {
@@ -2402,6 +2670,16 @@
               ],
               "writeOnly": true
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "status": {
               "$ref": "#/definitions/LocalShellStatus"
             },
@@ -2435,6 +2713,16 @@
                 "null"
               ],
               "writeOnly": true
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "name": {
               "type": "string"
@@ -2481,6 +2769,16 @@
               ],
               "writeOnly": true
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "status": {
               "type": [
                 "string",
@@ -2507,6 +2805,16 @@
           "properties": {
             "call_id": {
               "type": "string"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "output": {
               "$ref": "#/definitions/FunctionCallOutputBody"
@@ -2542,6 +2850,16 @@
             "input": {
               "type": "string"
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "name": {
               "type": "string"
             },
@@ -2572,6 +2890,16 @@
           "properties": {
             "call_id": {
               "type": "string"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "name": {
               "type": [
@@ -2608,6 +2936,16 @@
             },
             "execution": {
               "type": "string"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": "string"
@@ -2652,6 +2990,16 @@
               ],
               "writeOnly": true
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "status": {
               "type": [
                 "string",
@@ -2676,6 +3024,16 @@
           "properties": {
             "id": {
               "type": "string"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "result": {
               "type": "string"
@@ -2711,6 +3069,16 @@
             "encrypted_content": {
               "type": "string"
             },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "enum": [
                 "compaction"
@@ -2728,6 +3096,16 @@
         },
         {
           "properties": {
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ResponseItemMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "enum": [
                 "other"
@@ -2743,6 +3121,17 @@
           "type": "object"
         }
       ]
+    },
+    "ResponseItemMetadata": {
+      "properties": {
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "ResponsesApiWebSearchAction": {
       "oneOf": [
@@ -3077,6 +3466,28 @@
         }
       ]
     },
+    "SelectedCapabilityRoot": {
+      "description": "A user-selected root that can expose one or more runtime capabilities.",
+      "properties": {
+        "id": {
+          "description": "Stable identifier supplied by the capability selection platform.",
+          "type": "string"
+        },
+        "location": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CapabilityRootLocation"
+            }
+          ],
+          "description": "Where the selected root can be resolved."
+        }
+      },
+      "required": [
+        "id",
+        "location"
+      ],
+      "type": "object"
+    },
     "SendAddCreditsNudgeEmailParams": {
       "properties": {
         "creditType": {
@@ -3286,6 +3697,17 @@
       "type": "object"
     },
     "ThreadCompactStartParams": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadDeleteParams": {
       "properties": {
         "threadId": {
           "type": "string"
@@ -3704,6 +4126,42 @@
         }
       ]
     },
+    "ThreadResumeInitialTurnsPageParams": {
+      "properties": {
+        "itemsView": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How much item detail to include for each returned turn; defaults to summary."
+        },
+        "limit": {
+          "description": "Optional turn page size.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sortDirection": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SortDirection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional turn pagination direction; defaults to descending."
+        }
+      },
+      "type": "object"
+    },
     "ThreadResumeParams": {
       "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nThe precedence is: history > path > thread_id. If using history or path, the thread_id param will be ignored.\n\nPrefer using thread_id whenever possible.",
       "properties": {
@@ -4079,7 +4537,7 @@
     "TurnEnvironmentParams": {
       "properties": {
         "cwd": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "$ref": "#/definitions/LegacyAppPathString"
         },
         "environmentId": {
           "type": "string"
@@ -4129,6 +4587,12 @@
             }
           ],
           "description": "Override where approval requests are routed for review on this turn and subsequent turns."
+        },
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "cwd": {
           "description": "Override the working directory for this turn and subsequent turns.",
@@ -4227,6 +4691,12 @@
     },
     "TurnSteerParams": {
       "properties": {
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "expectedTurnId": {
           "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
           "type": "string"
@@ -4518,6 +4988,30 @@
         "params"
       ],
       "title": "Thread/archiveRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/delete"
+          ],
+          "title": "Thread/deleteRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadDeleteParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/deleteRequest",
       "type": "object"
     },
     {
@@ -5797,6 +6291,53 @@
         },
         "method": {
           "enum": [
+            "account/rateLimitResetCredit/consume"
+          ],
+          "title": "Account/rateLimitResetCredit/consumeRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ConsumeAccountRateLimitResetCreditParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Account/rateLimitResetCredit/consumeRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "account/usage/read"
+          ],
+          "title": "Account/usage/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "Account/usage/readRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
             "account/sendAddCreditsNudgeEmail"
           ],
           "title": "Account/sendAddCreditsNudgeEmailRequestMethod",
@@ -6008,6 +6549,29 @@
         "params"
       ],
       "title": "ExternalAgentConfig/importRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "externalAgentConfig/import/readHistories"
+          ],
+          "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "ExternalAgentConfig/import/readHistoriesRequest",
       "type": "object"
     },
     {

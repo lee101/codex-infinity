@@ -19,8 +19,11 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
         })
         .collect();
 
-    if is_safe_command_windows(&command) {
-        return true;
+    #[cfg(windows)]
+    {
+        if is_safe_command_windows(&command) {
+            return true;
+        }
     }
 
     if is_safe_to_call_with_exec(&command) {

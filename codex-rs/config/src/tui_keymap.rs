@@ -23,6 +23,9 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use std::collections::BTreeMap;
 
+/// Highest function key supported by portable TUI keymap configuration.
+pub const MAX_FUNCTION_KEY: u8 = 24;
+
 /// Normalized string representation of a single key event (for example `ctrl-a`).
 ///
 /// The parser accepts a small alias set (for example `escape` -> `esc`,
@@ -109,6 +112,8 @@ pub struct TuiGlobalKeymap {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiChatKeymap {
+    /// Interrupt the active turn.
+    pub interrupt_turn: Option<KeybindingsSpec>,
     /// Decrease the active reasoning effort.
     pub decrease_reasoning_effort: Option<KeybindingsSpec>,
     /// Increase the active reasoning effort.
@@ -399,7 +404,7 @@ fn normalize_key_name(key: &str, original: &str) -> Result<String, String> {
 
     if let Some(number) = alias.strip_prefix('f')
         && let Ok(number) = number.parse::<u8>()
-        && (1..=12).contains(&number)
+        && (1..=MAX_FUNCTION_KEY).contains(&number)
     {
         return Ok(alias.to_string());
     }
@@ -441,6 +446,20 @@ mod tests {
             .expect_err("expected unknown action under context");
         assert!(
             err.to_string().contains("open_transcrip"),
+            "expected error to mention misspelled field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn misspelled_vim_text_object_action_is_rejected() {
+        let toml_input = r#"
+            [vim_text_object]
+            double_quotes = "shift-quote"
+        "#;
+        let err = toml::from_str::<TuiKeymap>(toml_input)
+            .expect_err("expected unknown vim text object action");
+        assert!(
+            err.to_string().contains("double_quotes"),
             "expected error to mention misspelled field, got: {err}"
         );
     }

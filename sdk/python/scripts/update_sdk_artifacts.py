@@ -201,7 +201,6 @@ def stage_python_sdk_package(staging_dir: Path, codex_version: str) -> Path:
     pyproject_text = pyproject_path.read_text()
     pyproject_text = _rewrite_project_name(pyproject_text, SDK_DISTRIBUTION_NAME)
     pyproject_text = _rewrite_project_version(pyproject_text, package_version)
-    pyproject_text = _rewrite_sdk_runtime_dependency(pyproject_text, package_version)
     pyproject_path.write_text(pyproject_text)
     return staging_dir
 
@@ -746,6 +745,7 @@ def _render_codex_block(
         "        *,",
         *_kw_signature_lines(thread_list_fields),
         "    ) -> ThreadListResponse:",
+        '        """List saved conversation threads."""',
         "        params = ThreadListParams(",
         *_model_arg_lines(thread_list_fields),
         "        )",
@@ -778,9 +778,11 @@ def _render_codex_block(
         "        return Thread(self._client, forked.thread.id)",
         "",
         "    def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:",
+        '        """Archive a stored conversation thread."""',
         "        return self._client.thread_archive(thread_id)",
         "",
         "    def thread_unarchive(self, thread_id: str) -> Thread:",
+        '        """Restore an archived conversation thread."""',
         "        unarchived = self._client.thread_unarchive(thread_id)",
         "        return Thread(self._client, unarchived.thread.id)",
     ]
@@ -799,6 +801,7 @@ def _render_async_codex_block(
         "        *,",
         *_kw_signature_lines(thread_start_fields),
         "    ) -> AsyncThread:",
+        '        """Create a new Codex conversation thread."""',
         "        await self._ensure_initialized()",
         "        params = ThreadStartParams(",
         *_model_arg_lines(thread_start_fields),
@@ -811,6 +814,7 @@ def _render_async_codex_block(
         "        *,",
         *_kw_signature_lines(thread_list_fields),
         "    ) -> ThreadListResponse:",
+        '        """List saved conversation threads."""',
         "        await self._ensure_initialized()",
         "        params = ThreadListParams(",
         *_model_arg_lines(thread_list_fields),
@@ -823,6 +827,7 @@ def _render_async_codex_block(
         "        *,",
         *_kw_signature_lines(resume_fields),
         "    ) -> AsyncThread:",
+        '        """Resume an existing conversation thread by ID."""',
         "        await self._ensure_initialized()",
         "        params = ThreadResumeParams(",
         "            thread_id=thread_id,",
@@ -837,6 +842,7 @@ def _render_async_codex_block(
         "        *,",
         *_kw_signature_lines(fork_fields),
         "    ) -> AsyncThread:",
+        '        """Create a new thread from an existing thread."""',
         "        await self._ensure_initialized()",
         "        params = ThreadForkParams(",
         "            thread_id=thread_id,",
@@ -846,10 +852,12 @@ def _render_async_codex_block(
         "        return AsyncThread(self, forked.thread.id)",
         "",
         "    async def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:",
+        '        """Archive a stored conversation thread."""',
         "        await self._ensure_initialized()",
         "        return await self._client.thread_archive(thread_id)",
         "",
         "    async def thread_unarchive(self, thread_id: str) -> AsyncThread:",
+        '        """Restore an archived conversation thread."""',
         "        await self._ensure_initialized()",
         "        unarchived = await self._client.thread_unarchive(thread_id)",
         "        return AsyncThread(self, unarchived.thread.id)",
@@ -889,6 +897,7 @@ def _render_async_thread_block(
         "        *,",
         *_kw_signature_lines(turn_fields),
         "    ) -> AsyncTurnHandle:",
+        '        """Start a turn and return a handle for streaming or control."""',
         "        await self._codex._ensure_initialized()",
         "        wire_input = _to_wire_input(input)",
         "        params = TurnStartParams(",
@@ -920,6 +929,7 @@ def generate_public_api_flat_methods() -> None:
         "codex_app_server.generated.v2_all",
         "ThreadStartParams",
     )
+    thread_start_fields = _replace_public_sandbox_field(thread_start_fields, wire_name="sandbox")
     thread_list_fields = _load_public_fields(
         "codex_app_server.generated.v2_all",
         "ThreadListParams",
@@ -929,16 +939,19 @@ def generate_public_api_flat_methods() -> None:
         "ThreadResumeParams",
         exclude={"thread_id"},
     )
+    thread_resume_fields = _replace_public_sandbox_field(thread_resume_fields, wire_name="sandbox")
     thread_fork_fields = _load_public_fields(
         "codex_app_server.generated.v2_all",
         "ThreadForkParams",
         exclude={"thread_id"},
     )
+    thread_fork_fields = _replace_public_sandbox_field(thread_fork_fields, wire_name="sandbox")
     turn_start_fields = _load_public_fields(
         "codex_app_server.generated.v2_all",
         "TurnStartParams",
         exclude={"thread_id", "input"},
     )
+    turn_start_fields = _replace_public_sandbox_field(turn_start_fields, wire_name="sandbox_policy")
 
     source = public_api_path.read_text()
     source = _replace_generated_block(
@@ -991,7 +1004,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage_sdk_parser = subparsers.add_parser(
         "stage-sdk",
-        help="Stage a releasable SDK package pinned to a runtime version",
+        help="Stage a releasable SDK package while preserving its reviewed runtime pin",
     )
     stage_sdk_parser.add_argument(
         "staging_dir",
@@ -999,20 +1012,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for the staged SDK package",
     )
     stage_sdk_parser.add_argument(
-        "--codex-version",
-        help=(
-            "Codex release version to write into the staged SDK package and exact "
-            f"{RUNTIME_DISTRIBUTION_NAME} dependency. Accepts PEP 440 versions "
-            "or release tags such as rust-v0.116.0-alpha.1."
-        ),
-    )
-    stage_sdk_parser.add_argument(
-        "--runtime-version",
-        help=argparse.SUPPRESS,
-    )
-    stage_sdk_parser.add_argument(
         "--sdk-version",
-        help=argparse.SUPPRESS,
+        required=True,
+        help=(
+            "Python SDK release version to write into the staged package. "
+            "Accepts PEP 440 versions such as 0.1.0b1."
+        ),
     )
 
     stage_runtime_parser = subparsers.add_parser(
@@ -1031,20 +1036,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage_runtime_parser.add_argument(
         "--codex-version",
+        required=True,
         help=(
             "Codex release version to write into the staged runtime package. "
             "Accepts PEP 440 versions or release tags such as rust-v0.116.0-alpha.1."
         ),
     )
     stage_runtime_parser.add_argument(
-        "--runtime-version",
-        help=argparse.SUPPRESS,
-    )
-    stage_runtime_parser.add_argument(
         "--platform-tag",
         help=(
             "Optional wheel platform tag override, for example "
-            "macosx_11_0_arm64 or musllinux_1_1_x86_64."
+            "macosx_11_0_arm64 or manylinux_2_17_x86_64."
         ),
     )
     return parser
@@ -1088,14 +1090,12 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
     if args.command == "generate-types":
         ops.generate_types()
     elif args.command == "stage-sdk":
-        codex_version = _resolve_codex_version(args)
         ops.generate_types()
         ops.stage_python_sdk_package(
             args.staging_dir,
-            codex_version,
+            normalize_codex_version(args.sdk_version),
         )
     elif args.command == "stage-runtime":
-        codex_version = _resolve_codex_version(args)
         ops.stage_python_runtime_package(
             args.staging_dir,
             codex_version,

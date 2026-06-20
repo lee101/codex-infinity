@@ -9,8 +9,12 @@ use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
+use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::EnabledToolMetadata;
+use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::enabled_tool_metadata;
 use codex_protocol::ToolName;
-use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
@@ -369,7 +373,6 @@ mod tests {
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
-            cell_id: "1".to_string(),
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),

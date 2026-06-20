@@ -9,7 +9,6 @@ use codex_config::RequirementSource;
 use codex_config::Sourced;
 
 use codex_config::config_toml::ConfigToml;
-use codex_config::profile_toml::ConfigProfile;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;

@@ -277,8 +277,8 @@ fn resize_conpty_handle(hpc: &Arc<StdMutex<Option<HANDLE>>>, size: TerminalSize)
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_windows_sandbox_session_legacy(
-    policy_json_or_preset: &str,
-    sandbox_policy_cwd: &Path,
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
     command: Vec<String>,
     cwd: &Path,
@@ -297,7 +297,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         /*inherit_path*/ false,
         /*add_git_safe_directory*/ false,
     )?;
-    if !common.policy.has_full_disk_read_access() {
+    if !common.permissions.has_full_disk_read_access() {
         anyhow::bail!("Restricted read-only access requires the elevated Windows sandbox backend");
     }
     let security = prepare_legacy_session_security(&common.policy, codex_home, cwd)?;

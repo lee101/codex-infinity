@@ -36,7 +36,7 @@ from codex_app_server.generated.v2_all import ThreadItem, ThreadTokenUsage
 ## Codex (sync)
 
 ```python
-Codex(config: AppServerConfig | None = None)
+Codex(config: CodexConfig | None = None)
 ```
 
 Properties/methods:
@@ -61,7 +61,7 @@ with Codex() as codex:
 ## AsyncCodex (async parity)
 
 ```python
-AsyncCodex(config: AppServerConfig | None = None)
+AsyncCodex(config: CodexConfig | None = None)
 ```
 
 Preferred usage:
@@ -156,6 +156,27 @@ phase-less assistant message item.
 
 Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
 `interrupt()`) or the canonical generated `Turn` from `TurnHandle.run()`.
+
+## Sandbox
+
+Use `sandbox=` consistently on thread lifecycle methods and turns:
+
+```python
+from openai_codex import Codex, Sandbox
+
+with Codex() as codex:
+    thread = codex.thread_start(sandbox=Sandbox.workspace_write)
+    result = thread.run("Review the diff only.", sandbox=Sandbox.read_only)
+```
+
+Presets:
+
+- `Sandbox.read_only`: read files without allowing writes.
+- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read files and write inside the workspace and configured writable roots.
+- `Sandbox.full_access`: run without filesystem access restrictions.
+
+When `sandbox=` is omitted, Codex uses its configured default. A sandbox
+passed to `run(...)` or `turn(...)` applies to that turn and subsequent turns.
 
 ## TurnHandle / AsyncTurnHandle
 

@@ -15,6 +15,7 @@ import type { ContextCompactedNotification } from "./v2/ContextCompactedNotifica
 import type { DeprecationNoticeNotification } from "./v2/DeprecationNoticeNotification";
 import type { ErrorNotification } from "./v2/ErrorNotification";
 import type { ExternalAgentConfigImportCompletedNotification } from "./v2/ExternalAgentConfigImportCompletedNotification";
+import type { ExternalAgentConfigImportProgressNotification } from "./v2/ExternalAgentConfigImportProgressNotification";
 import type { FileChangeOutputDeltaNotification } from "./v2/FileChangeOutputDeltaNotification";
 import type { FileChangePatchUpdatedNotification } from "./v2/FileChangePatchUpdatedNotification";
 import type { FsChangedNotification } from "./v2/FsChangedNotification";
@@ -41,6 +42,7 @@ import type { SkillsChangedNotification } from "./v2/SkillsChangedNotification";
 import type { TerminalInteractionNotification } from "./v2/TerminalInteractionNotification";
 import type { ThreadArchivedNotification } from "./v2/ThreadArchivedNotification";
 import type { ThreadClosedNotification } from "./v2/ThreadClosedNotification";
+import type { ThreadDeletedNotification } from "./v2/ThreadDeletedNotification";
 import type { ThreadGoalClearedNotification } from "./v2/ThreadGoalClearedNotification";
 import type { ThreadGoalUpdatedNotification } from "./v2/ThreadGoalUpdatedNotification";
 import type { ThreadNameUpdatedNotification } from "./v2/ThreadNameUpdatedNotification";
@@ -58,6 +60,7 @@ import type { ThreadTokenUsageUpdatedNotification } from "./v2/ThreadTokenUsageU
 import type { ThreadUnarchivedNotification } from "./v2/ThreadUnarchivedNotification";
 import type { TurnCompletedNotification } from "./v2/TurnCompletedNotification";
 import type { TurnDiffUpdatedNotification } from "./v2/TurnDiffUpdatedNotification";
+import type { TurnModerationMetadataNotification } from "./v2/TurnModerationMetadataNotification";
 import type { TurnPlanUpdatedNotification } from "./v2/TurnPlanUpdatedNotification";
 import type { TurnStartedNotification } from "./v2/TurnStartedNotification";
 import type { WarningNotification } from "./v2/WarningNotification";

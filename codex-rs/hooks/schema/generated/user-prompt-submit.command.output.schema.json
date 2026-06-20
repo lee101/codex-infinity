@@ -27,7 +27,8 @@
           "type": "string"
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "UserPromptSubmit",
+          "type": "string"
         }
       },
       "required": [

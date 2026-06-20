@@ -48,12 +48,16 @@ impl LoaderOverrides {
         }
     }
 
-    /// Returns overrides with host MDM disabled and managed config loaded from `managed_config_path`.
+    /// Returns overrides with host MDM disabled and managed config loaded from
+    /// `managed_config_path`. System requirements are loaded from a sibling
+    /// `requirements.toml` fixture.
     ///
     /// This is intended for tests that supply an explicit managed config fixture.
     pub fn with_managed_config_path_for_tests(managed_config_path: PathBuf) -> Self {
+        let system_requirements_path = managed_config_path.with_file_name("requirements.toml");
         Self {
             managed_config_path: Some(managed_config_path),
+            system_requirements_path: Some(system_requirements_path),
             ..Self::without_managed_config_for_tests()
         }
     }
@@ -63,9 +67,14 @@ impl LoaderOverrides {
 pub struct ConfigLayerEntry {
     pub name: ConfigLayerSource,
     pub config: TomlValue,
-    pub raw_toml: Option<String>,
     pub version: String,
     pub disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RawTomlLayer {
+    contents: String,
+    base_dir: AbsolutePathBuf,
 }
 
 impl ConfigLayerEntry {
@@ -74,18 +83,21 @@ impl ConfigLayerEntry {
         Self {
             name,
             config,
-            raw_toml: None,
             version,
             disabled_reason: None,
         }
     }
 
-    pub fn new_with_raw_toml(name: ConfigLayerSource, config: TomlValue, raw_toml: String) -> Self {
+    pub fn new_with_raw_toml(
+        name: ConfigLayerSource,
+        config: TomlValue,
+        raw_toml: String,
+        raw_toml_base_dir: AbsolutePathBuf,
+    ) -> Self {
         let version = version_for_toml(&config);
         Self {
             name,
             config,
-            raw_toml: Some(raw_toml),
             version,
             disabled_reason: None,
         }
@@ -100,7 +112,6 @@ impl ConfigLayerEntry {
         Self {
             name,
             config,
-            raw_toml: None,
             version,
             disabled_reason: Some(disabled_reason.into()),
         }
@@ -111,7 +122,13 @@ impl ConfigLayerEntry {
     }
 
     pub fn raw_toml(&self) -> Option<&str> {
-        self.raw_toml.as_deref()
+        self.raw_toml
+            .as_ref()
+            .map(|raw_toml| raw_toml.contents.as_str())
+    }
+
+    pub fn raw_toml_base_dir(&self) -> Option<&AbsolutePathBuf> {
+        self.raw_toml.as_ref().map(|raw_toml| &raw_toml.base_dir)
     }
 
     pub fn metadata(&self) -> ConfigLayerMetadata {
@@ -269,8 +286,8 @@ impl ConfigLayerStack {
 
     /// Returns the merged config-layer view.
     ///
-    /// This only merges ordinary config layers and does not apply requirements
-    /// such as cloud requirements.
+    /// This only merges ordinary config layers. Requirements are composed and
+    /// tracked separately.
     pub fn effective_config(&self) -> TomlValue {
         let mut merged = TomlValue::Table(toml::map::Map::new());
         for layer in self.get_layers(

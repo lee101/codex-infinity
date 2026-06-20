@@ -10,26 +10,32 @@ filegroup(
 
 codex_rust_crate(
     name = "core",
-    crate_name = "codex_core",
     compile_data = glob(
         include = ["**"],
+        allow_empty = True,
         exclude = [
             "**/* *",
             "BUILD.bazel",
             "Cargo.toml",
         ],
-        allow_empty = True,
     ),
+    crate_name = "codex_core",
+    extra_binaries = [
+        "//codex-rs/bwrap:bwrap",
+        "//codex-rs/linux-sandbox:codex-linux-sandbox",
+        "//codex-rs/rmcp-client:test_stdio_server",
+        "//codex-rs/rmcp-client:test_streamable_http_server",
+        "//codex-rs/cli:codex",
+        "//codex-rs/windows-sandbox-rs:codex-command-runner",
+        "//codex-rs/windows-sandbox-rs:codex-windows-sandbox-setup",
+    ],
+    integration_test_timeout = "long",
+    run_tests_with_wine_exec = True,
     rustc_env = {
         # Keep manifest-root path lookups inside the Bazel execroot for code
         # that relies on env!("CARGO_MANIFEST_DIR").
         "CARGO_MANIFEST_DIR": "codex-rs/core",
     },
-    integration_compile_data_extra = [
-        "//codex-rs/apply-patch:apply_patch_tool_instructions.md",
-        "templates/realtime/backend_prompt.md",
-    ],
-    integration_test_timeout = "long",
     test_data_extra = [
         "config.schema.json",
     ] + glob([

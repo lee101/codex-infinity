@@ -47,7 +47,7 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
         ))
         .build()
         .await?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
@@ -130,7 +130,7 @@ async fn experimental_feature_list_marks_apps_and_plugins_disabled_by_workspace_
         .mount(&server)
         .await;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -162,16 +162,18 @@ async fn experimental_feature_enablement_set_applies_to_global_and_thread_config
     let project_cwd = codex_home.path().join("project");
     std::fs::create_dir_all(&project_cwd)?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let actual =
-        set_experimental_feature_enablement(&mut mcp, BTreeMap::from([("apps".to_string(), true)]))
-            .await?;
+    let actual = set_experimental_feature_enablement(
+        &mut mcp,
+        BTreeMap::from([("auth_elicitation".to_string(), true)]),
+    )
+    .await?;
     assert_eq!(
         actual,
         ExperimentalFeatureEnablementSetResponse {
-            enablement: BTreeMap::from([("apps".to_string(), true)]),
+            enablement: BTreeMap::from([("auth_elicitation".to_string(), true)]),
         }
     );
 
@@ -182,7 +184,7 @@ async fn experimental_feature_enablement_set_applies_to_global_and_thread_config
             config
                 .additional
                 .get("features")
-                .and_then(|features| features.get("apps")),
+                .and_then(|features| features.get("auth_elicitation")),
             Some(&json!(true))
         );
     }
@@ -197,7 +199,7 @@ async fn experimental_feature_enablement_set_does_not_override_user_config() -> 
         codex_home.path().join("config.toml"),
         "[features]\nmemories = false\n",
     )?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let actual = set_experimental_feature_enablement(
@@ -228,14 +230,18 @@ async fn experimental_feature_enablement_set_does_not_override_user_config() -> 
 #[tokio::test]
 async fn experimental_feature_enablement_set_only_updates_named_features() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    set_experimental_feature_enablement(&mut mcp, BTreeMap::from([("apps".to_string(), true)]))
-        .await?;
+    set_experimental_feature_enablement(
+        &mut mcp,
+        BTreeMap::from([("mentions_v2".to_string(), true)]),
+    )
+    .await?;
     let actual = set_experimental_feature_enablement(
         &mut mcp,
         BTreeMap::from([
+            ("auth_elicitation".to_string(), true),
             ("memories".to_string(), true),
             ("plugins".to_string(), true),
             ("tool_search".to_string(), true),
@@ -249,6 +255,7 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
         actual,
         ExperimentalFeatureEnablementSetResponse {
             enablement: BTreeMap::from([
+                ("auth_elicitation".to_string(), true),
                 ("memories".to_string(), true),
                 ("plugins".to_string(), true),
                 ("tool_search".to_string(), true),
@@ -264,7 +271,14 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
         config
             .additional
             .get("features")
-            .and_then(|features| features.get("apps")),
+            .and_then(|features| features.get("mentions_v2")),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        config
+            .additional
+            .get("features")
+            .and_then(|features| features.get("auth_elicitation")),
         Some(&json!(true))
     );
     assert_eq!(
@@ -278,7 +292,7 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
         config
             .additional
             .get("features")
-            .and_then(|features| features.get("plugins")),
+            .and_then(|features| features.get("remote_plugin")),
         Some(&json!(true))
     );
     assert_eq!(
@@ -293,13 +307,6 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
             .additional
             .get("features")
             .and_then(|features| features.get("tool_suggest")),
-        Some(&json!(true))
-    );
-    assert_eq!(
-        config
-            .additional
-            .get("features")
-            .and_then(|features| features.get("tool_call_mcp_elicitation")),
         Some(&json!(false))
     );
 
@@ -309,7 +316,7 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
 #[tokio::test]
 async fn experimental_feature_enablement_set_allows_remote_control() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     let remote_control_enabled = false;
     let enablement = BTreeMap::from([("remote_control".to_string(), remote_control_enabled)]);
@@ -327,11 +334,14 @@ async fn experimental_feature_enablement_set_allows_remote_control() -> Result<(
 #[tokio::test]
 async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    set_experimental_feature_enablement(&mut mcp, BTreeMap::from([("apps".to_string(), true)]))
-        .await?;
+    set_experimental_feature_enablement(
+        &mut mcp,
+        BTreeMap::from([("mentions_v2".to_string(), true)]),
+    )
+    .await?;
     let actual = set_experimental_feature_enablement(&mut mcp, BTreeMap::new()).await?;
 
     assert_eq!(
@@ -347,7 +357,7 @@ async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> 
         config
             .additional
             .get("features")
-            .and_then(|features| features.get("apps")),
+            .and_then(|features| features.get("mentions_v2")),
         Some(&json!(true))
     );
 
@@ -355,21 +365,24 @@ async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> 
 }
 
 #[tokio::test]
-async fn experimental_feature_enablement_set_rejects_non_allowlisted_feature() -> Result<()> {
+async fn experimental_feature_enablement_set_ignores_invalid_features() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_experimental_feature_enablement_set_request(ExperimentalFeatureEnablementSetParams {
-            enablement: BTreeMap::from([("personality".to_string(), true)]),
-        })
-        .await?;
-    let JSONRPCError { error, .. } = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    let actual = set_experimental_feature_enablement(
+        &mut mcp,
+        BTreeMap::from([
+            ("apps".to_string(), false),
+            ("auth_elicitation".to_string(), true),
+            ("connectors".to_string(), false),
+            ("personality".to_string(), false),
+            ("plugins".to_string(), false),
+            ("tool_call_mcp_elicitation".to_string(), false),
+            ("unknown_feature".to_string(), true),
+        ]),
     )
-    .await??;
+    .await?;
 
     assert_eq!(error.code, -32600);
     assert!(
@@ -391,7 +404,7 @@ async fn experimental_feature_enablement_set_rejects_non_allowlisted_feature() -
 }
 
 async fn set_experimental_feature_enablement(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     enablement: BTreeMap<String, bool>,
 ) -> Result<ExperimentalFeatureEnablementSetResponse> {
     let request_id = mcp
@@ -402,7 +415,7 @@ async fn set_experimental_feature_enablement(
     read_response(mcp, request_id).await
 }
 
-async fn read_config(mcp: &mut McpProcess, cwd: Option<String>) -> Result<ConfigReadResponse> {
+async fn read_config(mcp: &mut TestAppServer, cwd: Option<String>) -> Result<ConfigReadResponse> {
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
             include_layers: false,
@@ -412,7 +425,7 @@ async fn read_config(mcp: &mut McpProcess, cwd: Option<String>) -> Result<Config
     read_response(mcp, request_id).await
 }
 
-async fn read_response<T: DeserializeOwned>(mcp: &mut McpProcess, request_id: i64) -> Result<T> {
+async fn read_response<T: DeserializeOwned>(mcp: &mut TestAppServer, request_id: i64) -> Result<T> {
     let response: JSONRPCResponse = timeout(
         DEFAULT_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),

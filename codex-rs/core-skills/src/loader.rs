@@ -108,6 +108,7 @@ const SKILLS_METADATA_DIR: &str = "agents";
 const SKILLS_METADATA_FILENAME: &str = "openai.yaml";
 const SKILLS_DIR_NAME: &str = "skills";
 const MAX_NAME_LEN: usize = 64;
+const MAX_QUALIFIED_NAME_LEN: usize = 128;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_SHORT_DESCRIPTION_LEN: usize = MAX_DESCRIPTION_LEN;
 const MAX_DEFAULT_PROMPT_LEN: usize = MAX_DESCRIPTION_LEN;
@@ -164,8 +165,8 @@ where
     let mut file_systems_by_skill_path: HashMap<AbsolutePathBuf, Arc<dyn ExecutorFileSystem>> =
         HashMap::new();
     for root in roots {
-        let root_path = canonicalize_for_skill_identity(&root.path);
         let fs = root.file_system;
+        let root_path = canonicalize_for_skill_identity(fs.as_ref(), &root.path).await;
         let skills_before_root = outcome.skills.len();
         discover_skills_under_root(fs.as_ref(), &root_path, root.scope, &mut outcome).await;
         for skill in &outcome.skills[skills_before_root..] {
@@ -232,6 +233,7 @@ pub(crate) async fn skill_roots(
         cwd,
         home_dir.as_ref(),
         plugin_skill_roots,
+        extra_skill_roots,
     )
     .await
 }
@@ -248,6 +250,13 @@ async fn skill_roots_with_home_dir(
         path,
         scope: SkillScope::User,
         file_system: Arc::clone(&LOCAL_FS),
+    }));
+    roots.extend(extra_skill_roots.into_iter().map(|path| SkillRoot {
+        path,
+        scope: SkillScope::User,
+        file_system: Arc::clone(&LOCAL_FS),
+        plugin_id: None,
+        plugin_root: None,
     }));
     roots.extend(repo_agents_skill_roots(fs, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
@@ -315,6 +324,7 @@ fn skill_roots_from_layer_stack_inner(
                 });
             }
             ConfigLayerSource::Mdm { .. }
+            | ConfigLayerSource::EnterpriseManaged { .. }
             | ConfigLayerSource::SessionFlags
             | ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
             | ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {}
@@ -338,7 +348,8 @@ async fn repo_agents_skill_roots(
     let mut roots = Vec::new();
     for dir in dirs {
         let agents_skills = dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME);
-        match fs.get_metadata(&agents_skills, /*sandbox*/ None).await {
+        let agents_skills_uri = PathUri::from_abs_path(&agents_skills);
+        match fs.get_metadata(&agents_skills_uri, /*sandbox*/ None).await {
             Ok(metadata) if metadata.is_directory => roots.push(SkillRoot {
                 path: agents_skills,
                 scope: SkillScope::Repo,
@@ -391,7 +402,8 @@ async fn find_project_root(
     for ancestor in cwd.ancestors() {
         for marker in project_root_markers {
             let marker_path = ancestor.join(marker);
-            match fs.get_metadata(&marker_path, /*sandbox*/ None).await {
+            let marker_path_uri = PathUri::from_abs_path(&marker_path);
+            match fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await {
                 Ok(_) => return ancestor,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -433,8 +445,15 @@ fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
     roots.retain(|root| seen.insert(root.path.clone()));
 }
 
-fn canonicalize_for_skill_identity(path: &AbsolutePathBuf) -> AbsolutePathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.clone())
+async fn canonicalize_for_skill_identity(
+    fs: &dyn ExecutorFileSystem,
+    path: &AbsolutePathBuf,
+) -> AbsolutePathBuf {
+    let path_uri = PathUri::from_abs_path(path);
+    fs.canonicalize(&path_uri, /*sandbox*/ None)
+        .await
+        .and_then(|path| path.to_abs_path())
+        .unwrap_or_else(|_| path.clone())
 }
 
 async fn discover_skills_under_root(
@@ -445,7 +464,8 @@ async fn discover_skills_under_root(
 ) {
     let root = canonicalize_for_skill_identity(root);
 
-    match fs.get_metadata(&root, /*sandbox*/ None).await {
+    let root_uri = PathUri::from_abs_path(&root);
+    match fs.get_metadata(&root_uri, /*sandbox*/ None).await {
         Ok(metadata) if metadata.is_directory => {}
         Ok(_) => return,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return,
@@ -487,7 +507,8 @@ async fn discover_skills_under_root(
     let mut truncated_by_dir_limit = false;
 
     while let Some((dir, depth)) = queue.pop_front() {
-        let entries = match fs.read_directory(&dir, /*sandbox*/ None).await {
+        let dir_uri = PathUri::from_abs_path(&dir);
+        let entries = match fs.read_directory(&dir_uri, /*sandbox*/ None).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("failed to read skills dir {}: {e:#}", dir.display());
@@ -502,7 +523,8 @@ async fn discover_skills_under_root(
             }
 
             let path = dir.join(&file_name);
-            let metadata = match fs.get_metadata(&path, /*sandbox*/ None).await {
+            let path_uri = PathUri::from_abs_path(&path);
+            let metadata = match fs.get_metadata(&path_uri, /*sandbox*/ None).await {
                 Ok(metadata) => metadata,
                 Err(e) => {
                     error!("failed to stat skills path {}: {e:#}", path.display());
@@ -514,9 +536,9 @@ async fn discover_skills_under_root(
                 if !follow_symlinks {
                     continue;
                 }
-                match fs.read_directory(&path, /*sandbox*/ None).await {
+                match fs.read_directory(&path_uri, /*sandbox*/ None).await {
                     Ok(_) => {
-                        let resolved_dir = canonicalize_for_skill_identity(&path);
+                        let resolved_dir = canonicalize_for_skill_identity(fs, &path).await;
                         enqueue_dir(
                             &mut queue,
                             &mut visited_dirs,
@@ -541,7 +563,7 @@ async fn discover_skills_under_root(
             }
 
             if metadata.is_directory {
-                let resolved_dir = canonicalize_for_skill_identity(&path);
+                let resolved_dir = canonicalize_for_skill_identity(fs, &path).await;
                 enqueue_dir(
                     &mut queue,
                     &mut visited_dirs,
@@ -584,8 +606,9 @@ async fn parse_skill_file(
     path: &AbsolutePathBuf,
     scope: SkillScope,
 ) -> Result<SkillMetadata, SkillParseError> {
+    let path_uri = PathUri::from_abs_path(path);
     let contents = fs
-        .read_file_text(path, /*sandbox*/ None)
+        .read_file_text(&path_uri, /*sandbox*/ None)
         .await
         .map_err(SkillParseError::Read)?;
 
@@ -618,7 +641,8 @@ async fn parse_skill_file(
         policy,
     } = load_skill_metadata(fs, path).await;
 
-    validate_len(&name, MAX_NAME_LEN, "name")?;
+    validate_len(&base_name, MAX_NAME_LEN, "name")?;
+    validate_len(&name, MAX_QUALIFIED_NAME_LEN, "qualified name")?;
     validate_len(&description, MAX_DESCRIPTION_LEN, "description")?;
     if let Some(short_description) = short_description.as_deref() {
         validate_len(
@@ -628,7 +652,7 @@ async fn parse_skill_file(
         )?;
     }
 
-    let resolved_path = canonicalize_for_skill_identity(path);
+    let resolved_path = canonicalize_for_skill_identity(fs, path).await;
 
     Ok(SkillMetadata {
         name,
@@ -676,7 +700,8 @@ async fn load_skill_metadata(
     let metadata_path = skill_dir
         .join(SKILLS_METADATA_DIR)
         .join(SKILLS_METADATA_FILENAME);
-    match fs.get_metadata(&metadata_path, /*sandbox*/ None).await {
+    let metadata_path_uri = PathUri::from_abs_path(&metadata_path);
+    match fs.get_metadata(&metadata_path_uri, /*sandbox*/ None).await {
         Ok(metadata) if metadata.is_file => {}
         Ok(_) => return LoadedSkillMetadata::default(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -692,7 +717,10 @@ async fn load_skill_metadata(
         }
     }
 
-    let contents = match fs.read_file_text(&metadata_path, /*sandbox*/ None).await {
+    let contents = match fs
+        .read_file_text(&metadata_path_uri, /*sandbox*/ None)
+        .await
+    {
         Ok(contents) => contents,
         Err(error) => {
             tracing::warn!(
@@ -964,7 +992,15 @@ pub(crate) async fn skill_roots_from_layer_stack(
     cwd: &AbsolutePathBuf,
     home_dir: Option<&AbsolutePathBuf>,
 ) -> Vec<SkillRoot> {
-    skill_roots_with_home_dir(Some(fs), config_layer_stack, cwd, home_dir, Vec::new()).await
+    skill_roots_with_home_dir(
+        Some(fs),
+        config_layer_stack,
+        cwd,
+        home_dir,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -6,11 +6,7 @@ The generated wire-model layer is currently sourced from the bundled v2 schema a
 
 ## Install
 
-```bash
-cd sdk/python
-uv sync
-source .venv/bin/activate
-```
+Install the SDK:
 
 Published SDK builds pin an exact `openai-codex-cli-bin` runtime dependency
 with the same version as the SDK. For local repo development, either pass
@@ -20,75 +16,52 @@ automatically.
 
 ## Quickstart
 
+The SDK reuses your existing Codex authentication when one is already
+available:
+
 ```python
 from codex_app_server import Codex
 
 with Codex() as codex:
-    # Call login_api_key(...) first when this app-server session is not
-    # already authenticated.
-    thread = codex.thread_start(model="gpt-5")
-    result = thread.run("Say hello in one sentence.")
+    thread = codex.thread_start()
+    result = thread.run("Explain this repository in three bullets.")
     print(result.final_response)
-    print(len(result.items))
 ```
 
-`thread.run(...)` and `thread.turn(...).run()` return `TurnResult`. Its
-`final_response` is `None` when the turn completes without a final-answer or
-phase-less assistant message item.
+`thread.run(...)` returns a `TurnResult` containing the final response,
+collected items, and token usage.
 
-## Login
+## Authentication
 
-Use the auth helper that matches your app:
+Existing Codex authentication is reused automatically. To start ChatGPT
+browser login explicitly:
 
 ```python
 from openai_codex import Codex
 
 with Codex() as codex:
-    codex.login_api_key("sk-...")
-    account = codex.account()
-    print(account.account)
+    login = codex.login_chatgpt()
+    print(login.auth_url)
+    print(login.wait().success)
 ```
 
-Interactive ChatGPT login returns a handle. Open the provided URL or device-code
-page, then wait for the matching completion event:
+For device-code login:
 
 ```python
 with Codex() as codex:
-    login = codex.login_chatgpt()
-    print(login.auth_url)
-    completed = login.wait()
-    print(completed.success)
-```
-
-Use `login_chatgpt_device_code()` for device-code auth, `handle.cancel()` to
-stop an in-progress interactive login, and `logout()` to clear the active
-app-server account session.
-
-## Docs map
-
-- Golden path tutorial: `docs/getting-started.md`
-- API reference (signatures + behavior): `docs/api-reference.md`
-- Common decisions and pitfalls: `docs/faq.md`
-- Runnable examples index: `examples/README.md`
-- Jupyter walkthrough notebook: `notebooks/sdk_walkthrough.ipynb`
-
-## Examples
-
-Start here:
-
-```bash
-cd sdk/python
-python examples/01_quickstart_constructor/sync.py
-python examples/01_quickstart_constructor/async.py
+    login = codex.login_chatgpt_device_code()
+    print(login.verification_url, login.user_code)
+    login.wait()
 ```
 
 ## Runtime packaging
 
 The repo no longer checks `codex` binaries into `sdk/python`.
 
-Published SDK builds are pinned to an exact `openai-codex-cli-bin` package
-version, and that runtime package carries the platform-specific binary for the
-target wheel. The SDK package version and runtime package version must match.
+```python
+with Codex() as codex:
+    codex.login_api_key("sk-...")
+```
 
 For local repo development, the checked-in `sdk/python-runtime` package is only
 a template for staged release artifacts. Editable installs should use an
@@ -132,7 +105,7 @@ This supports the CI release flow:
 - Target protocol: Codex `app-server` JSON-RPC v2
 - Versioning rule: the SDK package version is the underlying Codex runtime version
 
-## Notes
+## Documentation
 
 - `Codex()` is eager and performs startup + `initialize` in the constructor.
 - Use context managers (`with Codex() as codex:`) to ensure shutdown.

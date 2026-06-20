@@ -32,6 +32,12 @@ pub struct AppsTestServer {
     pub chatgpt_base_url: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum AppsTestToolLoading {
+    Direct,
+    Searchable,
+}
+
 impl AppsTestServer {
     pub async fn mount(server: &MockServer) -> Result<Self> {
         Self::mount_with_connector_name(server, CONNECTOR_NAME).await
@@ -45,6 +51,7 @@ impl AppsTestServer {
             CONNECTOR_NAME.to_string(),
             CONNECTOR_DESCRIPTION.to_string(),
             /*searchable*/ true,
+            /*include_app_only_tool*/ false,
         )
         .await;
         Ok(Self {
@@ -63,6 +70,26 @@ impl AppsTestServer {
             connector_name.to_string(),
             CONNECTOR_DESCRIPTION.to_string(),
             /*searchable*/ false,
+            /*include_app_only_tool*/ false,
+        )
+        .await;
+        Ok(Self {
+            chatgpt_base_url: server.uri(),
+        })
+    }
+
+    pub async fn mount_with_app_only_tool(
+        server: &MockServer,
+        tool_loading: AppsTestToolLoading,
+    ) -> Result<Self> {
+        mount_oauth_metadata(server).await;
+        mount_connectors_directory(server).await;
+        mount_streamable_http_json_rpc(
+            server,
+            CONNECTOR_NAME.to_string(),
+            CONNECTOR_DESCRIPTION.to_string(),
+            matches!(tool_loading, AppsTestToolLoading::Searchable),
+            /*include_app_only_tool*/ true,
         )
         .await;
         Ok(Self {
@@ -119,6 +146,7 @@ async fn mount_streamable_http_json_rpc(
     connector_name: String,
     connector_description: String,
     searchable: bool,
+    include_app_only_tool: bool,
 ) {
     Mock::given(method("POST"))
         .and(path_regex("^/api/codex/apps/?$"))
@@ -126,6 +154,7 @@ async fn mount_streamable_http_json_rpc(
             connector_name,
             connector_description,
             searchable,
+            include_app_only_tool,
         })
         .mount(server)
         .await;
@@ -135,6 +164,7 @@ struct CodexAppsJsonRpcResponder {
     connector_name: String,
     connector_description: String,
     searchable: bool,
+    include_app_only_tool: bool,
 }
 
 impl Respond for CodexAppsJsonRpcResponder {
@@ -304,6 +334,29 @@ impl Respond for CodexAppsJsonRpcResponder {
                             }
                         }));
                     }
+                }
+                if self.include_app_only_tool
+                    && let Some(tools) = response
+                        .pointer_mut("/result/tools")
+                        .and_then(Value::as_array_mut)
+                {
+                    tools.push(json!({
+                        "name": CALENDAR_APP_ONLY_TOOL_NAME,
+                        "description": "Open a calendar app-only action.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        },
+                        "_meta": {
+                            "connector_id": CONNECTOR_ID,
+                            "connector_name": self.connector_name.clone(),
+                            "connector_description": self.connector_description.clone(),
+                            "ui": {
+                                "visibility": ["app"]
+                            }
+                        }
+                    }));
                 }
                 ResponseTemplate::new(200).set_body_json(response)
             }

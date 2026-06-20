@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use codex_protocol::protocol::SessionSource;
 
+pub(crate) mod compression;
 pub(crate) mod config;
 pub(crate) mod list;
 pub(crate) mod metadata;
@@ -31,6 +32,11 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
+pub use compression::RolloutLineReader;
+pub use compression::existing_rollout_path;
+pub use compression::open_rollout_line_reader;
+pub use compression::plain_rollout_path;
+pub use compression::spawn_rollout_compression_worker;
 pub use config::Config;
 pub use config::RolloutConfig;
 pub use config::RolloutConfigView;
@@ -59,11 +65,13 @@ pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
 pub use search::first_rollout_content_match_snippet;
+pub use search::search_rollout_matches;
 pub use search::search_rollout_paths;
 pub use session_index::append_thread_name;
 pub use session_index::find_thread_meta_by_name_str;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_names_by_ids;
+pub use session_index::remove_thread_name_entries;
 pub use state_db::StateDbHandle;
 
 #[cfg(test)]

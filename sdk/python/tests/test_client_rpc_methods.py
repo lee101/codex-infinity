@@ -74,7 +74,7 @@ def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
 
 
 def test_notifications_are_typed_with_canonical_v2_methods() -> None:
-    client = AppServerClient()
+    client = CodexClient()
     event = client._coerce_notification(
         "thread/tokenUsage/updated",
         {
@@ -105,7 +105,7 @@ def test_notifications_are_typed_with_canonical_v2_methods() -> None:
 
 
 def test_unknown_notifications_fall_back_to_unknown_payloads() -> None:
-    client = AppServerClient()
+    client = CodexClient()
     event = client._coerce_notification(
         "unknown/notification",
         {

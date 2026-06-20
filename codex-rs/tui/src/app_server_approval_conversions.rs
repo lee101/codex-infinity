@@ -73,6 +73,7 @@ mod tests {
     use super::granted_permission_profile_from_request;
     use super::network_approval_context_to_core;
     use codex_app_server_protocol::FileUpdateChange;
+    use codex_app_server_protocol::GrantedPermissionProfile;
     use codex_app_server_protocol::PatchChangeKind;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
@@ -126,6 +127,20 @@ mod tests {
 
     #[test]
     fn converts_request_permissions_into_granted_permissions() {
+        let request = RequestPermissionProfile {
+            network: Some(AdditionalNetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(AdditionalFileSystemPermissions {
+                read: Some(vec![absolute_path("/tmp/read-only").into()]),
+                write: Some(vec![absolute_path("/tmp/write").into()]),
+                glob_scan_max_depth: None,
+                entries: None,
+            }),
+        };
+        let request = CoreRequestPermissionProfile::try_from(request)
+            .expect("API paths should convert to native paths");
+
         assert_eq!(
             granted_permission_profile_from_request(CoreRequestPermissionProfile {
                 network: Some(NetworkPermissions {
@@ -140,22 +155,22 @@ mod tests {
                 network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
                     enabled: Some(true),
                 }),
-                file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
-                    read: Some(vec![absolute_path("/tmp/read-only")]),
-                    write: Some(vec![absolute_path("/tmp/write")]),
+                file_system: Some(AdditionalFileSystemPermissions {
+                    read: Some(vec![absolute_path("/tmp/read-only").into()]),
+                    write: Some(vec![absolute_path("/tmp/write").into()]),
                     glob_scan_max_depth: None,
                     entries: Some(vec![
-                        codex_app_server_protocol::FileSystemSandboxEntry {
-                            path: codex_app_server_protocol::FileSystemPath::Path {
-                                path: absolute_path("/tmp/read-only"),
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Path {
+                                path: absolute_path("/tmp/read-only").into(),
                             },
-                            access: codex_app_server_protocol::FileSystemAccessMode::Read,
+                            access: FileSystemAccessMode::Read,
                         },
-                        codex_app_server_protocol::FileSystemSandboxEntry {
-                            path: codex_app_server_protocol::FileSystemPath::Path {
-                                path: absolute_path("/tmp/write"),
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Path {
+                                path: absolute_path("/tmp/write").into(),
                             },
-                            access: codex_app_server_protocol::FileSystemAccessMode::Write,
+                            access: FileSystemAccessMode::Write,
                         },
                     ]),
                 }),
@@ -165,6 +180,23 @@ mod tests {
 
     #[test]
     fn converts_request_permissions_into_canonical_granted_permissions() {
+        let request = RequestPermissionProfile {
+            network: None,
+            file_system: Some(AdditionalFileSystemPermissions {
+                read: None,
+                write: None,
+                glob_scan_max_depth: None,
+                entries: Some(vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    access: FileSystemAccessMode::Write,
+                }]),
+            }),
+        };
+        let request = CoreRequestPermissionProfile::try_from(request)
+            .expect("API paths should convert to native paths");
+
         assert_eq!(
             granted_permission_profile_from_request(CoreRequestPermissionProfile {
                 file_system: Some(FileSystemPermissions {
@@ -180,16 +212,16 @@ mod tests {
             }),
             codex_app_server_protocol::GrantedPermissionProfile {
                 network: None,
-                file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                file_system: Some(AdditionalFileSystemPermissions {
                     read: None,
                     write: None,
                     glob_scan_max_depth: None,
-                    entries: Some(vec![codex_app_server_protocol::FileSystemSandboxEntry {
-                        path: codex_app_server_protocol::FileSystemPath::Special {
-                            value: codex_app_server_protocol::FileSystemSpecialPath::Root,
+                    entries: Some(vec![FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
                         },
-                        access: codex_app_server_protocol::FileSystemAccessMode::Write,
-                    },]),
+                        access: FileSystemAccessMode::Write,
+                    }]),
                 }),
             }
         );

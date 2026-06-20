@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use codex_arg0::Arg0DispatchPaths;
@@ -10,16 +11,20 @@ use codex_core::config::Config;
 use codex_exec_server::EnvironmentManagerArgs;
 use codex_features::Feature;
 use codex_login::AuthManager;
+#[cfg(debug_assertions)]
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
 use crate::config_manager::ConfigManager;
+use crate::connection_cleanup::ConnectionCleanupTasks;
 use crate::message_processor::MessageProcessor;
 use crate::message_processor::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
@@ -77,6 +82,7 @@ mod config;
 mod config_api;
 mod config_manager;
 mod config_manager_service;
+mod connection_cleanup;
 mod connection_rpc_gate;
 mod device_key_api;
 mod dynamic_tools;
@@ -99,10 +105,12 @@ mod transport;
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
+pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::auth::AppServerWebsocketAuthArgs;
 pub use crate::transport::auth::AppServerWebsocketAuthSettings;
 pub use crate::transport::auth::WebsocketAuthCliMode;
+pub use crate::transport::take_remote_control_disabled_env;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 
@@ -477,11 +485,14 @@ pub async fn run_main_with_transport_options(
                 .replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
             let auth_manager =
                 AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-            config_manager.replace_cloud_requirements_loader(auth_manager, config.chatgpt_base_url);
+            config_manager
+                .replace_cloud_config_bundle_loader(auth_manager, config.chatgpt_base_url);
         }
         Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud requirements");
-            // TODO(gt): Make cloud requirements preload failures blocking once we can fail-closed.
+            warn!(error = %err, "Failed to preload config for cloud config bundle");
+            // TODO: Decide whether bootstrap config preload failures should block startup.
+            // If this fails, we cannot install cloud/thread config loaders, so non-strict
+            // startup may continue without managed cloud config.
         }
     };
     let mut config_warnings = Vec::new();
@@ -649,7 +660,11 @@ pub async fn run_main_with_transport_options(
     if remote_control_config_enabled && state_db.is_none() {
         error!("remote control disabled because sqlite state db is unavailable");
     }
-    if transport_accept_handles.is_empty() && !remote_control_enabled {
+    let no_local_transport = transport_accept_handles.is_empty();
+    if no_local_transport
+        && remote_control_startup_mode != RemoteControlStartupMode::ResolvePersisted
+        && !remote_control_enabled
+    {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             if remote_control_config_enabled && state_db.is_none() {
@@ -667,9 +682,35 @@ pub async fn run_main_with_transport_options(
         transport_event_tx.clone(),
         transport_shutdown_token.clone(),
         app_server_client_name_rx,
-        remote_control_enabled,
+        remote_control_startup_mode,
     )
     .await?;
+    if no_local_transport
+        && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
+    {
+        let persisted_enabled = match remote_control_handle
+            .resolve_persisted_preference(/*app_server_client_name*/ None)
+            .await
+        {
+            Ok(persisted_enabled) => persisted_enabled,
+            Err(err) => {
+                warn!("failed to resolve persisted remote control preference: {err}");
+                false
+            }
+        };
+        if !persisted_enabled {
+            transport_shutdown_token.cancel();
+            let _ = remote_control_accept_handle.await;
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
+                    "no transport configured; remote control disabled by managed requirements"
+                } else {
+                    "no transport configured; use --listen or enable remote control"
+                },
+            ));
+        }
+    }
     transport_accept_handles.push(remote_control_accept_handle);
 
     let outbound_handle = tokio::spawn(async move {
@@ -751,6 +792,7 @@ pub async fn run_main_with_transport_options(
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+        let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
@@ -834,14 +876,20 @@ pub async fn run_main_with_transport_options(
                                 let Some(connection_state) = connections.remove(&connection_id) else {
                                     continue;
                                 };
-                                if outbound_control_tx
+                                connection_state.session.rpc_gate.close().await;
+                                let outbound_closed = outbound_control_tx
                                     .send(OutboundControlEvent::Closed { connection_id })
                                     .await
-                                    .is_err()
-                                {
+                                    .is_ok();
+                                let processor = Arc::clone(&processor);
+                                connection_cleanup_tasks.spawn(async move {
+                                    processor
+                                        .connection_closed(connection_id, &connection_state.session)
+                                        .await;
+                                });
+                                if !outbound_closed {
                                     break;
                                 }
-                                processor.connection_closed(connection_id, &connection_state.session).await;
                                 if shutdown_when_no_connections && connections.is_empty() {
                                     break;
                                 }
@@ -931,6 +979,7 @@ pub async fn run_main_with_transport_options(
                             }
                         }
                     }
+                    _ = connection_cleanup_tasks.reap_next() => {}
                     changed = remote_control_status_rx.changed() => {
                         if changed.is_err() {
                             continue;
@@ -987,8 +1036,11 @@ pub async fn run_main_with_transport_options(
                         .map(|connection_state| connection_state.session.rpc_gate.shutdown()),
                 )
                 .await;
+                connection_cleanup_tasks.drain().await;
                 processor.drain_background_tasks().await;
                 processor.shutdown_threads().await;
+            } else {
+                connection_cleanup_tasks.abort();
             }
             info!("processor task exited (channel closed)");
         }
@@ -1011,6 +1063,167 @@ pub async fn run_main_with_transport_options(
     Ok(())
 }
 
+struct SqliteRecoveryNotice {
+    details: String,
+}
+
+struct RecoveredSqliteDatabase {
+    database_path: String,
+    backup_folder: String,
+}
+
+struct StateDbInitResult {
+    state_db: Option<rollout_state_db::StateDbHandle>,
+    recovery_notice: Option<SqliteRecoveryNotice>,
+}
+
+async fn init_sqlite_state_db_with_fresh_start_on_corruption(
+    config: &Config,
+) -> anyhow::Result<StateDbInitResult> {
+    let mut attempted_backups = HashSet::new();
+    let mut recovered_databases = Vec::new();
+    loop {
+        let err = match rollout_state_db::try_init(config).await {
+            Ok(state_db) => {
+                let recovery_notice = sqlite_recovery_notice(&recovered_databases);
+                if recovery_notice.is_some() {
+                    emit_state_db_backup_warning(SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY);
+                    for recovered_database in &recovered_databases {
+                        emit_state_db_backup_warning(&format!(
+                            "Database path: {}",
+                            recovered_database.database_path
+                        ));
+                        emit_state_db_backup_warning(&format!(
+                            "Backup folder: {}",
+                            recovered_database.backup_folder
+                        ));
+                    }
+                }
+                return Ok(StateDbInitResult {
+                    state_db: Some(state_db),
+                    recovery_notice,
+                });
+            }
+            Err(err) => err,
+        };
+        let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
+            .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
+        if !codex_state::is_sqlite_corruption_error(&err)
+            && !sqlite_home_is_blocking_file(database_path.as_path())
+        {
+            return Err(err);
+        }
+
+        if !attempted_backups.insert(database_path.clone()) {
+            return Err(anyhow::anyhow!(
+                "failed to initialize sqlite state runtime after moving damaged database file into a backup folder: {err}"
+            ));
+        }
+
+        let original_error = err.to_string();
+        emit_state_db_backup_warning(&format!(
+            "Codex local database at {} appears damaged. Moving it into a backup folder so the app server can rebuild it from saved data.",
+            database_path.display()
+        ));
+        let backups = codex_state::backup_runtime_db_for_fresh_start(database_path.as_path())
+            .await
+            .map_err(|backup_err| {
+                anyhow::anyhow!(
+                    "failed to move damaged sqlite state database files into a backup folder: {backup_err}; original error: {original_error}"
+                )
+            })?;
+        for backup in &backups {
+            emit_state_db_backup_warning(&format!(
+                "Moved damaged Codex local database file {} to {}",
+                backup.original_path.display(),
+                backup.backup_path.display()
+            ));
+        }
+        if let Some(first_backup) = backups.first()
+            && let Some(backup_folder) = first_backup.backup_path.parent()
+        {
+            recovered_databases.push(RecoveredSqliteDatabase {
+                database_path: first_backup.original_path.display().to_string(),
+                backup_folder: backup_folder.display().to_string(),
+            });
+        }
+    }
+}
+
+fn sqlite_home_is_blocking_file(database_path: &Path) -> bool {
+    database_path
+        .parent()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.is_file())
+}
+
+fn sqlite_recovery_notice(
+    recovered_databases: &[RecoveredSqliteDatabase],
+) -> Option<SqliteRecoveryNotice> {
+    if recovered_databases.is_empty() {
+        return None;
+    }
+
+    let details = recovered_databases
+        .iter()
+        .map(|recovered_database| {
+            format!(
+                "Database path: {}\nBackup folder: {}",
+                recovered_database.database_path, recovered_database.backup_folder
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(SqliteRecoveryNotice { details })
+}
+
+fn emit_state_db_backup_warning(message: &str) {
+    warn!("{message}");
+    if !tracing::dispatcher::has_been_set() {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("{message}");
+        }
+    }
+}
+
+fn test_user_config_file_from_env() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(TEST_USER_CONFIG_FILE_ENV_VAR)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+fn loader_overrides_with_test_user_config_file(
+    mut loader_overrides: LoaderOverrides,
+    test_user_config_file: Option<std::path::PathBuf>,
+) -> IoResult<LoaderOverrides> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = test_user_config_file {
+        let path = AbsolutePathBuf::from_absolute_path(path).map_err(|err| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid test user config path: {err}"),
+            )
+        })?;
+        warn!(
+            path = %path.as_path().display(),
+            "using debug-only app-server test user config file"
+        );
+        loader_overrides.user_config_path = Some(path);
+    }
+
+    #[cfg(not(debug_assertions))]
+    let _ = test_user_config_file;
+
+    Ok(loader_overrides)
+}
+
 fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransport {
     match transport {
         AppServerTransport::Stdio => AppServerRpcTransport::Stdio,
@@ -1023,6 +1236,12 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 #[cfg(test)]
 mod tests {
     use super::LogFormat;
+    #[cfg(debug_assertions)]
+    use super::loader_overrides_with_test_user_config_file;
+    #[cfg(debug_assertions)]
+    use codex_config::LoaderOverrides;
+    #[cfg(debug_assertions)]
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -1041,5 +1260,21 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_test_user_config_file_overrides_loader_path() {
+        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
+        let loader_overrides = loader_overrides_with_test_user_config_file(
+            LoaderOverrides::default(),
+            Some(path.clone()),
+        )
+        .expect("test config path should be valid");
+
+        assert_eq!(
+            loader_overrides.user_config_path,
+            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
+        );
     }
 }

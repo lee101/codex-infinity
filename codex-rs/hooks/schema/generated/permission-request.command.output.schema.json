@@ -61,7 +61,8 @@
           "default": null
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "PermissionRequest",
+          "type": "string"
         }
       },
       "required": [

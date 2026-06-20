@@ -1,14 +1,34 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use async_trait::async_trait;
+use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::CodeModeNestedToolCall;
+use codex_code_mode_protocol::CodeModeSession;
+use codex_code_mode_protocol::CodeModeSessionDelegate;
+use codex_code_mode_protocol::CodeModeSessionProvider;
+use codex_code_mode_protocol::CodeModeSessionProviderFuture;
+use codex_code_mode_protocol::CodeModeSessionResultFuture;
+use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
+use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::ExecuteToPendingOutcome;
+use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::NotificationFuture;
+use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::ToolInvocationFuture;
+use codex_code_mode_protocol::WaitOutcome;
+use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::WaitToPendingOutcome;
+use codex_code_mode_protocol::WaitToPendingRequest;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -24,28 +44,62 @@ use crate::runtime::WaitOutcome;
 use crate::runtime::WaitRequest;
 use crate::runtime::spawn_runtime;
 
-#[async_trait]
-pub trait CodeModeTurnHost: Send + Sync {
-    async fn invoke_tool(
-        &self,
-        invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String>;
+pub struct NoopCodeModeSessionDelegate;
 
-    async fn notify(&self, call_id: String, cell_id: String, text: String) -> Result<(), String>;
+impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            cancellation_token.cancelled().await;
+            Err("code mode nested tools are unavailable".to_string())
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+#[derive(Default)]
+pub struct InProcessCodeModeSessionProvider;
+
+impl CodeModeSessionProvider for InProcessCodeModeSessionProvider {
+    fn create_session<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async move {
+            let session: Arc<dyn CodeModeSession> =
+                Arc::new(CodeModeService::with_delegate(delegate));
+            Ok(session)
+        })
+    }
 }
 
 #[derive(Clone)]
-struct SessionHandle {
-    control_tx: mpsc::UnboundedSender<SessionControlCommand>,
+struct CellHandle {
+    control_tx: mpsc::UnboundedSender<CellControlCommand>,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
+    cancellation_token: CancellationToken,
+    termination_requested: Arc<AtomicBool>,
 }
 
 struct Inner {
     stored_values: Mutex<HashMap<String, JsonValue>>,
-    sessions: Mutex<HashMap<String, SessionHandle>>,
-    turn_message_tx: async_channel::Sender<TurnMessage>,
-    turn_message_rx: async_channel::Receiver<TurnMessage>,
+    cells: Mutex<HashMap<CellId, CellHandle>>,
+    delegate: Arc<dyn CodeModeSessionDelegate>,
+    shutting_down: AtomicBool,
     next_cell_id: AtomicU64,
 }
 
@@ -55,21 +109,28 @@ pub struct CodeModeService {
 
 impl CodeModeService {
     pub fn new() -> Self {
-        let (turn_message_tx, turn_message_rx) = async_channel::unbounded();
+        Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
+    }
 
+    pub fn with_delegate(delegate: Arc<dyn CodeModeSessionDelegate>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),
-                sessions: Mutex::new(HashMap::new()),
-                turn_message_tx,
-                turn_message_rx,
+                cells: Mutex::new(HashMap::new()),
+                delegate,
+                shutting_down: AtomicBool::new(false),
                 next_cell_id: AtomicU64::new(1),
             }),
         }
     }
 
-    async fn stored_values(&self) -> HashMap<String, JsonValue> {
-        self.inner.stored_values.lock().await.clone()
+    fn allocate_cell_id(&self) -> CellId {
+        CellId::new(
+            self.inner
+                .next_cell_id
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string(),
+        )
     }
 
     /// Reserves the runtime cell id for a future `execute` request.
@@ -101,25 +162,25 @@ impl CodeModeService {
             let (runtime_tx, runtime_terminate_handle) =
                 spawn_runtime(stored_values, request, event_tx)?;
 
-            // Keep the session registry locked through insertion so a
-            // caller-owned cell id cannot race with another execute and replace
-            // a live runtime.
-            sessions.insert(
+            cells.insert(
                 cell_id.clone(),
-                SessionHandle {
+                CellHandle {
                     control_tx,
                     runtime_tx: runtime_tx.clone(),
+                    cancellation_token: cancellation_token.clone(),
+                    termination_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
             (runtime_tx, runtime_terminate_handle)
         };
 
-        tokio::spawn(run_session_control(
+        tokio::spawn(run_cell_control(
             Arc::clone(&self.inner),
-            SessionControlContext {
-                cell_id: cell_id.clone(),
+            CellControlContext {
+                cell_id,
                 runtime_tx,
                 runtime_terminate_handle,
+                cancellation_token,
             },
             event_rx,
             control_rx,
@@ -133,34 +194,57 @@ impl CodeModeService {
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
-        let cell_id = request.cell_id.clone();
-        let handle = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(&request.cell_id)
-            .cloned();
+        self.begin_wait(request).await.await
+    }
+
+    async fn begin_wait(
+        &self,
+        request: WaitRequest,
+    ) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
+        let WaitRequest {
+            cell_id,
+            yield_time_ms,
+        } = request;
+        let handle = self.inner.cells.lock().await.get(&cell_id).cloned();
+        let Some(handle) = handle else {
+            return missing_wait(cell_id);
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let control_message = CellControlCommand::Poll {
+            yield_time_ms,
+            response_tx,
+        };
+        if handle.control_tx.send(control_message).is_err() {
+            return missing_wait(cell_id);
+        }
+        wait_for_response(cell_id, response_rx)
+    }
+
+    pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        let handle = self.inner.cells.lock().await.get(&cell_id).cloned();
         let Some(handle) = handle else {
             return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
         };
+        if handle
+            .termination_requested
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(already_terminating_error(&cell_id));
+        }
         let (response_tx, response_rx) = oneshot::channel();
-        let control_message = if request.terminate {
-            SessionControlCommand::Terminate { response_tx }
-        } else {
-            SessionControlCommand::Poll {
-                yield_time_ms: request.yield_time_ms,
-                response_tx,
-            }
-        };
-        if handle.control_tx.send(control_message).is_err() {
+        if handle
+            .control_tx
+            .send(CellControlCommand::Terminate { response_tx })
+            .is_err()
+        {
+            handle.termination_requested.store(false, Ordering::Relaxed);
             return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
         }
         match response_rx.await {
-            Ok(response) => Ok(WaitOutcome::LiveCell(response)),
-            Err(_) => Ok(WaitOutcome::MissingCell(missing_cell_response(
-                request.cell_id,
-            ))),
+            Ok(Ok(response)) => Ok(WaitOutcome::LiveCell(response)),
+            Ok(Err(error_text)) => Err(error_text),
+            Err(_) => Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))),
         }
     }
 
@@ -227,6 +311,10 @@ impl CodeModeService {
         CodeModeTurnWorker {
             shutdown_tx: Some(shutdown_tx),
         }
+        while !self.inner.cells.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        Ok(())
     }
 }
 
@@ -236,25 +324,54 @@ impl Default for CodeModeService {
     }
 }
 
-pub struct CodeModeTurnWorker {
-    shutdown_tx: Option<oneshot::Sender<()>>,
-}
-
-impl Drop for CodeModeTurnWorker {
+impl Drop for CodeModeService {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.inner.shutting_down.store(true, Ordering::Release);
+        if let Ok(cells) = self.inner.cells.try_lock() {
+            for handle in cells.values() {
+                handle.cancellation_token.cancel();
+                let (response_tx, _response_rx) = oneshot::channel();
+                let _ = handle
+                    .control_tx
+                    .send(CellControlCommand::Terminate { response_tx });
+                let _ = handle.runtime_tx.send(RuntimeCommand::Terminate);
+            }
         }
     }
 }
 
-enum SessionControlCommand {
+impl CodeModeSession for CodeModeService {
+    fn is_alive(&self) -> bool {
+        !self.inner.shutting_down.load(Ordering::Acquire)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        request: ExecuteRequest,
+    ) -> CodeModeSessionResultFuture<'a, StartedCell> {
+        Box::pin(CodeModeService::execute(self, request))
+    }
+
+    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(CodeModeService::wait(self, request))
+    }
+
+    fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(CodeModeService::terminate(self, cell_id))
+    }
+
+    fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
+        Box::pin(CodeModeService::shutdown(self))
+    }
+}
+
+enum CellControlCommand {
     Poll {
         yield_time_ms: u64,
-        response_tx: oneshot::Sender<RuntimeResponse>,
+        response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
     },
     Terminate {
-        response_tx: oneshot::Sender<RuntimeResponse>,
+        response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
     },
 }
 
@@ -263,13 +380,14 @@ struct PendingResult {
     error_text: Option<String>,
 }
 
-struct SessionControlContext {
-    cell_id: String,
+struct CellControlContext {
+    cell_id: CellId,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_terminate_handle: v8::IsolateHandle,
+    cancellation_token: CancellationToken,
 }
 
-fn missing_cell_response(cell_id: String) -> RuntimeResponse {
+fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
     RuntimeResponse::Result {
         error_text: Some(format!("exec cell {cell_id} not found")),
         cell_id,
@@ -277,16 +395,41 @@ fn missing_cell_response(cell_id: String) -> RuntimeResponse {
     }
 }
 
-fn pending_result_response(cell_id: &str, result: PendingResult) -> RuntimeResponse {
+fn missing_wait(cell_id: CellId) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
+    Box::pin(async move { Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))) })
+}
+
+fn wait_for_response(
+    cell_id: CellId,
+    response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
+) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
+    Box::pin(async move {
+        match response_rx.await {
+            Ok(Ok(response)) => Ok(WaitOutcome::LiveCell(response)),
+            Ok(Err(error_text)) => Err(error_text),
+            Err(_) => Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))),
+        }
+    })
+}
+
+fn busy_observer_error(cell_id: &CellId) -> String {
+    format!("exec cell {cell_id} already has an active observer")
+}
+
+fn already_terminating_error(cell_id: &CellId) -> String {
+    format!("exec cell {cell_id} is already terminating")
+}
+
+fn pending_result_response(cell_id: &CellId, result: PendingResult) -> RuntimeResponse {
     RuntimeResponse::Result {
-        cell_id: cell_id.to_string(),
+        cell_id: cell_id.clone(),
         content_items: result.content_items,
         error_text: result.error_text,
     }
 }
 
 fn send_or_buffer_result(
-    cell_id: &str,
+    cell_id: &CellId,
     result: PendingResult,
     response_tx: &mut Option<oneshot::Sender<RuntimeResponse>>,
     pending_result: &mut Option<PendingResult>,
@@ -302,33 +445,131 @@ fn send_or_buffer_result(
 
 async fn run_session_control(
     inner: Arc<Inner>,
-    context: SessionControlContext,
+    context: CellControlContext,
     mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut control_rx: mpsc::UnboundedReceiver<SessionControlCommand>,
     initial_response_tx: oneshot::Sender<RuntimeResponse>,
     initial_yield_time_ms: u64,
 ) {
-    let SessionControlContext {
+    let CellControlContext {
         cell_id,
         runtime_tx,
         runtime_terminate_handle,
+        cancellation_token,
     } = context;
     let mut content_items = Vec::new();
     let mut pending_result: Option<PendingResult> = None;
     let mut response_tx = Some(initial_response_tx);
+    let mut termination_response_tx = None;
     let mut termination_requested = false;
     let mut runtime_closed = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut notification_tasks = JoinSet::new();
+    let mut tool_tasks = JoinSet::new();
 
     loop {
+        let yield_deadline_elapsed = yield_timer
+            .as_ref()
+            .is_some_and(|yield_timer| yield_timer.deadline() <= tokio::time::Instant::now());
         tokio::select! {
+            biased;
+            maybe_command = control_rx.recv() => {
+                let Some(command) = maybe_command else {
+                    break;
+                };
+                match command {
+                    CellControlCommand::Poll {
+                        yield_time_ms,
+                        response_tx: next_response_tx,
+                    } => {
+                        if let Some(result) = pending_result.take() {
+                            let _ = next_response_tx.send(Ok(pending_result_response(&cell_id, result)));
+                            break;
+                        }
+                        if response_tx.is_some() || termination_response_tx.is_some() {
+                            let _ = next_response_tx.send(Err(busy_observer_error(&cell_id)));
+                            continue;
+                        }
+                        response_tx = Some(CellResponseSender::Runtime(next_response_tx));
+                        yield_timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(yield_time_ms))));
+                        resume_paused_runtime(&runtime_control_tx, pending_mode);
+                    }
+                    CellControlCommand::PollToPending {
+                        response_tx: next_response_tx,
+                    } => {
+                        if let Some(result) = pending_result.take() {
+                            let response = pending_result_response(&cell_id, result);
+                            let _ = next_response_tx
+                                .send(Ok(ExecuteToPendingOutcome::Completed(response)));
+                            break;
+                        }
+                        if response_tx.is_some() || termination_response_tx.is_some() {
+                            let _ = next_response_tx.send(Err(busy_observer_error(&cell_id)));
+                            continue;
+                        }
+                        response_tx =
+                            Some(CellResponseSender::ExecuteToPending(next_response_tx));
+                        yield_timer = None;
+                        resume_paused_runtime(&runtime_control_tx, pending_mode);
+                    }
+                    CellControlCommand::Terminate { response_tx: next_response_tx } => {
+                        if let Some(result) = pending_result.take() {
+                            let _ = next_response_tx.send(Ok(pending_result_response(&cell_id, result)));
+                            break;
+                        }
+
+                        if termination_response_tx.is_some() {
+                            let _ = next_response_tx.send(Err(already_terminating_error(&cell_id)));
+                            continue;
+                        }
+
+                        termination_response_tx = Some(next_response_tx);
+                        termination_requested = true;
+                        cancellation_token.cancel();
+                        yield_timer = None;
+                        let _ = runtime_tx.send(RuntimeCommand::Terminate);
+                        terminate_paused_runtime(&runtime_control_tx, pending_mode);
+                        let _ = runtime_terminate_handle.terminate_execution();
+                        if runtime_closed {
+                            finish_callbacks(
+                                &cancellation_token,
+                                &mut notification_tasks,
+                                &mut tool_tasks,
+                                CallbackCompletion::Cancel,
+                            ).await;
+                            let response = RuntimeResponse::Terminated {
+                                cell_id: cell_id.clone(),
+                                content_items: std::mem::take(&mut content_items),
+                            };
+                            send_termination_responses(
+                                response_tx.take(),
+                                termination_response_tx.take(),
+                                response,
+                            );
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ = async {
+                if let Some(yield_timer) = yield_timer.as_mut() {
+                    yield_timer.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                yield_timer = None;
+                send_yield_response(&cell_id, &mut content_items, &mut response_tx);
+            }
             maybe_event = async {
                 if runtime_closed {
                     std::future::pending::<Option<RuntimeEvent>>().await
                 } else {
                     event_rx.recv().await
                 }
-            } => {
+            }, if !yield_deadline_elapsed => {
                 let Some(event) = maybe_event else {
                     runtime_closed = true;
                     if termination_requested {
@@ -373,23 +614,38 @@ async fn run_session_control(
                         }
                     }
                     RuntimeEvent::Notify { call_id, text } => {
-                        let _ = inner.turn_message_tx.send(TurnMessage::Notify {
-                            cell_id: cell_id.clone(),
-                            call_id,
-                            text,
-                        }).await;
+                        let delegate = Arc::clone(&inner.delegate);
+                        let cell_id = cell_id.clone();
+                        let cancellation_token = cancellation_token.child_token();
+                        notification_tasks.spawn(async move {
+                            if let Err(err) = delegate
+                                .notify(call_id, cell_id.clone(), text, cancellation_token)
+                                .await
+                            {
+                                warn!(
+                                    "failed to deliver code mode notification for cell {cell_id}: {err}"
+                                );
+                            }
+                        });
                     }
                     RuntimeEvent::ToolCall { id, name, input } => {
                         let tool_call = CodeModeNestedToolCall {
                             cell_id: cell_id.clone(),
-                            runtime_tool_call_id: id,
+                            runtime_tool_call_id: id.clone(),
                             tool_name: name,
                             input,
                         };
-                        let _ = inner
-                            .turn_message_tx
-                            .send(TurnMessage::ToolCall(tool_call))
-                            .await;
+                        let delegate = Arc::clone(&inner.delegate);
+                        let runtime_tx = runtime_tx.clone();
+                        let cancellation_token = cancellation_token.child_token();
+                        tool_tasks.spawn(async move {
+                            let response = delegate.invoke_tool(tool_call, cancellation_token).await;
+                            let command = match response {
+                                Ok(result) => RuntimeCommand::ToolResponse { id, result },
+                                Err(error_text) => RuntimeCommand::ToolError { id, error_text },
+                            };
+                            let _ = runtime_tx.send(command);
+                        });
                     }
                     RuntimeEvent::Result {
                         stored_value_writes,
@@ -405,6 +661,12 @@ async fn run_session_control(
                             }
                             break;
                         }
+                        finish_callbacks(
+                            &cancellation_token,
+                            &mut notification_tasks,
+                            &mut tool_tasks,
+                            CallbackCompletion::DrainNotifications,
+                        ).await;
                         inner
                             .stored_values
                             .lock()
@@ -466,11 +728,11 @@ async fn run_session_control(
                     }
                 }
             }
-            _ = async {
-                if let Some(yield_timer) = yield_timer.as_mut() {
-                    yield_timer.await;
-                } else {
-                    std::future::pending::<()>().await;
+            task_result = tool_tasks.join_next(), if !tool_tasks.is_empty() => {
+                if let Some(Err(err)) = task_result
+                    && !err.is_cancelled()
+                {
+                    warn!("code mode tool task failed: {err}");
                 }
             } => {
                 yield_timer = None;
@@ -493,6 +755,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use pretty_assertions::assert_eq;
@@ -500,6 +763,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
 
+    use super::CellControlCommand;
+    use super::CellControlContext;
+    use super::CellId;
+    use super::CellResponseSender;
     use super::CodeModeService;
     use super::Inner;
     use super::RuntimeCommand;
@@ -516,7 +783,6 @@ mod tests {
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
-            cell_id: "1".to_string(),
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),
@@ -525,13 +791,26 @@ mod tests {
         }
     }
 
+    fn cell_id(value: &str) -> CellId {
+        CellId::new(value.to_string())
+    }
+
+    async fn execute(service: &CodeModeService, request: ExecuteRequest) -> RuntimeResponse {
+        service
+            .execute(request)
+            .await
+            .unwrap()
+            .initial_response()
+            .await
+            .unwrap()
+    }
+
     fn test_inner() -> Arc<Inner> {
-        let (turn_message_tx, turn_message_rx) = async_channel::unbounded();
         Arc::new(Inner {
             stored_values: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            turn_message_tx,
-            turn_message_rx,
+            cells: Mutex::new(HashMap::new()),
+            delegate: Arc::new(NoopCodeModeSessionDelegate),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             next_cell_id: AtomicU64::new(1),
         })
     }
@@ -540,19 +819,20 @@ mod tests {
     async fn synchronous_exit_returns_successfully() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"text("before"); exit(); text("after");"#.to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "before".to_string(),
                 }],
@@ -565,19 +845,20 @@ mod tests {
     async fn v8_console_is_not_exposed_on_global_this() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"text(String(Object.hasOwn(globalThis, "console")));"#.to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "false".to_string(),
                 }],
@@ -590,8 +871,9 @@ mod tests {
     async fn date_locale_string_formats_with_icu_data() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 const value = new Date("2025-01-02T03:04:05Z")
   .toLocaleString("fr-FR", {
@@ -609,14 +891,14 @@ text(value);
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
                 }],
@@ -629,8 +911,9 @@ text(value);
     async fn intl_date_time_format_formats_with_icu_data() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 const formatter = new Intl.DateTimeFormat("fr-FR", {
   weekday: "long",
@@ -647,14 +930,14 @@ text(formatter.format(new Date("2025-01-02T03:04:05Z")));
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
                 }],
@@ -667,12 +950,13 @@ text(formatter.format(new Date("2025-01-02T03:04:05Z")));
     async fn output_helpers_return_undefined() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 const returnsUndefined = [
   text("first"),
-  image("https://example.com/image.jpg"),
+  image("data:image/png;base64,AAA"),
   notify("ping"),
 ].map((value) => value === undefined);
 text(JSON.stringify(returnsUndefined));
@@ -680,20 +964,20 @@ text(JSON.stringify(returnsUndefined));
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![
                     FunctionCallOutputContentItem::InputText {
                         text: "first".to_string(),
                     },
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: "https://example.com/image.jpg".to_string(),
+                        image_url: "data:image/png;base64,AAA".to_string(),
                         detail: Some(crate::DEFAULT_IMAGE_DETAIL),
                     },
                     FunctionCallOutputContentItem::InputText {
@@ -709,8 +993,9 @@ text(JSON.stringify(returnsUndefined));
     async fn image_helper_accepts_raw_mcp_image_block_with_original_detail() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 image({
   type: "image",
@@ -722,14 +1007,14 @@ image({
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::Original),
@@ -740,11 +1025,50 @@ image({
     }
 
     #[tokio::test]
+    async fn generated_image_helper_appends_image_and_output_hint() {
+        let service = CodeModeService::new();
+
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"
+generatedImage({
+  image_url: "data:image/png;base64,AAA",
+  output_hint: "generated image save hint",
+});
+"#
+                .to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,AAA".to_string(),
+                        detail: Some(crate::DEFAULT_IMAGE_DETAIL),
+                    },
+                    FunctionCallOutputContentItem::InputText {
+                        text: "generated image save hint".to_string(),
+                    },
+                ],
+                error_text: None,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn image_helper_second_arg_overrides_explicit_object_detail() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 image(
   {
@@ -757,16 +1081,16 @@ image(
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
-                    image_url: "https://example.com/image.jpg".to_string(),
+                    image_url: "data:image/png;base64,AAA".to_string(),
                     detail: Some(crate::ImageDetail::Original),
                 }],
                 error_text: None,
@@ -778,8 +1102,9 @@ image(
     async fn image_helper_second_arg_overrides_raw_mcp_image_detail() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 image(
   {
@@ -794,14 +1119,14 @@ image(
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::Low),
@@ -815,8 +1140,9 @@ image(
     async fn image_helper_rejects_raw_mcp_result_container() {
         let service = CodeModeService::new();
 
-        let response = service
-            .execute(ExecuteRequest {
+        let response = execute(
+            &service,
+            ExecuteRequest {
                 source: r#"
 image({
   content: [
@@ -833,14 +1159,14 @@ image({
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
 
         assert_eq!(
             response,
             RuntimeResponse::Result {
-                cell_id: "1".to_string(),
+                cell_id: cell_id("1"),
                 content_items: Vec::new(),
                 error_text: Some(
                     "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block".to_string(),
@@ -855,9 +1181,8 @@ image({
 
         let response = service
             .wait(WaitRequest {
-                cell_id: "missing".to_string(),
+                cell_id: cell_id("missing"),
                 yield_time_ms: 1,
-                terminate: false,
             })
             .await
             .unwrap();
@@ -865,7 +1190,7 @@ image({
         assert_eq!(
             response,
             WaitOutcome::MissingCell(RuntimeResponse::Result {
-                cell_id: "missing".to_string(),
+                cell_id: cell_id("missing"),
                 content_items: Vec::new(),
                 error_text: Some("exec cell missing not found".to_string()),
             })
@@ -890,12 +1215,13 @@ image({
         )
         .unwrap();
 
-        tokio::spawn(run_session_control(
+        tokio::spawn(run_cell_control(
             inner,
-            SessionControlContext {
-                cell_id: "cell-1".to_string(),
+            CellControlContext {
+                cell_id: cell_id("cell-1"),
                 runtime_tx: runtime_tx.clone(),
                 runtime_terminate_handle,
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
             },
             event_rx,
             control_rx,
@@ -907,15 +1233,15 @@ image({
         event_tx.send(RuntimeEvent::YieldRequested).unwrap();
         assert_eq!(
             initial_response_rx.await.unwrap(),
-            RuntimeResponse::Yielded {
-                cell_id: "cell-1".to_string(),
+            Ok(RuntimeResponse::Yielded {
+                cell_id: cell_id("cell-1"),
                 content_items: Vec::new(),
-            }
+            })
         );
 
         let (terminate_response_tx, terminate_response_rx) = oneshot::channel();
         control_tx
-            .send(SessionControlCommand::Terminate {
+            .send(CellControlCommand::Terminate {
                 response_tx: terminate_response_tx,
             })
             .unwrap();
@@ -931,12 +1257,16 @@ image({
 
         assert_eq!(
             terminate_response.await,
-            RuntimeResponse::Terminated {
-                cell_id: "cell-1".to_string(),
+            Ok(RuntimeResponse::Terminated {
+                cell_id: cell_id("cell-1"),
                 content_items: Vec::new(),
-            }
+            })
         );
 
         let _ = runtime_tx.send(RuntimeCommand::Terminate);
     }
 }
+
+#[cfg(test)]
+#[path = "service_contract_tests.rs"]
+mod contract_tests;

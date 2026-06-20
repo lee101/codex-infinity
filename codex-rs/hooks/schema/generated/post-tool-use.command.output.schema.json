@@ -27,7 +27,8 @@
           "type": "string"
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "PostToolUse",
+          "type": "string"
         },
         "updatedMCPToolOutput": {
           "default": null

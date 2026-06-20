@@ -15,11 +15,13 @@ PLATFORMS = [
 
 # Match Cargo's Windows linker behavior so Bazel-built binaries and tests use
 # the same stack reserve on both Windows ABIs and resolve UCRT imports on MSVC.
+WINDOWS_GNULLVM_RUSTC_LINK_FLAGS = [
+    "-C",
+    "link-arg=-Wl,--stack,8388608",  # 8 MiB
+]
+
 WINDOWS_RUSTC_LINK_FLAGS = select({
-    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": [
-        "-C",
-        "link-arg=-Wl,--stack,8388608",  # 8 MiB
-    ],
+    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": WINDOWS_GNULLVM_RUSTC_LINK_FLAGS,
     "@rules_rs//rs/experimental/platforms/constraints:windows_msvc": [
         "-C",
         "link-arg=/STACK:8388608",  # 8 MiB
@@ -42,21 +44,6 @@ MACOS_WEBRTC_RUSTC_LINK_FLAGS = select({
     ],
     "//conditions:default": [],
 })
-
-def multiplatform_binaries(name, platforms = PLATFORMS):
-    for platform in platforms:
-        platform_data(
-            name = name + "_" + platform,
-            platform = "@llvm//platforms:" + platform,
-            target = name,
-            tags = ["manual"],
-        )
-
-    native.filegroup(
-        name = "release_binaries",
-        srcs = [name + "_" + platform for platform in platforms],
-        tags = ["manual"],
-    )
 
 def _workspace_root_test_impl(ctx):
     is_windows = ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo])
@@ -143,7 +130,9 @@ def codex_rust_crate(
         test_shard_counts = {},
         test_tags = [],
         unit_test_timeout = None,
-        extra_binaries = []):
+        extra_binaries = [],
+        extra_binaries_non_windows = [],
+        run_tests_with_wine_exec = False):
     """Defines a Rust crate with library, binaries, and tests wired for Bazel + Cargo parity.
 
     The macro mirrors Cargo conventions: it builds a library when `src/` exists,
@@ -186,6 +175,12 @@ def codex_rust_crate(
             generated from `src/**/*.rs`.
         extra_binaries: Additional binary labels to surface as test data and
             `CARGO_BIN_EXE_*` environment variables. These are only needed for binaries from a different crate.
+        extra_binaries_non_windows: Like `extra_binaries`, but omitted from
+            Windows test data and environment variables. Tests using these
+            binaries must be excluded when targeting Windows.
+        run_tests_with_wine_exec: Boolean, defaults to False. Whether to emit a
+            Wine-exec variant for each integration test. Variants inherit the
+            native test's timeout, tags, and shard count.
     """
     test_env = {
         # The launcher resolves an absolute workspace root at runtime so
@@ -319,6 +314,37 @@ def codex_rust_crate(
         binary = Label(binary_label).name
         cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath %s)" % binary_label
 
+    integration_test_binaries = sanitized_binaries
+    integration_test_cargo_env = cargo_env
+    integration_test_cargo_env_runfiles = cargo_env_runfiles
+    non_windows_sanitized_binaries = []
+    non_windows_cargo_env = {}
+    non_windows_cargo_env_runfiles = {}
+    if extra_binaries_non_windows:
+        for binary_label in extra_binaries_non_windows:
+            non_windows_sanitized_binaries.append(binary_label)
+            binary = Label(binary_label).name
+            non_windows_cargo_env_runfiles[binary_label] = "CARGO_BIN_EXE_" + binary
+            non_windows_cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath %s)" % binary_label
+
+        integration_test_binaries = sanitized_binaries + select({
+            "@platforms//os:windows": [],
+            "//conditions:default": non_windows_sanitized_binaries,
+        })
+        integration_test_cargo_env = select({
+            "@platforms//os:windows": cargo_env,
+            "//conditions:default": cargo_env | non_windows_cargo_env,
+        })
+        integration_test_cargo_env_runfiles = select({
+            "@platforms//os:windows": cargo_env_runfiles,
+            "//conditions:default": cargo_env_runfiles | non_windows_cargo_env_runfiles,
+        })
+
+    wine_host_binaries = {
+        env_var.removeprefix("CARGO_BIN_EXE_"): binary_label
+        for binary_label, env_var in (cargo_env_runfiles | non_windows_cargo_env_runfiles).items()
+    }
+
     integration_test_kwargs = {}
     if integration_test_args:
         integration_test_kwargs["args"] = integration_test_args
@@ -345,7 +371,7 @@ def codex_rust_crate(
             crate_name = test_crate_name,
             crate_root = test,
             srcs = [test],
-            data = native.glob(["tests/**"], allow_empty = True) + sanitized_binaries + test_data_extra,
+            data = native.glob(["tests/**"], allow_empty = True) + integration_test_binaries + test_data_extra,
             compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
             deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
             # Bazel has emitted both `codex-rs/<crate>/...` and

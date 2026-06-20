@@ -38,19 +38,12 @@ impl CodeModeExecuteHandler {
                 call_id.as_str(),
                 args.code.as_str(),
             );
-        let started_at = std::time::Instant::now();
-        let response = exec
-            .session
+        exec.session
             .services
             .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                cell_id: runtime_cell_id,
-                tool_call_id: call_id,
-                enabled_tools,
-                source: args.code,
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-            })
+            .mark_cell_ready_for_dispatch(&cell_id);
+        let response = started_cell
+            .initial_response()
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         // Record the raw runtime boundary. The model-visible custom-tool output
@@ -61,6 +54,10 @@ impl CodeModeExecuteHandler {
         // here when the first response also ended the runtime.
         if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
             code_cell_trace.record_ended(&response);
+            exec.session
+                .services
+                .code_mode_service
+                .finish_cell_dispatch(&cell_id);
         }
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await

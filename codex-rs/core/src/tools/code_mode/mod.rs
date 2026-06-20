@@ -1,3 +1,4 @@
+mod delegate;
 mod execute_handler;
 mod response_adapter;
 mod wait_handler;
@@ -6,12 +7,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeTurnHost;
 use codex_code_mode::RuntimeResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::models::ResponseInputItem;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,7 @@ use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouterParams;
 use crate::unified_exec::resolve_max_tokens;
-use codex_features::Feature;
+use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::collect_code_mode_tool_definitions;
@@ -37,6 +37,8 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
+use delegate::CodeModeDispatchBroker;
+use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
@@ -57,42 +59,67 @@ pub(crate) struct ExecContext {
 }
 
 pub(crate) struct CodeModeService {
-    inner: codex_code_mode::CodeModeService,
+    session: Option<Arc<dyn CodeModeSession>>,
+    dispatch_broker: Arc<CodeModeDispatchBroker>,
 }
 
 impl CodeModeService {
     pub(crate) fn new() -> Self {
+        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
         Self {
-            inner: codex_code_mode::CodeModeService::new(),
+            session: Some(Arc::new(codex_code_mode::CodeModeService::with_delegate(
+                dispatch_broker.clone(),
+            ))),
+            dispatch_broker,
         }
-    }
-
-    pub(crate) fn allocate_cell_id(&self) -> String {
-        self.inner.allocate_cell_id()
     }
 
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
-    ) -> Result<RuntimeResponse, String> {
-        self.inner.execute(request).await
+    ) -> Result<codex_code_mode::StartedCell, String> {
+        self.session()?.execute(request).await
     }
 
     pub(crate) async fn wait(
         &self,
         request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.inner.wait(request).await
+        self.session()?.wait(request).await
     }
 
-    pub(crate) async fn start_turn_worker(
+    pub(crate) async fn terminate(
+        &self,
+        cell_id: CellId,
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.session()?.terminate(cell_id).await
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        match &self.session {
+            Some(session) => session.shutdown().await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
+        self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
+    }
+
+    pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
+        self.dispatch_broker.close_cell(cell_id);
+    }
+
+    pub(crate) fn start_turn_worker(
         &self,
         session: &Arc<Session>,
         turn: &Arc<TurnContext>,
         router: Arc<ToolRouter>,
         tracker: SharedTurnDiffTracker,
-    ) -> Option<codex_code_mode::CodeModeTurnWorker> {
-        if !turn.features.enabled(Feature::CodeMode) {
+    ) -> Option<CodeModeDispatchWorker> {
+        if !matches!(turn.tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
+            || self.session.is_none()
+        {
             return None;
         }
 
@@ -100,50 +127,16 @@ impl CodeModeService {
             session: Arc::clone(session),
             turn: Arc::clone(turn),
         };
-        let tool_runtime =
-            ToolCallRuntime::new(router, Arc::clone(session), Arc::clone(turn), tracker);
-        let host = Arc::new(CoreTurnHost { exec, tool_runtime });
-        Some(self.inner.start_turn_worker(host))
-    }
-}
-
-struct CoreTurnHost {
-    exec: ExecContext,
-    tool_runtime: ToolCallRuntime,
-}
-
-#[async_trait::async_trait]
-impl CodeModeTurnHost for CoreTurnHost {
-    async fn invoke_tool(
-        &self,
-        invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
-        call_nested_tool(
-            self.exec.clone(),
-            self.tool_runtime.clone(),
-            invocation,
-            cancellation_token,
+        Some(
+            self.dispatch_broker
+                .start_turn_worker(exec, router, tracker),
         )
-        .await
-        .map_err(|error| error.to_string())
     }
 
-    async fn notify(&self, call_id: String, cell_id: String, text: String) -> Result<(), String> {
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        self.exec
-            .session
-            .inject_response_items(vec![ResponseInputItem::CustomToolCallOutput {
-                call_id,
-                name: Some(PUBLIC_TOOL_NAME.to_string()),
-                output: FunctionCallOutputPayload::from_text(text),
-            }])
-            .await
-            .map_err(|_| {
-                format!("failed to inject exec notify message for cell {cell_id}: no active turn")
-            })
+    fn session(&self) -> Result<&Arc<dyn CodeModeSession>, String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "code mode is unavailable".to_string())
     }
 }
 
@@ -337,7 +330,7 @@ async fn call_nested_tool(
         .handle_tool_call_with_source(
             call,
             ToolCallSource::CodeMode {
-                cell_id,
+                cell_id: cell_id.to_string(),
                 runtime_tool_call_id,
             },
             cancellation_token,

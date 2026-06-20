@@ -67,6 +67,8 @@ use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_goal_extension::GoalService;
+use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_login::auth::ExternalAuth;
 use codex_login::auth::ExternalAuthRefreshContext;
@@ -101,13 +103,6 @@ impl ExternalAuthRefreshBridge {
         match reason {
             ExternalAuthRefreshReason::Unauthorized => ChatgptAuthTokensRefreshReason::Unauthorized,
         }
-    }
-}
-
-#[async_trait]
-impl ExternalAuth for ExternalAuthRefreshBridge {
-    fn auth_mode(&self) -> LoginAuthMode {
-        LoginAuthMode::Chatgpt
     }
 
     async fn refresh(
@@ -156,6 +151,19 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
             response.chatgpt_account_id,
             response.chatgpt_plan_type,
         ))
+    }
+}
+
+impl ExternalAuth for ExternalAuthRefreshBridge {
+    fn auth_mode(&self) -> LoginAuthMode {
+        LoginAuthMode::Chatgpt
+    }
+
+    fn refresh(
+        &self,
+        context: ExternalAuthRefreshContext,
+    ) -> codex_login::ExternalAuthFuture<'_, ExternalAuthTokens> {
+        Box::pin(ExternalAuthRefreshBridge::refresh(self, context))
     }
 }
 
@@ -556,7 +564,19 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
-        session_state.rpc_gate.shutdown().await;
+        if timeout(
+            CONNECTION_RPC_DRAIN_TIMEOUT,
+            session_state.rpc_gate.shutdown(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                ?connection_id,
+                timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
+                "timed out waiting for connection RPCs to drain"
+            );
+        }
         self.outgoing.connection_closed(connection_id).await;
         self.fs_watch_manager.connection_closed(connection_id).await;
         self.codex_message_processor

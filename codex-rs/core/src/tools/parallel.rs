@@ -93,6 +93,7 @@ impl ToolCallRuntime {
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let invocation_cancellation_token = cancellation_token.clone();
+        let wait_for_runtime_cancellation = self.router.tool_waits_for_runtime_cancellation(&call);
         let started = Instant::now();
         let display_name = call.tool_name.display();
 

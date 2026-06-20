@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::goal_display::format_goal_elapsed_seconds;
+use crate::goal_files;
 use crate::status::format_tokens_compact;
 
 impl ChatWidget {

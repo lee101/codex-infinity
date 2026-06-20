@@ -25,6 +25,8 @@ use crate::mcp::sanitize_responses_api_tool_name;
 pub(crate) const MCP_TOOLS_CACHE_WRITE_DURATION_METRIC: &str =
     "codex.mcp.tools.cache_write.duration_ms";
 
+const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     /// Raw MCP server name used for routing the tool call.
@@ -157,8 +159,13 @@ where
             continue;
         }
 
+        let callable_namespace = callable_namespace_with_prefix(
+            &sanitize_responses_api_tool_name(&tool.callable_namespace),
+            prefix_mcp_tool_names,
+        );
+
         candidates.push(CallableToolCandidate {
-            callable_namespace: sanitize_responses_api_tool_name(&tool.callable_namespace),
+            callable_namespace,
             callable_name: sanitize_responses_api_tool_name(&tool.callable_name),
             raw_namespace_identity,
             raw_tool_identity,
@@ -220,6 +227,7 @@ where
             &candidate.callable_name,
             &candidate.raw_tool_identity,
             &mut used_names,
+            MCP_TOOL_NAME_DELIMITER.len(),
         );
         candidate.tool.callable_namespace = callable_namespace;
         candidate.tool.callable_name = callable_name;
@@ -241,6 +249,14 @@ const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const CALLABLE_NAME_HASH_LEN: usize = 12;
 const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";
+
+fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) -> String {
+    if !prefix_mcp_tool_names || namespace.starts_with(LEGACY_MCP_TOOL_NAME_PREFIX) {
+        namespace.to_string()
+    } else {
+        format!("{LEGACY_MCP_TOOL_NAME_PREFIX}{namespace}")
+    }
+}
 
 fn mask_input_schema_for_file_path_params(input_schema: &mut JsonValue, file_params: &[String]) {
     let Some(properties) = input_schema
@@ -325,9 +341,10 @@ fn fit_callable_parts_with_hash(
     namespace: &str,
     tool_name: &str,
     raw_identity: &str,
+    reserved_len: usize,
 ) -> (String, String) {
     let suffix = callable_name_hash_suffix(raw_identity);
-    let max_tool_len = MAX_TOOL_NAME_LENGTH.saturating_sub(namespace.len());
+    let max_tool_len = MAX_TOOL_NAME_LENGTH.saturating_sub(namespace.len() + reserved_len);
     if max_tool_len >= suffix.len() {
         let prefix_len = max_tool_len - suffix.len();
         return (
@@ -336,7 +353,7 @@ fn fit_callable_parts_with_hash(
         );
     }
 
-    let max_namespace_len = MAX_TOOL_NAME_LENGTH - suffix.len();
+    let max_namespace_len = MAX_TOOL_NAME_LENGTH.saturating_sub(suffix.len() + reserved_len);
     (truncate_name(namespace, max_namespace_len), suffix)
 }
 

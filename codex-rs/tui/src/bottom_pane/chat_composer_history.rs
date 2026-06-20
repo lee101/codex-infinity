@@ -47,7 +47,11 @@ impl HistoryEntry {
     /// recorded with the full `HistoryEntry` value built by the composer; using `new` for a local
     /// image or paste submission would make recall lose placeholder ownership.
     pub(crate) fn new(text: String) -> Self {
-        let decoded = decode_history_mentions(&text);
+        Self::new_with_at_mentions(text, /*at_mentions_enabled*/ true)
+    }
+
+    pub(crate) fn new_with_at_mentions(text: String, at_mentions_enabled: bool) -> Self {
+        let decoded = decode_history_mentions_with_at_mentions(&text, at_mentions_enabled);
         Self {
             text: decoded.text,
             text_elements: Vec::new(),
@@ -57,6 +61,7 @@ impl HistoryEntry {
                 .mentions
                 .into_iter()
                 .map(|mention| MentionBinding {
+                    sigil: mention.sigil,
                     mention: mention.mention,
                     path: mention.path,
                 })
@@ -114,6 +119,8 @@ pub(crate) struct ChatComposerHistory {
     /// Messages submitted by the user *during this UI session* (newest at END).
     /// Local entries retain full draft state (text elements, image paths, pending pastes, remote image URLs).
     local_history: Vec<HistoryEntry>,
+    /// Local entries seeded from resumed transcript replay.
+    replay_seeded_history: Vec<HistoryEntry>,
 
     /// Cache of persistent history entries fetched on-demand (text-only).
     fetched_history: HashMap<usize, HistoryEntry>,
@@ -121,6 +128,7 @@ pub(crate) struct ChatComposerHistory {
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
     history_cursor: Option<isize>,
+    pending_navigation_direction: Option<HistorySearchDirection>,
 
     /// The text that was last inserted into the composer as a result of
     /// history navigation. Used to decide if further Up/Down presses should be
@@ -130,6 +138,8 @@ pub(crate) struct ChatComposerHistory {
 
     /// Active incremental history search, if Ctrl+R search mode is open.
     search: Option<HistorySearchState>,
+    /// Whether persistent history restore should rehydrate `@` tool mentions.
+    at_mention_restore_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,11 +229,25 @@ impl ChatComposerHistory {
             history_log_id: None,
             history_entry_count: 0,
             local_history: Vec::new(),
+            replay_seeded_history: Vec::new(),
             fetched_history: HashMap::new(),
             history_cursor: None,
+            pending_navigation_direction: None,
             last_history_text: None,
             search: None,
+            at_mention_restore_enabled: false,
         }
+    }
+
+    pub fn set_at_mention_restore_enabled(&mut self, enabled: bool) {
+        if self.at_mention_restore_enabled == enabled {
+            return;
+        }
+        self.at_mention_restore_enabled = enabled;
+        self.fetched_history.clear();
+        self.history_cursor = None;
+        self.last_history_text = None;
+        self.search = None;
     }
 
     /// Updates persistent history metadata when a new session is configured.
@@ -236,7 +260,9 @@ impl ChatComposerHistory {
         self.history_entry_count = entry_count;
         self.fetched_history.clear();
         self.local_history.clear();
+        self.replay_seeded_history.clear();
         self.history_cursor = None;
+        self.pending_navigation_direction = None;
         self.last_history_text = None;
         self.search = None;
     }
@@ -246,6 +272,16 @@ impl ChatComposerHistory {
     /// Empty submissions are ignored, adjacent duplicates are collapsed, and active navigation or
     /// search state is reset because a new newest entry changes the combined history offset space.
     pub fn record_local_submission(&mut self, entry: HistoryEntry) {
+        self.record_local_submission_inner(entry);
+    }
+
+    pub fn record_replayed_submission(&mut self, entry: HistoryEntry) {
+        if self.record_local_submission_inner(entry.clone()) {
+            self.replay_seeded_history.push(entry);
+        }
+    }
+
+    fn record_local_submission_inner(&mut self, entry: HistoryEntry) -> bool {
         if entry.text.is_empty()
             && entry.text_elements.is_empty()
             && entry.local_image_paths.is_empty()
@@ -253,18 +289,20 @@ impl ChatComposerHistory {
             && entry.mention_bindings.is_empty()
             && entry.pending_pastes.is_empty()
         {
-            return;
+            return false;
         }
         self.history_cursor = None;
+        self.pending_navigation_direction = None;
         self.last_history_text = None;
         self.search = None;
 
         // Avoid inserting a duplicate if identical to the previous entry.
         if self.local_history.last().is_some_and(|prev| prev == &entry) {
-            return;
+            return false;
         }
 
         self.local_history.push(entry);
+        true
     }
 
     /// Resets normal history navigation so the next Up key resumes from the newest entry.
@@ -274,6 +312,7 @@ impl ChatComposerHistory {
     /// influence later Up/Down recall.
     pub fn reset_navigation(&mut self) {
         self.history_cursor = None;
+        self.pending_navigation_direction = None;
         self.last_history_text = None;
         self.search = None;
     }
@@ -336,7 +375,11 @@ impl ChatComposerHistory {
         };
 
         self.history_cursor = Some(next_idx);
-        self.populate_history_at_index(next_idx as usize, app_event_tx)
+        self.populate_history_at_index(
+            next_idx as usize,
+            HistorySearchDirection::Older,
+            app_event_tx,
+        )
     }
 
     /// Handles Down by moving toward newer entries or clearing the composer past the newest entry.
@@ -360,11 +403,16 @@ impl ChatComposerHistory {
         match next_idx_opt {
             Some(idx) => {
                 self.history_cursor = Some(idx);
-                self.populate_history_at_index(idx as usize, app_event_tx)
+                self.populate_history_at_index(
+                    idx as usize,
+                    HistorySearchDirection::Newer,
+                    app_event_tx,
+                )
             }
             None => {
                 // Past newest – clear and exit browsing mode.
                 self.history_cursor = None;
+                self.pending_navigation_direction = None;
                 self.last_history_text = None;
                 Some(HistoryEntry::new(String::new()))
             }
@@ -389,7 +437,9 @@ impl ChatComposerHistory {
             return HistoryEntryResponse::Ignored;
         }
 
-        let entry = entry.map(HistoryEntry::new);
+        let entry = entry.map(|entry| {
+            HistoryEntry::new_with_at_mentions(entry, self.at_mention_restore_enabled)
+        });
         if let Some(entry) = entry.clone() {
             self.fetched_history.insert(offset, entry);
         }
@@ -424,9 +474,22 @@ impl ChatComposerHistory {
         }
 
         if self.history_cursor == Some(offset as isize) {
+            let direction = self.pending_navigation_direction.take();
             let Some(entry) = entry else {
                 return HistoryEntryResponse::Ignored;
             };
+            if self.persistent_entry_duplicates_local(&entry)
+                && let Some(direction) = direction
+            {
+                let Some(offset) = self.next_history_offset(offset, direction) else {
+                    return HistoryEntryResponse::Ignored;
+                };
+                self.history_cursor = Some(offset as isize);
+                return self
+                    .populate_history_at_index(offset, direction, app_event_tx)
+                    .map(HistoryEntryResponse::Found)
+                    .unwrap_or(HistoryEntryResponse::Ignored);
+            }
             self.last_history_text = Some(entry.text.clone());
             return HistoryEntryResponse::Found(entry);
         }
@@ -703,6 +766,7 @@ impl ChatComposerHistory {
     fn populate_history_at_index(
         &mut self,
         global_idx: usize,
+        direction: HistorySearchDirection,
         app_event_tx: &AppEventSender,
     ) -> Option<HistoryEntry> {
         if global_idx >= self.history_entry_count {
@@ -724,7 +788,25 @@ impl ChatComposerHistory {
                 log_id,
             }));
         }
-        None
+    }
+
+    fn next_history_offset(
+        &self,
+        offset: usize,
+        direction: HistorySearchDirection,
+    ) -> Option<usize> {
+        match direction {
+            HistorySearchDirection::Older => offset.checked_sub(1),
+            HistorySearchDirection::Newer => offset
+                .checked_add(1)
+                .filter(|next| *next < self.total_entries()),
+        }
+    }
+
+    fn persistent_entry_duplicates_local(&self, entry: &HistoryEntry) -> bool {
+        self.replay_seeded_history.iter().any(|local_entry| {
+            local_entry.text == entry.text && local_entry.mention_bindings == entry.mention_bindings
+        })
     }
 }
 
@@ -830,6 +912,75 @@ mod tests {
     }
 
     #[test]
+    fn persistent_restore_gates_at_mentions() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut history = ChatComposerHistory::new();
+        history.set_metadata(test_thread_id(), /*log_id*/ 42, /*entry_count*/ 1);
+
+        assert!(history.navigate_up(&tx).is_none());
+        let disabled = history.on_entry_response(
+            /*log_id*/ 42,
+            /*offset*/ 0,
+            Some("[@sample](plugin://sample@test) and [$figma](app://figma)".to_string()),
+            &tx,
+        );
+        assert_eq!(
+            disabled,
+            HistoryEntryResponse::Found(HistoryEntry {
+                text: "$sample and $figma".to_string(),
+                text_elements: Vec::new(),
+                local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
+                mention_bindings: vec![
+                    MentionBinding {
+                        sigil: '$',
+                        mention: "sample".to_string(),
+                        path: "plugin://sample@test".to_string(),
+                    },
+                    MentionBinding {
+                        sigil: '$',
+                        mention: "figma".to_string(),
+                        path: "app://figma".to_string(),
+                    },
+                ],
+                pending_pastes: Vec::new(),
+            })
+        );
+
+        history.set_at_mention_restore_enabled(/*enabled*/ true);
+        assert!(history.navigate_up(&tx).is_none());
+        let enabled = history.on_entry_response(
+            /*log_id*/ 42,
+            /*offset*/ 0,
+            Some("[@sample](plugin://sample@test) and [$figma](app://figma)".to_string()),
+            &tx,
+        );
+        assert_eq!(
+            enabled,
+            HistoryEntryResponse::Found(HistoryEntry {
+                text: "@sample and $figma".to_string(),
+                text_elements: Vec::new(),
+                local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
+                mention_bindings: vec![
+                    MentionBinding {
+                        sigil: '@',
+                        mention: "sample".to_string(),
+                        path: "plugin://sample@test".to_string(),
+                    },
+                    MentionBinding {
+                        sigil: '$',
+                        mention: "figma".to_string(),
+                        path: "app://figma".to_string(),
+                    },
+                ],
+                pending_pastes: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
     fn navigation_with_async_fetch() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
@@ -838,8 +989,14 @@ mod tests {
         // Pretend there are 3 persistent entries.
         history.set_metadata(/*log_id*/ 1, /*entry_count*/ 3);
 
-        // First Up should request offset 2 (latest) and await async data.
+        // First Up should recall current-session local history.
         assert!(history.should_handle_navigation("", /*cursor*/ 0));
+        assert_eq!(
+            Some(HistoryEntry::new("latest".to_string())),
+            history.navigate_up(&tx)
+        );
+
+        // Next Up should request offset 2 and await async data.
         assert!(history.navigate_up(&tx).is_none()); // don't replace the text yet
 
         // Verify that a history lookup request was sent.

@@ -98,6 +98,58 @@ impl ToolHandler for McpHandler {
             original_image_detail_supported: can_request_original_image_detail(&turn.model_info),
         })
     }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return None;
+        };
+
+        Some(PreToolUsePayload {
+            tool_name: self.hook_tool_name(),
+            tool_input: mcp_hook_tool_input(arguments),
+        })
+    }
+
+    fn with_updated_hook_input(
+        &self,
+        mut invocation: ToolInvocation,
+        updated_input: Value,
+    ) -> Result<ToolInvocation, FunctionCallError> {
+        invocation.payload = match invocation.payload {
+            ToolPayload::Function { .. } => ToolPayload::Function {
+                arguments: serde_json::to_string(&updated_input).map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to serialize rewritten MCP arguments: {err}"
+                    ))
+                })?,
+            },
+            payload => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "tool {} does not support hook input rewriting for payload {payload:?}",
+                    self.tool_name()
+                )));
+            }
+        };
+        Ok(invocation)
+    }
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &dyn crate::tools::context::ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        let ToolPayload::Function { .. } = &invocation.payload else {
+            return None;
+        };
+
+        let tool_response =
+            result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
+        Some(PostToolUsePayload {
+            tool_name: self.hook_tool_name(),
+            tool_use_id: invocation.call_id.clone(),
+            tool_input: result.post_tool_use_input(&invocation.payload)?,
+            tool_response,
+        })
+    }
 }
 
 fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
@@ -141,7 +193,7 @@ mod tests {
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-mcp-pre".to_string(),
-                tool_name: codex_tools::ToolName::namespaced("mcp__memory__", "create_entities"),
+                tool_name: codex_tools::ToolName::namespaced("memory", "create_entities"),
                 source: ToolCallSource::Direct,
                 payload,
             }),
@@ -189,7 +241,7 @@ mod tests {
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-mcp-post".to_string(),
-            tool_name: codex_tools::ToolName::namespaced("mcp__filesystem__", "read_file"),
+            tool_name: codex_tools::ToolName::namespaced("filesystem", "read_file"),
             source: ToolCallSource::Direct,
             payload,
         };

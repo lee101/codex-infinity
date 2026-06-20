@@ -98,6 +98,7 @@ pub(crate) enum ToolEmitter {
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
         auto_approved: bool,
+        environment_id: Option<String>,
     },
     UnifiedExec {
         command: Vec<String>,
@@ -125,10 +126,15 @@ impl ToolEmitter {
         }
     }
 
-    pub fn apply_patch(changes: HashMap<PathBuf, FileChange>, auto_approved: bool) -> Self {
+    pub fn apply_patch_for_environment(
+        changes: HashMap<PathBuf, FileChange>,
+        auto_approved: bool,
+        environment_id: String,
+    ) -> Self {
         Self::ApplyPatch {
             changes,
             auto_approved,
+            environment_id: Some(environment_id),
         }
     }
 

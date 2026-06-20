@@ -10,6 +10,8 @@ use codex_core_plugins::OPENAI_BUNDLED_MARKETPLACE_NAME;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_features::Feature;
 use codex_tools::DiscoverablePluginInfo;
+use std::collections::HashSet;
+use tracing::instrument;
 
 const TOOL_SUGGEST_DISCOVERABLE_PLUGIN_ALLOWLIST: &[&str] = &[
     "github@openai-curated",
@@ -30,6 +32,9 @@ const TOOL_SUGGEST_DISCOVERABLE_MARKETPLACE_ALLOWLIST: &[&str] = &[
 
 pub(crate) async fn list_tool_suggest_discoverable_plugins(
     config: &Config,
+    plugins_manager: &PluginsManager,
+    auth: Option<&CodexAuth>,
+    loaded_plugin_app_connector_ids: &[String],
 ) -> anyhow::Result<Vec<DiscoverablePluginInfo>> {
     if !config.features.enabled(Feature::Plugins) {
         return Ok(Vec::new());

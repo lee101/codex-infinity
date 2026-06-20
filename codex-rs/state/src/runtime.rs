@@ -10,6 +10,7 @@ use crate::LOGS_DB_VERSION;
 use crate::LogEntry;
 use crate::LogQuery;
 use crate::LogRow;
+use crate::MEMORIES_DB_FILENAME;
 use crate::STATE_DB_FILENAME;
 use crate::STATE_DB_VERSION;
 use crate::SortKey;
@@ -18,6 +19,7 @@ use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::apply_rollout_item;
 use crate::migrations::runtime_logs_migrator;
+use crate::migrations::runtime_memories_migrator;
 use crate::migrations::runtime_state_migrator;
 use crate::model::AgentJobRow;
 use crate::model::ThreadGoalRow;
@@ -30,7 +32,6 @@ use crate::paths::file_modified_time_utc;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::protocol::RolloutItem;
 use log::LevelFilter;
 use serde_json::Value;
@@ -62,6 +63,7 @@ mod device_key_tests;
 mod goals;
 mod logs;
 mod memories;
+mod recovery;
 mod remote_control;
 #[cfg(test)]
 mod test_support;
@@ -131,6 +133,7 @@ impl StateRuntime {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 warn!("failed to open logs db at {}: {err}", logs_path.display());
+                close_sqlite_pools(&[pool.as_ref()]).await;
                 return Err(err);
             }
         };

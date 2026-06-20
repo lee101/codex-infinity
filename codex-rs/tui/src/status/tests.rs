@@ -2,13 +2,20 @@ use super::new_status_output;
 use super::new_status_output_with_rate_limits;
 use super::new_status_output_with_rate_limits_handle;
 use super::rate_limit_snapshot_display;
+use super::rate_limits::RateLimitSnapshotDisplay;
+use super::rate_limits::RateLimitWindowDisplay;
+use super::rate_limits::SpendControlLimitSnapshotDisplay;
+use super::rate_limits::StatusRateLimitData;
+use super::rate_limits::compose_rate_limit_data_many;
 use crate::history_cell::HistoryCell;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::status::StatusAccountDisplay;
+use crate::status::remote_connection::RemoteConnectionStatus;
 use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 use chrono::Duration as ChronoDuration;
+use chrono::Local;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_protocol::ThreadId;
@@ -27,6 +34,35 @@ use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use ratatui::prelude::*;
 use tempfile::TempDir;
+use unicode_width::UnicodeWidthStr;
+
+#[test]
+fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
+    let now = Local::now();
+    let snapshot = RateLimitSnapshotDisplay {
+        limit_name: "codex".to_string(),
+        captured_at: now,
+        primary: Some(RateLimitWindowDisplay {
+            used_percent: 20.0,
+            resets_at: Some("soon".to_string()),
+            window_minutes: Some(300),
+        }),
+        secondary: None,
+        credits: None,
+        individual_limit: Some(SpendControlLimitSnapshotDisplay {
+            captured_at: now - ChronoDuration::minutes(20),
+            percent_remaining: 68.0,
+            used: "8,000".to_string(),
+            limit: "25,000".to_string(),
+            resets_at: Some("later".to_string()),
+        }),
+    };
+
+    assert!(matches!(
+        compose_rate_limit_data_many(&[snapshot], now),
+        StatusRateLimitData::Stale(_)
+    ));
+}
 
 async fn test_config(temp_home: &TempDir) -> Config {
     let mut config = ConfigBuilder::default()
@@ -52,7 +88,7 @@ fn test_status_account_display() -> Option<StatusAccountDisplay> {
 
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
     let context_window =
-        crate::legacy_core::test_support::construct_model_info_offline(model_slug, config)
+        construct_model_info_offline_for_tests(model_slug, &config.to_models_manager_config())
             .context_window;
     TokenUsageInfo {
         total_token_usage: usage.clone(),
@@ -74,18 +110,27 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
 }
 
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+    let frame_width = lines
+        .iter()
+        .find(|line| line.starts_with('╭'))
+        .map(|line| UnicodeWidthStr::width(line.as_str()));
     lines
         .into_iter()
         .map(|line| {
-            if let (Some(dir_pos), Some(pipe_idx)) = (line.find("Directory: "), line.rfind('│')) {
+            if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
+                (frame_width, line.find("Directory: "), line.rfind('│'))
+            {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
                 let suffix = &line[pipe_idx..];
-                let content_width = pipe_idx.saturating_sub(dir_pos + "Directory: ".len());
                 let replacement = "[[workspace]]";
+                let content_width = frame_width.saturating_sub(
+                    UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix),
+                );
                 let mut rebuilt = prefix.to_string();
                 rebuilt.push_str(replacement);
-                if content_width > replacement.len() {
-                    rebuilt.push_str(&" ".repeat(content_width - replacement.len()));
+                let replacement_width = UnicodeWidthStr::width(replacement);
+                if content_width > replacement_width {
+                    rebuilt.push_str(&" ".repeat(content_width - replacement_width));
                 }
                 rebuilt.push_str(suffix);
                 rebuilt
@@ -108,7 +153,7 @@ fn permissions_text_for(config: &Config) -> Option<String> {
         .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
         .single()
         .expect("timestamp");
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let composite = new_status_output(
         config,
         test_status_account_display().as_ref(),
@@ -177,12 +222,13 @@ async fn status_snapshot_includes_reasoning_details() {
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 1_200)),
         }),
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
 
     let reasoning_effort_override = Some(Some(ReasoningEffort::High));
@@ -258,7 +304,7 @@ async fn status_permissions_full_disk_managed_with_network_is_danger_full_access
 
     assert_eq!(
         permissions_text_for(&config).as_deref(),
-        Some("Custom (danger-full-access, on-request)")
+        Some("Custom (danger-full-access, Ask for approval)")
     );
 }
 
@@ -281,7 +327,7 @@ async fn status_permissions_full_disk_managed_without_network_is_external_sandbo
 
     assert_eq!(
         permissions_text_for(&config).as_deref(),
-        Some("Custom (external-sandbox, on-request)")
+        Some("Custom (external-sandbox, Ask for approval)")
     );
 }
 
@@ -307,7 +353,7 @@ async fn status_snapshot_includes_forked_from() {
         .single()
         .expect("valid time");
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let session_id =
         ThreadId::from_string("0f0f3c13-6cf9-4aa4-8b80-7d49c2f1be2e").expect("session id");
@@ -370,12 +416,13 @@ async fn status_snapshot_includes_monthly_limit() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -422,11 +469,12 @@ async fn status_snapshot_shows_unlimited_credits() {
             unlimited: true,
             balance: None,
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -472,11 +520,12 @@ async fn status_snapshot_shows_positive_credits() {
             unlimited: false,
             balance: Some("12.5".to_string()),
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -522,11 +571,12 @@ async fn status_snapshot_hides_zero_credits() {
             unlimited: false,
             balance: Some("0".to_string()),
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -570,11 +620,12 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
             unlimited: true,
             balance: None,
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -619,7 +670,7 @@ async fn status_card_token_usage_excludes_cached_tokens() {
         .single()
         .expect("timestamp");
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -676,12 +727,13 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let reasoning_effort_override = Some(Some(ReasoningEffort::High));
     let composite = new_status_output(
@@ -731,7 +783,7 @@ async fn status_snapshot_shows_missing_limits_message() {
         .single()
         .expect("timestamp");
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -778,8 +830,12 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
         .with_ymd_and_hms(2024, 2, 3, 4, 5, 6)
         .single()
         .expect("timestamp");
+    let remote_connection = RemoteConnectionStatus {
+        address: "unix:///tmp/codex-home/app-server-control/app-server-control.sock".to_string(),
+        version: "v0.133.0".to_string(),
+    };
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let (composite, _) = new_status_output_with_rate_limits_handle(
         &config,
@@ -840,12 +896,13 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 2_700)),
         }),
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output_with_rate_limits(
         &config,
@@ -911,12 +968,13 @@ async fn status_snapshot_includes_credits_and_limits() {
             unlimited: false,
             balance: Some("37.5".to_string()),
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -965,6 +1023,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
         primary: None,
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
@@ -974,7 +1033,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
         .expect("timestamp");
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -1022,6 +1081,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         primary: None,
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
@@ -1031,7 +1091,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         .expect("timestamp");
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output_with_rate_limits(
         &config,
@@ -1093,13 +1153,14 @@ async fn status_snapshot_shows_stale_limits_message() {
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 1_800)),
         }),
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
     let now = captured_at + ChronoDuration::minutes(20);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -1164,13 +1225,14 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
             unlimited: false,
             balance: Some("80".to_string()),
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     };
     let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
     let now = captured_at + ChronoDuration::minutes(20);
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output(
         &config,
@@ -1224,7 +1286,7 @@ async fn status_context_window_uses_last_usage() {
         .single()
         .expect("timestamp");
 
-    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = TokenUsageInfo {
         total_token_usage: total_usage.clone(),
         last_token_usage: last_usage,

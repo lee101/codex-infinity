@@ -13,6 +13,8 @@ use std::process::Stdio;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths;
 use crate::helper_materialization::helper_bin_dir;
+use crate::identity::sandbox_setup_is_complete;
+use crate::logging::current_log_file_path;
 use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::policy::SandboxPolicy;
@@ -22,11 +24,12 @@ use crate::setup_error::clear_setup_error_report;
 use crate::setup_error::failure;
 use crate::setup_error::read_setup_error_report;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
@@ -100,8 +103,8 @@ pub struct SetupRootOverrides {
 }
 
 pub fn run_setup_refresh(
-    policy: &SandboxPolicy,
-    policy_cwd: &Path,
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
     command_cwd: &Path,
     env_map: &HashMap<String, String>,
     codex_home: &Path,
@@ -128,8 +131,8 @@ pub fn run_setup_refresh_with_overrides(
 }
 
 pub fn run_setup_refresh_with_extra_read_roots(
-    policy: &SandboxPolicy,
-    policy_cwd: &Path,
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
     command_cwd: &Path,
     env_map: &HashMap<String, String>,
     codex_home: &Path,
@@ -184,11 +187,24 @@ fn run_setup_refresh_inner(
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
+        mode: SetupMode::Full,
         refresh_only: true,
     };
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
     let exe = find_setup_exe();
+    let sbx_dir = sandbox_dir(request.codex_home);
+    let log_path = current_log_file_path(&sbx_dir);
+    let cleared_report = match clear_setup_error_report(request.codex_home) {
+        Ok(()) => true,
+        Err(err) => {
+            log_note(
+                &format!("setup refresh: failed to clear setup_error.json before launch: {err}"),
+                Some(&sbx_dir),
+            );
+            false
+        }
+    };
     // Refresh should never request elevation; ensure verb isn't set and we don't trigger UAC.
     let mut cmd = Command::new(&exe);
     cmd.arg(&b64).stdout(Stdio::null()).stderr(Stdio::null());
@@ -200,24 +216,34 @@ fn run_setup_refresh_inner(
             cwd.display(),
             b64.len()
         ),
-        Some(&sandbox_dir(request.codex_home)),
+        Some(&sbx_dir),
     );
-    let status = cmd
-        .status()
-        .map_err(|e| {
-            log_note(
-                &format!("setup refresh: failed to spawn {}: {e}", exe.display()),
-                Some(&sandbox_dir(request.codex_home)),
-            );
-            e
-        })
-        .context("spawn setup refresh")?;
+    let status = cmd.status().map_err(|err| {
+        let message = format!(
+            "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
+            exe.display(),
+            cwd.display(),
+            log_path.display()
+        );
+        log_note(&format!("setup refresh: {message}"), Some(&sbx_dir));
+        failure(SetupErrorCode::OrchestratorHelperLaunchFailed, message)
+    })?;
     if !status.success() {
         log_note(
             &format!("setup refresh: exited with status {status:?}"),
-            Some(&sandbox_dir(request.codex_home)),
+            Some(&sbx_dir),
         );
-        return Err(anyhow!("setup refresh failed with status {status}"));
+        return Err(report_helper_failure(
+            request.codex_home,
+            cleared_report,
+            status.code(),
+        ));
+    }
+    if let Err(err) = clear_setup_error_report(request.codex_home) {
+        log_note(
+            &format!("setup refresh: failed to clear setup_error.json after success: {err}"),
+            Some(&sbx_dir),
+        );
     }
     Ok(())
 }
@@ -422,8 +448,16 @@ struct ElevationPayload {
     #[serde(default)]
     allow_local_binding: bool,
     real_user: String,
+    mode: SetupMode,
     #[serde(default)]
     refresh_only: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SetupMode {
+    Full,
+    ProvisionOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,6 +628,17 @@ fn report_helper_failure(
     }
 }
 
+fn verify_setup_completed(codex_home: &Path) -> Result<()> {
+    if sandbox_setup_is_complete(codex_home) {
+        Ok(())
+    } else {
+        Err(failure(
+            SetupErrorCode::OrchestratorHelperIncomplete,
+            "setup helper exited successfully before setup completed",
+        ))
+    }
+}
+
 fn run_setup_exe(
     payload: &ElevationPayload,
     needs_elevation: bool,
@@ -647,6 +692,7 @@ fn run_setup_exe(
                 status.code(),
             ));
         }
+        verify_setup_completed(codex_home)?;
         if let Err(err) = clear_setup_error_report(codex_home) {
             log_note(
                 &format!(
@@ -696,6 +742,7 @@ fn run_setup_exe(
             ));
         }
     }
+    verify_setup_completed(codex_home)?;
     if let Err(err) = clear_setup_error_report(codex_home) {
         log_note(
             &format!("setup orchestrator: failed to clear setup_error.json after success: {err}"),
@@ -743,6 +790,45 @@ pub fn run_elevated_setup(
         )
     })?;
     run_setup_exe(&payload, needs_elevation, request.codex_home)
+}
+
+pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Result<()> {
+    let sbx_dir = sandbox_dir(codex_home);
+    std::fs::create_dir_all(&sbx_dir).map_err(|err| {
+        failure(
+            SetupErrorCode::OrchestratorSandboxDirCreateFailed,
+            format!("failed to create sandbox dir {}: {err}", sbx_dir.display()),
+        )
+    })?;
+    if !is_elevated().map_err(|err| {
+        failure(
+            SetupErrorCode::OrchestratorElevationCheckFailed,
+            format!("failed to determine elevation state: {err}"),
+        )
+    })? {
+        return Err(failure(
+            SetupErrorCode::OrchestratorElevationRequired,
+            "sandbox provisioning setup must be run from an elevated process",
+        ));
+    }
+    let payload = ElevationPayload {
+        version: SETUP_VERSION,
+        offline_username: OFFLINE_USERNAME.to_string(),
+        online_username: ONLINE_USERNAME.to_string(),
+        codex_home: codex_home.to_path_buf(),
+        command_cwd: codex_home.to_path_buf(),
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
+        deny_read_paths: Vec::new(),
+        deny_write_paths: Vec::new(),
+        proxy_ports: Vec::new(),
+        allow_local_binding: false,
+        otel: codex_otel::global_statsig_metrics_settings(),
+        real_user: real_user.to_string(),
+        mode: SetupMode::ProvisionOnly,
+        refresh_only: false,
+    };
+    run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
 }
 
 fn build_payload_roots(
@@ -954,6 +1040,7 @@ mod tests {
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1301,10 +1388,10 @@ mod tests {
     fn build_payload_roots_preserves_helper_roots_when_read_override_is_provided() {
         let tmp = TempDir::new().expect("tempdir");
         let codex_home = tmp.path().join("codex-home");
-        let policy_cwd = tmp.path().join("policy-cwd");
+        let workspace_root = tmp.path().join("workspace-root");
         let command_cwd = tmp.path().join("workspace");
         let readable_root = tmp.path().join("docs");
-        fs::create_dir_all(&policy_cwd).expect("create policy cwd");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
         fs::create_dir_all(&command_cwd).expect("create workspace");
         fs::create_dir_all(&readable_root).expect("create readable root");
         let policy = SandboxPolicy::ReadOnly {
@@ -1348,10 +1435,10 @@ mod tests {
     fn build_payload_roots_replaces_full_read_policy_when_read_override_is_provided() {
         let tmp = TempDir::new().expect("tempdir");
         let codex_home = tmp.path().join("codex-home");
-        let policy_cwd = tmp.path().join("policy-cwd");
+        let workspace_root = tmp.path().join("workspace-root");
         let command_cwd = tmp.path().join("workspace");
         let readable_root = tmp.path().join("docs");
-        fs::create_dir_all(&policy_cwd).expect("create policy cwd");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
         fs::create_dir_all(&command_cwd).expect("create workspace");
         fs::create_dir_all(&readable_root).expect("create readable root");
         let policy = SandboxPolicy::ReadOnly {

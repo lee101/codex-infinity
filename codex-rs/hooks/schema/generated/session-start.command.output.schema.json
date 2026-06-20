@@ -21,7 +21,8 @@
           "type": "string"
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "SessionStart",
+          "type": "string"
         }
       },
       "required": [

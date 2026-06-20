@@ -15,6 +15,7 @@ fn user_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
+        metadata: None,
     }
 }
 
@@ -26,6 +27,19 @@ fn assistant_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
+        metadata: None,
+    }
+}
+
+fn developer_msg(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        metadata: None,
     }
 }
 
@@ -38,6 +52,16 @@ fn inter_agent_msg(text: &str, trigger_turn: bool) -> ResponseItem {
         trigger_turn,
     );
     communication.to_response_input_item().into()
+}
+
+fn inter_agent_communication(text: &str, trigger_turn: bool) -> RolloutItem {
+    RolloutItem::InterAgentCommunication(InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("agent path"),
+        Vec::new(),
+        text.to_string(),
+        trigger_turn,
+    ))
 }
 
 #[test]
@@ -55,6 +79,7 @@ fn truncates_rollout_from_start_before_nth_user_only() {
             }],
             content: None,
             encrypted_content: None,
+            metadata: None,
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -62,6 +87,7 @@ fn truncates_rollout_from_start_before_nth_user_only() {
             name: "tool".to_string(),
             namespace: None,
             arguments: "{}".to_string(),
+            metadata: None,
         },
         assistant_msg("a4"),
     ];
@@ -190,6 +216,37 @@ fn truncates_rollout_to_last_n_fork_turns_counts_trigger_turn_messages() {
 
     let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
     let expected = rollout[4..].to_vec();
+
+    assert_eq!(
+        serde_json::to_value(&truncated).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+}
+
+#[test]
+fn fork_turn_positions_use_inter_agent_delivery_metadata() {
+    let rollout = vec![
+        RolloutItem::ResponseItem(user_msg("user task")),
+        inter_agent_communication("queued during user turn", /*trigger_turn*/ false),
+        RolloutItem::ResponseItem(assistant_msg("first answer")),
+        inter_agent_communication("follow-up task", /*trigger_turn*/ true),
+        RolloutItem::ResponseItem(assistant_msg("second answer")),
+        RolloutItem::ResponseItem(user_msg("next user task")),
+    ];
+
+    assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![0, 3, 5]);
+}
+
+#[test]
+fn truncates_rollout_to_last_n_fork_turns_drops_startup_prefix_even_when_under_limit() {
+    let rollout = vec![
+        RolloutItem::ResponseItem(developer_msg("startup developer context")),
+        RolloutItem::ResponseItem(user_msg("current task")),
+        RolloutItem::ResponseItem(assistant_msg("answer")),
+    ];
+
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let expected = rollout[1..].to_vec();
 
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),

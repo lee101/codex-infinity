@@ -9,12 +9,12 @@ use crate::find_archived_thread_path_by_id_str;
 use crate::find_thread_path_by_id_str;
 use crate::rollout::RolloutRecorder;
 use crate::session::emit_subagent_session_started;
+use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
-use codex_features::Feature;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -24,6 +24,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
@@ -40,8 +41,16 @@ use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
 
-const AGENT_NAMES: &str = include_str!("agent_names.txt");
+pub(crate) use self::execution::AgentExecutionGuard;
+use self::execution::AgentExecutionLimiter;
+use self::residency::V2Residency;
+
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
+
+mod execution;
+mod legacy;
+mod residency;
+mod spawn;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -53,6 +62,7 @@ pub(crate) enum SpawnAgentForkMode {
 pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
+    pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
 }
 
@@ -137,6 +147,8 @@ pub(crate) struct AgentControl {
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
     manager: Weak<ThreadManagerState>,
     state: Arc<AgentRegistry>,
+    v2_residency: Arc<V2Residency>,
+    agent_execution_limiter: Arc<AgentExecutionLimiter>,
 }
 
 impl AgentControl {
@@ -622,36 +634,41 @@ impl AgentControl {
         agent_id: ThreadId,
         initial_operation: Op,
     ) -> CodexResult<String> {
-        let last_task_message = render_input_preview(&initial_operation);
         let state = self.upgrade()?;
+        self.ensure_execution_capacity_for_op(agent_id, &initial_operation)
+            .await?;
+        self.send_input_after_capacity_check(agent_id, &state, initial_operation)
+            .await
+    }
+
+    async fn send_input_after_capacity_check(
+        &self,
+        agent_id: ThreadId,
+        state: &Arc<ThreadManagerState>,
+        initial_operation: Op,
+    ) -> CodexResult<String> {
+        let last_task_message = match &initial_operation {
+            Op::InterAgentCommunication { communication } => {
+                last_task_message_from_communication(communication)
+            }
+            _ => non_empty_task_message(render_input_preview(&initial_operation)),
+        };
         let result = self
             .handle_thread_request_result(
                 agent_id,
-                &state,
+                state,
                 state.send_op(agent_id, initial_operation).await,
             )
             .await;
         if result.is_ok() {
-            self.state
-                .update_last_task_message(agent_id, last_task_message);
+            match last_task_message {
+                Some(last_task_message) => self
+                    .state
+                    .update_last_task_message(agent_id, last_task_message),
+                None => self.state.clear_last_task_message(agent_id),
+            }
         }
         result
-    }
-
-    /// Append a prebuilt message to an existing agent thread outside the normal user-input path.
-    #[cfg(test)]
-    pub(crate) async fn append_message(
-        &self,
-        agent_id: ThreadId,
-        message: ResponseItem,
-    ) -> CodexResult<String> {
-        let state = self.upgrade()?;
-        self.handle_thread_request_result(
-            agent_id,
-            &state,
-            state.append_message(agent_id, message).await,
-        )
-        .await
     }
 
     pub(crate) async fn send_inter_agent_communication(
@@ -659,20 +676,20 @@ impl AgentControl {
         agent_id: ThreadId,
         communication: InterAgentCommunication,
     ) -> CodexResult<String> {
-        let last_task_message = communication.content.clone();
+        let last_task_message = last_task_message_from_communication(&communication);
         let state = self.upgrade()?;
+        let op = Op::InterAgentCommunication { communication };
+        self.ensure_execution_capacity_for_op(agent_id, &op).await?;
         let result = self
-            .handle_thread_request_result(
-                agent_id,
-                &state,
-                state
-                    .send_op(agent_id, Op::InterAgentCommunication { communication })
-                    .await,
-            )
+            .handle_thread_request_result(agent_id, &state, state.send_op(agent_id, op).await)
             .await;
         if result.is_ok() {
-            self.state
-                .update_last_task_message(agent_id, last_task_message);
+            match last_task_message {
+                Some(last_task_message) => self
+                    .state
+                    .update_last_task_message(agent_id, last_task_message),
+                None => self.state.clear_last_task_message(agent_id),
+            }
         }
         result
     }
@@ -680,7 +697,12 @@ impl AgentControl {
     /// Interrupt the current task for an existing agent thread.
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
-        state.send_op(agent_id, Op::Interrupt).await
+        self.handle_thread_request_result(
+            agent_id,
+            &state,
+            state.send_op(agent_id, Op::Interrupt).await,
+        )
+        .await
     }
 
     async fn handle_thread_request_result(
@@ -691,6 +713,7 @@ impl AgentControl {
     ) -> CodexResult<String> {
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
             let _ = state.remove_thread(&agent_id).await;
+            self.forget_v2_residency(agent_id);
             self.state.release_spawned_thread(agent_id);
         }
         result
@@ -759,15 +782,21 @@ impl AgentControl {
     pub(crate) fn register_session_root(
         &self,
         current_thread_id: ThreadId,
-        current_session_source: &SessionSource,
+        current_parent_thread_id: Option<ThreadId>,
     ) {
-        if thread_spawn_parent_thread_id(current_session_source).is_none() {
+        if current_parent_thread_id.is_none() {
             self.state.register_root_thread(current_thread_id);
         }
     }
 
     pub(crate) fn get_agent_metadata(&self, agent_id: ThreadId) -> Option<AgentMetadata> {
         self.state.agent_metadata_for_thread(agent_id)
+    }
+
+    pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
+        self.state
+            .agent_metadata_for_thread(agent_id)
+            .ok_or(CodexErr::ThreadNotFound(agent_id))
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(
@@ -961,13 +990,13 @@ impl AgentControl {
                 return;
             };
             let child_thread = state.get_thread(child_thread_id).await.ok();
-            let message = format_subagent_notification_message(child_reference.as_str(), &status);
-            if child_agent_path.is_some()
-                && child_thread
-                    .as_ref()
-                    .map(|thread| thread.enabled(Feature::MultiAgentV2))
-                    .unwrap_or(true)
-            {
+            let child_uses_multi_agent_v2 = match child_thread.as_ref() {
+                Some(child_thread) => {
+                    child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                }
+                None => true,
+            };
+            if child_agent_path.is_some() && child_uses_multi_agent_v2 {
                 let Some(child_agent_path) = child_agent_path.clone() else {
                     return;
                 };
@@ -976,6 +1005,13 @@ impl AgentControl {
                     .rsplit_once('/')
                     .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
                 else {
+                    return;
+                };
+                let Some(message) = format_inter_agent_completion_message(
+                    parent_agent_path.clone(),
+                    child_agent_path.clone(),
+                    &status,
+                ) else {
                     return;
                 };
                 let communication = InterAgentCommunication::new(
@@ -990,6 +1026,7 @@ impl AgentControl {
                     .await;
                 return;
             }
+            let message = format_subagent_notification_message(child_reference.as_str(), &status);
             let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
                 return;
             };
@@ -1003,7 +1040,7 @@ impl AgentControl {
     fn prepare_thread_spawn(
         &self,
         reservation: &mut crate::agent::registry::SpawnReservation,
-        config: &crate::config::Config,
+        config: &Config,
         parent_thread_id: ThreadId,
         depth: i32,
         agent_path: Option<AgentPath>,
@@ -1016,7 +1053,7 @@ impl AgentControl {
         if let Some(agent_path) = agent_path.as_ref() {
             reservation.reserve_agent_path(agent_path)?;
         }
-        let candidate_names = agent_nickname_candidates(config, agent_role.as_deref());
+        let candidate_names = spawn::agent_nickname_candidates(config, agent_role.as_deref());
         let candidate_name_refs: Vec<&str> = candidate_names.iter().map(String::as_str).collect();
         let agent_nickname = Some(reservation.reserve_agent_nickname_with_preference(
             &candidate_name_refs,
@@ -1045,11 +1082,11 @@ impl AgentControl {
             .ok_or_else(|| CodexErr::UnsupportedOperation("thread manager dropped".to_string()))
     }
 
-    async fn inherited_shell_snapshot_for_source(
+    async fn inherited_environments_for_source(
         &self,
         state: &Arc<ThreadManagerState>,
         session_source: Option<&SessionSource>,
-    ) -> Option<Arc<ShellSnapshot>> {
+    ) -> Option<TurnEnvironmentSnapshot> {
         let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
         })) = session_source
@@ -1058,14 +1095,22 @@ impl AgentControl {
         };
 
         let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
-        parent_thread.codex.session.user_shell().shell_snapshot()
+        Some(
+            parent_thread
+                .codex
+                .session
+                .services
+                .turn_environments
+                .snapshot()
+                .await,
+        )
     }
 
     async fn inherited_exec_policy_for_source(
         &self,
         state: &Arc<ThreadManagerState>,
         session_source: Option<&SessionSource>,
-        child_config: &crate::config::Config,
+        child_config: &Config,
     ) -> Option<Arc<crate::exec_policy::ExecPolicyManager>> {
         let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
@@ -1144,7 +1189,8 @@ impl AgentControl {
         child_thread_id: ThreadId,
         session_source: Option<&SessionSource>,
     ) {
-        let Some(parent_thread_id) = session_source.and_then(thread_spawn_parent_thread_id) else {
+        let Some(parent_thread_id) = session_source.and_then(SessionSource::parent_thread_id)
+        else {
             return;
         };
         let Some(state_db_ctx) = thread.state_db() else {
@@ -1189,15 +1235,6 @@ impl AgentControl {
     }
 }
 
-fn thread_spawn_parent_thread_id(session_source: &SessionSource) -> Option<ThreadId> {
-    match session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id, ..
-        }) => Some(*parent_thread_id),
-        _ => None,
-    }
-}
-
 fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> bool {
     if prefix.is_root() {
         return true;
@@ -1229,6 +1266,17 @@ pub(crate) fn render_input_preview(initial_operation: &Op) -> String {
         Op::InterAgentCommunication { communication } => communication.content.clone(),
         _ => String::new(),
     }
+}
+
+fn last_task_message_from_communication(communication: &InterAgentCommunication) -> Option<String> {
+    if communication.encrypted_content.is_some() {
+        return None;
+    }
+    non_empty_task_message(communication.content.clone())
+}
+
+fn non_empty_task_message(message: String) -> Option<String> {
+    (!message.is_empty()).then_some(message)
 }
 
 fn thread_spawn_depth(session_source: &SessionSource) -> Option<i32> {

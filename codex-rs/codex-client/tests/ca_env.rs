@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Subprocess coverage for custom CA behavior that must build a real reqwest client.
 //!
 //! These tests intentionally run through `custom_ca_probe` and
@@ -23,16 +24,13 @@ const TRUSTED_TEST_CERT: &str = include_str!("fixtures/test-ca-trusted.pem");
 
 fn write_cert_file(temp_dir: &TempDir, name: &str, contents: &str) -> std::path::PathBuf {
     let path = temp_dir.path().join(name);
-    fs::write(&path, contents).unwrap_or_else(|error| {
-        panic!("write cert fixture failed for {}: {error}", path.display())
-    });
+    fs::write(&path, contents).expect("certificate fixture should be writable");
     path
 }
 
 fn run_probe(envs: &[(&str, &Path)]) -> std::process::Output {
     let mut cmd = Command::new(
-        cargo_bin("custom_ca_probe")
-            .unwrap_or_else(|error| panic!("failed to locate custom_ca_probe: {error}")),
+        cargo_bin("custom_ca_probe").expect("custom_ca_probe binary should be available"),
     );
     // `Command` inherits the parent environment by default, so scrub CA-related variables first or
     // these tests can accidentally pass/fail based on the developer shell or CI runner.
@@ -41,8 +39,7 @@ fn run_probe(envs: &[(&str, &Path)]) -> std::process::Output {
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.output()
-        .unwrap_or_else(|error| panic!("failed to run custom_ca_probe: {error}"))
+    cmd.output().expect("custom_ca_probe should run")
 }
 
 #[test]

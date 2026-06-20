@@ -4,7 +4,7 @@ use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::DEFAULT_CLIENT_NAME;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::start_analytics_events_server;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
@@ -41,7 +41,7 @@ enabled = true
 "#,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let params = PluginUninstallParams {
@@ -99,7 +99,7 @@ async fn plugin_uninstall_tracks_analytics_event() -> Result<()> {
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -200,7 +200,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
 
     Mock::given(method("POST"))
         .and(path(format!(
-            "/backend-api/plugins/{REMOTE_PLUGIN_ID}/uninstall"
+            "/backend-api/ps/plugins/{REMOTE_PLUGIN_ID}/uninstall"
         )))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
@@ -224,7 +224,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
         .join(format!("plugins/cache/chatgpt-global/{REMOTE_PLUGIN_ID}"));
     std::fs::create_dir_all(legacy_remote_plugin_cache_root.join("local/.codex-plugin"))?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -243,7 +243,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
     wait_for_remote_plugin_request_count(
         &server,
         "POST",
-        &format!("/plugins/{REMOTE_PLUGIN_ID}/uninstall"),
+        &format!("/ps/plugins/{REMOTE_PLUGIN_ID}/uninstall"),
         /*expected_count*/ 1,
     )
     .await?;
@@ -273,7 +273,7 @@ async fn plugin_uninstall_uses_detail_scope_for_cache_namespace() -> Result<()> 
 
     Mock::given(method("POST"))
         .and(path(format!(
-            "/backend-api/plugins/{REMOTE_PLUGIN_ID}/uninstall"
+            "/backend-api/ps/plugins/{REMOTE_PLUGIN_ID}/uninstall"
         )))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
@@ -297,7 +297,7 @@ async fn plugin_uninstall_uses_detail_scope_for_cache_namespace() -> Result<()> 
         .join("plugins/cache/chatgpt-global/linear");
     std::fs::create_dir_all(global_cache_root.join("1.0.0/.codex-plugin"))?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -316,7 +316,7 @@ async fn plugin_uninstall_uses_detail_scope_for_cache_namespace() -> Result<()> 
     wait_for_remote_plugin_request_count(
         &server,
         "POST",
-        &format!("/plugins/{REMOTE_PLUGIN_ID}/uninstall"),
+        &format!("/ps/plugins/{REMOTE_PLUGIN_ID}/uninstall"),
         /*expected_count*/ 1,
     )
     .await?;
@@ -360,7 +360,7 @@ async fn plugin_uninstall_posts_even_when_remote_detail_fetch_fails() -> Result<
         .join(format!("plugins/cache/chatgpt-global/{REMOTE_PLUGIN_ID}"));
     std::fs::create_dir_all(legacy_remote_plugin_cache_root.join("local/.codex-plugin"))?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -395,7 +395,7 @@ async fn plugin_uninstall_rejects_malformed_local_plugin_id_before_remote_path()
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -430,7 +430,7 @@ async fn plugin_uninstall_rejects_invalid_remote_plugin_id_before_network_call()
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -450,7 +450,7 @@ async fn plugin_uninstall_rejects_invalid_remote_plugin_id_before_network_call()
     wait_for_remote_plugin_request_count(
         &server,
         "POST",
-        "/plugins/linear/../../oops/uninstall",
+        "/ps/plugins/linear/../../oops/uninstall",
         /*expected_count*/ 0,
     )
     .await?;
@@ -465,7 +465,7 @@ async fn plugin_uninstall_rejects_empty_remote_plugin_id() -> Result<()> {
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp

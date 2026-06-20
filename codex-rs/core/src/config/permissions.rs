@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Component;
 use std::path::Path;
@@ -574,6 +575,7 @@ fn parse_special_path(path: &str) -> Option<FileSystemSpecialPath> {
         ":minimal" => Some(FileSystemSpecialPath::Minimal),
         ":project_roots" => Some(FileSystemSpecialPath::project_roots(/*subpath*/ None)),
         ":tmpdir" => Some(FileSystemSpecialPath::Tmpdir),
+        ":slash_tmp" => Some(FileSystemSpecialPath::SlashTmp),
         _ if path.starts_with(':') => {
             Some(FileSystemSpecialPath::unknown(path, /*subpath*/ None))
         }

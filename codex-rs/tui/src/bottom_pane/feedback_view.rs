@@ -1,5 +1,6 @@
 use codex_feedback::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackDiagnostics;
+use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -310,7 +311,7 @@ pub(crate) fn feedback_success_cell(
     include_logs: bool,
     thread_id: &str,
     feedback_audience: FeedbackAudience,
-) -> history_cell::PlainHistoryCell {
+) -> history_cell::WebHyperlinkHistoryCell {
     let prefix = if include_logs {
         "• Feedback uploaded."
     } else {
@@ -356,7 +357,7 @@ pub(crate) fn feedback_success_cell(
             ]);
         }
     }
-    history_cell::PlainHistoryCell::new(lines)
+    history_cell::WebHyperlinkHistoryCell::new(lines)
 }
 
 fn issue_url_for_category(
@@ -501,6 +502,15 @@ pub(crate) fn feedback_upload_consent_params(
         Line::from("The following files will be sent:".dim()).into(),
         Line::from(vec!["  • ".into(), "codex-logs.log".into()]).into(),
     ];
+    if include_windows_sandbox_log {
+        header_lines.push(
+            Line::from(vec![
+                "  • ".into(),
+                WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME.into(),
+            ])
+            .into(),
+        );
+    }
     if let Some(path) = rollout_path.as_deref()
         && let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string())
     {

@@ -1,5 +1,6 @@
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
+use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
@@ -10,6 +11,7 @@ use tracing::debug_span;
 use tracing::info_span;
 
 use crate::session::SteerInputError;
+use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::session::SessionSettingsUpdate;
 
@@ -36,6 +38,7 @@ use codex_mcp::collect_mcp_snapshot_from_manager;
 use codex_mcp::compute_auth_statuses;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -66,9 +69,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
-use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
-use codex_protocol::user_input::UserInput;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
@@ -125,7 +126,7 @@ pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
     op: Op,
-    mirror_user_text_to_realtime: Option<()>,
+    client_user_message_id: Option<String>,
 ) {
     let (items, updates, responsesapi_client_metadata) = match op {
         Op::UserTurn {
@@ -248,17 +249,18 @@ pub(super) async fn user_input_or_turn_inner(
     };
     sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
         .await;
-    let accepted_items = match sess
+    match sess
         .steer_input(
             items.clone(),
+            additional_context.clone(),
             /*expected_turn_id*/ None,
+            client_user_message_id.clone(),
             responsesapi_client_metadata.clone(),
         )
         .await
     {
         Ok(_) => {
             current_context.session_telemetry.user_prompt(&items);
-            Some(items)
         }
         Err(SteerInputError::NoActiveTurn(items)) => {
             if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
@@ -272,11 +274,10 @@ pub(super) async fn user_input_or_turn_inner(
             let accepted_items = items.clone();
             sess.spawn_task(
                 Arc::clone(&current_context),
-                items,
+                task_input,
                 crate::tasks::RegularTask::new(),
             )
             .await;
-            Some(accepted_items)
         }
         Err(err) => {
             sess.send_event_raw(Event {
@@ -284,37 +285,11 @@ pub(super) async fn user_input_or_turn_inner(
                 msg: EventMsg::Error(err.to_error_event()),
             })
             .await;
-            None
         }
-    };
-    if let (Some(items), Some(())) = (accepted_items, mirror_user_text_to_realtime) {
-        self::mirror_user_text_to_realtime(sess, &items).await;
     }
 }
 
-async fn mirror_user_text_to_realtime(sess: &Arc<Session>, items: &[UserInput]) {
-    let text = UserMessageItem::new(items).message();
-    if text.is_empty() {
-        return;
-    }
-    let text = if sess.conversation.is_running_v2().await {
-        prefix_realtime_v2_text(text, REALTIME_USER_TEXT_PREFIX)
-    } else {
-        text
-    };
-    let text = truncate_realtime_text_to_token_budget(&text, REALTIME_TURN_TOKEN_BUDGET);
-    if text.is_empty() {
-        return;
-    }
-    if sess.conversation.running_state().await.is_none() {
-        return;
-    }
-    if let Err(err) = sess.conversation.text_in(text).await {
-        debug!("failed to mirror user text to realtime conversation: {err}");
-    }
-}
-
-/// Records an inter-agent assistant envelope, then lets the shared pending-work scheduler
+/// Queues an inter-agent message, then lets the shared pending-work scheduler
 /// decide whether an idle session should start a regular turn.
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
@@ -884,11 +859,14 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         .unified_exec_manager
         .terminate_all_processes()
         .await;
-    let mcp_shutdown = {
-        let mut manager = sess.services.mcp_connection_manager.write().await;
-        manager.begin_shutdown()
-    };
-    mcp_shutdown.await;
+    if let Err(err) = sess.services.code_mode_service.shutdown().await {
+        warn!("failed to shutdown code mode session: {err}");
+    }
+    sess.services
+        .mcp_connection_manager
+        .load_full()
+        .shutdown()
+        .await;
     sess.guardian_review_session.shutdown().await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
@@ -1007,6 +985,10 @@ pub(super) async fn submission_loop(
                 }
                 Op::RealtimeConversationText(params) => {
                     handle_realtime_conversation_text(&sess, sub.id.clone(), params).await;
+                    false
+                }
+                Op::RealtimeConversationSpeech(params) => {
+                    handle_realtime_conversation_speech(&sess, sub.id.clone(), params).await;
                     false
                 }
                 Op::RealtimeConversationClose => {
@@ -1219,11 +1201,11 @@ Do not assume this also authorizes similar operations with different payloads.
 Approved action:
 {approved_action_json}"#,
     );
-    let items = vec![ResponseInputItem::Message {
+    let items = vec![ResponseItem::from(ResponseInputItem::Message {
         role: "developer".to_string(),
         content: vec![ContentItem::InputText { text }],
         phase: None,
-    }];
+    })];
 
     if let Err(items) = sess.inject_response_items(items).await {
         sess.queue_response_items_for_next_turn(items).await;

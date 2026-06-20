@@ -9,6 +9,7 @@ use codex_aws_auth::AwsRequestToSign;
 use codex_client::Request;
 use codex_client::RequestBody;
 use codex_client::RequestCompression;
+use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -41,10 +42,12 @@ async fn resolve_auth_method(aws: &ModelProviderAwsAuthInfo) -> Result<BedrockAu
 }
 
 pub(super) async fn resolve_provider_auth(
+    managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
 ) -> Result<SharedAuthProvider> {
-    match resolve_auth_method(aws).await? {
-        BedrockAuthMethod::EnvBearerToken { token, .. } => Ok(Arc::new(BearerAuthProvider {
+    match resolve_auth_method(managed_auth, aws).await? {
+        BedrockAuthMethod::ManagedBearerToken { token, .. }
+        | BedrockAuthMethod::EnvBearerToken { token, .. } => Ok(Arc::new(BearerAuthProvider {
             token: Some(token),
             account_id: None,
             is_fedramp_account: false,
@@ -65,18 +68,24 @@ pub(super) async fn resolve_region(aws: &ModelProviderAwsAuthInfo) -> Result<Str
 fn bearer_token_from_env() -> Option<String> {
     std::env::var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR)
         .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-fn bearer_token_region_from_config(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
-    region_from_config(aws).ok_or_else(|| {
-        CodexErr::Fatal(
-            "Amazon Bedrock bearer token auth requires \
-`model_providers.amazon-bedrock.aws.region`"
-                .to_string(),
-        )
-    })
+fn bearer_token_region(
+    aws: &ModelProviderAwsAuthInfo,
+    env_var: impl Fn(&'static str) -> std::result::Result<String, std::env::VarError> + Copy,
+) -> Result<String> {
+    region_from_config(aws)
+        .or_else(|| non_empty_env_var_from(AWS_REGION_ENV_VAR, env_var))
+        .or_else(|| non_empty_env_var_from(AWS_DEFAULT_REGION_ENV_VAR, env_var))
+        .ok_or_else(|| {
+            CodexErr::Fatal(
+                "Amazon Bedrock bearer token auth requires \
+`model_providers.amazon-bedrock.aws.region`, `AWS_REGION`, or `AWS_DEFAULT_REGION`"
+                    .to_string(),
+            )
+        })
 }
 
 fn aws_auth_error_to_codex_error(error: AwsAuthError) -> CodexErr {
@@ -108,11 +117,6 @@ impl BedrockMantleSigV4AuthProvider {
     fn new(context: AwsAuthContext) -> Self {
         Self { context }
     }
-}
-
-#[async_trait::async_trait]
-impl AuthProvider for BedrockMantleSigV4AuthProvider {
-    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
 
     async fn apply_auth(&self, request: Request) -> std::result::Result<Request, AuthError> {
         let mut request = request;
@@ -137,6 +141,14 @@ impl AuthProvider for BedrockMantleSigV4AuthProvider {
     }
 }
 
+impl AuthProvider for BedrockMantleSigV4AuthProvider {
+    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+
+    fn apply_auth(&self, request: Request) -> codex_api::AuthProviderFuture<'_> {
+        Box::pin(BedrockMantleSigV4AuthProvider::apply_auth(self, request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use codex_api::AuthProvider;
@@ -145,13 +157,23 @@ mod tests {
 
     use super::*;
 
+    fn missing_env_var(_: &'static str) -> std::result::Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
+
     #[test]
-    fn bedrock_bearer_auth_uses_configured_region_and_header() {
+    fn bedrock_bearer_auth_prefers_configured_region_and_uses_header() {
         let token = "bedrock-api-key-test".to_string();
-        let region = bearer_token_region_from_config(&ModelProviderAwsAuthInfo {
-            profile: None,
-            region: Some(" us-west-2 ".to_string()),
-        })
+        let region = bearer_token_region(
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: Some(" us-west-2 ".to_string()),
+            },
+            |name| match name {
+                AWS_REGION_ENV_VAR => Ok("eu-west-1".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
         .expect("configured region should resolve");
         let provider = BearerAuthProvider {
             token: Some(token),
@@ -172,17 +194,54 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_bearer_auth_uses_aws_region_env() {
+        let region = bearer_token_region(
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            },
+            |name| match name {
+                AWS_REGION_ENV_VAR => Ok(" eu-central-1 ".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .expect("AWS_REGION should resolve");
+
+        assert_eq!(region, "eu-central-1");
+    }
+
+    #[test]
+    fn bedrock_bearer_auth_uses_aws_default_region_env() {
+        let region = bearer_token_region(
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            },
+            |name| match name {
+                AWS_DEFAULT_REGION_ENV_VAR => Ok("ap-northeast-1".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .expect("AWS_DEFAULT_REGION should resolve");
+
+        assert_eq!(region, "ap-northeast-1");
+    }
+
+    #[test]
     fn bedrock_bearer_auth_rejects_missing_configured_region() {
-        let err = bearer_token_region_from_config(&ModelProviderAwsAuthInfo {
-            profile: None,
-            region: None,
-        })
+        let err = bearer_token_region(
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            },
+            missing_env_var,
+        )
         .expect_err("missing region should fail");
 
         assert_eq!(
             err.to_string(),
             "Fatal error: Amazon Bedrock bearer token auth requires \
-`model_providers.amazon-bedrock.aws.region`"
+`model_providers.amazon-bedrock.aws.region`, `AWS_REGION`, or `AWS_DEFAULT_REGION`"
         );
     }
 

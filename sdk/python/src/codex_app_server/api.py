@@ -73,8 +73,12 @@ def _split_user_agent(user_agent: str) -> tuple[str | None, str | None]:
 class Codex:
     """Minimal typed SDK surface for app-server v2."""
 
-    def __init__(self, config: AppServerConfig | None = None) -> None:
-        self._client = AppServerClient(config=config)
+    The client starts its runtime connection during construction. Use it as a
+    context manager so resources are closed promptly.
+    """
+
+    def __init__(self, config: CodexConfig | None = None) -> None:
+        self._client = CodexClient(config=config)
         try:
             self._client.start()
             self._init = validate_initialize_metadata(self._client.initialize())
@@ -138,7 +142,7 @@ class Codex:
         self._client.close()
 
     def login_api_key(self, api_key: str) -> None:
-        """Authenticate app-server with an API key."""
+        """Authenticate Codex with an API key."""
         self._client.account_login_start(
             LoginAccountParams(
                 root=ApiKeyLoginAccountParams(
@@ -157,11 +161,11 @@ class Codex:
         return start_device_code_login(self._client)
 
     def account(self, *, refresh_token: bool = False) -> GetAccountResponse:
-        """Read the current app-server account state."""
+        """Read the current Codex account state."""
         return self._client.account_read(GetAccountParams(refresh_token=refresh_token))
 
     def logout(self) -> None:
-        """Clear the current app-server account session."""
+        """Clear the current Codex account session."""
         self._client.account_logout()
 
     # BEGIN GENERATED: Codex.flat_methods
@@ -179,7 +183,7 @@ class Codex:
         model_provider: str | None = None,
         permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
-        sandbox: SandboxMode | None = None,
+        sandbox: Sandbox | None = None,
         service_name: str | None = None,
         service_tier: ServiceTier | None = None,
         session_start_source: ThreadStartSource | None = None,
@@ -196,7 +200,7 @@ class Codex:
             model_provider=model_provider,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox=sandbox,
+            sandbox=_sandbox_mode(sandbox),
             service_name=service_name,
             service_tier=service_tier,
             session_start_source=session_start_source,
@@ -218,6 +222,7 @@ class Codex:
         source_kinds: list[ThreadSourceKind] | None = None,
         use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
+        """List saved conversation threads."""
         params = ThreadListParams(
             archived=archived,
             cursor=cursor,
@@ -263,7 +268,7 @@ class Codex:
             model_provider=model_provider,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox=sandbox,
+            sandbox=_sandbox_mode(sandbox),
             service_tier=service_tier,
         )
         resumed = self._client.thread_resume(thread_id, params)
@@ -307,14 +312,17 @@ class Codex:
         return Thread(self._client, forked.thread.id)
 
     def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:
+        """Archive a stored conversation thread."""
         return self._client.thread_archive(thread_id)
 
     def thread_unarchive(self, thread_id: str) -> Thread:
+        """Restore an archived conversation thread."""
         unarchived = self._client.thread_unarchive(thread_id)
         return Thread(self._client, unarchived.thread.id)
     # END GENERATED: Codex.flat_methods
 
     def models(self, *, include_hidden: bool = False) -> ModelListResponse:
+        """List available models reported by Codex."""
         return self._client.model_list(include_hidden=include_hidden)
 
 
@@ -326,8 +334,8 @@ class AsyncCodex:
     or first awaited API use.
     """
 
-    def __init__(self, config: AppServerConfig | None = None) -> None:
-        self._client = AsyncAppServerClient(config=config)
+    def __init__(self, config: CodexConfig | None = None) -> None:
+        self._client = AsyncCodexClient(config=config)
         self._init: InitializeResponse | None = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -371,7 +379,7 @@ class AsyncCodex:
         self._initialized = False
 
     async def login_api_key(self, api_key: str) -> None:
-        """Authenticate app-server with an API key."""
+        """Authenticate Codex with an API key."""
         await self._ensure_initialized()
         await self._client.account_login_start(
             LoginAccountParams(
@@ -393,12 +401,12 @@ class AsyncCodex:
         return await async_start_device_code_login(self)
 
     async def account(self, *, refresh_token: bool = False) -> GetAccountResponse:
-        """Read the current app-server account state."""
+        """Read the current Codex account state."""
         await self._ensure_initialized()
         return await self._client.account_read(GetAccountParams(refresh_token=refresh_token))
 
     async def logout(self) -> None:
-        """Clear the current app-server account session."""
+        """Clear the current Codex account session."""
         await self._ensure_initialized()
         await self._client.account_logout()
 
@@ -417,11 +425,12 @@ class AsyncCodex:
         model_provider: str | None = None,
         permission_profile: PermissionProfile | None = None,
         personality: Personality | None = None,
-        sandbox: SandboxMode | None = None,
+        sandbox: Sandbox | None = None,
         service_name: str | None = None,
         service_tier: ServiceTier | None = None,
         session_start_source: ThreadStartSource | None = None,
     ) -> AsyncThread:
+        """Create a new Codex conversation thread."""
         await self._ensure_initialized()
         params = ThreadStartParams(
             approval_policy=approval_policy,
@@ -435,7 +444,7 @@ class AsyncCodex:
             model_provider=model_provider,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox=sandbox,
+            sandbox=_sandbox_mode(sandbox),
             service_name=service_name,
             service_tier=service_tier,
             session_start_source=session_start_source,
@@ -457,6 +466,7 @@ class AsyncCodex:
         source_kinds: list[ThreadSourceKind] | None = None,
         use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
+        """List saved conversation threads."""
         await self._ensure_initialized()
         params = ThreadListParams(
             archived=archived,
@@ -490,6 +500,7 @@ class AsyncCodex:
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
     ) -> AsyncThread:
+        """Resume an existing conversation thread by ID."""
         await self._ensure_initialized()
         params = ThreadResumeParams(
             thread_id=thread_id,
@@ -504,7 +515,7 @@ class AsyncCodex:
             model_provider=model_provider,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox=sandbox,
+            sandbox=_sandbox_mode(sandbox),
             service_tier=service_tier,
         )
         resumed = await self._client.thread_resume(thread_id, params)
@@ -528,6 +539,7 @@ class AsyncCodex:
         sandbox: SandboxMode | None = None,
         service_tier: ServiceTier | None = None,
     ) -> AsyncThread:
+        """Create a new thread from an existing thread."""
         await self._ensure_initialized()
         params = ThreadForkParams(
             thread_id=thread_id,
@@ -549,10 +561,12 @@ class AsyncCodex:
         return AsyncThread(self, forked.thread.id)
 
     async def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:
+        """Archive a stored conversation thread."""
         await self._ensure_initialized()
         return await self._client.thread_archive(thread_id)
 
     async def thread_unarchive(self, thread_id: str) -> AsyncThread:
+        """Restore an archived conversation thread."""
         await self._ensure_initialized()
         unarchived = await self._client.thread_unarchive(thread_id)
         return AsyncThread(self, unarchived.thread.id)
@@ -565,7 +579,9 @@ class AsyncCodex:
 
 @dataclass(slots=True)
 class Thread:
-    _client: AppServerClient
+    """Synchronous conversation thread used to run one or more turns."""
+
+    _client: CodexClient
     id: str
 
     def run(
@@ -584,6 +600,7 @@ class Thread:
         service_tier: ServiceTier | None = None,
         summary: ReasoningSummary | None = None,
     ) -> TurnResult:
+        """Run a complete turn and collect its final result."""
         turn = self.turn(
             _normalize_run_input(input),
             approval_policy=approval_policy,
@@ -594,7 +611,7 @@ class Thread:
             output_schema=output_schema,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox_policy=sandbox_policy,
+            sandbox=sandbox,
             service_tier=service_tier,
             summary=summary,
         )
@@ -633,7 +650,7 @@ class Thread:
             output_schema=output_schema,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox_policy=sandbox_policy,
+            sandbox_policy=_sandbox_policy(sandbox),
             service_tier=service_tier,
             summary=summary,
         )
@@ -642,6 +659,7 @@ class Thread:
     # END GENERATED: Thread.flat_methods
 
     def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
+        """Read this thread, optionally including its turn history."""
         return self._client.thread_read(self.id, include_turns=include_turns)
 
     def set_name(self, name: str) -> ThreadSetNameResponse:
@@ -653,6 +671,8 @@ class Thread:
 
 @dataclass(slots=True)
 class AsyncThread:
+    """Asynchronous conversation thread used to run one or more turns."""
+
     _codex: AsyncCodex
     id: str
 
@@ -672,6 +692,7 @@ class AsyncThread:
         service_tier: ServiceTier | None = None,
         summary: ReasoningSummary | None = None,
     ) -> TurnResult:
+        """Run a complete turn asynchronously and collect its final result."""
         turn = await self.turn(
             _normalize_run_input(input),
             approval_policy=approval_policy,
@@ -682,7 +703,7 @@ class AsyncThread:
             output_schema=output_schema,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox_policy=sandbox_policy,
+            sandbox=sandbox,
             service_tier=service_tier,
             summary=summary,
         )
@@ -709,6 +730,7 @@ class AsyncThread:
         service_tier: ServiceTier | None = None,
         summary: ReasoningSummary | None = None,
     ) -> AsyncTurnHandle:
+        """Start a turn and return a handle for streaming or control."""
         await self._codex._ensure_initialized()
         wire_input = _to_wire_input(input)
         params = TurnStartParams(
@@ -722,7 +744,7 @@ class AsyncThread:
             output_schema=output_schema,
             permission_profile=permission_profile,
             personality=personality,
-            sandbox_policy=sandbox_policy,
+            sandbox_policy=_sandbox_policy(sandbox),
             service_tier=service_tier,
             summary=summary,
         )
@@ -735,6 +757,7 @@ class AsyncThread:
     # END GENERATED: AsyncThread.flat_methods
 
     async def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
+        """Read this thread, optionally including its turn history."""
         await self._codex._ensure_initialized()
         return await self._codex._client.thread_read(
             self.id, include_turns=include_turns
@@ -751,11 +774,14 @@ class AsyncThread:
 
 @dataclass(slots=True)
 class TurnHandle:
-    _client: AppServerClient
+    """Control and consume a synchronous turn after it has started."""
+
+    _client: CodexClient
     thread_id: str
     id: str
 
     def steer(self, input: RunInput) -> TurnSteerResponse:
+        """Send additional input to this active turn."""
         return self._client.turn_steer(
             self.thread_id,
             self.id,
@@ -763,6 +789,7 @@ class TurnHandle:
         )
 
     def interrupt(self) -> TurnInterruptResponse:
+        """Request interruption of this active turn."""
         return self._client.turn_interrupt(self.thread_id, self.id)
 
     def stream(self) -> Iterator[Notification]:
@@ -782,6 +809,7 @@ class TurnHandle:
             self._client.release_turn_consumer(self.id)
 
     def run(self) -> TurnResult:
+        """Consume the turn stream and return its completed result."""
         stream = self.stream()
         try:
             for event in stream:
@@ -797,11 +825,14 @@ class TurnHandle:
 
 @dataclass(slots=True)
 class AsyncTurnHandle:
+    """Control and consume an asynchronous turn after it has started."""
+
     _codex: AsyncCodex
     thread_id: str
     id: str
 
     async def steer(self, input: RunInput) -> TurnSteerResponse:
+        """Send additional input to this active turn."""
         await self._codex._ensure_initialized()
         return await self._codex._client.turn_steer(
             self.thread_id,
@@ -810,6 +841,7 @@ class AsyncTurnHandle:
         )
 
     async def interrupt(self) -> TurnInterruptResponse:
+        """Request interruption of this active turn."""
         await self._codex._ensure_initialized()
         return await self._codex._client.turn_interrupt(self.thread_id, self.id)
 
@@ -831,6 +863,7 @@ class AsyncTurnHandle:
             self._codex._client.release_turn_consumer(self.id)
 
     async def run(self) -> TurnResult:
+        """Consume the turn stream and return its completed result."""
         stream = self.stream()
         try:
             async for event in stream:

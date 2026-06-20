@@ -1,7 +1,11 @@
 use crate::color::blend;
 use crate::color::is_light;
+use crate::terminal_palette::StdoutColorLevel;
 use crate::terminal_palette::best_color;
 use crate::terminal_palette::default_bg;
+use crate::terminal_palette::default_fg;
+use crate::terminal_palette::rgb_color;
+use crate::terminal_palette::stdout_color_level;
 use ratatui::style::Color;
 use ratatui::style::Style;
 

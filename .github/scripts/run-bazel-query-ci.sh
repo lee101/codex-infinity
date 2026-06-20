@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
-# Run Bazel queries with the same CI startup settings as the main build/test
-# invocation so target-discovery queries can reuse the same Bazel server.
+# Run target-discovery queries with the same startup settings as the main
+# build/test invocation so they can reuse the same Bazel server. Queries only
+# enumerate labels, so they intentionally do not select a CI build/test config
+# or remote execution.
 
 query_args=()
 while [[ $# -gt 0 ]]; do
@@ -43,20 +45,14 @@ fi
 
 run_bazel() {
   if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-    MSYS2_ARG_CONV_EXCL='*' bazel "$@"
+    MSYS2_ARG_CONV_EXCL='*' "$(dirname "${BASH_SOURCE[0]}")/run_bazel_with_buildbuddy.py" "$@"
     return
   fi
 
-  bazel "$@"
+  "$(dirname "${BASH_SOURCE[0]}")/run_bazel_with_buildbuddy.py" "$@"
 }
 
-bazel_query_args=(--noexperimental_remote_repo_contents_cache query)
-if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-  bazel_query_args+=(
-    "--config=${ci_config}"
-    "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
-  )
-fi
+bazel_query_args=(query)
 
 if [[ -n "${BAZEL_REPO_CONTENTS_CACHE:-}" ]]; then
   bazel_query_args+=("--repo_contents_cache=${BAZEL_REPO_CONTENTS_CACHE}")
@@ -66,10 +62,9 @@ if [[ -n "${BAZEL_REPOSITORY_CACHE:-}" ]]; then
   bazel_query_args+=("--repository_cache=${BAZEL_REPOSITORY_CACHE}")
 fi
 
-bazel_query_args+=("${query_args[@]}" "$query_expression")
-
-if (( ${#bazel_startup_args[@]} > 0 )); then
-  run_bazel "${bazel_startup_args[@]}" "${bazel_query_args[@]}"
-else
-  run_bazel "${bazel_query_args[@]}"
+if (( ${#query_args[@]} > 0 )); then
+  bazel_query_args+=("${query_args[@]}")
 fi
+bazel_query_args+=("$query_expression")
+
+run_bazel "${bazel_query_args[@]}"

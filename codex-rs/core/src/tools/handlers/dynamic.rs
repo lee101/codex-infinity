@@ -8,6 +8,8 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;

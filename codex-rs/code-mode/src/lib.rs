@@ -1,5 +1,3 @@
-mod description;
-mod response;
 mod runtime;
 mod service;
 
@@ -27,8 +25,5 @@ pub use runtime::RuntimeResponse;
 pub use runtime::WaitOutcome;
 pub use runtime::WaitRequest;
 pub use service::CodeModeService;
-pub use service::CodeModeTurnHost;
-pub use service::CodeModeTurnWorker;
-
-pub const PUBLIC_TOOL_NAME: &str = "exec";
-pub const WAIT_TOOL_NAME: &str = "wait";
+pub use service::InProcessCodeModeSessionProvider;
+pub use service::NoopCodeModeSessionDelegate;

@@ -6,6 +6,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use crate::rollout::list::find_thread_path_by_id_str;
+use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell;
@@ -18,15 +19,24 @@ use codex_protocol::ThreadId;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::fs;
 use tokio::process::Command;
-use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::info_span;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellSnapshot {
-    pub path: AbsolutePathBuf,
-    pub cwd: AbsolutePathBuf,
+#[derive(Clone)]
+pub(crate) struct ShellSnapshot {
+    config: Option<Arc<ShellSnapshotConfig>>,
+}
+
+struct ShellSnapshotConfig {
+    codex_home: AbsolutePathBuf,
+    session_id: ThreadId,
+    session_telemetry: SessionTelemetry,
+    state_db: Option<StateDbHandle>,
+}
+
+pub(crate) struct ShellSnapshotFile {
+    path: AbsolutePathBuf,
 }
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,11 +45,9 @@ const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 
 impl ShellSnapshot {
-    pub fn start_snapshotting(
+    pub(crate) fn new(
         codex_home: AbsolutePathBuf,
         session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
-        shell: &mut Shell,
         session_telemetry: SessionTelemetry,
     ) -> watch::Sender<Option<Arc<ShellSnapshot>>> {
         let (shell_snapshot_tx, shell_snapshot_rx) = watch::channel(None);
@@ -57,10 +65,29 @@ impl ShellSnapshot {
         shell_snapshot_tx
     }
 
-    pub fn refresh_snapshot(
-        codex_home: AbsolutePathBuf,
-        session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
+    pub(crate) fn disabled() -> Self {
+        Self { config: None }
+    }
+
+    pub(crate) async fn build(
+        self,
+        environment: TurnEnvironment,
+    ) -> Option<Arc<ShellSnapshotFile>> {
+        let config = self.config.as_ref()?;
+        if environment.environment.is_remote() {
+            return None;
+        }
+
+        let shell = environment.shell.clone()?;
+        // TODO(anp): Migrate shell snapshot creation to accept PathUri and defer native
+        // conversion to the spawned shell process.
+        let cwd = environment.cwd().to_abs_path().ok()?;
+        Self::build_for_cwd(Arc::clone(config), cwd, shell).await
+    }
+
+    async fn build_for_cwd(
+        config: Arc<ShellSnapshotConfig>,
+        cwd: AbsolutePathBuf,
         shell: Shell,
         shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
         session_telemetry: SessionTelemetry,
@@ -101,11 +128,16 @@ impl ShellSnapshot {
                 session_telemetry.counter("codex.shell_snapshot", /*inc*/ 1, &counter_tags);
                 let _ = shell_snapshot_tx.send(snapshot.ok());
             }
-            .instrument(snapshot_span),
-        );
+            config
+                .session_telemetry
+                .counter("codex.shell_snapshot", /*inc*/ 1, &counter_tags);
+            snapshot.ok().map(Arc::new)
+        }
+        .instrument(snapshot_span)
+        .await
     }
 
-    async fn try_new(
+    async fn try_create(
         codex_home: &AbsolutePathBuf,
         session_id: ThreadId,
         session_cwd: &AbsolutePathBuf,
@@ -137,9 +169,7 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        if let Err(err) =
-            write_shell_snapshot(shell.shell_type.clone(), &temp_path, session_cwd).await
-        {
+        if let Err(err) = write_shell_snapshot(shell.shell_type, &temp_path, session_cwd).await {
             tracing::warn!(
                 "Failed to create shell snapshot for {}: {err:?}",
                 shell.name()
@@ -163,14 +193,17 @@ impl ShellSnapshot {
             return Err("write_failed");
         }
 
-        Ok(Self {
-            path,
-            cwd: session_cwd.clone(),
-        })
+        Ok(ShellSnapshotFile { path })
     }
 }
 
-impl Drop for ShellSnapshot {
+impl ShellSnapshotFile {
+    pub(crate) fn path(&self) -> AbsolutePathBuf {
+        self.path.clone()
+    }
+}
+
+impl Drop for ShellSnapshotFile {
     fn drop(&mut self) {
         if let Err(err) = std::fs::remove_file(&self.path) {
             tracing::warn!(
@@ -189,7 +222,7 @@ async fn write_shell_snapshot(
     if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
         bail!("Shell snapshot not supported yet for {shell_type:?}");
     }
-    let shell = get_shell(shell_type.clone(), /*path*/ None)
+    let shell = get_shell(shell_type, /*path*/ None)
         .with_context(|| format!("No available shell for {shell_type:?}"))?;
 
     let raw_snapshot = capture_snapshot(&shell, cwd).await?;
@@ -211,7 +244,7 @@ async fn write_shell_snapshot(
 }
 
 async fn capture_snapshot(shell: &Shell, cwd: &AbsolutePathBuf) -> Result<String> {
-    let shell_type = shell.shell_type.clone();
+    let shell_type = shell.shell_type;
     match shell_type {
         ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd).await,
         ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd).await,

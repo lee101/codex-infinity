@@ -23,6 +23,19 @@ pub enum ShellCommandBackendConfig {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnifiedExecFeatureMode {
+    /// Unified exec should not be selected by this feature set.
+    ///
+    /// This includes standalone `shell_zsh_fork`: until
+    /// `unified_exec_zsh_fork` is enabled too, `shell_zsh_fork` keeps using
+    /// the shell command backend instead of silently opting unified exec into
+    /// zsh-fork interception.
+    Disabled,
+    Direct,
+    ZshFork,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ToolUserShellType {
     Zsh,
     Bash,
@@ -45,13 +58,13 @@ pub struct ZshForkConfig {
 
 impl UnifiedExecShellMode {
     pub fn for_session(
-        shell_command_backend: ShellCommandBackendConfig,
+        feature_mode: UnifiedExecFeatureMode,
         user_shell_type: ToolUserShellType,
         shell_zsh_path: Option<&PathBuf>,
         main_execve_wrapper_exe: Option<&PathBuf>,
     ) -> Self {
         if cfg!(unix)
-            && shell_command_backend == ShellCommandBackendConfig::ZshFork
+            && matches!(feature_mode, UnifiedExecFeatureMode::ZshFork)
             && matches!(user_shell_type, ToolUserShellType::Zsh)
             && let (Some(shell_zsh_path), Some(main_execve_wrapper_exe)) =
                 (shell_zsh_path, main_execve_wrapper_exe)

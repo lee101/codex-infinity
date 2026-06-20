@@ -35,6 +35,8 @@ use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
+use codex_utils_path_uri::PathUri;
+use std::time::Instant;
 
 pub(crate) struct ToolOrchestrator {
     sandbox: SandboxManager,
@@ -221,6 +223,7 @@ impl ToolOrchestrator {
                 .windows_sandbox_private_desktop,
         };
 
+        let initial_attempt_start = Instant::now();
         let (first_result, first_deferred_network_approval) = Self::run_attempt(
             tool,
             req,
@@ -229,6 +232,7 @@ impl ToolOrchestrator {
             managed_network_active,
         )
         .await;
+        let initial_duration = initial_attempt_start.elapsed();
         match first_result {
             Ok(out) => {
                 // We have a successful initial result
@@ -249,17 +253,33 @@ impl ToolOrchestrator {
                     None
                 };
                 if network_policy_decision.is_some() && network_approval_context.is_none() {
+                    otel.sandbox_outcome(
+                        &otel_tn,
+                        otel_ci,
+                        "denied",
+                        initial_duration,
+                        /*escalated_duration*/ None,
+                    );
                     return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                         output,
                         network_policy_decision,
                     })));
                 }
                 if !tool.escalate_on_failure() {
+                    otel.sandbox_outcome(
+                        &otel_tn,
+                        otel_ci,
+                        "denied",
+                        initial_duration,
+                        /*escalated_duration*/ None,
+                    );
                     return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                         output,
                         network_policy_decision,
                     })));
                 }
+                let unsandboxed_allowed =
+                    unsandboxed_execution_allowed(&file_system_sandbox_policy);
                 // Under `Never` or `OnRequest`, do not retry without sandbox;
                 // surface a concise sandbox denial that preserves the
                 // original output.
@@ -275,11 +295,31 @@ impl ToolOrchestrator {
                                 ExecApprovalRequirement::NeedsApproval { .. }
                             );
                     if !allow_on_request_network_prompt {
+                        otel.sandbox_outcome(
+                            &otel_tn,
+                            otel_ci,
+                            "denied",
+                            initial_duration,
+                            /*escalated_duration*/ None,
+                        );
                         return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                             output,
                             network_policy_decision,
                         })));
                     }
+                }
+                if !unsandboxed_allowed && network_approval_context.is_none() {
+                    otel.sandbox_outcome(
+                        &otel_tn,
+                        otel_ci,
+                        "denied",
+                        initial_duration,
+                        /*escalated_duration*/ None,
+                    );
+                    return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                        output,
+                        network_policy_decision,
+                    })));
                 }
                 let retry_reason =
                     if let Some(network_approval_context) = network_approval_context.as_ref() {
@@ -323,8 +363,24 @@ impl ToolOrchestrator {
                         .await?;
                 }
 
-                let escalated_attempt = SandboxAttempt {
-                    sandbox: SandboxType::None,
+                let retry_sandbox = if unsandboxed_allowed {
+                    SandboxType::None
+                } else {
+                    self.sandbox.select_initial(
+                        &file_system_sandbox_policy,
+                        network_sandbox_policy,
+                        tool.sandbox_preference(),
+                        turn_ctx.windows_sandbox_level,
+                        managed_network_active,
+                    )
+                };
+                let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
+                    None
+                } else {
+                    turn_ctx.codex_linux_sandbox_exe.as_ref()
+                };
+                let retry_attempt = SandboxAttempt {
+                    sandbox: retry_sandbox,
                     permissions: &turn_ctx.permission_profile,
                     enforce_managed_network: managed_network_active,
                     manager: &self.sandbox,
@@ -339,20 +395,51 @@ impl ToolOrchestrator {
                 };
 
                 // Second attempt.
-                let (retry_result, retry_deferred_network_approval) = Self::run_attempt(
-                    tool,
-                    req,
-                    tool_ctx,
-                    &escalated_attempt,
-                    managed_network_active,
-                )
-                .await;
-                retry_result.map(|output| OrchestratorRunResult {
-                    output,
-                    deferred_network_approval: retry_deferred_network_approval,
-                })
+                let escalated_attempt_start = Instant::now();
+                let (retry_result, retry_deferred_network_approval) =
+                    Self::run_attempt(tool, req, tool_ctx, &retry_attempt, managed_network_active)
+                        .await;
+                let escalated_duration = escalated_attempt_start.elapsed();
+                match retry_result {
+                    Ok(output) => {
+                        otel.sandbox_outcome(
+                            &otel_tn,
+                            otel_ci,
+                            "escalated",
+                            initial_duration,
+                            Some(escalated_duration),
+                        );
+                        Ok(OrchestratorRunResult {
+                            output,
+                            deferred_network_approval: retry_deferred_network_approval,
+                        })
+                    }
+                    Err(err) => {
+                        if let Some(outcome) = sandbox_outcome_from_tool_error(&err) {
+                            otel.sandbox_outcome(
+                                &otel_tn,
+                                otel_ci,
+                                outcome,
+                                initial_duration,
+                                Some(escalated_duration),
+                            );
+                        }
+                        Err(err)
+                    }
+                }
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                if let Some(outcome) = sandbox_outcome_from_tool_error(&err) {
+                    otel.sandbox_outcome(
+                        &otel_tn,
+                        otel_ci,
+                        outcome,
+                        initial_duration,
+                        /*escalated_duration*/ None,
+                    );
+                }
+                Err(err)
+            }
         }
     }
 
@@ -448,6 +535,15 @@ impl ToolOrchestrator {
                 }
             },
         }
+    }
+}
+
+fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
+    match err {
+        ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { .. })) => Some("denied"),
+        ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { .. })) => Some("timed_out"),
+        ToolError::Codex(CodexErr::Sandbox(SandboxErr::Signal(_))) => Some("signal"),
+        ToolError::Rejected(_) | ToolError::Codex(_) => None,
     }
 }
 

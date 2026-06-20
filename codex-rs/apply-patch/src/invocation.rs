@@ -21,6 +21,7 @@ use crate::parser::Hunk;
 use crate::parser::ParseError;
 use crate::parser::parse_patch;
 use crate::unified_diff_from_chunks;
+use codex_utils_path_uri::PathUri;
 use std::str::Utf8Error;
 use tree_sitter::LanguageError;
 

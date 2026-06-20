@@ -61,7 +61,6 @@ impl DefaultEnvironmentProvider {
     }
 }
 
-#[async_trait]
 impl EnvironmentProvider for DefaultEnvironmentProvider {
     async fn get_environments(
         &self,

@@ -50,11 +50,7 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
-    let installed = sess
-        .services
-        .mcp_manager
-        .configured_servers(config.as_ref())
-        .await;
+    let installed = sess.runtime_mcp_servers(config.as_ref()).await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -87,7 +83,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     }
 
     let codex_home = config.codex_home.clone();
-    let installed = sess.services.mcp_manager.configured_servers(config).await;
+    let installed = sess.runtime_mcp_servers(config).await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -152,6 +148,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             &name,
             &oauth_config.url,
             config.mcp_oauth_credentials_store_mode,
+            config.auth_keyring_backend_kind(),
             oauth_config.http_headers.clone(),
             oauth_config.env_http_headers.clone(),
             &resolved_scopes.scopes,
@@ -175,6 +172,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
                     &name,
                     &oauth_config.url,
                     config.mcp_oauth_credentials_store_mode,
+                    config.auth_keyring_backend_kind(),
                     oauth_config.http_headers,
                     oauth_config.env_http_headers,
                     &[],
@@ -201,10 +199,15 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         .effective_servers(config, auth.as_ref())
         .await;
     for (name, server_config) in &servers {
-        refresh_servers
+        configured_servers
             .entry(name.clone())
             .or_insert_with(|| server_config.clone());
     }
+    if let Err(err) = refresh_config.mcp_servers.set(configured_servers) {
+        warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
+        return;
+    }
+    let refresh_servers = sess.runtime_mcp_servers(&refresh_config).await;
     sess.refresh_mcp_servers_now(
         turn_context,
         refresh_servers,
@@ -251,6 +254,7 @@ async fn should_install_mcp_dependencies(
     };
     let args = RequestUserInputArgs {
         questions: vec![question],
+        auto_resolution_ms: None,
     };
     let sub_id = &turn_context.sub_id;
     let call_id = format!("mcp-deps-{sub_id}");

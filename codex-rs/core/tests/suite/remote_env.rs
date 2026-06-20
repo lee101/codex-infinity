@@ -11,6 +11,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::get_remote_test_env;
 use core_test_support::skip_if_no_network;
@@ -30,20 +31,21 @@ async fn remote_test_env_can_connect_and_use_filesystem() -> Result<()> {
     let test_env = test_env().await?;
     let file_system = test_env.environment().get_filesystem();
 
-    let file_path_abs = remote_test_file_path().abs();
+    let file_path_abs = test_env.cwd().join("remote-test-env-ok");
+    let file_path_uri = PathUri::from_path(&file_path_abs)?;
     let payload = b"remote-test-env-ok".to_vec();
 
     file_system
-        .write_file(&file_path_abs, payload.clone(), /*sandbox*/ None)
+        .write_file(&file_path_uri, payload.clone(), /*sandbox*/ None)
         .await?;
     let actual = file_system
-        .read_file(&file_path_abs, /*sandbox*/ None)
+        .read_file(&file_path_uri, /*sandbox*/ None)
         .await?;
     assert_eq!(actual, payload);
 
     file_system
         .remove(
-            &file_path_abs,
+            &file_path_uri,
             RemoveOptions {
                 recursive: false,
                 force: true,
@@ -55,11 +57,52 @@ async fn remote_test_env_can_connect_and_use_filesystem() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
+    let Some(_remote_env) = get_remote_test_env() else {
+        return Ok(());
+    };
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build_with_remote_env(&server).await?;
+
+    test.submit_turn("report remote environment").await?;
+
+    let request = response_mock.single_request();
+    let environment_context = request
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.starts_with("<environment_context>"))
+        .context("environment context should be model visible")?;
+    // TODO(anp): Assert Wine-exec exposes a `C:\\...` cwd after model-visible paths preserve
+    // target-native spelling instead of the Linux orchestrator's `/C:/...` representation.
+    let expected_shell = match core_test_support::test_environment() {
+        TestEnvironment::Docker { .. } => "<shell>bash</shell>",
+        TestEnvironment::WineExec => "<shell>powershell</shell>",
+        TestEnvironment::Local => unreachable!("test requires a remote environment"),
+    };
+    assert_eq!(
+        environment_context
+            .lines()
+            .find(|line| line.trim_start().starts_with("<shell>"))
+            .map(str::trim),
+        Some(expected_shell),
+    );
+
+    Ok(())
+}
+
 fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
-    match AbsolutePathBuf::try_from(path) {
-        Ok(path) => path,
-        Err(error) => panic!("path should be absolute: {error}"),
-    }
+    AbsolutePathBuf::try_from(path).expect("path should be absolute")
 }
 
 fn read_only_sandbox(readable_root: PathBuf) -> FileSystemSandboxContext {
@@ -109,8 +152,11 @@ fn assert_normalized_path_rejected(error: &std::io::Error) {
 
 fn remote_exec(script: &str) -> Result<()> {
     let remote_env = get_remote_test_env().context("remote env should be configured")?;
+    let container_name = remote_env
+        .docker_container_name()
+        .context("test requires direct access to the Docker container")?;
     let output = Command::new("docker")
-        .args(["exec", &remote_env.container_name, "sh", "-lc", script])
+        .args(["exec", container_name, "sh", "-lc", script])
         .output()?;
     assert!(
         output.status.success(),
@@ -123,6 +169,8 @@ fn remote_exec(script: &str) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_test_env_sandboxed_read_allows_readable_root() -> Result<()> {
+    // TODO(anp): Remove after remote sandbox fixtures use target-native paths.
+    skip_if_wine_exec!(Ok(()), "requires the Docker-backed POSIX executor");
     skip_if_no_network!(Ok(()));
     let Some(_remote_env) = get_remote_test_env() else {
         return Ok(());
@@ -133,16 +181,18 @@ async fn remote_test_env_sandboxed_read_allows_readable_root() -> Result<()> {
 
     let allowed_dir = PathBuf::from(format!("/tmp/codex-remote-readable-{}", std::process::id()));
     let file_path = allowed_dir.join("note.txt");
+    let allowed_dir_uri = PathUri::from_path(&allowed_dir)?;
+    let file_path_uri = PathUri::from_path(&file_path)?;
     file_system
         .create_directory(
-            &absolute_path(allowed_dir.clone()),
+            &allowed_dir_uri,
             CreateDirectoryOptions { recursive: true },
             /*sandbox*/ None,
         )
         .await?;
     file_system
         .write_file(
-            &absolute_path(file_path.clone()),
+            &file_path_uri,
             b"sandboxed hello".to_vec(),
             /*sandbox*/ None,
         )
@@ -150,13 +200,13 @@ async fn remote_test_env_sandboxed_read_allows_readable_root() -> Result<()> {
 
     let sandbox = read_only_sandbox(allowed_dir.clone());
     let contents = file_system
-        .read_file(&absolute_path(file_path.clone()), Some(&sandbox))
+        .read_file(&file_path_uri, Some(&sandbox))
         .await?;
     assert_eq!(contents, b"sandboxed hello");
 
     file_system
         .remove(
-            &absolute_path(allowed_dir),
+            &allowed_dir_uri,
             RemoveOptions {
                 recursive: true,
                 force: true,
@@ -170,6 +220,7 @@ async fn remote_test_env_sandboxed_read_allows_readable_root() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_test_env_sandboxed_read_rejects_symlink_parent_dotdot_escape() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "tests POSIX symlink and parent traversal semantics");
     skip_if_no_network!(Ok(()));
     let Some(_remote_env) = get_remote_test_env() else {
         return Ok(());
@@ -190,7 +241,8 @@ async fn remote_test_env_sandboxed_read_rejects_symlink_parent_dotdot_escape() -
         secret = secret_path.display(),
     ))?;
 
-    let requested_path = absolute_path(allowed_dir.join("link").join("..").join("secret.txt"));
+    let requested_path =
+        PathUri::from_path(allowed_dir.join("link").join("..").join("secret.txt"))?;
     let sandbox = read_only_sandbox(allowed_dir.clone());
     let error = match file_system.read_file(&requested_path, Some(&sandbox)).await {
         Ok(_) => anyhow::bail!("read should fail after path normalization"),
@@ -204,6 +256,7 @@ async fn remote_test_env_sandboxed_read_rejects_symlink_parent_dotdot_escape() -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_test_env_remove_removes_symlink_not_target() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "tests POSIX symlink removal semantics");
     skip_if_no_network!(Ok(()));
     let Some(_remote_env) = get_remote_test_env() else {
         return Ok(());
@@ -237,7 +290,7 @@ async fn remote_test_env_remove_removes_symlink_not_target() -> Result<()> {
     let sandbox = workspace_write_sandbox(allowed_dir.clone());
     file_system
         .remove(
-            &absolute_path(symlink_path.clone()),
+            &PathUri::from_path(&symlink_path)?,
             RemoveOptions {
                 recursive: false,
                 force: false,
@@ -247,18 +300,21 @@ async fn remote_test_env_remove_removes_symlink_not_target() -> Result<()> {
         .await?;
 
     let symlink_exists = file_system
-        .get_metadata(&absolute_path(symlink_path), /*sandbox*/ None)
+        .get_metadata(
+            &PathUri::from_abs_path(&absolute_path(symlink_path)),
+            /*sandbox*/ None,
+        )
         .await
         .is_ok();
     assert!(!symlink_exists);
     let outside = file_system
-        .read_file_text(&absolute_path(outside_file.clone()), /*sandbox*/ None)
+        .read_file_text(&PathUri::from_path(&outside_file)?, /*sandbox*/ None)
         .await?;
     assert_eq!(outside, "outside");
 
     file_system
         .remove(
-            &absolute_path(root),
+            &PathUri::from_path(&root)?,
             RemoveOptions {
                 recursive: true,
                 force: true,
@@ -271,6 +327,7 @@ async fn remote_test_env_remove_removes_symlink_not_target() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_test_env_copy_preserves_symlink_source() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "tests POSIX symlink copy semantics");
     skip_if_no_network!(Ok(()));
     let Some(_remote_env) = get_remote_test_env() else {
         return Ok(());
@@ -299,19 +356,21 @@ async fn remote_test_env_copy_preserves_symlink_source() -> Result<()> {
     let sandbox = workspace_write_sandbox(allowed_dir.clone());
     file_system
         .copy(
-            &absolute_path(source_symlink),
-            &absolute_path(copied_symlink.clone()),
+            &PathUri::from_path(&source_symlink)?,
+            &PathUri::from_path(&copied_symlink)?,
             CopyOptions { recursive: false },
             Some(&sandbox),
         )
         .await?;
 
+    let remote_env = get_remote_test_env().context("remote env should be configured")?;
+    let container_name = remote_env
+        .docker_container_name()
+        .context("test requires direct access to the Docker container")?;
     let link_target = Command::new("docker")
         .args([
             "exec",
-            &get_remote_test_env()
-                .context("remote env should still be configured")?
-                .container_name,
+            container_name,
             "readlink",
             copied_symlink
                 .to_str()
@@ -331,7 +390,7 @@ async fn remote_test_env_copy_preserves_symlink_source() -> Result<()> {
 
     file_system
         .remove(
-            &absolute_path(root),
+            &PathUri::from_path(&root)?,
             RemoveOptions {
                 recursive: true,
                 force: true,
@@ -340,15 +399,4 @@ async fn remote_test_env_copy_preserves_symlink_source() -> Result<()> {
         )
         .await?;
     Ok(())
-}
-
-fn remote_test_file_path() -> PathBuf {
-    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    };
-    PathBuf::from(format!(
-        "/tmp/codex-remote-test-env-{}-{nanos}.txt",
-        std::process::id()
-    ))
 }

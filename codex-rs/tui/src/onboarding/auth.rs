@@ -10,6 +10,7 @@
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
+#[cfg(test)]
 use codex_app_server_protocol::AuthMode as AppServerAuthMode;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientRequest;
@@ -546,24 +547,36 @@ impl AuthModeWidget {
 
     fn render_chatgpt_success_message(&self, area: Rect, buf: &mut Buffer) {
         let lines = vec![
-            "✓ Signed in with your ChatGPT account".fg(Color::Green).into(),
+            "✓ Signed in with your ChatGPT account"
+                .fg(Color::Green)
+                .into(),
             "".into(),
             "  Before you start:".into(),
             "".into(),
             "  Decide how much autonomy you want to grant Codex".into(),
             Line::from(vec![
                 "  For more details see the ".into(),
-                "\u{1b}]8;;https://developers.openai.com/codex/security\u{7}Codex docs\u{1b}]8;;\u{7}".underlined(),
+                crate::terminal_hyperlinks::osc8_hyperlink(
+                    "https://developers.openai.com/codex/security",
+                    "Codex docs",
+                )
+                .underlined(),
             ])
             .dim(),
             "".into(),
             "  Codex can make mistakes".into(),
-            "  Review the code it writes and commands it runs".dim().into(),
+            "  Review the code it writes and commands it runs"
+                .dim()
+                .into(),
             "".into(),
             "  Powered by your ChatGPT account".into(),
             Line::from(vec![
                 "  Uses your plan's rate limits and ".into(),
-                "\u{1b}]8;;https://chatgpt.com/#settings\u{7}training data preferences\u{1b}]8;;\u{7}".underlined(),
+                crate::terminal_hyperlinks::osc8_hyperlink(
+                    "https://chatgpt.com/#settings",
+                    "training data preferences",
+                )
+                .underlined(),
             ])
             .dim(),
             "".into(),
@@ -835,8 +848,7 @@ impl AuthModeWidget {
     fn handle_existing_chatgpt_login(&mut self) -> bool {
         if matches!(
             self.login_status,
-            LoginStatus::AuthMode(AppServerAuthMode::Chatgpt)
-                | LoginStatus::AuthMode(AppServerAuthMode::ChatgptAuthTokens)
+            LoginStatus::AuthMode(auth_mode) if auth_mode.has_chatgpt_account()
         ) {
             *self.sign_in_state.write().unwrap() = SignInState::ChatGptSuccess;
             self.request_frame.schedule_frame();
@@ -1000,8 +1012,9 @@ mod tests {
     use codex_app_server_client::InProcessAppServerClient;
     use codex_app_server_client::InProcessClientStartArgs;
     use codex_arg0::Arg0DispatchPaths;
-    use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+    use codex_cloud_config::cloud_config_bundle_loader_for_storage;
     use codex_config::types::AuthCredentialsStoreMode;
+    use codex_login::AuthKeyringBackendKind;
 
     use codex_protocol::protocol::SessionSource;
     use pretty_assertions::assert_eq;
@@ -1025,6 +1038,7 @@ mod tests {
                 codex_home_path.clone(),
                 /*enable_codex_api_key_env*/ false,
                 AuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
                 "https://chatgpt.com/backend-api/".to_string(),
             )
             .await,
@@ -1090,17 +1104,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_chatgpt_auth_tokens_login_counts_as_signed_in() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
-        widget.login_status = LoginStatus::AuthMode(AppServerAuthMode::ChatgptAuthTokens);
+    async fn existing_non_oauth_chatgpt_login_counts_as_signed_in() {
+        for auth_mode in [
+            AppServerAuthMode::ChatgptAuthTokens,
+            AppServerAuthMode::PersonalAccessToken,
+        ] {
+            let (mut widget, _tmp) = widget_forced_chatgpt().await;
+            widget.login_status = LoginStatus::AuthMode(auth_mode);
 
-        let handled = widget.handle_existing_chatgpt_login();
+            let handled = widget.handle_existing_chatgpt_login();
 
-        assert_eq!(handled, true);
-        assert!(matches!(
-            &*widget.sign_in_state.read().unwrap(),
-            SignInState::ChatGptSuccess
-        ));
+            assert_eq!(handled, true);
+            assert!(matches!(
+                &*widget.sign_in_state.read().unwrap(),
+                SignInState::ChatGptSuccess
+            ));
+        }
     }
 
     #[tokio::test]

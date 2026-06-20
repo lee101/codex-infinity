@@ -97,7 +97,7 @@ pub fn format_response_items_snapshot(items: &[Value], options: &ContextSnapshot
                                         }
                                         if options.strip_agents_md_user_context
                                             && role == "user"
-                                            && text.starts_with("# AGENTS.md instructions for ")
+                                            && text.starts_with("# AGENTS.md instructions")
                                         {
                                             return None;
                                         }
@@ -281,7 +281,7 @@ fn canonicalize_snapshot_text(text: &str) -> String {
     if text.starts_with(PLUGINS_INSTRUCTIONS_OPEN_TAG) {
         return "<PLUGINS_INSTRUCTIONS>".to_string();
     }
-    if text.starts_with("# AGENTS.md instructions for ") {
+    if text.starts_with("# AGENTS.md instructions") {
         return "<AGENTS_MD>".to_string();
     }
     if text.starts_with("<environment_context>") {
@@ -347,6 +347,7 @@ mod tests {
     use super::ContextSnapshotOptions;
     use super::ContextSnapshotRenderMode;
     use super::format_response_items_snapshot;
+    use super::format_snapshot_json_string;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -597,6 +598,19 @@ mod tests {
         assert_eq!(
             rendered,
             "00:message/developer:## Skills\\n- openai-docs: helper (file: <SYSTEM_SKILLS_ROOT>/openai-docs/SKILL.md)"
+        );
+    }
+
+    #[test]
+    fn redacted_text_mode_normalizes_turn_metadata_dynamic_json_strings() {
+        let rendered = format_snapshot_json_string(
+            r#"{"turn_id":"019eaded-ba5c-7d40-8a81-a4dcebc4679e","sandbox":"seccomp","turn_started_at_unix_ms":1781035793002}"#,
+            &ContextSnapshotOptions::default(),
+        );
+
+        assert_eq!(
+            rendered,
+            r#"{"turn_id":"<UUID>","sandbox":"<SANDBOX>","turn_started_at_unix_ms":<UNIX_MS>}"#
         );
     }
 }

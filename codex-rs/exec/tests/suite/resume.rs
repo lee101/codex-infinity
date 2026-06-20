@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 use anyhow::Context;
 use codex_utils_cargo_bin::find_resource;
 use core_test_support::test_codex_exec::test_codex_exec;

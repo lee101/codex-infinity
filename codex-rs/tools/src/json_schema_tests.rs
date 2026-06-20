@@ -3,6 +3,7 @@ use super::JsonSchema;
 use super::JsonSchemaPrimitiveType;
 use super::JsonSchemaType;
 use super::parse_tool_input_schema;
+use super::parse_tool_input_schema_without_compaction;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
@@ -21,6 +22,20 @@ fn parse_tool_input_schema_coerces_boolean_schemas() {
     let schema = parse_tool_input_schema(&serde_json::json!(true)).expect("parse schema");
 
     assert_eq!(schema, JsonSchema::string(/*description*/ None));
+}
+
+#[test]
+fn json_schema_serializes_encrypted_marker() {
+    let schema = JsonSchema::string(Some("Secret value".to_string())).with_encrypted();
+
+    assert_eq!(
+        serde_json::to_value(schema).expect("serialize schema"),
+        serde_json::json!({
+            "type": "string",
+            "description": "Secret value",
+            "encrypted": true,
+        })
+    );
 }
 
 #[test]
@@ -639,6 +654,109 @@ fn parse_tool_input_schema_preserves_nested_any_of_property() {
                     vec![
                         JsonSchema::string(/*description*/ None),
                         JsonSchema::number(/*description*/ None),
+                    ],
+                    /*description*/ None,
+                ),
+            )]),
+            /*required*/ None,
+            /*additional_properties*/ None
+        )
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_preserves_nested_one_of_property() {
+    // Example schema shape:
+    // {
+    //   "type": "object",
+    //   "properties": {
+    //     "query": {
+    //       "oneOf": [
+    //         { "const": "exact" },
+    //         { "type": "number" }
+    //       ]
+    //     }
+    //   }
+    // }
+    //
+    // Expected normalization behavior:
+    // - The nested `oneOf` is preserved.
+    // - Child variants are recursively sanitized, including `const` to `enum`.
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "oneOf": [
+                    { "const": "exact" },
+                    { "type": "number" }
+                ]
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        schema,
+        JsonSchema::object(
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema::one_of(
+                    vec![
+                        JsonSchema::string_enum(
+                            vec![serde_json::json!("exact")],
+                            /*description*/ None,
+                        ),
+                        JsonSchema::number(/*description*/ None),
+                    ],
+                    /*description*/ None,
+                ),
+            )]),
+            /*required*/ None,
+            /*additional_properties*/ None
+        )
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_preserves_nested_all_of_property() {
+    // Example schema shape:
+    // {
+    //   "type": "object",
+    //   "properties": {
+    //     "query": {
+    //       "allOf": [
+    //         { "type": "string" },
+    //         { "description": "unrecognized by itself" }
+    //       ]
+    //     }
+    //   }
+    // }
+    //
+    // Expected normalization behavior:
+    // - The nested `allOf` is preserved structurally rather than flattened.
+    // - Child variants are recursively sanitized.
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "allOf": [
+                    { "type": "string" },
+                    { "description": "unrecognized by itself" }
+                ]
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        schema,
+        JsonSchema::object(
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema::all_of(
+                    vec![
+                        JsonSchema::string(/*description*/ None),
+                        JsonSchema::default(),
                     ],
                     /*description*/ None,
                 ),

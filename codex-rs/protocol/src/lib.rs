@@ -7,6 +7,7 @@ pub use agent_path::AgentPath;
 pub use thread_id::ThreadId;
 pub use tool_name::ToolName;
 pub mod approvals;
+pub mod capabilities;
 pub mod config_types;
 pub mod dynamic_tools;
 pub mod error;

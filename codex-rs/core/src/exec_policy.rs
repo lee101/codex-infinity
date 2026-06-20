@@ -20,9 +20,9 @@ use codex_execpolicy::RuleMatch;
 use codex_execpolicy::blocking_append_allow_prefix_rule;
 use codex_execpolicy::blocking_append_network_rule;
 use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
@@ -205,8 +205,7 @@ pub(crate) struct ExecApprovalRequest<'a> {
     pub(crate) command: &'a [String],
     pub(crate) approval_policy: AskForApproval,
     pub(crate) permission_profile: PermissionProfile,
-    pub(crate) file_system_sandbox_policy: &'a FileSystemSandboxPolicy,
-    pub(crate) sandbox_cwd: &'a Path,
+    pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) sandbox_permissions: SandboxPermissions,
     pub(crate) prefix_rule: Option<Vec<String>>,
 }
@@ -240,8 +239,7 @@ impl ExecPolicyManager {
             command,
             approval_policy,
             permission_profile,
-            file_system_sandbox_policy,
-            sandbox_cwd,
+            windows_sandbox_level,
             sandbox_permissions,
             prefix_rule,
         } = req;
@@ -594,14 +592,13 @@ pub fn render_decision_for_unmatched_command(
         return Decision::Allow;
     }
 
-    // On Windows, ReadOnly sandbox is not a real sandbox, so special-case it
-    // here.
-    let environment_lacks_sandbox_protections = cfg!(windows)
-        && profile_is_managed_read_only(
-            permission_profile,
-            file_system_sandbox_policy,
-            sandbox_cwd,
-        );
+    // When the Windows sandbox backend is disabled, managed filesystem
+    // restrictions are only a policy shape; there is no platform sandbox to
+    // enforce the boundary. Keep that legacy case conservative while still
+    // relying on the real Windows sandbox when it is enabled.
+    let windows_managed_fs_restrictions_without_sandbox_backend = cfg!(windows)
+        && windows_sandbox_level == WindowsSandboxLevel::Disabled
+        && profile_has_managed_filesystem_restrictions(permission_profile);
 
     // If the command is flagged as dangerous or we have no sandbox protection,
     // we should never allow it to run without approval.
@@ -678,20 +675,14 @@ pub fn render_decision_for_unmatched_command(
     }
 }
 
-fn profile_is_managed_read_only(
-    permission_profile: &PermissionProfile,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    sandbox_cwd: &Path,
-) -> bool {
+fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionProfile) -> bool {
+    let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
     matches!(permission_profile, PermissionProfile::Managed { .. })
         && matches!(
             file_system_sandbox_policy.kind,
             FileSystemSandboxKind::Restricted
         )
         && !file_system_sandbox_policy.has_full_disk_write_access()
-        && file_system_sandbox_policy
-            .get_writable_roots_with_cwd(sandbox_cwd)
-            .is_empty()
 }
 
 fn default_policy_path(codex_home: &Path) -> PathBuf {

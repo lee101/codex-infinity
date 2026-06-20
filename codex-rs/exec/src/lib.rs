@@ -51,7 +51,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
@@ -59,6 +60,7 @@ use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::ConfigTomlLoadResult;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_and_loader_overrides;
 use codex_core::config::resolve_oss_provider;
@@ -348,41 +350,26 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cli_kv_overrides.clone(),
         loader_overrides.clone(),
     )
-    .await
-    {
-        Ok(config_toml) => config_toml,
-        Err(err) => {
-            let config_error = err
-                .get_ref()
-                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
-                .map(ConfigLoadError::config_error);
-            if let Some(config_error) = config_error {
-                eprintln!(
-                    "Error loading config.toml:\n{}",
-                    format_config_error_with_source(config_error)
-                );
-            } else {
-                eprintln!("Error loading config.toml: {err}");
-            }
-            std::process::exit(1);
-        }
-    };
+    .await;
+    let bootstrap_config_toml = &bootstrap_config.config_toml;
 
-    let chatgpt_base_url = config_toml
+    let chatgpt_base_url = bootstrap_config_toml
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
-    let cloud_requirements = cloud_requirements_loader_for_storage(
+    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
-        config_toml.cli_auth_credentials_store.unwrap_or_default(),
+        bootstrap_config_toml
+            .cli_auth_credentials_store
+            .unwrap_or_default(),
+        resolve_bootstrap_auth_keyring_backend_kind(&bootstrap_config)?,
         chatgpt_base_url,
     )
     .await;
     let run_cli_overrides = cli_kv_overrides.clone();
     let run_loader_overrides = loader_overrides.clone();
-    let run_cloud_requirements = cloud_requirements.clone();
+    let run_cloud_config_bundle = cloud_config_bundle.clone();
 
     let model_provider = if oss {
         let resolved = resolve_oss_provider(
@@ -414,7 +401,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         None // No model specified, will use the default.
     };
 
-    // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
         review_model: None,
@@ -468,6 +454,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     if let Err(err) = enforce_login_restrictions(&AuthConfig {
         codex_home: config.codex_home.to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
+        keyring_backend_kind: config.auth_keyring_backend_kind(),
         forced_login_method: config.forced_login_method,
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
         chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
@@ -565,6 +552,81 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     .await
 }
 
+async fn build_exec_config<BuildConfig, BuildFuture>(
+    overrides: ConfigOverrides,
+    preserve_headless_approval_policy: bool,
+    build_config: BuildConfig,
+) -> std::io::Result<Config>
+where
+    BuildConfig: Fn(ConfigOverrides) -> BuildFuture,
+    BuildFuture: Future<Output = std::io::Result<Config>>,
+{
+    let build_without_headless_approval_policy = || {
+        build_config(ConfigOverrides {
+            approval_policy: None,
+            ..overrides.clone()
+        })
+    };
+    match build_config(overrides.clone()).await {
+        Ok(config)
+            if config.approvals_reviewer == ApprovalsReviewer::AutoReview
+                && !preserve_headless_approval_policy =>
+        {
+            build_without_headless_approval_policy().await
+        }
+        Ok(config) => Ok(config),
+        Err(headless_error) if !preserve_headless_approval_policy => {
+            match build_without_headless_approval_policy().await {
+                Ok(config) if config.approvals_reviewer == ApprovalsReviewer::AutoReview => {
+                    Ok(config)
+                }
+                Ok(_) | Err(_) => Err(headless_error),
+            }
+        }
+        Err(headless_error) => Err(headless_error),
+    }
+}
+
+#[allow(clippy::print_stderr)]
+async fn load_bootstrap_config_or_exit(
+    codex_home: &Path,
+    cwd: Option<&AbsolutePathBuf>,
+    cli_kv_overrides: Vec<(String, codex_config::TomlValue)>,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    cloud_config_bundle: CloudConfigBundleLoader,
+) -> ConfigTomlLoadResult {
+    match load_config_toml_with_layer_stack(
+        codex_home,
+        cwd,
+        cli_kv_overrides,
+        ConfigLoadOptions {
+            loader_overrides,
+            strict_config,
+            cloud_config_bundle,
+        },
+    )
+    .await
+    {
+        Ok(config_toml) => config_toml,
+        Err(err) => {
+            let config_error = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
+                .map(ConfigLoadError::config_error);
+            if let Some(config_error) = config_error {
+                eprintln!(
+                    "Error loading config.toml:\n{}",
+                    format_config_error_with_source(config_error)
+                );
+            } else {
+                eprintln!("Error loading config.toml: {err}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let ExecRunArgs {
         in_process_start_args,
@@ -610,7 +672,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_effort = config.model_reasoning_effort;
+    let default_effort = config.model_reasoning_effort.clone();
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
         (Some(ExecCommand::Review(review_cli)), _, _) => {
@@ -778,8 +840,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     request_id: request_ids.next(),
                     params: TurnStartParams {
                         thread_id: primary_thread_id_for_span.clone(),
+                        client_user_message_id: None,
                         input: items.into_iter().map(Into::into).collect(),
                         responsesapi_client_metadata: None,
+                        additional_context: None,
                         environments: None,
                         cwd: Some(default_cwd),
                         approval_policy: Some(default_approval_policy.into()),
@@ -1016,7 +1080,7 @@ fn session_configured_from_thread_start_response(
         response.sandbox.to_core(),
         response.permission_profile.clone().map(Into::into),
         response.cwd.clone(),
-        response.reasoning_effort,
+        response.reasoning_effort.clone(),
     )
 }
 
@@ -1035,7 +1099,7 @@ fn session_configured_from_thread_resume_response(
         response.sandbox.to_core(),
         response.permission_profile.clone().map(Into::into),
         response.cwd.clone(),
-        response.reasoning_effort,
+        response.reasoning_effort.clone(),
     )
 }
 
@@ -1068,6 +1132,10 @@ fn session_configured_from_thread_response(
 ) -> Result<SessionConfiguredEvent, String> {
     let session_id = codex_protocol::ThreadId::from_string(thread_id)
         .map_err(|err| format!("thread id `{thread_id}` is invalid: {err}"))?;
+    let parent_thread_id = parent_thread_id
+        .map(ThreadId::from_string)
+        .transpose()
+        .map_err(|err| format!("parent thread id is invalid: {err}"))?;
 
     Ok(SessionConfiguredEvent {
         session_id,
@@ -1102,6 +1170,11 @@ fn should_process_notification(
 ) -> bool {
     match notification {
         ServerNotification::ConfigWarning(_) | ServerNotification::DeprecationNotice(_) => true,
+        // TODO(anp) resolve duplicate startup warnings
+        ServerNotification::Warning(notification) => notification
+            .thread_id
+            .as_deref()
+            .is_none_or(|candidate| candidate == thread_id),
         ServerNotification::Error(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
@@ -1284,6 +1357,7 @@ async fn resolve_resume_thread_id(
                         model_providers: model_providers.clone(),
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
+                        parent_thread_id: None,
                         cwd: None,
                         use_state_db_only: false,
                         search_term: None,
@@ -1348,6 +1422,7 @@ async fn resolve_resume_thread_id(
                     model_providers: model_providers.clone(),
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
+                    parent_thread_id: None,
                     cwd: None,
                     use_state_db_only: false,
                     search_term: Some(session_id.to_string()),

@@ -13,6 +13,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -79,7 +80,6 @@ async fn no_collaboration_instructions_by_default() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -141,7 +141,6 @@ async fn user_input_includes_collaboration_instructions_after_override() -> Resu
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -244,7 +243,6 @@ async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Re
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -373,7 +371,6 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -403,7 +400,6 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -462,7 +458,6 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -492,7 +487,6 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -553,7 +547,6 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -586,7 +579,6 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -648,7 +640,6 @@ async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged()
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -681,7 +672,6 @@ async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged()
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -747,7 +737,6 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     initial
         .codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -762,7 +751,6 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     resumed
         .codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
@@ -821,7 +809,6 @@ async fn empty_collaboration_instructions_are_ignored() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),

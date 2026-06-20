@@ -94,7 +94,6 @@ async fn continue_after_stream_error() {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "first message".into(),
                 text_elements: Vec::new(),
@@ -115,7 +114,6 @@ async fn continue_after_stream_error() {
     // error above, this submission would be rejected/queued indefinitely.
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "follow up".into(),
                 text_elements: Vec::new(),

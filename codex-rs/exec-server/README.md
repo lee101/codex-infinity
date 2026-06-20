@@ -23,6 +23,16 @@ The CLI entrypoint supports:
 
 - `ws://IP:PORT` (default)
 
+Alternatively, API users can instead use `CODEX_API_KEY`;
+Codex sends it as a bearer token on the registration request. For example:
+
+```sh
+CODEX_API_KEY="$OPENAI_API_KEY" \
+codex exec-server \
+  --remote ... \
+  --environment-id "$ENVIRONMENT_ID"
+```
+
 Wire framing:
 
 - websocket: one JSON-RPC message per websocket text frame
@@ -80,7 +90,7 @@ Request params:
 {
   "processId": "proc-1",
   "argv": ["bash", "-lc", "printf 'hello\\n'"],
-  "cwd": "/absolute/working/directory",
+  "cwd": "file:///absolute/working/directory",
   "env": {
     "PATH": "/usr/bin:/bin"
   },
@@ -94,7 +104,7 @@ Field definitions:
 
 - `processId`: caller-chosen stable id for this process within the connection.
 - `argv`: command vector. It must be non-empty.
-- `cwd`: absolute working directory used for the child process.
+- `cwd`: `file:` URI for the child process working directory.
 - `env`: environment variables passed to the child process.
 - `tty`: when `true`, spawn a PTY-backed interactive process.
 - `pipeStdin`: when `true`, keep non-PTY stdin writable via `process/write`.
@@ -261,13 +271,17 @@ Params:
 
 ## Filesystem RPCs
 
-Filesystem methods use absolute paths and return JSON-RPC errors for invalid
-or unavailable paths:
+Filesystem methods use canonical `file:` URIs and return JSON-RPC errors for
+invalid or unavailable paths. For compatibility, requests also accept native
+absolute path strings and normalize them to `file:` URIs:
 
 - `fs/readFile`
+- `fs/open`, `fs/readBlock`, and `fs/close` (internal transport for
+  `ExecutorFileSystem::read_file_stream`)
 - `fs/writeFile`
 - `fs/createDirectory`
 - `fs/getMetadata`
+- `fs/canonicalize`
 - `fs/readDirectory`
 - `fs/remove`
 - `fs/copy`
@@ -326,7 +340,7 @@ Initialize:
 Start a process:
 
 ```json
-{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"/tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
+{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"file:///tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
 {"id":2,"result":{"processId":"proc-1"}}
 {"method":"process/output","params":{"processId":"proc-1","seq":1,"stream":"stdout","chunk":"cmVhZHkK"}}
 ```

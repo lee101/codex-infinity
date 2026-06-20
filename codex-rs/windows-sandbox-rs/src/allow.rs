@@ -95,7 +95,8 @@ pub fn compute_allow_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use std::fs;
     use tempfile::TempDir;
@@ -108,14 +109,20 @@ mod tests {
         let _ = fs::create_dir_all(&command_cwd);
         let _ = fs::create_dir_all(&extra_root);
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![AbsolutePathBuf::try_from(extra_root.as_path()).unwrap()],
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        };
+        let writable_roots = vec![AbsolutePathBuf::try_from(extra_root.as_path()).unwrap()];
+        let permission_profile = workspace_write_profile(
+            &writable_roots,
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ false,
+        );
+        let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &HashMap::new(),
+        );
 
         assert!(paths
             .allow
@@ -134,16 +141,20 @@ mod tests {
         let _ = fs::create_dir_all(&command_cwd);
         let _ = fs::create_dir_all(&temp_dir);
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        );
         let mut env_map = HashMap::new();
         env_map.insert("TEMP".into(), temp_dir.to_string_lossy().to_string());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &env_map);
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &env_map,
+        );
 
         assert!(paths
             .allow
@@ -161,14 +172,19 @@ mod tests {
         let git_dir = command_cwd.join(".git");
         let _ = fs::create_dir_all(&git_dir);
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        );
+        let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &HashMap::new(),
+        );
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
@@ -188,14 +204,19 @@ mod tests {
         let _ = fs::create_dir_all(&command_cwd);
         let _ = fs::write(&git_file, "gitdir: .git/worktrees/example");
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        );
+        let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &HashMap::new(),
+        );
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
@@ -216,14 +237,19 @@ mod tests {
         let _ = fs::create_dir_all(&codex_dir);
         let _ = fs::create_dir_all(&agents_dir);
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        );
+        let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &HashMap::new(),
+        );
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
@@ -244,14 +270,19 @@ mod tests {
         let command_cwd = tmp.path().join("workspace");
         let _ = fs::create_dir_all(&command_cwd);
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        );
+        let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths = compute_allow_paths(
+            &permission_profile,
+            workspace_roots.as_slice(),
+            &command_cwd,
+            &HashMap::new(),
+        );
         assert_eq!(paths.allow.len(), 1);
         assert!(paths.deny.is_empty(), "no deny when protected dirs are absent");
     }

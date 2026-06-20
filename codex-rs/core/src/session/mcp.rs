@@ -113,16 +113,11 @@ impl Session {
 
         self.services
             .mcp_connection_manager
-            .read()
-            .await
+            .load_full()
             .resolve_elicitation(server_name, id, response)
             .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP resource calls are serialized through the session-owned manager guard"
-    )]
     pub async fn list_resources(
         &self,
         server: &str,
@@ -130,16 +125,11 @@ impl Session {
     ) -> anyhow::Result<ListResourcesResult> {
         self.services
             .mcp_connection_manager
-            .read()
-            .await
+            .load_full()
             .list_resources(server, params)
             .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP resource calls are serialized through the session-owned manager guard"
-    )]
     pub async fn list_resource_templates(
         &self,
         server: &str,
@@ -147,16 +137,11 @@ impl Session {
     ) -> anyhow::Result<ListResourceTemplatesResult> {
         self.services
             .mcp_connection_manager
-            .read()
-            .await
+            .load_full()
             .list_resource_templates(server, params)
             .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP resource calls are serialized through the session-owned manager guard"
-    )]
     pub async fn read_resource(
         &self,
         server: &str,
@@ -164,16 +149,11 @@ impl Session {
     ) -> anyhow::Result<ReadResourceResult> {
         self.services
             .mcp_connection_manager
-            .read()
-            .await
+            .load_full()
             .read_resource(server, params)
             .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP tool calls are serialized through the session-owned manager guard"
-    )]
     pub async fn call_tool(
         &self,
         server: &str,
@@ -183,8 +163,7 @@ impl Session {
     ) -> anyhow::Result<CallToolResult> {
         self.services
             .mcp_connection_manager
-            .read()
-            .await
+            .load_full()
             .call_tool(server, tool, arguments, meta)
             .await
     }
@@ -224,15 +203,19 @@ impl Session {
         {
             let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
             guard.cancel();
-            *guard = CancellationToken::new();
-        }
-        let (refreshed_manager, cancel_token) = McpConnectionManager::new(
+            let cancellation_token = CancellationToken::new();
+            *guard = cancellation_token.clone();
+            cancellation_token
+        };
+        let refreshed_manager = McpConnectionManager::new(
             &mcp_servers,
             store_mode,
+            keyring_backend_kind,
             auth_statuses,
             &turn_context.approval_policy,
             turn_context.sub_id.clone(),
             self.get_tx_event(),
+            mcp_startup_cancellation_token,
             turn_context.permission_profile(),
             McpRuntimeEnvironment::new(
                 turn_context
@@ -271,6 +254,7 @@ impl Session {
         let McpServerRefreshConfig {
             mcp_servers,
             mcp_oauth_credentials_store_mode,
+            auth_keyring_backend_kind,
         } = refresh_config;
 
         let mcp_servers =
@@ -290,6 +274,14 @@ impl Session {
                 return;
             }
         };
+        let keyring_backend_kind =
+            match serde_json::from_value::<AuthKeyringBackendKind>(auth_keyring_backend_kind) {
+                Ok(kind) => kind,
+                Err(err) => {
+                    warn!("failed to parse MCP auth keyring backend refresh config: {err}");
+                    return;
+                }
+            };
 
         self.refresh_mcp_servers_inner(turn_context, mcp_servers, store_mode)
             .await;

@@ -69,7 +69,7 @@ impl ToolHandler for Handler {
             .send_event(
                 &turn,
                 CollabWaitingEndEvent {
-                    sender_thread_id: session.conversation_id,
+                    sender_thread_id: session.thread_id,
                     call_id,
                     agent_statuses: Vec::new(),
                     statuses: HashMap::new(),
@@ -95,15 +95,15 @@ pub(crate) struct WaitAgentResult {
 }
 
 impl WaitAgentResult {
-    fn from_timed_out(timed_out: bool) -> Self {
-        let message = if timed_out {
-            "Wait timed out."
-        } else {
-            "Wait completed."
+    fn from_outcome(outcome: WaitOutcome) -> Self {
+        let message = match outcome {
+            WaitOutcome::MailboxActivity => "Wait completed.",
+            WaitOutcome::Steered => "Wait interrupted by new input.",
+            WaitOutcome::TimedOut => "Wait timed out.",
         };
         Self {
             message: message.to_string(),
-            timed_out,
+            timed_out: outcome == WaitOutcome::TimedOut,
         }
     }
 }

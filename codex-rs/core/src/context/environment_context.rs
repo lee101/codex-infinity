@@ -1,5 +1,11 @@
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
 use std::path::PathBuf;
@@ -13,6 +19,7 @@ pub(crate) struct EnvironmentContext {
     pub(crate) current_date: Option<String>,
     pub(crate) timezone: Option<String>,
     pub(crate) network: Option<NetworkContext>,
+    pub(crate) filesystem: Option<FileSystemContext>,
     pub(crate) subagents: Option<String>,
 }
 
@@ -46,6 +53,7 @@ impl EnvironmentContext {
             current_date,
             timezone,
             network,
+            filesystem,
             subagents,
         }
     }
@@ -89,6 +97,7 @@ impl EnvironmentContext {
             after.current_date.clone(),
             after.timezone.clone(),
             network,
+            filesystem,
             /*subagents*/ None,
         )
     }
@@ -101,7 +110,12 @@ impl EnvironmentContext {
             turn_context.timezone.clone(),
             Self::network_from_turn_context(turn_context),
             /*subagents*/ None,
-        )
+        );
+        context.filesystem = Some(FileSystemContext::from_permission_profile(
+            &turn_context.permission_profile,
+            &turn_context.config.effective_workspace_roots(),
+        ));
+        context
     }
 
     pub(crate) fn from_turn_context_item(
@@ -114,6 +128,7 @@ impl EnvironmentContext {
             turn_context_item.current_date.clone(),
             turn_context_item.timezone.clone(),
             Self::network_from_turn_context_item(turn_context_item),
+            Self::filesystem_from_turn_context_item(turn_context_item),
             /*subagents*/ None,
         )
     }
@@ -159,6 +174,30 @@ impl EnvironmentContext {
             denied_domains.clone(),
         ))
     }
+
+    fn filesystem_from_turn_context_item(
+        turn_context_item: &TurnContextItem,
+    ) -> Option<FileSystemContext> {
+        Some(FileSystemContext::from_permission_profile(
+            &turn_context_item.permission_profile(),
+            &workspace_roots_from_turn_context_item(turn_context_item),
+        ))
+    }
+}
+
+fn workspace_roots_from_turn_context_item(
+    turn_context_item: &TurnContextItem,
+) -> Vec<AbsolutePathBuf> {
+    if let Some(workspace_roots) = turn_context_item.workspace_roots.as_ref() {
+        return workspace_roots.clone();
+    }
+
+    // Older rollout items did not persist workspace roots. Fall back to the
+    // legacy cwd binding only when reconstructing that historical context.
+    match AbsolutePathBuf::try_from(turn_context_item.cwd.clone()) {
+        Ok(cwd) => vec![cwd],
+        Err(_) => Vec::new(),
+    }
 }
 
 impl ContextualUserFragment for EnvironmentContext {
@@ -194,6 +233,9 @@ impl ContextualUserFragment for EnvironmentContext {
                 // TODO(mbolin): Include this line if it helps the model.
                 // lines.push("  <network enabled=\"false\" />".to_string());
             }
+        }
+        if let Some(filesystem) = &self.filesystem {
+            lines.push(format!("  {}", filesystem.render()));
         }
         if let Some(subagents) = &self.subagents {
             lines.push("  <subagents>".to_string());

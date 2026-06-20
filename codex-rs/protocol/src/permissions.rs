@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
+use codex_utils_path_uri::PathUri;
 use globset::GlobBuilder;
 use globset::GlobMatcher;
 use schemars::JsonSchema;
@@ -174,9 +175,29 @@ impl FileSystemSpecialPath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
-pub struct FileSystemSandboxEntry {
-    pub path: FileSystemPath,
+pub struct FileSystemSandboxEntry<PathType = AbsolutePathBuf> {
+    pub path: FileSystemPath<PathType>,
     pub access: FileSystemAccessMode,
+}
+
+impl From<FileSystemSandboxEntry<AbsolutePathBuf>> for FileSystemSandboxEntry<PathUri> {
+    fn from(value: FileSystemSandboxEntry<AbsolutePathBuf>) -> Self {
+        FileSystemSandboxEntry {
+            path: value.path.into(),
+            access: value.access,
+        }
+    }
+}
+
+impl TryFrom<FileSystemSandboxEntry<PathUri>> for FileSystemSandboxEntry<AbsolutePathBuf> {
+    type Error = io::Error;
+
+    fn try_from(value: FileSystemSandboxEntry<PathUri>) -> Result<Self, Self::Error> {
+        Ok(FileSystemSandboxEntry {
+            path: value.path.try_into()?,
+            access: value.access,
+        })
+    }
 }
 
 #[derive(
@@ -298,9 +319,9 @@ impl ReadDenyMatcher {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
-pub enum FileSystemPath {
+pub enum FileSystemPath<PathType = AbsolutePathBuf> {
     Path {
-        path: AbsolutePathBuf,
+        path: PathType,
     },
     /// A git-style glob pattern. Pattern entries currently support
     /// FileSystemAccessMode::None only.
@@ -314,20 +335,15 @@ pub enum FileSystemPath {
 
 impl Default for FileSystemSandboxPolicy {
     fn default() -> Self {
-        Self {
-            kind: FileSystemSandboxKind::Restricted,
-            glob_scan_max_depth: None,
-            entries: vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::Root,
-                },
-                access: FileSystemAccessMode::Read,
-            }],
-        }
+        Self::read_only()
     }
 }
 
 impl FileSystemSandboxPolicy {
+    pub fn read_only() -> Self {
+        Self::restricted(read_only_file_system_entries())
+    }
+
     pub fn unrestricted() -> Self {
         Self {
             kind: FileSystemSandboxKind::Unrestricted,

@@ -11,6 +11,7 @@ use codex_utils_cli::CliConfigOverrides;
 use supports_color::Stream;
 
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
+    let is_fatal = matches!(&exit_info.exit_reason, ExitReason::Fatal(_));
     let AppExitInfo {
         token_usage,
         thread_id,
@@ -31,6 +32,8 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
             resume_cmd
         };
         lines.push(format!("To continue this session, run {command}"));
+    } else if is_fatal && let Some(thread_id) = thread_id {
+        lines.push(format!("Session ID: {thread_id}"));
     }
 
     lines
@@ -61,17 +64,21 @@ fn main() -> anyhow::Result<()> {
             /*remote_auth_token*/ None,
         )
         .await?;
-        match exit_info.exit_reason {
+        let is_fatal = match &exit_info.exit_reason {
             ExitReason::Fatal(message) => {
                 eprintln!("ERROR: {message}");
-                std::process::exit(1);
+                true
             }
-            ExitReason::UserRequested => {}
-        }
+            ExitReason::UserRequested => false,
+        };
 
         let color_enabled = supports_color::on(Stream::Stdout).is_some();
         for line in format_exit_messages(exit_info, color_enabled) {
             println!("{line}");
+        }
+        if is_fatal {
+            std::io::stdout().flush()?;
+            std::process::exit(1);
         }
         Ok(())
     })

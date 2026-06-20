@@ -9,6 +9,7 @@ use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tracing::info;
+use tracing::instrument;
 use tracing::warn;
 
 use crate::SkillLoadOutcome;
@@ -50,6 +51,7 @@ impl SkillsLoadInput {
 pub struct SkillsManager {
     codex_home: AbsolutePathBuf,
     restriction_product: Option<Product>,
+    extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_by_cwd: RwLock<HashMap<AbsolutePathBuf, SkillLoadOutcome>>,
     cache_by_config: RwLock<HashMap<ConfigSkillsCacheKey, SkillLoadOutcome>>,
 }
@@ -67,6 +69,7 @@ impl SkillsManager {
         let manager = Self {
             codex_home,
             restriction_product,
+            extra_roots: RwLock::new(Vec::new()),
             cache_by_cwd: RwLock::new(HashMap::new()),
             cache_by_config: RwLock::new(HashMap::new()),
         };
@@ -80,12 +83,24 @@ impl SkillsManager {
         manager
     }
 
+    pub fn set_extra_roots(&self, extra_roots: Vec<AbsolutePathBuf>) {
+        {
+            let mut roots = self
+                .extra_roots
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *roots = extra_roots;
+        }
+        self.clear_cache();
+    }
+
     /// Load skills for an already-constructed [`Config`], avoiding any additional config-layer
     /// loading.
     ///
     /// This path uses a cache keyed by the effective skill-relevant config state rather than just
     /// cwd so role-local and session-local skill overrides cannot bleed across sessions that happen
     /// to share a directory.
+    #[instrument(level = "trace", skip_all)]
     pub async fn skills_for_config(
         &self,
         input: &SkillsLoadInput,
@@ -117,6 +132,7 @@ impl SkillsManager {
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
+            self.extra_roots(),
         )
         .await;
         if !input.bundled_skills_enabled {
@@ -155,6 +171,7 @@ impl SkillsManager {
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
+            self.extra_roots(),
         )
         .await;
         if !bundled_skills_enabled_from_stack(&input.config_layer_stack) {
@@ -183,6 +200,7 @@ impl SkillsManager {
         outcome
     }
 
+    #[instrument(level = "trace", skip_all)]
     async fn build_skill_outcome(
         &self,
         roots: Vec<SkillRoot>,
@@ -233,6 +251,13 @@ impl SkillsManager {
         match self.cache_by_config.read() {
             Ok(cache) => cache.get(cache_key).cloned(),
             Err(err) => err.into_inner().get(cache_key).cloned(),
+        }
+    }
+
+    fn extra_roots(&self) -> Vec<AbsolutePathBuf> {
+        match self.extra_roots.read() {
+            Ok(roots) => roots.clone(),
+            Err(err) => err.into_inner().clone(),
         }
     }
 }

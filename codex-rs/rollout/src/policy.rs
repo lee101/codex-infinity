@@ -14,7 +14,8 @@ pub enum EventPersistenceMode {
 pub fn is_persisted_response_item(item: &RolloutItem, mode: EventPersistenceMode) -> bool {
     match item {
         RolloutItem::ResponseItem(item) => should_persist_response_item(item),
-        RolloutItem::EventMsg(ev) => should_persist_event_msg(ev, mode),
+        RolloutItem::InterAgentCommunication(_) => true,
+        RolloutItem::EventMsg(ev) => should_persist_event_msg(ev),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
         RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {
             true
@@ -27,6 +28,7 @@ pub fn is_persisted_response_item(item: &RolloutItem, mode: EventPersistenceMode
 pub fn should_persist_response_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { .. }
+        | ResponseItem::AgentMessage { .. }
         | ResponseItem::Reasoning { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
@@ -55,40 +57,17 @@ pub fn should_persist_response_item_for_memories(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. } => true,
-        ResponseItem::Reasoning { .. }
+        ResponseItem::AgentMessage { .. }
+        | ResponseItem::Reasoning { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::Other => false,
     }
 }
 
-/// Whether an `EventMsg` should be persisted in rollout files for the
-/// provided persistence `mode`.
+/// Whether an `EventMsg` should be persisted in rollout files.
 #[inline]
-pub fn should_persist_event_msg(ev: &EventMsg, mode: EventPersistenceMode) -> bool {
-    match mode {
-        EventPersistenceMode::Limited => should_persist_event_msg_limited(ev),
-        EventPersistenceMode::Extended => should_persist_event_msg_extended(ev),
-    }
-}
-
-fn should_persist_event_msg_limited(ev: &EventMsg) -> bool {
-    matches!(
-        event_msg_persistence_mode(ev),
-        Some(EventPersistenceMode::Limited)
-    )
-}
-
-fn should_persist_event_msg_extended(ev: &EventMsg) -> bool {
-    matches!(
-        event_msg_persistence_mode(ev),
-        Some(EventPersistenceMode::Limited) | Some(EventPersistenceMode::Extended)
-    )
-}
-
-/// Returns the minimum persistence mode that includes this event.
-/// `None` means the event should never be persisted.
-fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
+pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
     match ev {
         EventMsg::UserMessage(_)
         | EventMsg::AgentMessage(_)
@@ -106,14 +85,14 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::TurnComplete(_)
         | EventMsg::ImageGenerationEnd(_) => Some(EventPersistenceMode::Limited),
         EventMsg::ItemCompleted(event) => {
-            // Plan items are derived from streaming tags and are not part of the
-            // raw ResponseItem history, so we persist their completion to replay
-            // them on resume without bloating rollouts with every item lifecycle.
-            if matches!(event.item, codex_protocol::items::TurnItem::Plan(_)) {
-                Some(EventPersistenceMode::Limited)
-            } else {
-                None
-            }
+            // These items have no equivalent raw ResponseItem or legacy event,
+            // so persist their completion for replay without retaining every
+            // item lifecycle event.
+            matches!(
+                event.item,
+                codex_protocol::items::TurnItem::Plan(_)
+                    | codex_protocol::items::TurnItem::Sleep(_)
+            )
         }
         EventMsg::Error(_)
         | EventMsg::GuardianAssessment(_)
@@ -128,8 +107,8 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
-        | EventMsg::DynamicToolCallResponse(_) => Some(EventPersistenceMode::Extended),
-        EventMsg::Warning(_)
+        | EventMsg::DynamicToolCallResponse(_)
+        | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)

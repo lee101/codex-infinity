@@ -16,22 +16,18 @@ use super::ToolRouter;
 use super::ToolRouterParams;
 
 #[tokio::test]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "test builds a router from session-owned MCP manager state"
-)]
 async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow::Result<()> {
     let (session, turn) = make_session_and_context().await;
     let mcp_tools = session
         .services
         .mcp_connection_manager
-        .read()
-        .await
+        .load_full()
         .list_all_tools()
         .await;
     let router = ToolRouter::from_config(
         &turn.tools_config,
         ToolRouterParams {
+            tool_suggest_candidates: None,
             deferred_mcp_tools: None,
             mcp_tools: Some(mcp_tools),
             unavailable_called_tools: Vec::new(),
@@ -39,6 +35,7 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
             discoverable_tools: None,
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     let parallel_tool_name = ["shell", "local_shell", "exec_command", "shell_command"]
@@ -105,6 +102,7 @@ async fn mcp_parallel_support_uses_exact_payload_server() -> anyhow::Result<()> 
     let router = ToolRouter::from_config(
         &turn.tools_config,
         ToolRouterParams {
+            tool_suggest_candidates: None,
             deferred_mcp_tools: None,
             mcp_tools: None,
             unavailable_called_tools: Vec::new(),
@@ -112,6 +110,7 @@ async fn mcp_parallel_support_uses_exact_payload_server() -> anyhow::Result<()> 
             discoverable_tools: None,
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     let deferred_call = ToolCall {
@@ -144,34 +143,37 @@ async fn model_visible_specs_filter_deferred_dynamic_tools() -> anyhow::Result<(
     let (_, turn) = make_session_and_context().await;
     let hidden_tool = "hidden_dynamic_tool";
     let visible_tool = "visible_dynamic_tool";
-    let dynamic_tools = vec![
-        DynamicToolSpec {
-            namespace: Some("codex_app".to_string()),
-            name: hidden_tool.to_string(),
-            description: "Hidden until discovered.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
+    let dynamic_tools = vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Codex app tools.".to_string(),
+        tools: vec![
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: hidden_tool.to_string(),
+                description: "Hidden until discovered.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: true,
             }),
-            defer_loading: true,
-        },
-        DynamicToolSpec {
-            namespace: Some("codex_app".to_string()),
-            name: visible_tool.to_string(),
-            description: "Visible immediately.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: visible_tool.to_string(),
+                description: "Visible immediately.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: false,
             }),
-            defer_loading: false,
-        },
-    ];
+        ],
+    })];
 
     let router = ToolRouter::from_config(
         &turn.tools_config,
         ToolRouterParams {
+            tool_suggest_candidates: None,
             deferred_mcp_tools: None,
             mcp_tools: None,
             unavailable_called_tools: Vec::new(),
@@ -179,6 +181,7 @@ async fn model_visible_specs_filter_deferred_dynamic_tools() -> anyhow::Result<(
             discoverable_tools: None,
             dynamic_tools: &dynamic_tools,
         },
+        &Default::default(),
     );
 
     assert!(

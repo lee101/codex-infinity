@@ -30,6 +30,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -40,13 +41,13 @@ fn annotations(
     destructive: Option<bool>,
     open_world: Option<bool>,
 ) -> ToolAnnotations {
-    ToolAnnotations {
-        destructive_hint: destructive,
-        idempotent_hint: None,
-        open_world_hint: open_world,
-        read_only_hint: read_only,
-        title: None,
-    }
+    ToolAnnotations::from_raw(
+        /*title*/ None,
+        read_only,
+        destructive,
+        /*idempotent_hint*/ None,
+        open_world,
+    )
 }
 
 fn approval_metadata(
@@ -502,7 +503,7 @@ async fn approval_elicitation_request_uses_message_override_and_preserves_tool_p
     assert_eq!(
         request,
         McpServerElicitationRequestParams {
-            thread_id: session.conversation_id.to_string(),
+            thread_id: session.thread_id.to_string(),
             turn_id: Some(turn_context.sub_id),
             server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
             request: McpServerElicitationRequest::Form {
@@ -1411,6 +1412,7 @@ async fn persist_codex_app_tool_approval_writes_tool_override() {
                 "calendar".to_string(),
                 AppConfig {
                     enabled: true,
+                    approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
                     default_tools_approval_mode: None,
@@ -1671,7 +1673,7 @@ async fn approve_mode_skips_when_annotations_do_not_require_approval() {
         &turn_context,
         "call-1",
         &invocation,
-        "mcp__test__tool",
+        &HookToolName::new("mcp__test__tool"),
         Some(&metadata),
         AppToolApproval::Approve,
     )
@@ -1744,7 +1746,7 @@ async fn guardian_mode_skips_auto_when_annotations_do_not_require_approval() {
         &turn_context,
         "call-guardian",
         &invocation,
-        "mcp__test__tool",
+        &HookToolName::new("mcp__test__tool"),
         Some(&metadata),
         AppToolApproval::Auto,
     )
@@ -1800,7 +1802,7 @@ async fn permission_request_hook_allows_mcp_tool_call() {
         &turn_context,
         "call-mcp-hook",
         &invocation,
-        "mcp__memory__create_entities",
+        &HookToolName::new("mcp__memory__create_entities"),
         Some(&metadata),
         AppToolApproval::Auto,
     )
@@ -1860,7 +1862,7 @@ async fn permission_request_hook_uses_hook_tool_name_without_metadata() {
         &turn_context,
         "call-mcp-hook-no-metadata",
         &invocation,
-        "mcp__memory__create_entities",
+        &HookToolName::new("mcp__memory__create_entities"),
         /*metadata*/ None,
         AppToolApproval::Auto,
     )
@@ -1937,7 +1939,7 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval() {
         &turn_context,
         "call-mcp-remembered",
         &invocation,
-        "mcp__memory__create_entities",
+        &HookToolName::new("mcp__memory__create_entities"),
         Some(&metadata),
         AppToolApproval::Auto,
     )
@@ -2017,7 +2019,7 @@ async fn guardian_mode_mcp_denial_returns_rationale_message() {
         &turn_context,
         "call-guardian-deny",
         &invocation,
-        "mcp__test__tool",
+        &HookToolName::new("mcp__test__tool"),
         Some(&metadata),
         AppToolApproval::Auto,
     )
@@ -2074,7 +2076,7 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
                 &turn_context,
                 "call-prompt",
                 &invocation,
-                "mcp__test__tool",
+                &HookToolName::new("mcp__test__tool"),
                 Some(&metadata),
                 AppToolApproval::Prompt,
             )
@@ -2375,7 +2377,7 @@ async fn full_access_mode_skips_arc_monitor_for_all_approval_modes() {
             &turn_context,
             "call-2",
             &invocation,
-            "mcp__test__tool",
+            &HookToolName::new("mcp__test__tool"),
             Some(&metadata),
             approval_mode,
         )

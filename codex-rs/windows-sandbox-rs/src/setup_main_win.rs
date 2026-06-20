@@ -69,6 +69,8 @@ mod read_acl_mutex;
 mod sandbox_users;
 use read_acl_mutex::acquire_read_acl_mutex;
 use read_acl_mutex::read_acl_mutex_exists;
+use sandbox_users::commit_setup_marker;
+use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
 use sandbox_users::resolve_sid;
@@ -100,6 +102,7 @@ struct Payload {
 enum SetupMode {
     #[default]
     Full,
+    ProvisionOnly,
     ReadAclsOnly,
 }
 
@@ -441,8 +444,19 @@ fn real_main() -> Result<()> {
 fn run_setup(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<()> {
     match payload.mode {
         SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
+        SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
         SetupMode::Full => run_setup_full(payload, log, sbx_dir),
+    }?;
+    if writes_setup_marker {
+        commit_setup_marker(
+            &payload.codex_home,
+            &payload.offline_username,
+            &payload.online_username,
+            &payload.proxy_ports,
+            payload.allow_local_binding,
+        )?;
     }
+    Ok(())
 }
 
 fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
@@ -804,24 +818,7 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         }
     }
 
-    lock_sandbox_dir(
-        &sandbox_bin_dir(&payload.codex_home),
-        &payload.real_user,
-        &sandbox_group_sid,
-        GRANT_ACCESS,
-        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        log,
-    )
-    .map_err(|err| {
-        anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperSandboxLockFailed,
-            format!(
-                "lock sandbox bin dir {} failed: {err}",
-                sandbox_bin_dir(&payload.codex_home).display()
-            ),
-        ))
-    })?;
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
 
     if refresh_only {
         log_line(
@@ -834,46 +831,7 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         )?;
     }
     if !refresh_only {
-        lock_sandbox_dir(
-            &sandbox_dir(&payload.codex_home),
-            &payload.real_user,
-            &sandbox_group_sid,
-            GRANT_ACCESS,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-            log,
-        )
-        .map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperSandboxLockFailed,
-                format!(
-                    "lock sandbox dir {} failed: {err}",
-                    sandbox_dir(&payload.codex_home).display()
-                ),
-            ))
-        })?;
-        lock_sandbox_dir(
-            &sandbox_secrets_dir(&payload.codex_home),
-            &payload.real_user,
-            &sandbox_group_sid,
-            DENY_ACCESS,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-            log,
-        )
-        .map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperSandboxLockFailed,
-                format!(
-                    "lock sandbox secrets dir {} failed: {err}",
-                    sandbox_secrets_dir(&payload.codex_home).display()
-                ),
-            ))
-        })?;
-        let legacy_users = sandbox_dir(&payload.codex_home).join("sandbox_users.json");
-        if legacy_users.exists() {
-            let _ = std::fs::remove_file(&legacy_users);
-        }
+        lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
     }
 
     unsafe {

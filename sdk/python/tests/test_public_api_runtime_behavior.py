@@ -150,7 +150,7 @@ def test_codex_init_failure_closes_client(monkeypatch: pytest.MonkeyPatch) -> No
             self._closed = True
             closed.append(True)
 
-    monkeypatch.setattr(public_api_module, "AppServerClient", FakeClient)
+    monkeypatch.setattr(public_api_module, "CodexClient", FakeClient)
 
     with pytest.raises(RuntimeError, match="missing required metadata"):
         Codex()
@@ -563,6 +563,40 @@ def test_async_thread_run_returns_none_when_only_commentary_messages_complete() 
         assert result.items == [commentary_notification.payload.item]
 
     asyncio.run(scenario())
+
+
+def test_sandbox_presets_serialize_for_threads_and_turns() -> None:
+    """One public sandbox enum should map to both stable wire representations."""
+    assert {
+        sandbox.name: public_api_module._sandbox_mode(sandbox).value for sandbox in Sandbox
+    } == {
+        "read_only": "read-only",
+        "workspace_write": "workspace-write",
+        "full_access": "danger-full-access",
+    }
+    assert {
+        sandbox.name: public_api_module._sandbox_policy(sandbox).model_dump(
+            by_alias=True,
+            mode="json",
+        )
+        for sandbox in Sandbox
+    } == {
+        "read_only": {"networkAccess": False, "type": "readOnly"},
+        "workspace_write": {
+            "excludeSlashTmp": False,
+            "excludeTmpdirEnvVar": False,
+            "networkAccess": False,
+            "type": "workspaceWrite",
+            "writableRoots": [],
+        },
+        "full_access": {"type": "dangerFullAccess"},
+    }
+
+
+def test_raw_sandbox_strings_are_rejected() -> None:
+    """Callers should use the discoverable enum rather than memorizing values."""
+    with pytest.raises(ValueError, match="Sandbox\\.workspace_write"):
+        public_api_module._sandbox_mode("workspace")  # type: ignore[arg-type]
 
 
 def test_retry_examples_compare_status_with_enum() -> None:

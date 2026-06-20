@@ -1,4 +1,4 @@
-# Codex CLI (Rust Implementation)
+# Codex CLI
 
 > **New:** `--auto-next-steps`, `--auto-next-idea`, and `--auto-next-goal` let Codex keep going without manual prompts.
 > Use `--auto-next-steps` to have Codex automatically continue with whatever natural follow-up work (including running relevant tests) makes sense after each response.  

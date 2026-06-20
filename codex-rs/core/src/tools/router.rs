@@ -5,6 +5,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
@@ -50,6 +51,18 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) parallel_mcp_server_names: HashSet<String>,
     pub(crate) discoverable_tools: Option<Vec<DiscoverableTool>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolSuggestPresentation {
+    ListTool,
+    RecommendationContext,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolSuggestCandidates {
+    pub(crate) tools: Vec<DiscoverableTool>,
+    pub(crate) presentation: ToolSuggestPresentation,
 }
 
 impl ToolRouter {
@@ -170,6 +183,12 @@ impl ToolRouter {
             ToolPayload::Mcp { server, .. } => self.parallel_mcp_server_names.contains(server),
             _ => self.configured_tool_supports_parallel(&call.tool_name),
         }
+    }
+
+    pub fn tool_waits_for_runtime_cancellation(&self, call: &ToolCall) -> bool {
+        self.registry
+            .waits_for_runtime_cancellation(&call.tool_name)
+            .unwrap_or(false)
     }
 
     #[instrument(level = "trace", skip_all, err)]

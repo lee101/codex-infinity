@@ -23,7 +23,7 @@ Similar to [MCP](https://modelcontextprotocol.io/), `codex app-server` supports 
 
 Supported transports:
 
-- stdio (`--listen stdio://`, default): newline-delimited JSON (JSONL)
+- stdio (`--stdio` or `--listen stdio://`, default): newline-delimited JSON (JSONL)
 - websocket (`--listen ws://IP:PORT`): one JSON-RPC message per websocket text frame (**experimental / unsupported**)
 - unix socket (`--listen unix://` or `--listen unix://PATH`): websocket connections over `$CODEX_HOME/app-server-control/app-server-control.sock` or a custom socket path, using the standard HTTP Upgrade handshake
 - off (`--listen off`): do not expose a local transport
@@ -159,20 +159,24 @@ Example with notification opt-out:
 - `thread/goal/cleared` — notification emitted whenever a thread goal is removed.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
 - `thread/archive` — move a thread’s rollout file into the archived directory and attempt to move any spawned descendant thread rollout files; returns `{}` on success and emits `thread/archived` for each archived thread.
+- `thread/delete` — hard-delete an active or archived thread and any spawned descendant threads; returns `{}` on success and emits `thread/deleted` for each deleted thread.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server keeps the thread loaded and unloads it only after it has had no subscribers and no thread activity for 30 minutes, then emits `thread/closed`.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
 - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
+- `thread/backgroundTerminals/list` — list running background terminals for a loaded thread (experimental; requires `capabilities.experimentalApi`); returns `data` with the running terminal ids.
+- `thread/backgroundTerminals/terminate` — terminate one running background terminal by app-server `processId` (experimental; requires `capabilities.experimentalApi`); returns whether a process was terminated.
 - `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. Prefer `permissionProfile` for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissionProfile`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
 - `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success.
-- `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. Review and manual compaction turns reject `turn/steer`.
+- `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
-- `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`.
+- `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, optionally pass `model` and `version` to override configured realtime selection for this session only, and pass `includeStartupContext: false` to omit Codex's generated startup context. By default, automatic Codex text follows the protocol's speakable output path. Pass `codexResponsesAsItems: true` to send automatic Codex responses as realtime conversation items instead, and optionally pass `codexResponseItemPrefix` to prepend experiment instructions to those items. Returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`.
 - `thread/realtime/appendAudio` — append an input audio chunk to the active realtime session (experimental); returns `{}`.
-- `thread/realtime/appendText` — append text input to the active realtime session (experimental); returns `{}`.
+- `thread/realtime/appendText` — append text input to the active realtime session with a required `role` of `user` or `developer` (experimental); returns `{}`. Older clients that omit `role` default to `user`.
+- `thread/realtime/appendSpeech` — append text that the realtime model should speak to the user (experimental); returns `{}`.
 - `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`.
 - `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start` and emits `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
@@ -213,7 +217,7 @@ Example with notification opt-out:
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
-- `mcpServerStatus/list` — enumerate configured MCP servers with their tools and auth status, plus resources/resource templates for `full` detail; supports cursor+limit pagination. If `detail` is omitted, the server defaults to `full`.
+- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly. If `detail` is omitted, the server defaults to `full`.
 - `mcpServer/resource/read` — read a resource from a configured MCP server by optional `threadId`, `server`, and `uri`, returning text/blob resource `contents`. If `threadId` is omitted, the server reads from the latest MCP config directly.
 - `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
@@ -245,16 +249,24 @@ Start a fresh thread when you need a new Codex conversation.
     // Experimental: requires opt-in
     "dynamicTools": [
         {
-            "name": "lookup_ticket",
-            "description": "Fetch a ticket by id",
-            "deferLoading": true,
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"]
-            }
+            "type": "namespace",
+            "name": "tickets",
+            "description": "Ticket management tools",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup_ticket",
+                    "description": "Fetch a ticket by id",
+                    "deferLoading": true,
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" }
+                        },
+                        "required": ["id"]
+                    }
+                }
+            ]
         }
     ],
 } }
@@ -275,6 +287,8 @@ To continue a stored session, call `thread/resume` with the `thread.id` you prev
 
 By default, `thread/resume` includes the reconstructed turn history in `thread.turns`. Pass `excludeTurns: true` to return only thread metadata and live resume state, then call `thread/turns/list` separately if you want to page the turn history over the network. In that mode the server also skips replaying restored `thread/tokenUsage/updated`, which avoids rebuilding turns just to attribute historical usage.
 
+Experimental clients that want the live resume subscription plus a turns page in one round trip can pass `initialTurnsPage`. It accepts the same `limit`, `sortDirection`, and `itemsView` controls as `thread/turns/list`; omitted controls use its defaults. The response includes `initialTurnsPage` with `nextCursor` and `backwardsCursor` for follow-up pagination.
+
 By default, resume uses the latest persisted `model` and `reasoningEffort` values associated with the thread. Supplying any of `model`, `modelProvider`, `config.model`, or `config.model_reasoning_effort` disables that persisted fallback and uses the explicit overrides plus normal config resolution instead.
 
 Example:
@@ -291,6 +305,24 @@ Example:
     "excludeTurns": true
 } }
 { "id": 12, "result": { "thread": { "id": "thr_123", "turns": [], … } } }
+
+{ "method": "thread/resume", "id": 13, "params": {
+    "threadId": "thr_123",
+    "excludeTurns": true,
+    "initialTurnsPage": {
+        "limit": 20,
+        "sortDirection": "desc",
+        "itemsView": "summary"
+    }
+} }
+{ "id": 13, "result": {
+    "thread": { "id": "thr_123", "turns": [], … },
+    "initialTurnsPage": {
+        "data": [ ... ],
+        "nextCursor": "older-turns-cursor-or-null",
+        "backwardsCursor": "newer-turns-cursor-or-null"
+    }
+} }
 ```
 
 To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. When the source history includes persisted token usage, the server also emits `thread/tokenUsage/updated` for the new thread immediately after the response. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. Pass `ephemeral: true` when the fork should stay in-memory only:
@@ -342,6 +374,24 @@ Example:
 ```
 
 When `nextCursor` is `null`, you’ve reached the final page.
+
+### Example: List direct child threads
+
+Enable `capabilities.experimentalApi` during initialization, then use `thread/list` with `parentThreadId` to page through a thread's direct spawned children from persisted spawn-edge state. Results do not recursively include grandchildren. Review and Guardian threads are not included because they do not participate in the spawn-edge lifecycle. When `modelProviders` or `sourceKinds` is omitted, parent-filtered requests include every provider or source kind, respectively. Explicit filters retain the ordinary `thread/list` behavior, including the interactive-only default for an empty `sourceKinds` list.
+
+```json
+{ "method": "thread/list", "id": 21, "params": {
+    "parentThreadId": "00000000-0000-0000-0000-000000000100",
+    "limit": 25
+} }
+{ "id": 21, "result": {
+    "data": [
+        { "id": "00000000-0000-0000-0000-000000000101", "parentThreadId": "00000000-0000-0000-0000-000000000100", "status": { "type": "notLoaded" } }
+    ],
+    "nextCursor": null,
+    "backwardsCursor": null
+} }
+```
 
 ### Example: List loaded threads
 
@@ -553,6 +603,16 @@ Use `thread/archive` to move the persisted rollout (stored as a JSONL file on di
 
 An archived thread will not appear in `thread/list` unless `archived` is set to `true`.
 
+### Example: Delete a thread
+
+Use `thread/delete` to hard-delete a thread and its spawned descendant threads. Existing rollout files and associated metadata must be removed before the request succeeds; missing rollout files are treated as already deleted.
+
+```json
+{ "method": "thread/delete", "id": 23, "params": { "threadId": "thr_b" } }
+{ "id": 23, "result": {} }
+{ "method": "thread/deleted", "params": { "threadId": "thr_b" } }
+```
+
 ### Example: Unarchive a thread
 
 Use `thread/unarchive` to move an archived rollout back into the sessions directory.
@@ -622,6 +682,7 @@ You can optionally specify config overrides on the new turn. If specified, these
 ```json
 { "method": "turn/start", "id": 30, "params": {
     "threadId": "thr_123",
+    "clientUserMessageId": "client_msg_123",
     "input": [ { "type": "text", "text": "Run tests" } ],
     // Below are optional config overrides
     "cwd": "/Users/me/project",
@@ -776,6 +837,19 @@ Then send `offer.sdp` to app-server. Core uses `experimental_realtime_ws_backend
 
 Omit `prompt` to use Codex's default realtime backend prompt. Send `prompt: null` or
 `prompt: ""` when the session should start without that default backend prompt.
+Clients may also pass `model` and `version` on `thread/realtime/start` to select a
+different realtime session configuration without changing thread or user config.
+Pass `includeStartupContext: false` to skip Codex's startup context for this
+session while still using the selected backend prompt.
+Pass `codexResponsesAsItems: true` to inject automatic Codex responses with
+`conversation.item.create` instead of the protocol's default speakable output
+path. When using that mode, `codexResponseItemPrefix` can prepend short
+experiment instructions to each automatic Codex response item. Omit
+`codexResponsesAsItems`, or pass `false`, to preserve the default speakable
+behavior. Call
+`thread/realtime/appendText` to append app-provided realtime text items, or
+`thread/realtime/appendSpeech` when the app decides a realtime update should be
+spoken.
 
 ```javascript
 await pc.setRemoteDescription({
@@ -809,6 +883,32 @@ Use `thread/backgroundTerminals/clean` to terminate all running background termi
 { "id": 35, "result": {} }
 ```
 
+### Example: List and terminate background terminals
+
+Use `thread/backgroundTerminals/list` to inspect running background terminals associated with a loaded thread. The `backgroundTerminals` segment intentionally follows the existing `thread/backgroundTerminals/clean` method. The returned `processId` is the app-server process id; host OS metadata is nullable. The request accepts the standard `cursor` and `limit` pagination fields. When `nextCursor` is non-null, pass it as `cursor` to fetch the next page.
+
+```json
+{ "method": "thread/backgroundTerminals/list", "id": 36, "params": { "threadId": "thr_123" } }
+{ "id": 36, "result": { "data": [
+    {
+        "itemId": "item_456",
+        "processId": "42",
+        "command": "python3 -m http.server",
+        "cwd": "/workspace",
+        "osPid": null,
+        "cpuPercent": null,
+        "rssKb": null
+    }
+], "nextCursor": null } }
+```
+
+Use `thread/backgroundTerminals/terminate` to terminate one running background terminal by that `processId`.
+
+```json
+{ "method": "thread/backgroundTerminals/terminate", "id": 37, "params": { "threadId": "thr_123", "processId": "42" } }
+{ "id": 37, "result": { "terminated": true } }
+```
+
 ### Example: Steer an active turn
 
 Use `turn/steer` to append additional user input to the currently active regular turn. This does
@@ -817,6 +917,7 @@ not emit `turn/started` and does not accept turn context overrides.
 ```json
 { "method": "turn/steer", "id": 32, "params": {
     "threadId": "thr_123",
+    "clientUserMessageId": "client_msg_124",
     "input": [ { "type": "text", "text": "Actually focus on failing tests first." } ],
     "expectedTurnId": "turn_456"
 } }
@@ -1112,7 +1213,7 @@ Because audio is intentionally separate from `ThreadItem`, clients can opt out o
 
 ### MCP server startup events
 
-- `mcpServer/startupStatus/updated` — `{ name, status, error }` when app-server observes an MCP server startup transition. `status` is one of `starting`, `ready`, `failed`, or `cancelled`. `error` is `null` except for `failed`.
+- `mcpServer/startupStatus/updated` — `{ threadId, name, status, error }` when app-server observes an MCP server startup transition. `threadId` identifies the owning thread when startup is thread-scoped and is `null` when startup is app-scoped. `status` is one of `starting`, `ready`, `failed`, or `cancelled`. `error` is `null` except for `failed`.
 
 ### Turn events
 
@@ -1124,6 +1225,7 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 - `turn/plan/updated` — `{ turnId, explanation?, plan }` whenever the agent shares or changes its plan; each `plan` entry is `{ step, status }` with `status` in `pending`, `inProgress`, or `completed`.
 - `model/rerouted` — `{ threadId, turnId, fromModel, toModel, reason }` when the backend reroutes a request to a different model (for example, due to high-risk cyber safety checks).
 - `model/verification` — `{ threadId, turnId, verifications }` when the backend flags additional account verification, such as `trustedAccessForCyber`.
+- `turn/moderationMetadata` — experimental; `{ threadId, turnId, metadata }` when a first-party backend supplies turn-scoped moderation metadata for client-side presentation.
 
 Today both notifications carry an empty `items` array even when item events were streamed; rely on `item/*` notifications for the canonical item list until this is fixed.
 
@@ -1131,7 +1233,7 @@ Today both notifications carry an empty `items` array even when item events were
 
 `ThreadItem` is the tagged union carried in turn responses and `item/*` notifications. Currently we support events for the following items:
 
-- `userMessage` — `{id, content}` where `content` is a list of user inputs (`text`, `image`, or `localImage`).
+- `userMessage` — `{id, clientId, content}` where `clientId` is the optional `clientUserMessageId` supplied to `turn/start` or `turn/steer`, and `content` is a list of user inputs (`text`, `image`, or `localImage`).
 - `agentMessage` — `{id, text}` containing the accumulated agent reply.
 - `plan` — `{id, text}` emitted for plan-mode turns; plan text can stream via `item/plan/delta` (experimental).
 - `reasoning` — `{id, summary, content}` where `summary` holds streamed reasoning summaries (applicable for most OpenAI models) and `content` holds raw reasoning blocks (applicable for e.g. open source models).
@@ -1141,6 +1243,7 @@ Today both notifications carry an empty `items` array even when item events were
 - `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadId?, newThreadId?, prompt?, agentStatus?}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `status` is `inProgress`, `completed`, or `failed`.
 - `webSearch` — `{id, query, action?}` for a web search request issued by the agent; `action` mirrors the Responses API web_search action payload (`search`, `open_page`, `find_in_page`) and may be omitted until completion.
 - `imageView` — `{id, path}` emitted when the agent invokes the image viewer tool.
+- `sleep` — `{id, durationMs}` emitted while the agent waits for a duration or new input.
 - `enteredReviewMode` — `{id, review}` sent when the reviewer starts; `review` is a short user-facing label such as `"current changes"` or the requested target description.
 - `exitedReviewMode` — `{id, review}` emitted when the reviewer finishes; `review` is the full plain-text review (usually, overall notes plus bullet point findings).
 - `contextCompaction` — `{id}` emitted when codex compacts the conversation history. This can happen automatically.
@@ -1257,7 +1360,7 @@ the client can offer session-scoped and/or persistent approval choices.
 
 ### Permission requests
 
-The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access. The `cwd` field identifies the directory used to resolve project-root permissions and relative deny globs.
+The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access. The `environmentId` and `cwd` fields identify the environment and directory used to resolve project-root permissions and relative deny globs.
 
 ```json
 {
@@ -1267,6 +1370,7 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
     "threadId": "thr_123",
     "turnId": "turn_123",
     "itemId": "call_123",
+    "environmentId": "local",
     "cwd": "/Users/me/project",
     "reason": "Select a workspace root",
     "permissions": {
@@ -1316,6 +1420,7 @@ When a dynamic tool is invoked during a turn, the server sends an `item/tool/cal
     "threadId": "thr_123",
     "turnId": "turn_123",
     "callId": "call_123",
+    "namespace": "tickets",
     "tool": "lookup_ticket",
     "arguments": { "id": "ABC-123" }
   }
@@ -1382,6 +1487,7 @@ You can also add `perCwdExtraUserRoots` to scan additional absolute paths as `us
 Entries whose `cwd` is not present in `cwds` are ignored.
 `skills/list` might reuse a cached skills result per `cwd`; setting `forceReload` to `true` refreshes the result from disk.
 The server also emits `skills/changed` notifications when watched local skill files change. Treat this as an invalidation signal and re-run `skills/list` with your current params when needed.
+Use `skills/extraRoots/set` to replace additional standalone skill roots for the current app-server process. These roots use the same layout as other standalone skill roots: each root contains skill directories, and each skill directory contains `SKILL.md`. Missing roots are accepted and load no skills until they exist. This setting is lost when app-server exits.
 
 ```json
 { "method": "skills/list", "id": 25, "params": {
@@ -1424,12 +1530,23 @@ The server also emits `skills/changed` notifications when watched local skill fi
 }
 ```
 
+```json
+{
+  "method": "skills/extraRoots/set",
+  "id": 26,
+  "params": {
+    "extraRoots": ["/Users/me/generated-skills"]
+  }
+}
+{ "id": 26, "result": {} }
+```
+
 To enable or disable a skill by absolute path:
 
 ```json
 {
   "method": "skills/config/write",
-  "id": 26,
+  "id": 27,
   "params": {
     "path": "/Users/alice/.codex/skills/skill-creator/SKILL.md",
     "name": null,
@@ -1443,7 +1560,7 @@ To enable or disable a skill by name:
 ```json
 {
   "method": "skills/config/write",
-  "id": 27,
+  "id": 28,
   "params": {
     "path": null,
     "name": "github:yeet",
@@ -1549,6 +1666,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"` for the browser flow or `type: "chatgptDeviceCode"` for device code; Codex persists tokens to disk and refreshes them automatically.
+- **Personal access token (`personalAccessToken`)**: Codex uses a ChatGPT-backed personal access token loaded outside the app-server login RPCs, such as with `codex login --with-access-token` or `CODEX_ACCESS_TOKEN`.
 
 ### API Overview
 
@@ -1557,12 +1675,14 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
-- `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
-- `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
+- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, `personalAccessToken`, or `null`) and includes the current ChatGPT `planType` when available.
+- `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, and the number of earned rate-limit resets currently available. Rate-limit updates arrive via `account/rateLimits/updated` (notify); the reset count is snapshot-only.
+- `account/rateLimitResetCredit/consume` — consume one earned reset using a caller-provided idempotency key.
+- `account/usage/read` — fetch ChatGPT account token-activity summary and daily buckets.
+- `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change. This is a sparse rolling update; merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot.
 - `account/sendAddCreditsNudgeEmail` — ask ChatGPT to email the workspace owner about depleted credits or a reached usage limit.
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, success, error? }`.
-- `mcpServer/startupStatus/updated` (notify) — emitted when a configured MCP server's startup status changes for a loaded thread; payload includes `{ name, status, error }` where `status` is `starting`, `ready`, `failed`, or `cancelled`.
+- `mcpServer/startupStatus/updated` (notify) — emitted when a configured MCP server's startup status changes; payload includes `{ threadId, name, status, error }`, where `threadId` is the owning thread when startup is thread-scoped and `null` when it is app-scoped, and `status` is `starting`, `ready`, `failed`, or `cancelled`.
 
 ### 1) Check auth state
 
@@ -1579,12 +1699,15 @@ Response examples:
 { "id": 1, "result": { "account": null, "requiresOpenaiAuth": true } }  // OpenAI auth required (typical for OpenAI-hosted models)
 { "id": 1, "result": { "account": { "type": "apiKey" }, "requiresOpenaiAuth": true } }
 { "id": 1, "result": { "account": { "type": "chatgpt", "email": "user@example.com", "planType": "pro" }, "requiresOpenaiAuth": true } }
+{ "id": 1, "result": { "account": { "type": "amazonBedrock", "credentialSource": "codexManaged" }, "requiresOpenaiAuth": false } }
+{ "id": 1, "result": { "account": { "type": "amazonBedrock", "credentialSource": "awsManaged" }, "requiresOpenaiAuth": false } }
 ```
 
 Field notes:
 
 - `refreshToken` (bool): set `true` to force a token refresh.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
+- Amazon Bedrock reports `credentialSource: "codexManaged"` when it uses a Bedrock API key managed by Codex. Otherwise it reports `credentialSource: "awsManaged"` for the external AWS credential path. This identifies the selected credential source; it does not validate that the AWS credential chain can resolve credentials.
 
 ### 2) Log in with an API key
 
@@ -1653,7 +1776,7 @@ Field notes:
 
 ```json
 { "method": "account/rateLimits/read", "id": 7 }
-{ "id": 7, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null } } }
+{ "id": 7, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null }, "rateLimitResetCredits": { "availableCount": 2 } } }
 { "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
 ```
 
@@ -1663,12 +1786,30 @@ Field notes:
 - `windowDurationMins` is the quota window length.
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
 - `rateLimitReachedType` identifies the backend-classified limit state when one has been reached.
+- `individualLimit` describes the effective monthly credit limit when available. In an `account/rateLimits/read` response, `null` means no monthly limit is available. In a sparse `account/rateLimits/updated` notification, nullable account metadata may be unavailable and does not clear a previously observed value.
+- `rateLimitResetCredits` contains the available earned-reset count when the backend provides it; otherwise it is `null`. Refetch `account/rateLimits/read` after consuming a reset.
 
-### 8) Notify a workspace owner about a limit
+### 8) Earned rate-limit resets (ChatGPT)
 
 ```json
-{ "method": "account/sendAddCreditsNudgeEmail", "id": 8, "params": { "creditType": "credits" } }
-{ "id": 8, "result": { "status": "sent" } }
+{ "method": "account/rateLimitResetCredit/consume", "id": 8, "params": { "idempotencyKey": "8ae96ff3-3425-4f4c-8772-b6fd61502868" } }
+{ "id": 8, "result": { "outcome": "reset" } }
+```
+
+Field notes:
+
+- `idempotencyKey` must be non-empty. A UUID is recommended for each logical redemption attempt; reuse the same value when retrying that attempt.
+- `reset` means a credit was consumed.
+- `alreadyRedeemed` means the same redemption completed previously. Treat it as an idempotent success and refresh account limits.
+- `nothingToReset` means there is no eligible rate-limit window to reset.
+- `noCredit` means the account has no earned reset credits available.
+- Refetch `account/rateLimits/read` after consuming a reset instead of inferring updated windows from this response.
+
+### 9) Notify a workspace owner about a limit
+
+```json
+{ "method": "account/sendAddCreditsNudgeEmail", "id": 9, "params": { "creditType": "credits" } }
+{ "id": 9, "result": { "status": "sent" } }
 ```
 
 Use `creditType: "credits"` when workspace credits are depleted, or `creditType: "usage_limit"` when the workspace usage limit has been reached. If the owner was already notified recently, the response status is `cooldown_active`.

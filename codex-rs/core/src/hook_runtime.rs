@@ -20,6 +20,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
@@ -29,6 +30,7 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
+use tracing::instrument;
 
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
@@ -100,6 +102,7 @@ impl From<UserPromptSubmitOutcome> for ContextInjectingHookOutcome {
     }
 }
 
+#[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -430,7 +433,7 @@ fn track_hook_completed_analytics(
     completed: &HookCompletedEvent,
 ) {
     let (tracking, hook) =
-        hook_run_analytics_payload(sess.conversation_id.to_string(), turn_context, completed);
+        hook_run_analytics_payload(sess.thread_id.to_string(), turn_context, completed);
     sess.services
         .analytics_events_client
         .track_hook_run(tracking, hook);

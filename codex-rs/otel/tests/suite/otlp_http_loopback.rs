@@ -179,6 +179,12 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     ))?;
 
     metrics.counter("codex.turns", /*inc*/ 1, &[("source", "test")])?;
+    metrics.gauge_with_description(
+        "codex.active",
+        "Number of active Codex operations.",
+        /*value*/ 1,
+        &[("component", "test")],
+    )?;
     metrics.shutdown()?;
 
     server.join().expect("server join");
@@ -187,17 +193,7 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     let request = captured
         .iter()
         .find(|req| req.path == "/v1/metrics")
-        .unwrap_or_else(|| {
-            let paths = captured
-                .iter()
-                .map(|req| req.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            panic!(
-                "missing /v1/metrics request; got {}: {paths}",
-                captured.len()
-            );
-        });
+        .expect("/v1/metrics request should be captured");
     let content_type = request
         .content_type
         .as_deref()
@@ -211,6 +207,16 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     assert!(
         body.contains("codex.turns"),
         "expected metric name not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("codex.active"),
+        "expected gauge not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("component") && body.contains("test"),
+        "expected gauge tag not found; body prefix: {}",
         &body.chars().take(2000).collect::<String>()
     );
 
@@ -290,17 +296,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
     let request = captured
         .iter()
         .find(|req| req.path == "/v1/traces")
-        .unwrap_or_else(|| {
-            let paths = captured
-                .iter()
-                .map(|req| req.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            panic!(
-                "missing /v1/traces request; got {}: {paths}",
-                captured.len()
-            );
-        });
+        .expect("/v1/traces request should be captured");
     let content_type = request
         .content_type
         .as_deref()
@@ -398,17 +394,7 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
     let request = captured
         .iter()
         .find(|req| req.path == "/v1/traces")
-        .unwrap_or_else(|| {
-            let paths = captured
-                .iter()
-                .map(|req| req.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            panic!(
-                "missing /v1/traces request; got {}: {paths}",
-                captured.len()
-            );
-        });
+        .expect("/v1/traces request should be captured");
     let content_type = request
         .content_type
         .as_deref()
@@ -525,17 +511,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     let request = captured
         .iter()
         .find(|req| req.path == "/v1/traces")
-        .unwrap_or_else(|| {
-            let paths = captured
-                .iter()
-                .map(|req| req.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            panic!(
-                "missing /v1/traces request; got {}: {paths}",
-                captured.len()
-            );
-        });
+        .expect("/v1/traces request should be captured");
     let content_type = request
         .content_type
         .as_deref()

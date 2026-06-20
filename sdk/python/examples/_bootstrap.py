@@ -52,7 +52,7 @@ def runtime_config():
     from codex_app_server import AppServerConfig
 
     ensure_runtime_package_installed(sys.executable, _SDK_PYTHON_DIR)
-    return AppServerConfig()
+    return CodexConfig()
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:

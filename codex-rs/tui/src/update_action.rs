@@ -10,9 +10,9 @@ pub enum UpdateAction {
     NpmGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
-    /// Update via `curl -fsSL https://chatgpt.com/codex/install.sh | sh`.
+    /// Update via `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`.
     StandaloneUnix,
-    /// Update via `irm https://chatgpt.com/codex/install.ps1|iex`.
+    /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
     StandaloneWindows,
 }
 
@@ -40,7 +40,10 @@ impl UpdateAction {
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             UpdateAction::StandaloneUnix => (
                 "sh",
-                &["-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"],
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
+                ],
             ),
             UpdateAction::StandaloneWindows => (
                 "powershell",
@@ -112,7 +115,10 @@ mod tests {
             UpdateAction::StandaloneUnix.command_args(),
             (
                 "sh",
-                &["-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"][..],
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
             )
         );
         assert_eq!(

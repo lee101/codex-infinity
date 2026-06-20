@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::to_value;
 use std::sync::Arc;
 
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
 pub struct CompactClient<T: HttpTransport> {
     session: EndpointSession<T>,
 }
@@ -42,6 +44,14 @@ impl<T: HttpTransport> CompactClient<T> {
             .session
             .execute(Method::POST, Self::path(), extra_headers, Some(body))
             .await?;
+        if let Some(turn_state) = turn_state
+            && let Some(header_value) = resp
+                .headers
+                .get(X_CODEX_TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok())
+        {
+            let _ = turn_state.set(header_value.to_string());
+        }
         let parsed: CompactHistoryResponse =
             serde_json::from_slice(&resp.body).map_err(|e| ApiError::Stream(e.to_string()))?;
         Ok(parsed.output)
@@ -66,7 +76,6 @@ struct CompactHistoryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
@@ -75,7 +84,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct DummyTransport;
 
-    #[async_trait]
     impl HttpTransport for DummyTransport {
         async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
             Err(TransportError::Build("execute should not run".to_string()))

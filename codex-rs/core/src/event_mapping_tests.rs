@@ -1,3 +1,5 @@
+use super::has_non_contextual_dev_message_content;
+use super::is_contextual_dev_message_content;
 use super::parse_turn_item;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::HookPromptFragment;
@@ -10,8 +12,29 @@ use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn recognizes_skills_instructions_as_contextual_developer_content() {
+    assert!(is_contextual_dev_message_content(&[
+        ContentItem::InputText {
+            text: format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills"),
+        },
+    ]));
+}
+
+#[test]
+fn recognizes_token_budget_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: "<token_budget>\nYou have 710 tokens left in this context window.\n</token_budget>"
+            .to_string(),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
 
 #[test]
 fn parses_user_message_with_text_and_two_images() {
@@ -35,6 +58,7 @@ fn parses_user_message_with_text_and_two_images() {
             },
         ],
         phase: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -58,7 +82,7 @@ fn parses_user_message_with_text_and_two_images() {
 #[test]
 fn skips_local_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
-    let label = codex_protocol::models::local_image_open_tag_text(/*label_number*/ 1);
+    let label = r#"<image name=[Image #1] path="/tmp/local.png">"#.to_string();
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
@@ -78,6 +102,7 @@ fn skips_local_image_label_text() {
             },
         ],
         phase: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -107,6 +132,7 @@ fn parses_assistant_message_input_text_for_backward_compatibility() {
                 .to_string(),
         }],
         phase: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected assistant message turn item");
@@ -156,6 +182,7 @@ fn skips_unnamed_image_label_text() {
             },
         ],
         phase: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -185,7 +212,7 @@ fn skips_user_instructions_and_env() {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
             phase: None,
-            },
+                metadata: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -193,7 +220,7 @@ fn skips_user_instructions_and_env() {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
             phase: None,
-            },
+                metadata: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -201,7 +228,7 @@ fn skips_user_instructions_and_env() {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
             phase: None,
-            },
+                metadata: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -210,7 +237,7 @@ fn skips_user_instructions_and_env() {
                         .to_string(),
                 }],
             phase: None,
-            },
+                metadata: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -218,7 +245,7 @@ fn skips_user_instructions_and_env() {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
             phase: None,
-            },
+                metadata: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -233,7 +260,7 @@ fn skips_user_instructions_and_env() {
                     },
                 ],
                 phase: None,
-            },
+                metadata: None,},
         ];
 
     for item in items {
@@ -283,7 +310,7 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
             },
         ],
         phase: None,
-    };
+        metadata: None,};
 
     let turn_item = parse_turn_item(&item).expect("expected hook prompt turn item");
 
@@ -311,6 +338,7 @@ fn parses_agent_message() {
             text: "Hello from Codex".to_string(),
         }],
         phase: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected agent message turn item");
@@ -342,6 +370,7 @@ fn parses_reasoning_summary_and_raw_content() {
             text: "raw details".to_string(),
         }]),
         encrypted_content: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected reasoning turn item");
@@ -374,6 +403,7 @@ fn parses_reasoning_including_raw_content() {
             },
         ]),
         encrypted_content: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected reasoning turn item");
@@ -399,6 +429,7 @@ fn parses_web_search_call() {
             query: Some("weather".to_string()),
             queries: None,
         }),
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -427,6 +458,7 @@ fn parses_web_search_open_page_call() {
         action: Some(WebSearchAction::OpenPage {
             url: Some("https://example.com".to_string()),
         }),
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -455,6 +487,7 @@ fn parses_web_search_find_in_page_call() {
             url: Some("https://example.com".to_string()),
             pattern: Some("needle".to_string()),
         }),
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -481,6 +514,7 @@ fn parses_partial_web_search_call_without_action_as_other() {
         id: Some("ws_partial".to_string()),
         status: Some("in_progress".to_string()),
         action: None,
+        metadata: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");

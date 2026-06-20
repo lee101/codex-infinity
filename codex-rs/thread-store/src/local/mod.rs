@@ -1,5 +1,6 @@
 mod archive_thread;
 mod create_thread;
+mod delete_thread;
 mod helpers;
 mod list_threads;
 mod live_writer;
@@ -10,7 +11,6 @@ mod update_thread_metadata;
 #[cfg(test)]
 mod test_support;
 
-use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
@@ -25,6 +25,7 @@ use tokio::sync::OnceCell;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
+use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
@@ -35,6 +36,7 @@ use crate::StoredThreadHistory;
 use crate::ThreadPage;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
+use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 
@@ -135,41 +137,6 @@ impl LocalThreadStore {
             }
         }
     }
-}
-
-#[async_trait]
-impl ThreadStore for LocalThreadStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
-        live_writer::create_thread(self, params).await
-    }
-
-    async fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreResult<()> {
-        live_writer::resume_thread(self, params).await
-    }
-
-    async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
-        live_writer::append_items(self, params).await
-    }
-
-    async fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        live_writer::persist_thread(self, thread_id).await
-    }
-
-    async fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        live_writer::flush_thread(self, thread_id).await
-    }
-
-    async fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        live_writer::shutdown_thread(self, thread_id).await
-    }
-
-    async fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        live_writer::discard_thread(self, thread_id).await
-    }
 
     async fn load_history(
         &self,
@@ -204,11 +171,7 @@ impl ThreadStore for LocalThreadStore {
         })
     }
 
-    async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread> {
-        read_thread::read_thread(self, params).await
-    }
-
-    async fn read_thread_by_rollout_path(
+    async fn read_thread_by_rollout_path_params(
         &self,
         params: ReadThreadByRolloutPathParams,
     ) -> ThreadStoreResult<StoredThread> {
@@ -220,27 +183,30 @@ impl ThreadStore for LocalThreadStore {
         )
         .await
     }
+}
 
-    async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage> {
-        list_threads::list_threads(self, params).await
+impl ThreadStore for LocalThreadStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreResult<StoredThread> {
-        update_thread_metadata::update_thread_metadata(self, params).await
+    ) -> ThreadStoreFuture<'_, StoredThread> {
+        Box::pin(async move { update_thread_metadata::update_thread_metadata(self, params).await })
     }
 
-    async fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreResult<()> {
-        archive_thread::archive_thread(self, params).await
+    fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { archive_thread::archive_thread(self, params).await })
     }
 
-    async fn unarchive_thread(
-        &self,
-        params: ArchiveThreadParams,
-    ) -> ThreadStoreResult<StoredThread> {
-        unarchive_thread::unarchive_thread(self, params).await
+    fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
+        Box::pin(async move { unarchive_thread::unarchive_thread(self, params).await })
+    }
+
+    fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { delete_thread::delete_thread(self, params).await })
     }
 }
 
@@ -570,7 +536,9 @@ mod tests {
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
             thread_id,
+            extra_config: None,
             forked_from_id: None,
+            parent_thread_id: None,
             source: SessionSource::Exec,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
@@ -580,6 +548,7 @@ mod tests {
 
     fn user_message_item(message: &str) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
             message: message.to_string(),
             images: None,
             local_images: Vec::new(),

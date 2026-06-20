@@ -167,6 +167,7 @@ async fn helpers_are_available_and_do_not_panic() {
         initial_user_message: None,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
+        has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
@@ -280,6 +281,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
             unlimited: false,
             balance: Some("17.5".to_string()),
         }),
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -300,6 +302,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -322,6 +325,40 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
 }
 
 #[tokio::test]
+async fn rolling_rate_limit_snapshot_preserves_prior_individual_limit() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut usage_limits = snapshot(/*percent*/ 10.0);
+    usage_limits.individual_limit = Some(SpendControlLimitSnapshot {
+        limit: "25000".to_string(),
+        used: "8000".to_string(),
+        remaining_percent: 68,
+        resets_at: 1_800_000_000,
+    });
+    chat.on_rate_limit_snapshot(Some(usage_limits));
+
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 20.0));
+
+    let display = chat
+        .rate_limit_snapshots_by_limit_id
+        .get("codex")
+        .expect("rate limits should be cached");
+    let individual_limit = display
+        .individual_limit
+        .as_ref()
+        .expect("rolling updates should preserve monthly limits");
+    assert_eq!(individual_limit.used, "8,000");
+    assert_eq!(individual_limit.limit, "25,000");
+    assert_eq!(individual_limit.percent_remaining, 68.0);
+
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 30.0)));
+    let display = chat
+        .rate_limit_snapshots_by_limit_id
+        .get("codex")
+        .expect("rate limits should be cached");
+    assert!(display.individual_limit.is_none());
+}
+
+#[tokio::test]
 async fn rate_limit_snapshot_updates_and_retains_plan_type() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -339,6 +376,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
             resets_at: None,
         }),
         credits: None,
+        individual_limit: None,
         plan_type: Some(PlanType::Plus),
         rate_limit_reached_type: None,
     }));
@@ -358,6 +396,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
             resets_at: Some(234),
         }),
         credits: None,
+        individual_limit: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -377,6 +416,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
             resets_at: Some(567),
         }),
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -401,6 +441,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
             unlimited: false,
             balance: Some("5.00".to_string()),
         }),
+        individual_limit: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -415,6 +456,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -468,6 +510,7 @@ async fn rate_limit_switch_prompt_skips_non_codex_limit() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -937,7 +980,7 @@ async fn streaming_final_answer_keeps_task_running_state() {
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     match op_rx.try_recv() {
-        Ok(Op::Interrupt) => {}
+        Ok(Op::Interrupt { .. }) => {}
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
@@ -1448,6 +1491,32 @@ async fn status_line_branch_refreshes_after_interrupt() {
 }
 
 #[tokio::test]
+async fn completed_turn_clears_visible_running_hook() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    handle_hook_started(
+        &mut chat,
+        hook_started_run(
+            "post-tool-use:0:/tmp/hooks.json",
+            codex_app_server_protocol::HookEventName::PostToolUse,
+            /*status_message*/ None,
+        ),
+    );
+    reveal_running_hooks(&mut chat);
+    let before_completion = active_hook_blob(&chat);
+
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+    assert_chatwidget_snapshot!(
+        "completed_turn_clears_visible_running_hook",
+        format!(
+            "before completion:\n{before_completion}after completion:\n{}",
+            active_hook_blob(&chat)
+        )
+    );
+}
+
+#[tokio::test]
 async fn status_line_fast_mode_renders_on_and_off() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.tui_status_line = Some(vec!["fast-mode".to_string()]);
@@ -1529,6 +1598,37 @@ async fn terminal_title_model_updates_on_model_change_without_manual_refresh() {
     chat.set_model("gpt-5.3-codex");
 
     assert_eq!(chat.last_terminal_title, Some("gpt-5.3-codex".to_string()));
+}
+
+#[tokio::test]
+async fn status_line_and_terminal_title_reasoning_render_only_effort() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.config.tui_status_line = Some(vec!["reasoning".to_string()]);
+    chat.config.tui_terminal_title = Some(vec!["reasoning".to_string()]);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
+
+    chat.refresh_status_line();
+    chat.refresh_terminal_title();
+
+    assert_eq!(status_line_text(&chat), Some("xhigh".to_string()));
+    assert_eq!(chat.last_terminal_title, Some("xhigh".to_string()));
+}
+
+#[tokio::test]
+async fn status_line_reasoning_updates_on_mode_switch_without_manual_refresh() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    chat.config.tui_status_line = Some(vec!["reasoning".to_string()]);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+    assert_eq!(status_line_text(&chat), Some("high".to_string()));
+
+    let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+
+    assert_eq!(status_line_text(&chat), Some("medium".to_string()));
 }
 
 #[tokio::test]

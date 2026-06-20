@@ -4,6 +4,8 @@ use crate::MessageRole;
 use crate::summarize_for_label;
 use crate::truncate;
 use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 use std::fs::File;
 use std::io;
 use std::io::BufRead;
@@ -17,6 +19,13 @@ const TOOL_RESULT_MAX_LEN: usize = 4_000;
 pub struct SessionSummary {
     pub latest_timestamp: i64,
     pub migration: ExternalAgentSessionMigration,
+}
+
+pub(super) struct ParsedSessionImport {
+    pub cwd: Option<PathBuf>,
+    pub source_title: Option<String>,
+    pub messages: Vec<ConversationMessage>,
+    pub content_sha256: String,
 }
 
 pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
@@ -34,7 +43,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<JsonValue>(trimmed) else {
+        let Ok(mut record) = serde_json::from_str::<JsonValue>(trimmed) else {
             continue;
         };
         if cwd.is_none() {
@@ -88,19 +97,40 @@ pub(super) fn custom_title_from_records(records: &[JsonValue]) -> Option<String>
 
 pub(super) fn read_records(path: &Path) -> io::Result<Vec<JsonValue>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut cwd = None;
+    let mut custom_title = None;
+    let mut ai_title = None;
+    let mut messages = Vec::new();
+    let mut line = String::new();
+    let mut hasher = Sha256::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        hasher.update(line.as_bytes());
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<JsonValue>(trimmed) else {
+        let Ok(mut record) = serde_json::from_str::<JsonValue>(trimmed) else {
             continue;
         };
-        if value.is_object() {
-            records.push(value);
+        if cwd.is_none() {
+            cwd = record
+                .get("cwd")
+                .and_then(JsonValue::as_str)
+                .map(PathBuf::from);
+        }
+        if let Some(title) = custom_title_from_record(&record) {
+            custom_title = Some(title.to_string());
+        }
+        if let Some(title) = ai_title_from_record(&record) {
+            ai_title = Some(title.to_string());
+        }
+        if let Some(message) = conversation_message_from_owned_record(&mut record) {
+            messages.push(message);
         }
     }
     Ok(records)
@@ -128,7 +158,7 @@ fn custom_title_from_record(record: &JsonValue) -> Option<&str> {
         .filter(|title| !title.is_empty())
 }
 
-fn conversation_message_from_record(record: &JsonValue) -> Option<ConversationMessage> {
+fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<ConversationMessage> {
     let record_type = record.get("type")?.as_str()?;
     if record_type != "assistant" && record_type != "user" {
         return None;
@@ -139,18 +169,30 @@ fn conversation_message_from_record(record: &JsonValue) -> Option<ConversationMe
         return None;
     }
 
-    let extracted = extract_message_text(record.get("message")?.get("content")?)?;
-    let role = if record_type == "assistant" || extracted.only_tool_result {
-        MessageRole::Assistant
-    } else {
-        MessageRole::User
-    };
+    let is_assistant = record_type == "assistant";
     let timestamp = record
         .get("timestamp")
         .and_then(JsonValue::as_str)
         .and_then(parse_timestamp);
+    let content = record.get_mut("message")?.get_mut("content")?.take();
+    let extracted = match content {
+        JsonValue::String(text) => {
+            if text.trim().is_empty() {
+                return None;
+            }
+            ExtractedMessage {
+                text,
+                only_tool_result: false,
+            }
+        }
+        content => extract_message_text(&content)?,
+    };
     Some(ConversationMessage {
-        role,
+        role: if is_assistant || extracted.only_tool_result {
+            MessageRole::Assistant
+        } else {
+            MessageRole::User
+        },
         text: extracted.text,
         timestamp,
     })

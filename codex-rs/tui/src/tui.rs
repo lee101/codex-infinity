@@ -40,6 +40,8 @@ use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
@@ -53,6 +55,7 @@ mod frame_requester;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
+mod terminal_stderr;
 
 /// Target frame interval for UI redraw scheduling.
 pub(crate) const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
@@ -200,12 +203,33 @@ pub fn restore() -> Result<()> {
     restore_common(RawModeRestore::Disable, KeyboardRestore::PopStack)
 }
 
+/// Force crossterm's cached raw-mode state back in sync with the terminal after `fg`.
+///
+/// A shell may restore the job's saved termios after the process receives `SIGCONT`. When that
+/// races with [`set_modes`], crossterm still believes raw mode is enabled even though the terminal
+/// has returned to canonical, echoing mode. Clearing crossterm's saved state before enabling raw
+/// mode again makes the kernel state authoritative once the shell has completed its handoff.
+#[cfg(unix)]
+pub(super) fn reapply_raw_mode_after_resume() -> Result<()> {
+    disable_raw_mode()?;
+    enable_raw_mode()
+}
+
 /// Restore the terminal after Codex is exiting.
 ///
 /// Uses a stronger keyboard reset than [`restore`] so the parent shell recovers even if a
 /// terminal missed the stack pop that normally pairs with [`set_modes`].
 pub fn restore_after_exit() -> Result<()> {
-    restore_common(RawModeRestore::Disable, KeyboardRestore::ResetAfterExit)
+    let mut first_error =
+        restore_common(RawModeRestore::Disable, KeyboardRestore::ResetAfterExit).err();
+    if let Err(err) = terminal_stderr::finish() {
+        first_error.get_or_insert(err);
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Restore the terminal to its original state, but keep raw mode enabled.
@@ -287,6 +311,28 @@ pub fn init() -> Result<Terminal> {
     Ok(tui)
 }
 
+#[cfg(windows)]
+fn probe_windows_default_colors() {
+    let started_at = std::time::Instant::now();
+    match crate::terminal_probe::default_colors(crate::terminal_probe::DEFAULT_TIMEOUT) {
+        Ok(colors) => {
+            tracing::info!(
+                duration_ms = %started_at.elapsed().as_millis(),
+                default_colors = colors.is_some(),
+                "terminal default color probe completed"
+            );
+            crate::terminal_palette::set_default_colors_from_startup_probe(colors);
+        }
+        Err(err) => {
+            tracing::warn!(
+                duration_ms = %started_at.elapsed().as_millis(),
+                "terminal default color probe failed: {err}"
+            );
+            crate::terminal_palette::set_default_colors_from_startup_probe(/*colors*/ None);
+        }
+    }
+}
+
 fn set_panic_hook() {
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
@@ -329,6 +375,8 @@ pub struct Tui {
     is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
     alt_screen_enabled: bool,
+    // Keeps unmanaged process stderr writes out of the inline viewport.
+    _stderr_guard: terminal_stderr::TerminalStderrGuard,
 }
 
 impl Tui {
@@ -364,6 +412,7 @@ impl Tui {
             notification_condition: NotificationCondition::default(),
             is_zellij,
             alt_screen_enabled: true,
+            _stderr_guard: stderr_guard,
         }
     }
 
@@ -407,8 +456,8 @@ impl Tui {
     /// Temporarily restore terminal state to run an external interactive program `f`.
     ///
     /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
-    /// terminal modes (optionally keeping raw mode enabled), then re-applies Codex TUI modes and
-    /// flushes pending stdin input before resuming events.
+    /// terminal modes and stderr (optionally keeping raw mode enabled), then re-applies Codex TUI
+    /// modes and stderr suppression before resuming events.
     pub async fn with_restored<R, F, Fut>(&mut self, mode: RestoreMode, f: F) -> R
     where
         F: FnOnce() -> Fut,
@@ -426,9 +475,15 @@ impl Tui {
         if let Err(err) = mode.restore() {
             tracing::warn!("failed to restore terminal modes before external program: {err}");
         }
+        if let Err(err) = terminal_stderr::pause() {
+            tracing::warn!("failed to restore terminal stderr before external program: {err}");
+        }
 
         let output = f().await;
 
+        if let Err(err) = terminal_stderr::resume() {
+            tracing::warn!("failed to suppress terminal stderr after external program: {err}");
+        }
         if let Err(err) = set_modes() {
             tracing::warn!("failed to re-enable terminal modes after external program: {err}");
         }
@@ -670,7 +725,7 @@ impl Tui {
         #[cfg(unix)]
         let mut prepared_resume = self
             .suspend_context
-            .prepare_resume_action(&mut self.terminal, &mut self.alt_saved_viewport);
+            .prepare_resume_action(&mut self.alt_saved_viewport);
 
         // Precompute any viewport updates that need a cursor-position query before entering
         // the synchronized update, to avoid racing with the event reader.
@@ -735,7 +790,7 @@ impl Tui {
         #[cfg(unix)]
         let mut prepared_resume = self
             .suspend_context
-            .prepare_resume_action(&mut self.terminal, &mut self.alt_saved_viewport);
+            .prepare_resume_action(&mut self.alt_saved_viewport);
 
         stdout().sync_update(|_| {
             #[cfg(unix)]

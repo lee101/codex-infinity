@@ -110,6 +110,12 @@ pub(crate) enum AppCommandView<'a> {
     Other(&'a Op),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum InterruptBehavior {
+    Default,
+    RestorePromptIfNoOutput,
+}
+
 impl AppCommand {
     pub(crate) fn interrupt() -> Self {
         Self(Op::Interrupt)

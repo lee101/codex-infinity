@@ -104,7 +104,7 @@ with Codex(config=runtime_config()) as codex:
         model=selected_model.model,
         output_schema=OUTPUT_SCHEMA,
         personality=Personality.pragmatic,
-        sandbox_policy=SANDBOX_POLICY,
+        sandbox=Sandbox.read_only,
         summary=ReasoningSummary.model_validate("concise"),
     ).run()
 

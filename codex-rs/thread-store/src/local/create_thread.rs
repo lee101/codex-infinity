@@ -17,6 +17,7 @@ pub(super) async fn create_thread(
         RolloutRecorderParams::new(
             params.thread_id,
             params.forked_from_id,
+            params.parent_thread_id,
             params.source,
             params.base_instructions,
             params.dynamic_tools,
@@ -28,9 +29,7 @@ pub(super) async fn create_thread(
     .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to initialize local thread recorder: {err}"),
-    })?;
-
-    Ok(recorder)
+    })
 }
 
 pub(super) fn event_persistence_mode(mode: ThreadEventPersistenceMode) -> EventPersistenceMode {

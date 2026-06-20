@@ -1,6 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -35,14 +35,14 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn initialized_mcp(codex_home: &TempDir) -> Result<McpProcess> {
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+async fn initialized_mcp(codex_home: &TempDir) -> Result<TestAppServer> {
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     Ok(mcp)
 }
 
 async fn expect_error_message(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     request_id: i64,
     expected_message: &str,
 ) -> Result<()> {
@@ -55,7 +55,6 @@ async fn expect_error_message(
     Ok(())
 }
 
-#[allow(clippy::expect_used)]
 fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
     assert!(
         path.is_absolute(),
@@ -830,7 +829,7 @@ fn fs_changed_notification(notification: JSONRPCNotification) -> Result<FsChange
 }
 
 async fn maybe_fs_changed_notification(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
 ) -> Result<Option<FsChangedNotification>> {
     match timeout(
         OPTIONAL_FS_CHANGE_TIMEOUT,

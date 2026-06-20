@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -29,9 +28,7 @@ use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::plugins::list_tool_suggest_discoverable_plugins;
 use crate::session::INITIAL_SUBMIT_ID;
-use codex_config::AppsRequirementsToml;
-use codex_config::types::AppToolApproval;
-use codex_config::types::AppsConfigToml;
+use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_features::Feature;
 use codex_login::AuthManager;
@@ -49,21 +46,6 @@ use codex_mcp::with_codex_apps_mcp;
 
 const CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS: Duration = Duration::from_secs(30);
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AppToolPolicy {
-    pub enabled: bool,
-    pub approval: AppToolApproval,
-}
-
-impl Default for AppToolPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            approval: AppToolApproval::Auto,
-        }
-    }
-}
 
 #[derive(Clone, PartialEq, Eq)]
 struct AccessibleConnectorsCacheKey {
@@ -116,8 +98,10 @@ pub(crate) async fn list_accessible_and_enabled_connectors_from_manager(
 
 pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
     config: &Config,
+    plugins_manager: &PluginsManager,
     auth: Option<&CodexAuth>,
     accessible_connectors: &[AppInfo],
+    loaded_plugin_app_connector_ids: &[String],
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let directory_connectors =
         list_directory_connectors_for_tool_suggest_with_auth(config, auth).await?;
@@ -131,10 +115,15 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
         )
         .into_iter()
         .map(DiscoverableTool::from);
-    let discoverable_plugins = list_tool_suggest_discoverable_plugins(config)
-        .await?
-        .into_iter()
-        .map(DiscoverableTool::from);
+    let discoverable_plugins = list_tool_suggest_discoverable_plugins(
+        config,
+        plugins_manager,
+        auth,
+        loaded_plugin_app_connector_ids,
+    )
+    .await?
+    .into_iter()
+    .map(DiscoverableTool::from);
     Ok(discoverable_connectors
         .chain(discoverable_plugins)
         .collect())
@@ -215,6 +204,23 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     force_refetch: bool,
     environment_manager: &EnvironmentManager,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(plugins_manager));
+    list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+        config,
+        force_refetch,
+        environment_manager,
+        mcp_manager,
+    )
+    .await
+}
+
+pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+    config: &Config,
+    force_refetch: bool,
+    environment_manager: Arc<EnvironmentManager>,
+    mcp_manager: Arc<McpManager>,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
     let auth = auth_manager.auth().await;
@@ -228,9 +234,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
         });
     }
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
-    let mcp_manager = McpManager::new(Arc::clone(&plugins_manager));
-    let tool_plugin_provenance = mcp_manager.tool_plugin_provenance(config).await;
+    let mcp_config = mcp_manager.runtime_config(config).await;
+    let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
     if !force_refetch && let Some(cached_connectors) = read_cached_accessible_connectors(&cache_key)
     {
         let cached_connectors = codex_connectors::filter::filter_disallowed_connectors(
@@ -256,6 +261,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     let auth_status_entries = compute_auth_statuses(
         mcp_servers.iter(),
         config.mcp_oauth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
         auth.as_ref(),
     )
     .await;
@@ -270,10 +276,12 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     let (mut mcp_connection_manager, cancel_token) = McpConnectionManager::new(
         &mcp_servers,
         config.mcp_oauth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
         auth_status_entries,
         &config.permissions.approval_policy,
         INITIAL_SUBMIT_ID.to_owned(),
         tx_event,
+        cancel_token.clone(),
         PermissionProfile::default(),
         McpRuntimeEnvironment::new(environment, config.cwd.to_path_buf()),
         config.codex_home.to_path_buf(),
@@ -408,8 +416,7 @@ async fn tool_suggest_connector_ids(config: &Config) -> HashSet<String> {
         .await
         .capability_summaries()
         .iter()
-        .flat_map(|plugin| plugin.app_connector_ids.iter())
-        .map(|connector_id| connector_id.0.clone())
+        .cloned()
         .collect::<HashSet<_>>();
     connector_ids.extend(
         config
@@ -532,7 +539,7 @@ pub(crate) fn accessible_connectors_from_mcp_tools(
 }
 
 pub fn with_app_enabled_state(mut connectors: Vec<AppInfo>, config: &Config) -> Vec<AppInfo> {
-    let user_apps_config = read_user_apps_config(config);
+    let user_apps_config = apps_config_from_layer_stack(&config.config_layer_stack);
     let requirements_apps_config = config.config_layer_stack.requirements_toml().apps.as_ref();
     if user_apps_config.is_none() && requirements_apps_config.is_none() {
         return connectors;
@@ -569,8 +576,9 @@ pub fn with_app_plugin_sources(
     connectors
 }
 
-pub(crate) fn app_tool_policy(
+pub(crate) fn mcp_approvals_reviewer(
     config: &Config,
+    server_name: &str,
     connector_id: Option<&str>,
     tool_name: &str,
     tool_title: Option<&str>,
@@ -613,25 +621,6 @@ fn read_apps_config(config: &Config) -> Option<AppsConfigToml> {
         Some(apps_config)
     } else {
         None
-    }
-}
-
-fn read_user_apps_config(config: &Config) -> Option<AppsConfigToml> {
-    config
-        .config_layer_stack
-        .effective_config()
-        .as_table()
-        .and_then(|table| table.get("apps"))
-        .cloned()
-        .and_then(|value| AppsConfigToml::deserialize(value).ok())
-}
-
-fn apply_requirements_apps_constraints(
-    apps_config: &mut AppsConfigToml,
-    requirements_apps_config: Option<&AppsRequirementsToml>,
-) {
-    let Some(requirements_apps_config) = requirements_apps_config else {
-        return;
     };
 
     for (app_id, requirement) in &requirements_apps_config.apps {
@@ -687,39 +676,7 @@ fn app_tool_policy_from_apps_config(
         };
     }
 
-    if let Some(enabled) = tool_config.and_then(|tool| tool.enabled) {
-        return AppToolPolicy { enabled, approval };
-    }
-
-    if let Some(enabled) = app.and_then(|app| app.default_tools_enabled) {
-        return AppToolPolicy { enabled, approval };
-    }
-
-    let app_defaults = apps_config.default.as_ref();
-    let destructive_enabled = app
-        .and_then(|app| app.destructive_enabled)
-        .unwrap_or_else(|| {
-            app_defaults
-                .map(|defaults| defaults.destructive_enabled)
-                .unwrap_or(true)
-        });
-    let open_world_enabled = app
-        .and_then(|app| app.open_world_enabled)
-        .unwrap_or_else(|| {
-            app_defaults
-                .map(|defaults| defaults.open_world_enabled)
-                .unwrap_or(true)
-        });
-    let destructive_hint = annotations
-        .and_then(|annotations| annotations.destructive_hint)
-        .unwrap_or(true);
-    let open_world_hint = annotations
-        .and_then(|annotations| annotations.open_world_hint)
-        .unwrap_or(true);
-    let enabled =
-        (destructive_enabled || !destructive_hint) && (open_world_enabled || !open_world_hint);
-
-    AppToolPolicy { enabled, approval }
+    config.approvals_reviewer
 }
 
 #[cfg(test)]

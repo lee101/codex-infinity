@@ -77,7 +77,7 @@ use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
-use codex_config::CloudRequirementsLoader;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
@@ -947,6 +947,14 @@ mod tests {
                     duration_ms: None,
                 },
             })
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ExternalAgentConfigImportCompleted(
+                ExternalAgentConfigImportCompletedNotification {
+                    import_id: "import".to_string(),
+                    item_type_results: Vec::new(),
+                },
+            )
         ));
     }
 }

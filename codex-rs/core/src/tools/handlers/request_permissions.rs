@@ -38,7 +38,7 @@ impl ToolHandler for RequestPermissionsHandler {
         };
 
         let mut args: RequestPermissionsArgs =
-            parse_arguments_with_base_path(&arguments, &turn.cwd)?;
+            parse_arguments_with_base_path(&arguments, &native_cwd)?;
         args.permissions = normalize_additional_permissions(args.permissions.into())
             .map(codex_protocol::request_permissions::RequestPermissionProfile::from)
             .map_err(FunctionCallError::RespondToModel)?;
@@ -49,7 +49,13 @@ impl ToolHandler for RequestPermissionsHandler {
         }
 
         let response = session
-            .request_permissions(&turn, call_id, args, cancellation_token)
+            .request_permissions_for_environment(
+                &turn,
+                call_id,
+                args,
+                turn_environment.selection(),
+                cancellation_token,
+            )
             .await
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(

@@ -23,11 +23,52 @@ pub struct ToolSearchHandler {
     search_engine: SearchEngine<usize>,
 }
 
+#[derive(Default)]
+pub(crate) struct ToolSearchHandlerCache {
+    cached: Mutex<Option<Arc<ToolSearchHandler>>>,
+}
+
+impl ToolSearchHandlerCache {
+    pub(crate) fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler> {
+        {
+            let cached = self.cached();
+            if let Some(cached) = cached.as_ref()
+                && cached.search_infos == search_infos
+            {
+                return Arc::clone(cached);
+            }
+        }
+
+        let handler = Arc::new(ToolSearchHandler::new(search_infos));
+        let mut cached = self.cached();
+        if let Some(cached) = cached.as_ref()
+            && cached.search_infos == handler.search_infos
+        {
+            return Arc::clone(cached);
+        }
+
+        *cached = Some(Arc::clone(&handler));
+        handler
+    }
+
+    fn cached(&self) -> std::sync::MutexGuard<'_, Option<Arc<ToolSearchHandler>>> {
+        match self.cached.lock() {
+            Ok(cached) => cached,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 impl ToolSearchHandler {
     pub(crate) fn new(entries: Vec<ToolSearchEntry>) -> Self {
         let documents: Vec<Document<usize>> = entries
             .iter()
-            .map(|entry| entry.search_text.clone())
+            .filter_map(|search_info| search_info.source_info.clone())
+            .collect::<Vec<_>>();
+        let spec = create_tool_search_tool(&search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT);
+        let documents: Vec<Document<usize>> = search_infos
+            .iter()
+            .map(|search_info| search_info.entry.search_text.clone())
             .enumerate()
             .map(|(idx, search_text)| Document::new(idx, search_text))
             .collect();
@@ -48,7 +89,13 @@ impl ToolHandler for ToolSearchHandler {
         ToolKind::Function
     }
 
-    async fn handle(
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl ToolSearchHandler {
+    async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<ToolSearchOutput, FunctionCallError> {
@@ -175,13 +222,37 @@ mod tests {
     use super::*;
     use crate::tools::tool_search_entry::build_tool_search_entries;
     use codex_mcp::ToolInfo;
-    use codex_protocol::dynamic_tools::DynamicToolSpec;
+    use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+    use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
     use codex_tools::ResponsesApiNamespace;
     use codex_tools::ResponsesApiNamespaceTool;
     use codex_tools::ResponsesApiTool;
     use pretty_assertions::assert_eq;
     use rmcp::model::Tool;
     use std::sync::Arc;
+
+    #[test]
+    fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes() {
+        let cache = ToolSearchHandlerCache::default();
+        let search_infos = vec![
+            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+                .expect("MCP tool should convert")
+                .search_info()
+                .expect("MCP handler should return search info"),
+        ];
+
+        let first = cache.get_or_build(search_infos.clone());
+        let second = cache.get_or_build(search_infos.clone());
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let mut changed_search_infos = search_infos;
+        changed_search_infos[0]
+            .entry
+            .search_text
+            .push_str(" changed");
+        let changed = cache.get_or_build(changed_search_infos);
+        assert!(!Arc::ptr_eq(&first, &changed));
+    }
 
     #[test]
     fn mixed_search_results_coalesce_mcp_namespaces() {
@@ -213,9 +284,9 @@ mod tests {
             &dynamic_tools,
         );
         let results = [
-            &handler.entries[0],
-            &handler.entries[2],
-            &handler.entries[1],
+            &handler.search_infos[0].entry,
+            &handler.search_infos[2].entry,
+            &handler.search_infos[1].entry,
         ];
 
         let tools = handler
@@ -226,8 +297,8 @@ mod tests {
             tools,
             vec![
                 LoadableToolSpec::Namespace(ResponsesApiNamespace {
-                    name: "mcp__calendar__".to_string(),
-                    description: "Tools in the mcp__calendar__ namespace.".to_string(),
+                    name: "mcp__calendar".to_string(),
+                    description: "Tools in the mcp__calendar namespace.".to_string(),
                     tools: vec![
                         ResponsesApiNamespaceTool::Function(ResponsesApiTool {
                             name: "create_event".to_string(),
@@ -402,12 +473,7 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false,
                 }))),
-                output_schema: None,
-                annotations: None,
-                execution: None,
-                icons: None,
-                meta: None,
-            },
+            ),
             connector_id: None,
             connector_name: None,
             plugin_display_names: Vec::new(),

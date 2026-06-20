@@ -297,6 +297,7 @@ mod tests {
         let read_thread = Thread {
             id: read_thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: "read thread".to_string(),
             ephemeral: false,
             model_provider: "read-provider".to_string(),

@@ -14,6 +14,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::test_codex::TestCodexHarness;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -105,12 +106,10 @@ fn command_asserting_policy_after_snapshot() -> String {
     )
 }
 
-#[allow(clippy::expect_used)]
 async fn run_snapshot_command(command: &str) -> Result<SnapshotRun> {
     run_snapshot_command_with_options(command, SnapshotRunOptions::default()).await
 }
 
-#[allow(clippy::expect_used)]
 async fn run_snapshot_command_with_options(
     command: &str,
     options: SnapshotRunOptions,
@@ -154,7 +153,7 @@ async fn run_snapshot_command_with_options(
     let codex = test.codex.clone();
     let codex_home = test.home.path().to_path_buf();
     let session_model = test.session_configured.model.clone();
-    let cwd = test.cwd_path().to_path_buf();
+    let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
@@ -205,12 +204,10 @@ async fn run_snapshot_command_with_options(
     })
 }
 
-#[allow(clippy::expect_used)]
 async fn run_shell_command_snapshot(command: &str) -> Result<SnapshotRun> {
     run_shell_command_snapshot_with_options(command, SnapshotRunOptions::default()).await
 }
 
-#[allow(clippy::expect_used)]
 async fn run_shell_command_snapshot_with_options(
     command: &str,
     options: SnapshotRunOptions,
@@ -249,7 +246,7 @@ async fn run_shell_command_snapshot_with_options(
     let codex = test.codex.clone();
     let codex_home = test.home.path().to_path_buf();
     let session_model = test.session_configured.model.clone();
-    let cwd = test.cwd_path().to_path_buf();
+    let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
@@ -300,7 +297,6 @@ async fn run_shell_command_snapshot_with_options(
     })
 }
 
-#[allow(clippy::expect_used)]
 async fn run_tool_turn_on_harness(
     harness: &TestCodexHarness,
     prompt: &str,
@@ -325,7 +321,7 @@ async fn run_tool_turn_on_harness(
     let test = harness.test();
     let codex = test.codex.clone();
     let session_model = test.session_configured.model.clone();
-    let cwd = test.cwd_path().to_path_buf();
+    let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
     codex
@@ -537,7 +533,7 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
 
     let test = harness.test();
     let codex = test.codex.clone();
-    let cwd = test.cwd_path().to_path_buf();
+    let cwd = test.config.cwd.clone();
     let codex_home = test.home.path().to_path_buf();
     let target = cwd.join("snapshot-apply.txt");
 

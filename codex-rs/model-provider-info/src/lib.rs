@@ -246,7 +246,12 @@ impl ModelProviderInfo {
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
         let default_base_url = if matches!(
             auth_mode,
-            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
+            Some(
+                AuthMode::Chatgpt
+                    | AuthMode::ChatgptAuthTokens
+                    | AuthMode::AgentIdentity
+                    | AuthMode::PersonalAccessToken
+            )
         ) {
             "https://chatgpt.com/backend-api/codex"
         } else {

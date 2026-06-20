@@ -535,6 +535,7 @@ impl crate::render::renderable::Renderable for AppLinkView {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(inner, buf);
+        crate::terminal_hyperlinks::mark_url_hyperlink(buf, inner, &self.url);
 
         if actions_area.height > 0 {
             let actions_area = Rect {
@@ -597,7 +598,10 @@ mod tests {
                         if symbol.is_empty() {
                             ' '
                         } else {
-                            symbol.chars().next().unwrap_or(' ')
+                            crate::terminal_hyperlinks::strip_osc8(symbol)
+                                .chars()
+                                .next()
+                                .unwrap_or(' ')
                         }
                     })
                     .collect::<String>()
@@ -797,7 +801,10 @@ mod tests {
                         if symbol.is_empty() {
                             ' '
                         } else {
-                            symbol.chars().next().unwrap_or(' ')
+                            crate::terminal_hyperlinks::strip_osc8(symbol)
+                                .chars()
+                                .next()
+                                .unwrap_or(' ')
                         }
                     })
                     .collect::<String>()

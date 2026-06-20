@@ -9,8 +9,10 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::ThreadItem;
@@ -63,10 +65,11 @@ pub(super) fn matching_rollout_file_name(
             ),
         });
     };
-    let required_suffix = format!("{thread_id}.jsonl");
-    if file_name
-        .to_string_lossy()
-        .ends_with(required_suffix.as_str())
+    let required_plain_suffix = format!("{thread_id}.jsonl");
+    let required_compressed_suffix = format!("{required_plain_suffix}.zst");
+    let file_name_str = file_name.to_string_lossy();
+    if file_name_str.ends_with(required_plain_suffix.as_str())
+        || file_name_str.ends_with(required_compressed_suffix.as_str())
     {
         Ok(file_name)
     } else {
@@ -105,8 +108,10 @@ pub(super) fn stored_thread_from_rollout_item(
 
     Some(StoredThread {
         thread_id,
-        rollout_path: Some(item.path),
+        extra_config: None,
+        rollout_path: Some(rollout_path),
         forked_from_id: None,
+        parent_thread_id: item.parent_thread_id,
         preview,
         name: None,
         model_provider: item
@@ -126,7 +131,7 @@ pub(super) fn stored_thread_from_rollout_item(
         agent_path: None,
         git_info,
         approval_mode: AskForApproval::OnRequest,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: PermissionProfile::read_only(),
         token_usage: None,
         first_user_message: item.first_user_message,
         history: None,
@@ -137,6 +142,20 @@ fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value?)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_legacy_sandbox_policy(value: &str) -> serde_json::Result<SandboxPolicy> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(value.to_string())))
+        .or_else(|_| match value {
+            "danger-full-access" => Ok(SandboxPolicy::DangerFullAccess),
+            "read-only" => Ok(SandboxPolicy::new_read_only_policy()),
+            "workspace-write" => Ok(SandboxPolicy::new_workspace_write_policy()),
+            "external-sandbox" => Ok(SandboxPolicy::ExternalSandbox {
+                network_access: NetworkAccess::Restricted,
+            }),
+            _ => serde_json::from_value(serde_json::Value::String(value.to_string())),
+        })
 }
 
 pub(super) fn git_info_from_parts(
@@ -156,6 +175,7 @@ pub(super) fn git_info_from_parts(
 
 fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
     let file_name = path.file_name()?.to_str()?;
+    let file_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
     let stem = file_name.strip_suffix(".jsonl")?;
     if stem.len() < 37 {
         return None;
@@ -165,4 +185,37 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
         return None;
     }
     ThreadId::from_string(&stem[uuid_start..]).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_rollout::ThreadItem;
+    use pretty_assertions::assert_eq;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn stored_thread_from_rollout_item_returns_logical_rollout_path() {
+        let uuid = Uuid::from_u128(1);
+        let compressed_path = PathBuf::from(format!(
+            "/tmp/sessions/2025/01/03/rollout-2025-01-03T12-00-00-{uuid}.jsonl.zst"
+        ));
+        let thread = stored_thread_from_rollout_item(
+            ThreadItem {
+                path: compressed_path.clone(),
+                ..Default::default()
+            },
+            /*archived*/ false,
+            "test-provider",
+        )
+        .expect("stored thread");
+
+        assert_eq!(
+            thread.rollout_path,
+            Some(
+                compressed_path.with_file_name(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
+            )
+        );
+    }
 }

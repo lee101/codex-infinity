@@ -78,6 +78,8 @@ pub enum Feature {
     ShellTool,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
     CodexHooks,
+    /// Store CLI auth in the encrypted local secrets backend when keyring storage is selected.
+    SecretAuthStorage,
 
     // Experimental
     /// Removed compatibility flag for the deleted JavaScript REPL feature.
@@ -92,7 +94,13 @@ pub enum Feature {
     UnifiedExec,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
-    /// Reflow transcript scrollback when the terminal is resized.
+    /// Allow unified exec to compose with the zsh exec bridge.
+    ///
+    /// This flag is only a composition gate. Enabling it by itself must not turn
+    /// on either `unified_exec` or `shell_zsh_fork` because those features have
+    /// separate rollout and enterprise controls.
+    UnifiedExecZshFork,
+    /// Removed compatibility flag. Transcript scrollback reflow on terminal resize is always on.
     TerminalResizeReflow,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
@@ -133,6 +141,8 @@ pub enum Feature {
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
+    /// Compress cold local thread-store rollout files.
+    LocalThreadStoreCompression,
     /// Enable the Chronicle sidecar for passive screen-context memories.
     Chronicle,
     /// Append additional AGENTS.md guidance to user instructions.
@@ -179,6 +189,10 @@ pub enum Feature {
     ExternalMigration,
     /// Allow the model to invoke the built-in image generation tool.
     ImageGeneration,
+    /// Replace hosted image generation with the standalone image-generation extension.
+    ImageGenExt,
+    /// Resize all inline data-URL images before recording them in history.
+    ResizeAllImages,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
     /// Prompt for missing skill env var dependencies.
@@ -570,8 +584,18 @@ impl Features {
 }
 
 impl FeaturesToml {
+    /// Removes compatibility-only inputs that no longer affect runtime
+    /// behavior or belong in newly materialized config.
+    pub fn clear_removed_compatibility_entries(&mut self) {
+        self.removed_apps_mcp_path_override = None;
+        self.entries.remove("apps_mcp_path_override");
+    }
+
     pub fn entries(&self) -> BTreeMap<String, bool> {
         let mut entries = self.entries.clone();
+        if let Some(enabled) = self.code_mode.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::CodeMode.key().to_string(), enabled);
+        }
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
         }
@@ -636,6 +660,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::SecretAuthStorage,
+        key: "secret_auth_storage",
+        stage: Stage::Stable,
+        default_enabled: cfg!(windows),
+    },
+    FeatureSpec {
         id: Feature::UnifiedExec,
         key: "unified_exec",
         stage: Stage::Stable,
@@ -644,6 +674,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ShellZshFork,
         key: "shell_zsh_fork",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UnifiedExecZshFork,
+        key: "unified_exec_zsh_fork",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -680,11 +716,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::TerminalResizeReflow,
         key: "terminal_resize_reflow",
-        stage: Stage::Experimental {
-            name: "Terminal resize reflow",
-            menu_description: "Rebuild Codex-owned transcript scrollback when the terminal width changes.",
-            announcement: "",
-        },
+        stage: Stage::Removed,
         default_enabled: true,
     },
     FeatureSpec {
@@ -697,6 +729,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::WebSearchCached,
         key: "web_search_cached",
         stage: Stage::Deprecated,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::StandaloneWebSearch,
+        key: "standalone_web_search",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -732,6 +770,12 @@ pub const FEATURES: &[FeatureSpec] = &[
             menu_description: "Allow Codex to create new memories from conversations and bring relevant memories into new conversations.",
             announcement: "NEW: Codex can now generate and uses memories. Try is now with `/memories`",
         },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::LocalThreadStoreCompression,
+        key: "local_thread_store_compression",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -861,6 +905,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::NonPrefixedMcpToolNames,
+        key: "non_prefixed_mcp_tool_names",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::UnavailableDummyTools,
         key: "unavailable_dummy_tools",
         stage: Stage::Stable,
@@ -911,11 +961,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ExternalMigration,
         key: "external_migration",
-        stage: Stage::Experimental {
-            name: "External migration",
-            menu_description: "Show a startup prompt when Codex detects migratable external agent config for this machine or project.",
-            announcement: "",
-        },
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -923,6 +969,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "image_generation",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ImageGenExt,
+        key: "imagegenext",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ResizeAllImages,
+        key: "resize_all_images",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::SkillMcpDependencyInstall,
@@ -949,6 +1007,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::TerminalVisualizationInstructions,
+        key: "terminal_visualization_instructions",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianApproval,
         key: "guardian_approval",
         stage: Stage::Stable,
@@ -957,6 +1021,18 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Goals,
         key: "goals",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::TokenBudget,
+        key: "token_budget",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::SleepTool,
+        key: "sleep_tool",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1071,7 +1147,13 @@ pub fn unstable_features_warning_event(
     let mut under_development_feature_keys = Vec::new();
     if let Some(table) = effective_features {
         for (key, value) in table {
-            if value.as_bool() != Some(true) {
+            let is_enabled = value.as_bool() == Some(true)
+                || value
+                    .as_table()
+                    .and_then(|table| table.get("enabled"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true);
+            if !is_enabled {
                 continue;
             }
             let Some(spec) = FEATURES.iter().find(|spec| spec.key == key.as_str()) else {
@@ -1090,6 +1172,7 @@ pub fn unstable_features_warning_event(
         return None;
     }
 
+    under_development_feature_keys.sort();
     let under_development_feature_keys = under_development_feature_keys.join(", ");
     let message = format!(
         "Under-development features enabled: {under_development_feature_keys}. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in {config_path}."

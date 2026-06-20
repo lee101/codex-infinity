@@ -326,12 +326,7 @@ fn run_repeated_resize_smoke(terminal_resize_reflow_enabled: bool) -> Result<()>
     )?;
     write_auth(codex_home.path())?;
 
-    let suffix = if terminal_resize_reflow_enabled {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    let session_name = format!("codex-resize-repeat-{suffix}-{}", std::process::id());
+    let session_name = format!("codex-resize-repeat-{}", std::process::id());
     let _session = TmuxSession {
         name: session_name.clone(),
     };
@@ -424,30 +419,20 @@ fn run_repeated_resize_smoke(terminal_resize_reflow_enabled: bool) -> Result<()>
         let restored_history_row =
             first_row_containing(&restored_capture, "resize reflow sentinel")
                 .with_context(|| format!("history row after resize cycle {cycle}"))?;
-        if terminal_resize_reflow_enabled {
-            anyhow::ensure!(
-                restored_row == baseline_row,
-                "composer row drifted after resize cycle {cycle} with terminal_resize_reflow={terminal_resize_reflow_enabled}: \
-                 baseline={baseline_row}, restored={restored_row}\n\
-                 baseline:\n{baseline_capture}\n\
-                 restored:\n{restored_capture}"
-            );
-            anyhow::ensure!(
-                restored_history_row == baseline_history_row,
-                "history row drifted after resize cycle {cycle} with terminal_resize_reflow={terminal_resize_reflow_enabled}: \
-                 baseline={baseline_history_row}, restored={restored_history_row}\n\
-                 baseline:\n{baseline_capture}\n\
-                 restored:\n{restored_capture}"
-            );
-        } else {
-            anyhow::ensure!(
-                restored_row <= baseline_row + 1,
-                "composer row snapped downward after resize cycle {cycle} with terminal_resize_reflow={terminal_resize_reflow_enabled}: \
-                 baseline={baseline_row}, restored={restored_row}\n\
-                 baseline:\n{baseline_capture}\n\
-                 restored:\n{restored_capture}"
-            );
-        }
+        anyhow::ensure!(
+            restored_row == baseline_row,
+            "composer row drifted after resize cycle {cycle}: baseline={baseline_row}, \
+             restored={restored_row}\n\
+             baseline:\n{baseline_capture}\n\
+             restored:\n{restored_capture}"
+        );
+        anyhow::ensure!(
+            restored_history_row == baseline_history_row,
+            "history row drifted after resize cycle {cycle}: baseline={baseline_history_row}, \
+             restored={restored_history_row}\n\
+             baseline:\n{baseline_capture}\n\
+             restored:\n{restored_capture}"
+        );
     }
 
     Ok(())
@@ -480,19 +465,12 @@ fn codex_binary(repo_root: &Path) -> Result<PathBuf> {
     Ok(fallback)
 }
 
-fn write_config(
-    codex_home: &Path,
-    repo_root: &Path,
-    terminal_resize_reflow_enabled: bool,
-) -> Result<()> {
+fn write_config(codex_home: &Path, repo_root: &Path) -> Result<()> {
     let repo_root_display = repo_root.display();
     let config = format!(
         r#"model = "gpt-5.4"
 model_provider = "openai"
 suppress_unstable_features_warning = true
-
-[features]
-terminal_resize_reflow = {terminal_resize_reflow_enabled}
 
 [projects."{repo_root_display}"]
 trust_level = "trusted"

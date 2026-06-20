@@ -29,6 +29,7 @@ use crate::facts::AppInvocation;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
 use crate::facts::CodexCompactionEvent;
+use crate::facts::CodexErrKind;
 use crate::facts::CompactionImplementation;
 use crate::facts::CompactionPhase;
 use crate::facts::CompactionReason;
@@ -48,6 +49,9 @@ use crate::facts::SkillInvokedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
 use crate::facts::TrackEventsContext;
+use crate::facts::TurnCodexErrorFact;
+use crate::facts::TurnProfile;
+use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRequestError;
@@ -70,6 +74,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy as AppServerSandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource as AppServerSessionSource;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -123,6 +128,7 @@ fn sample_thread_with_source(
     Thread {
         id: thread_id.to_string(),
         forked_from_id: None,
+        parent_thread_id,
         preview: "first prompt".to_string(),
         ephemeral,
         model_provider: "openai".to_string(),
@@ -221,6 +227,7 @@ fn sample_turn_start_request(thread_id: &str, request_id: i64) -> ClientRequest 
         request_id: RequestId::Integer(request_id),
         params: TurnStartParams {
             thread_id: thread_id.to_string(),
+            client_user_message_id: None,
             input: vec![
                 UserInput::Text {
                     text: "hello".to_string(),
@@ -327,7 +334,20 @@ fn sample_turn_resolved_config(turn_id: &str) -> TurnResolvedConfigFact {
         sandbox_network_access: true,
         collaboration_mode: ModeKind::Plan,
         personality: None,
+        workspace_kind: None,
         is_first_turn: true,
+    }
+}
+
+fn sample_turn_profile() -> TurnProfile {
+    TurnProfile {
+        before_first_sampling_ms: 100,
+        sampling_ms: 700,
+        between_sampling_overhead_ms: 50,
+        tool_blocking_ms: 250,
+        after_last_sampling_ms: 134,
+        sampling_request_count: 2,
+        sampling_retry_count: 1,
     }
 }
 
@@ -341,6 +361,7 @@ fn sample_turn_steer_request(
         params: TurnSteerParams {
             thread_id: thread_id.to_string(),
             expected_turn_id: expected_turn_id.to_string(),
+            client_user_message_id: None,
             input: vec![
                 UserInput::Text {
                     text: "more".to_string(),
@@ -351,6 +372,7 @@ fn sample_turn_steer_request(
                 },
             ],
             responsesapi_client_metadata: None,
+            additional_context: None,
         },
     }
 }
@@ -550,6 +572,18 @@ async fn ingest_turn_prerequisites(
             )
             .await;
     }
+
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnProfile(Box::new(
+                TurnProfileFact {
+                    turn_id: "turn-2".to_string(),
+                    profile: sample_turn_profile(),
+                },
+            ))),
+            out,
+        )
+        .await;
 }
 
 fn expected_absolute_path(path: &PathBuf) -> String {
@@ -706,13 +740,18 @@ fn compaction_event_serializes_expected_shape() {
                 phase: CompactionPhase::MidTurn,
                 strategy: CompactionStrategy::Memento,
                 status: CompactionStatus::Completed,
-                error: None,
+                codex_error_kind: None,
+                codex_error_http_status_code: None,
                 active_context_tokens_before: 120_000,
                 active_context_tokens_after: 18_000,
+                retained_image_count: None,
+                compaction_summary_tokens: None,
+                cached_input_tokens: None,
                 started_at: 100,
                 completed_at: 106,
                 duration_ms: Some(6543),
             },
+            "session-thread-1".to_string(),
             sample_app_server_client_metadata(),
             sample_runtime_metadata(),
             Some("user"),
@@ -729,6 +768,7 @@ fn compaction_event_serializes_expected_shape() {
             "event_type": "codex_compaction_event",
             "event_params": {
                 "thread_id": "thread-1",
+                "session_id": "session-thread-1",
                 "turn_id": "turn-1",
                 "app_server_client": {
                     "product_client_id": DEFAULT_ORIGINATOR,
@@ -752,9 +792,13 @@ fn compaction_event_serializes_expected_shape() {
                 "phase": "mid_turn",
                 "strategy": "memento",
                 "status": "completed",
-                "error": null,
+                "codex_error_kind": null,
+                "codex_error_http_status_code": null,
                 "active_context_tokens_before": 120000,
                 "active_context_tokens_after": 18000,
+                "retained_image_count": null,
+                "compaction_summary_tokens": null,
+                "cached_input_tokens": null,
                 "started_at": 100,
                 "completed_at": 106,
                 "duration_ms": 6543
@@ -799,6 +843,7 @@ fn thread_initialized_event_serializes_expected_shape() {
         event_type: "codex_thread_initialized",
         event_params: ThreadInitializedEventParams {
             thread_id: "thread-0".to_string(),
+            session_id: "session-thread-0".to_string(),
             app_server_client: CodexAppServerClientMetadata {
                 product_client_id: DEFAULT_ORIGINATOR.to_string(),
                 client_name: Some("codex-tui".to_string()),
@@ -818,6 +863,7 @@ fn thread_initialized_event_serializes_expected_shape() {
             initialization_mode: ThreadInitializationMode::New,
             subagent_source: None,
             parent_thread_id: None,
+            forked_from_thread_id: None,
             created_at: 1,
         },
     });
@@ -830,6 +876,7 @@ fn thread_initialized_event_serializes_expected_shape() {
             "event_type": "codex_thread_initialized",
             "event_params": {
                 "thread_id": "thread-0",
+                "session_id": "session-thread-0",
                 "app_server_client": {
                     "product_client_id": DEFAULT_ORIGINATOR,
                     "client_name": "codex-tui",
@@ -845,10 +892,11 @@ fn thread_initialized_event_serializes_expected_shape() {
                 },
                 "model": "gpt-5",
                 "ephemeral": true,
-                "thread_source": "user",
+                "thread_source": "automation",
                 "initialization_mode": "new",
                 "subagent_source": null,
                 "parent_thread_id": null,
+                "forked_from_thread_id": null,
                 "created_at": 1
             }
         })
@@ -919,6 +967,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
     let payload = serde_json::to_value(&events).expect("serialize events");
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_thread_initialized");
+    assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
     assert_eq!(
         payload[0]["event_params"]["app_server_client"]["product_client_id"],
         DEFAULT_ORIGINATOR
@@ -1018,9 +1067,13 @@ async fn compaction_event_ingests_custom_fact() {
                     phase: CompactionPhase::StandaloneTurn,
                     strategy: CompactionStrategy::Memento,
                     status: CompactionStatus::Failed,
-                    error: Some("context limit exceeded".to_string()),
+                    codex_error_kind: Some(CodexErrKind::ContextWindowExceeded),
+                    codex_error_http_status_code: None,
                     active_context_tokens_before: 131_000,
                     active_context_tokens_after: 131_000,
+                    retained_image_count: None,
+                    compaction_summary_tokens: None,
+                    cached_input_tokens: None,
                     started_at: 100,
                     completed_at: 101,
                     duration_ms: Some(1200),
@@ -1033,8 +1086,17 @@ async fn compaction_event_ingests_custom_fact() {
     let payload = serde_json::to_value(&events).expect("serialize events");
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_compaction_event");
+    assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
     assert_eq!(payload[0]["event_params"]["thread_id"], "thread-1");
     assert_eq!(payload[0]["event_params"]["turn_id"], "turn-compact");
+    assert_eq!(
+        payload[0]["event_params"]["codex_error_kind"],
+        json!("context_window_exceeded")
+    );
+    assert_eq!(
+        payload[0]["event_params"]["codex_error_http_status_code"],
+        json!(null)
+    );
     assert_eq!(
         payload[0]["event_params"]["app_server_client"]["product_client_id"],
         DEFAULT_ORIGINATOR
@@ -1127,6 +1189,7 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     decision: GuardianReviewDecision::Denied,
                     terminal_status: GuardianReviewTerminalStatus::TimedOut,
                     failure_reason: Some(GuardianReviewFailureReason::Timeout),
+                    attempt_count: 1,
                     risk_level: None,
                     user_authorization: None,
                     outcome: None,
@@ -1134,6 +1197,11 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     guardian_session_kind: None,
                     guardian_model: None,
                     guardian_reasoning_effort: None,
+                    guardian_default_review_model_id: Some("codex-auto-review".to_string()),
+                    guardian_catalog_contains_auto_review: Some(false),
+                    guardian_review_model_overridden: Some(false),
+                    guardian_review_model_override: None,
+                    guardian_model_provider_id: Some("openai".to_string()),
                     had_prior_review_context: None,
                     review_timeout_ms: 90_000,
                     tool_call_count: None,
@@ -1155,6 +1223,10 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
     let payload = serde_json::to_value(&events).expect("serialize events");
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_guardian_review");
+    assert_eq!(
+        payload[0]["event_params"]["session_id"],
+        "session-thread-guardian"
+    );
     assert_eq!(payload[0]["event_params"]["thread_id"], "thread-guardian");
     assert_eq!(payload[0]["event_params"]["turn_id"], "turn-guardian");
     assert_eq!(payload[0]["event_params"]["review_id"], "review-guardian");
@@ -1194,15 +1266,38 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
     );
     assert_eq!(payload[0]["event_params"]["terminal_status"], "timed_out");
     assert_eq!(payload[0]["event_params"]["failure_reason"], "timeout");
+    assert_eq!(payload[0]["event_params"]["attempt_count"], 1);
     assert_eq!(payload[0]["event_params"]["review_timeout_ms"], 90_000);
+    assert_eq!(
+        payload[0]["event_params"]["guardian_default_review_model_id"],
+        "codex-auto-review"
+    );
+    assert_eq!(
+        payload[0]["event_params"]["guardian_catalog_contains_auto_review"],
+        false
+    );
+    assert_eq!(
+        payload[0]["event_params"]["guardian_review_model_overridden"],
+        false
+    );
+    assert_eq!(
+        payload[0]["event_params"]["guardian_review_model_override"],
+        json!(null)
+    );
+    assert_eq!(
+        payload[0]["event_params"]["guardian_model_provider_id"],
+        "openai"
+    );
 }
 
 #[test]
 fn subagent_thread_started_review_serializes_expected_shape() {
     let event = TrackEventRequest::ThreadInitialized(subagent_thread_started_event_request(
         SubAgentThreadStartedInput {
+            session_id: "session-root".to_string(),
             thread_id: "thread-review".to_string(),
             parent_thread_id: None,
+            forked_from_thread_id: None,
             product_client_id: "codex-tui".to_string(),
             client_name: "codex-tui".to_string(),
             client_version: "1.0.0".to_string(),
@@ -1235,17 +1330,26 @@ fn subagent_thread_started_review_serializes_expected_shape() {
     assert_eq!(payload["event_params"]["initialization_mode"], "new");
     assert_eq!(payload["event_params"]["subagent_source"], "review");
     assert_eq!(payload["event_params"]["parent_thread_id"], json!(null));
+    assert_eq!(
+        payload["event_params"]["forked_from_thread_id"],
+        json!(null)
+    );
 }
 
 #[test]
-fn subagent_thread_started_thread_spawn_serializes_parent_thread_id() {
+fn subagent_thread_started_thread_spawn_serializes_thread_lineage() {
     let parent_thread_id =
         codex_protocol::ThreadId::from_string("11111111-1111-1111-1111-111111111111")
             .expect("valid thread id");
+    let forked_from_thread_id =
+        codex_protocol::ThreadId::from_string("22222222-2222-4222-8222-222222222222")
+            .expect("valid thread id");
     let event = TrackEventRequest::ThreadInitialized(subagent_thread_started_event_request(
         SubAgentThreadStartedInput {
+            session_id: "session-root".to_string(),
             thread_id: "thread-spawn".to_string(),
-            parent_thread_id: None,
+            parent_thread_id: Some(parent_thread_id.to_string()),
+            forked_from_thread_id: Some(forked_from_thread_id.to_string()),
             product_client_id: "codex-tui".to_string(),
             client_name: "codex-tui".to_string(),
             client_version: "1.0.0".to_string(),
@@ -1263,20 +1367,28 @@ fn subagent_thread_started_thread_spawn_serializes_parent_thread_id() {
     ));
 
     let payload = serde_json::to_value(&event).expect("serialize thread spawn subagent event");
+    assert_eq!(payload["event_params"]["thread_id"], "thread-spawn");
     assert_eq!(payload["event_params"]["thread_source"], "subagent");
     assert_eq!(payload["event_params"]["subagent_source"], "thread_spawn");
     assert_eq!(
         payload["event_params"]["parent_thread_id"],
         "11111111-1111-1111-1111-111111111111"
     );
+    assert_eq!(
+        payload["event_params"]["forked_from_thread_id"],
+        "22222222-2222-4222-8222-222222222222"
+    );
+    assert_eq!(payload["event_params"]["session_id"], "session-root");
 }
 
 #[test]
 fn subagent_thread_started_memory_consolidation_serializes_expected_shape() {
     let event = TrackEventRequest::ThreadInitialized(subagent_thread_started_event_request(
         SubAgentThreadStartedInput {
+            session_id: "session-root".to_string(),
             thread_id: "thread-memory".to_string(),
             parent_thread_id: None,
+            forked_from_thread_id: None,
             product_client_id: "codex-tui".to_string(),
             client_name: "codex-tui".to_string(),
             client_version: "1.0.0".to_string(),
@@ -1300,8 +1412,10 @@ fn subagent_thread_started_memory_consolidation_serializes_expected_shape() {
 fn subagent_thread_started_other_serializes_expected_shape() {
     let event = TrackEventRequest::ThreadInitialized(subagent_thread_started_event_request(
         SubAgentThreadStartedInput {
+            session_id: "session-root".to_string(),
             thread_id: "thread-guardian".to_string(),
             parent_thread_id: None,
+            forked_from_thread_id: None,
             product_client_id: "codex-tui".to_string(),
             client_name: "codex-tui".to_string(),
             client_version: "1.0.0".to_string(),
@@ -1319,10 +1433,15 @@ fn subagent_thread_started_other_serializes_expected_shape() {
 
 #[test]
 fn subagent_thread_started_other_serializes_explicit_parent_thread_id() {
+    let parent_thread_id =
+        codex_protocol::ThreadId::from_string("33333333-3333-4333-8333-333333333333")
+            .expect("valid thread id");
     let event = TrackEventRequest::ThreadInitialized(subagent_thread_started_event_request(
         SubAgentThreadStartedInput {
+            session_id: "session-root".to_string(),
             thread_id: "thread-guardian".to_string(),
-            parent_thread_id: Some("parent-thread-guardian".to_string()),
+            parent_thread_id: Some(parent_thread_id.to_string()),
+            forked_from_thread_id: None,
             product_client_id: "codex-tui".to_string(),
             client_name: "codex-tui".to_string(),
             client_version: "1.0.0".to_string(),
@@ -1337,7 +1456,7 @@ fn subagent_thread_started_other_serializes_explicit_parent_thread_id() {
     assert_eq!(payload["event_params"]["subagent_source"], "guardian");
     assert_eq!(
         payload["event_params"]["parent_thread_id"],
-        "parent-thread-guardian"
+        "33333333-3333-4333-8333-333333333333"
     );
 }
 
@@ -1350,8 +1469,10 @@ async fn subagent_thread_started_publishes_without_initialize() {
         .ingest(
             AnalyticsFact::Custom(CustomAnalyticsFact::SubAgentThreadStarted(
                 SubAgentThreadStartedInput {
+                    session_id: "session-root".to_string(),
                     thread_id: "thread-review".to_string(),
                     parent_thread_id: None,
+                    forked_from_thread_id: None,
                     product_client_id: "codex-tui".to_string(),
                     client_name: "codex-tui".to_string(),
                     client_version: "1.0.0".to_string(),
@@ -1402,6 +1523,7 @@ fn plugin_used_event_serializes_expected_shape() {
                 "mcp_server_count": 2,
                 "connector_ids": ["calendar", "drive"],
                 "product_client_id": originator().value,
+                "mcp_server_names": ["mcp-1", "mcp-2"],
                 "thread_id": "thread-3",
                 "turn_id": "turn-3",
                 "model_slug": "gpt-5"
@@ -1741,6 +1863,7 @@ fn turn_event_serializes_expected_shape() {
         event_type: "codex_turn_event",
         event_params: crate::events::CodexTurnEventParams {
             thread_id: "thread-2".to_string(),
+            session_id: "session-thread-2".to_string(),
             turn_id: "turn-2".to_string(),
             app_server_client: sample_app_server_client_metadata(),
             runtime: sample_runtime_metadata(),
@@ -1761,10 +1884,13 @@ fn turn_event_serializes_expected_shape() {
             sandbox_network_access: true,
             collaboration_mode: Some("plan"),
             personality: Some("pragmatic".to_string()),
+            workspace_kind: Some("projectless".to_string()),
             num_input_images: 2,
             is_first_turn: true,
             status: Some(TurnStatus::Completed),
             turn_error: None,
+            codex_error_kind: None,
+            codex_error_http_status_code: None,
             steer_count: Some(0),
             total_tool_call_count: None,
             shell_command_count: None,
@@ -1779,6 +1905,13 @@ fn turn_event_serializes_expected_shape() {
             output_tokens: None,
             reasoning_output_tokens: None,
             total_tokens: None,
+            before_first_sampling_ms: 100,
+            sampling_ms: 700,
+            between_sampling_overhead_ms: 50,
+            tool_blocking_ms: 250,
+            after_last_sampling_ms: 134,
+            sampling_request_count: 2,
+            sampling_retry_count: 1,
             duration_ms: Some(1234),
             started_at: Some(455),
             completed_at: Some(456),
@@ -1791,6 +1924,7 @@ fn turn_event_serializes_expected_shape() {
             "event_type": "codex_turn_event",
             "event_params": {
                 "thread_id": "thread-2",
+                "session_id": "session-thread-2",
                 "turn_id": "turn-2",
                 "submission_type": null,
                 "app_server_client": {
@@ -1822,10 +1956,13 @@ fn turn_event_serializes_expected_shape() {
                 "sandbox_network_access": true,
                 "collaboration_mode": "plan",
                 "personality": "pragmatic",
+                "workspace_kind": "projectless",
                 "num_input_images": 2,
                 "is_first_turn": true,
                 "status": "completed",
                 "turn_error": null,
+                "codex_error_kind": null,
+                "codex_error_http_status_code": null,
                 "steer_count": 0,
                 "total_tool_call_count": null,
                 "shell_command_count": null,
@@ -1840,6 +1977,13 @@ fn turn_event_serializes_expected_shape() {
                 "output_tokens": null,
                 "reasoning_output_tokens": null,
                 "total_tokens": null,
+                "before_first_sampling_ms": 100,
+                "sampling_ms": 700,
+                "between_sampling_overhead_ms": 50,
+                "tool_blocking_ms": 250,
+                "after_last_sampling_ms": 134,
+                "sampling_request_count": 2,
+                "sampling_retry_count": 1,
                 "duration_ms": 1234,
                 "started_at": 455,
                 "completed_at": 456
@@ -1891,6 +2035,10 @@ async fn accepted_turn_steer_emits_expected_event() {
     let payload = serde_json::to_value(&out[0]).expect("serialize turn steer event");
     assert_eq!(payload["event_type"], json!("codex_turn_steer_event"));
     assert_eq!(payload["event_params"]["thread_id"], json!("thread-2"));
+    assert_eq!(
+        payload["event_params"]["session_id"],
+        json!("session-thread-2")
+    );
     assert_eq!(payload["event_params"]["expected_turn_id"], json!("turn-2"));
     assert_eq!(payload["event_params"]["accepted_turn_id"], json!("turn-2"));
     assert_eq!(payload["event_params"]["num_input_images"], json!(1));
@@ -2107,6 +2255,10 @@ async fn turn_lifecycle_emits_turn_event() {
     let payload = serde_json::to_value(&out[0]).expect("serialize turn event");
     assert_eq!(payload["event_type"], json!("codex_turn_event"));
     assert_eq!(payload["event_params"]["thread_id"], json!("thread-2"));
+    assert_eq!(
+        payload["event_params"]["session_id"],
+        json!("session-thread-2")
+    );
     assert_eq!(payload["event_params"]["turn_id"], json!("turn-2"));
     assert_eq!(
         payload["event_params"]["app_server_client"],
@@ -2129,6 +2281,7 @@ async fn turn_lifecycle_emits_turn_event() {
     );
     assert!(payload["event_params"].get("product_client_id").is_none());
     assert_eq!(payload["event_params"]["ephemeral"], json!(false));
+    assert_eq!(payload["event_params"]["workspace_kind"], json!(null));
     assert_eq!(payload["event_params"]["num_input_images"], json!(1));
     assert_eq!(payload["event_params"]["status"], json!("completed"));
     assert_eq!(payload["event_params"]["steer_count"], json!(0));
@@ -2317,6 +2470,18 @@ async fn turn_lifecycle_emits_failed_turn_event() {
     .await;
     reducer
         .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnCodexError(Box::new(
+                TurnCodexErrorFact::from_codex_err(
+                    "thread-2".to_string(),
+                    "turn-2".to_string(),
+                    &CodexErr::InvalidRequest("unknown turn environment id `env-2`".to_string()),
+                ),
+            ))),
+            &mut out,
+        )
+        .await;
+    reducer
+        .ingest(
             AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
                 "thread-2",
                 "turn-2",
@@ -2331,6 +2496,14 @@ async fn turn_lifecycle_emits_failed_turn_event() {
     let payload = serde_json::to_value(&out[0]).expect("serialize turn event");
     assert_eq!(payload["event_params"]["status"], json!("failed"));
     assert_eq!(payload["event_params"]["turn_error"], json!("badRequest"));
+    assert_eq!(
+        payload["event_params"]["codex_error_kind"],
+        json!("invalid_request")
+    );
+    assert_eq!(
+        payload["event_params"]["codex_error_http_status_code"],
+        json!(null)
+    );
 }
 
 #[tokio::test]
@@ -2363,6 +2536,7 @@ async fn turn_lifecycle_emits_interrupted_turn_event_without_error() {
     let payload = serde_json::to_value(&out[0]).expect("serialize turn event");
     assert_eq!(payload["event_params"]["status"], json!("interrupted"));
     assert_eq!(payload["event_params"]["turn_error"], json!(null));
+    assert_eq!(payload["event_params"]["codex_error_kind"], json!(null));
 }
 
 #[tokio::test]

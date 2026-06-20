@@ -3,6 +3,7 @@ use codex_protocol::models::ShellCommandToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
@@ -80,6 +81,7 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
 struct RunExecLikeArgs {
     tool_name: String,
     exec_params: ExecParams,
+    cancellation_token: CancellationToken,
     hook_command: String,
     additional_permissions: Option<AdditionalPermissionProfile>,
     prefix_rule: Option<Vec<String>>,

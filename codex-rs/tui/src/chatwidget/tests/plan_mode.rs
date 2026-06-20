@@ -596,6 +596,7 @@ async fn request_user_input_notification_overrides_pending_agent_turn_complete_n
                 description: "Update only Plan mode.".to_string(),
             }]),
         }],
+        auto_resolution_ms: None,
     });
 
     assert_matches!(
@@ -624,6 +625,7 @@ async fn handle_request_user_input_sets_pending_notification() {
                 description: "Update only Plan mode.".to_string(),
             }]),
         }],
+        auto_resolution_ms: None,
     });
 
     assert_matches!(
@@ -1225,6 +1227,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: vec![MentionBinding {
+            sigil: '$',
             mention: "sample".to_string(),
             path: "plugin://sample@test".to_string(),
         }],
@@ -1485,7 +1488,7 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         .build()
         .await
         .expect("config");
-    let resolved_model = crate::legacy_core::test_support::get_model_offline(cfg.model.as_deref());
+    let resolved_model = get_model_offline_for_tests(cfg.model.as_deref());
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
@@ -1494,6 +1497,7 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         initial_user_message: None,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
+        has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,

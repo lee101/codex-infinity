@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from typing import AsyncIterator, Callable, Iterable, ParamSpec, TypeVar
 
 from pydantic import BaseModel
 
-from .client import AppServerClient, AppServerConfig
+from ._goal import _GoalOperationState
+from .client import CodexClient, CodexConfig
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
@@ -21,6 +23,9 @@ from .generated.v2_all import (
     ThreadCompactStartResponse,
     ThreadForkParams as V2ThreadForkParams,
     ThreadForkResponse,
+    ThreadGoalClearResponse,
+    ThreadGoalSetResponse,
+    ThreadGoalStatus,
     ThreadListParams as V2ThreadListParams,
     ThreadListResponse,
     ThreadReadResponse,
@@ -43,8 +48,8 @@ ParamsT = ParamSpec("ParamsT")
 ReturnT = TypeVar("ReturnT")
 
 
-class AsyncAppServerClient:
-    """Async wrapper around AppServerClient using thread offloading."""
+class AsyncCodexClient:
+    """Async wrapper around CodexClient using thread offloading."""
 
     def __init__(self, config: AppServerConfig | None = None) -> None:
         self._sync = AppServerClient(config=config)
@@ -91,6 +96,14 @@ class AsyncAppServerClient:
 
     def release_turn_consumer(self, turn_id: str) -> None:
         self._sync.release_turn_consumer(turn_id)
+
+    def register_goal_operation(self, thread_id: str) -> _GoalOperationState:
+        """Register a logical goal route on the wrapped sync client."""
+        return self._sync.register_goal_operation(thread_id)
+
+    def unregister_goal_operation(self, state: _GoalOperationState) -> None:
+        """Release one logical goal route."""
+        self._sync.unregister_goal_operation(state)
 
     async def request(
         self,
@@ -140,6 +153,81 @@ class AsyncAppServerClient:
 
     async def thread_compact(self, thread_id: str) -> ThreadCompactStartResponse:
         return await self._call_sync(self._sync.thread_compact, thread_id)
+
+    async def thread_goal_clear(self, thread_id: str) -> ThreadGoalClearResponse:
+        """Clear the persisted goal through the wrapped sync client."""
+        return await self._call_sync(self._sync.thread_goal_clear, thread_id)
+
+    async def thread_goal_set(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None = None,
+        status: ThreadGoalStatus | None = None,
+    ) -> ThreadGoalSetResponse:
+        """Create or update a persisted goal through the wrapped sync client."""
+        return await self._call_sync(
+            self._sync.thread_goal_set,
+            thread_id,
+            objective=objective,
+            status=status,
+        )
+
+    async def pause_goal(self, thread_id: str) -> ThreadGoalSetResponse:
+        """Pause the active goal through the wrapped sync client."""
+        return await self._call_sync(self._sync.pause_goal, thread_id)
+
+    async def cancel_goal_operation(self, state: _GoalOperationState) -> None:
+        """Stop continuation work after a logical goal operation is cancelled."""
+        await self._call_sync(self._sync.cancel_goal_operation, state)
+
+    async def start_goal_operation(
+        self,
+        thread_id: str,
+        objective: str,
+    ) -> tuple[_GoalOperationState, str]:
+        """Start a logical goal through the wrapped sync client."""
+        operation: Future[tuple[_GoalOperationState, str]] = Future()
+
+        def start_operation() -> None:
+            try:
+                operation.set_result(self._sync.start_goal_operation(thread_id, objective))
+            except BaseException as exc:
+                operation.set_exception(exc)
+
+        worker = threading.Thread(
+            target=start_operation,
+            name="codex-goal-start",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            return await asyncio.shield(asyncio.wrap_future(operation))
+        except asyncio.CancelledError:
+
+            def cleanup_cancelled_start(
+                completed: Future[tuple[_GoalOperationState, str]],
+            ) -> None:
+                try:
+                    state, _ = completed.result()
+                except BaseException:
+                    return
+
+                def stop_cancelled_goal() -> None:
+                    try:
+                        self._sync.cancel_goal_operation(state)
+                    finally:
+                        state.finish()
+                        self._sync.unregister_goal_operation(state)
+
+                threading.Thread(
+                    target=stop_cancelled_goal,
+                    name="codex-goal-start-cleanup",
+                    daemon=True,
+                ).start()
+
+            operation.add_done_callback(cleanup_cancelled_start)
+            raise
 
     async def turn_start(
         self,

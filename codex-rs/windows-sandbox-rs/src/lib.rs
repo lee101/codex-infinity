@@ -149,10 +149,6 @@ pub use logging::log_note;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
 #[cfg(target_os = "windows")]
-pub use policy::SandboxPolicy;
-#[cfg(target_os = "windows")]
-pub use policy::parse_policy;
-#[cfg(target_os = "windows")]
 pub use process::PipeSpawnHandles;
 #[cfg(target_os = "windows")]
 pub use process::StderrMode;
@@ -174,6 +170,8 @@ pub use setup::SETUP_VERSION;
 pub use setup::SandboxSetupRequest;
 #[cfg(target_os = "windows")]
 pub use setup::SetupRootOverrides;
+#[cfg(target_os = "windows")]
+pub use setup::run_elevated_provisioning_setup;
 #[cfg(target_os = "windows")]
 pub use setup::run_elevated_setup;
 #[cfg(target_os = "windows")]
@@ -226,11 +224,15 @@ pub use winutil::string_from_sid_bytes;
 pub use winutil::to_wide;
 #[cfg(target_os = "windows")]
 pub use workspace_acl::is_command_cwd_root;
+#[cfg(target_os = "windows")]
+pub use wrapper::CODEX_WINDOWS_SANDBOX_ARG1;
+#[cfg(target_os = "windows")]
+pub use wrapper::create_windows_sandbox_command_args_for_permission_profile;
+#[cfg(target_os = "windows")]
+pub use wrapper::run_windows_sandbox_wrapper_main;
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::CaptureResult;
-#[cfg(not(target_os = "windows"))]
-pub use stub::apply_world_writable_scan_and_denies;
 #[cfg(not(target_os = "windows"))]
 pub use stub::run_windows_sandbox_capture;
 #[cfg(not(target_os = "windows"))]
@@ -263,6 +265,8 @@ mod windows_impl {
     use std::path::Path;
     use std::path::PathBuf;
     use std::ptr;
+    use std::time::Duration;
+    use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -274,6 +278,50 @@ mod windows_impl {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
+
+    enum WaitOutcome {
+        Exited,
+        TimedOut,
+        Cancelled,
+    }
+
+    fn wait_for_process(
+        process: HANDLE,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&WindowsSandboxCancellationToken>,
+    ) -> WaitOutcome {
+        let Some(cancellation) = cancellation else {
+            let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+            let res = unsafe { WaitForSingleObject(process, timeout) };
+            return if res == 0x0000_0102 {
+                WaitOutcome::TimedOut
+            } else {
+                WaitOutcome::Exited
+            };
+        };
+
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            if cancellation.is_cancelled() {
+                return WaitOutcome::Cancelled;
+            }
+            let wait_ms = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return WaitOutcome::TimedOut;
+                    }
+                    remaining.min(Duration::from_millis(50)).as_millis() as u32
+                }
+                None => 50,
+            };
+            let res = unsafe { WaitForSingleObject(process, wait_ms) };
+            if res == 0x0000_0102 {
+                continue;
+            }
+            return WaitOutcome::Exited;
+        }
+    }
 
     unsafe fn setup_stdio_pipes() -> io::Result<PipeHandles> {
         let mut in_r: HANDLE = 0;
@@ -312,13 +360,14 @@ mod windows_impl {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_windows_sandbox_capture(
-        policy_json_or_preset: &str,
-        sandbox_policy_cwd: &Path,
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[AbsolutePathBuf],
         codex_home: &Path,
         command: Vec<String>,
         cwd: &Path,
         env_map: HashMap<String, String>,
         timeout_ms: Option<u64>,
+        cancellation: Option<WindowsSandboxCancellationToken>,
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
         run_windows_sandbox_capture_with_extra_deny_write_paths(
@@ -329,6 +378,7 @@ mod windows_impl {
             cwd,
             env_map,
             timeout_ms,
+            cancellation,
             &[],
             use_private_desktop,
         )
@@ -536,11 +586,11 @@ mod windows_impl {
             let _ = tx_err.send(buf);
         });
 
-        let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
-        let res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
-        let timed_out = res == 0x0000_0102;
+        let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
+        let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
+        let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
         let mut exit_code_u32: u32 = 1;
-        if !timed_out {
+        if !timed_out && !cancelled {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
@@ -591,14 +641,19 @@ mod windows_impl {
     }
 
     pub fn run_windows_sandbox_legacy_preflight(
-        sandbox_policy: &SandboxPolicy,
-        sandbox_policy_cwd: &Path,
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[AbsolutePathBuf],
         codex_home: &Path,
         cwd: &Path,
         env_map: &HashMap<String, String>,
     ) -> Result<()> {
-        let is_workspace_write = matches!(sandbox_policy, SandboxPolicy::WorkspaceWrite { .. });
-        if !is_workspace_write {
+        let Ok(permissions) = super::resolved_permissions::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        ) else {
+            return Ok(());
+        };
+        if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
             return Ok(());
         }
 
@@ -639,43 +694,62 @@ mod windows_impl {
         use crate::policy::SandboxPolicy;
         use crate::spawn_prep::should_apply_network_block;
 
-        fn workspace_policy(network_access: bool) -> SandboxPolicy {
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            }
+        fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile {
+            PermissionProfile::workspace_write_with(
+                &[],
+                network_policy,
+                /*exclude_tmpdir_env_var*/ false,
+                /*exclude_slash_tmp*/ false,
+            )
         }
 
         #[test]
         fn applies_network_block_when_access_is_disabled() {
-            assert!(should_apply_network_block(&workspace_policy(
-                /*network_access*/ false
+            assert!(should_apply_network_block(&workspace_profile(
+                NetworkSandboxPolicy::Restricted
             )));
         }
 
         #[test]
         fn skips_network_block_when_access_is_allowed() {
-            assert!(!should_apply_network_block(&workspace_policy(
-                /*network_access*/ true
+            assert!(!should_apply_network_block(&workspace_profile(
+                NetworkSandboxPolicy::Enabled
             )));
         }
 
         #[test]
         fn applies_network_block_for_read_only() {
-            assert!(should_apply_network_block(
-                &SandboxPolicy::new_read_only_policy()
-            ));
+            assert!(should_apply_network_block(&PermissionProfile::read_only()));
+        }
+
+        #[test]
+        fn legacy_preflight_skips_profiles_without_managed_filesystem_permissions() {
+            for permission_profile in [
+                PermissionProfile::Disabled,
+                PermissionProfile::External {
+                    network: NetworkSandboxPolicy::Restricted,
+                },
+            ] {
+                super::run_windows_sandbox_legacy_preflight(
+                    &permission_profile,
+                    &[],
+                    Path::new("."),
+                    Path::new("."),
+                    &HashMap::new(),
+                )
+                .expect("unsupported profiles do not need ACL preflight");
+            }
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod stub {
+    use super::WindowsSandboxCancellationToken;
     use anyhow::Result;
     use anyhow::bail;
-    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -689,31 +763,22 @@ mod stub {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_windows_sandbox_capture(
-        _policy_json_or_preset: &str,
-        _sandbox_policy_cwd: &Path,
+        _permission_profile: &PermissionProfile,
+        _workspace_roots: &[AbsolutePathBuf],
         _codex_home: &Path,
         _command: Vec<String>,
         _cwd: &Path,
         _env_map: HashMap<String, String>,
         _timeout_ms: Option<u64>,
+        _cancellation: Option<WindowsSandboxCancellationToken>,
         _use_private_desktop: bool,
     ) -> Result<CaptureResult> {
         bail!("Windows sandbox is only available on Windows")
     }
 
-    pub fn apply_world_writable_scan_and_denies(
-        _codex_home: &Path,
-        _cwd: &Path,
-        _env_map: &HashMap<String, String>,
-        _sandbox_policy: &SandboxPolicy,
-        _logs_base_dir: Option<&Path>,
-    ) -> Result<()> {
-        bail!("Windows sandbox is only available on Windows")
-    }
-
     pub fn run_windows_sandbox_legacy_preflight(
-        _sandbox_policy: &SandboxPolicy,
-        _sandbox_policy_cwd: &Path,
+        _permission_profile: &PermissionProfile,
+        _workspace_roots: &[AbsolutePathBuf],
         _codex_home: &Path,
         _cwd: &Path,
         _env_map: &HashMap<String, String>,

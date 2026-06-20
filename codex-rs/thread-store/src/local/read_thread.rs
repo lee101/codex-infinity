@@ -1,7 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::RolloutRecorder;
@@ -37,6 +37,7 @@ pub(super) async fn read_thread(
             )
             .await)
     {
+        let metadata_sandbox_policy = metadata.sandbox_policy.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await;
         attach_history_if_requested(&mut thread, params.include_history).await?;
         return Ok(thread);
@@ -58,7 +59,7 @@ async fn sqlite_rollout_path_can_load_history_for_thread(
     path: &std::path::Path,
     thread_id: codex_protocol::ThreadId,
 ) -> bool {
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+    if codex_rollout::existing_rollout_path(path).await.is_none() {
         return false;
     }
     // SQLite metadata can outlive a moved/recreated rollout path. When history is
@@ -75,7 +76,7 @@ pub(super) async fn read_thread_by_rollout_path(
     include_archived: bool,
     include_history: bool,
 ) -> ThreadStoreResult<StoredThread> {
-    let path = resolve_requested_rollout_path(store, rollout_path)?;
+    let path = resolve_requested_rollout_path(store, rollout_path).await?;
     let mut thread = read_thread_from_rollout_path(store, path).await?;
     if !include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
@@ -86,7 +87,7 @@ pub(super) async fn read_thread_by_rollout_path(
     Ok(thread)
 }
 
-fn resolve_requested_rollout_path(
+async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
@@ -95,7 +96,34 @@ fn resolve_requested_rollout_path(
     } else {
         rollout_path
     };
-    std::fs::canonicalize(&path).map_err(|err| ThreadStoreError::InvalidRequest {
+    match tokio::fs::metadata(path.as_path()).await {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "failed to resolve rollout path `{}`: path is a directory",
+                    path.display()
+                ),
+            });
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "failed to resolve rollout path `{}`: path is not a file",
+                    path.display()
+                ),
+            });
+        }
+        _ => {}
+    }
+    let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "failed to resolve rollout path `{}`: file does not exist",
+                path.display()
+            ),
+        });
+    };
+    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
         message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
     })
 }
@@ -219,7 +247,8 @@ async fn stored_thread_from_sqlite_metadata(
         .and_then(|meta_line| meta_line.meta.forked_from_id);
     StoredThread {
         thread_id: metadata.id,
-        rollout_path: Some(metadata.rollout_path),
+        extra_config: None,
+        rollout_path: Some(rollout_path),
         forked_from_id,
         preview: metadata.first_user_message.clone().unwrap_or_default(),
         name,
@@ -245,10 +274,7 @@ async fn stored_thread_from_sqlite_metadata(
             metadata.git_origin_url,
         ),
         approval_mode: parse_or_default(&metadata.approval_mode, AskForApproval::OnRequest),
-        sandbox_policy: parse_or_default(
-            &metadata.sandbox_policy,
-            SandboxPolicy::new_read_only_policy(),
-        ),
+        permission_profile,
         token_usage: None,
         first_user_message: metadata.first_user_message,
         history: None,
@@ -287,10 +313,13 @@ fn stored_thread_from_meta_line(
         .and_then(|meta| meta.modified().ok())
         .map(DateTime::<Utc>::from)
         .unwrap_or(created_at);
+    let rollout_path = codex_rollout::plain_rollout_path(path.as_path());
     StoredThread {
         thread_id: meta_line.meta.id,
-        rollout_path: Some(path),
+        extra_config: None,
+        rollout_path: Some(rollout_path),
         forked_from_id: meta_line.meta.forked_from_id,
+        parent_thread_id: meta_line.meta.parent_thread_id,
         preview: String::new(),
         name: None,
         model_provider: meta_line
@@ -311,7 +340,7 @@ fn stored_thread_from_meta_line(
         agent_path: meta_line.meta.agent_path,
         git_info: meta_line.git,
         approval_mode: AskForApproval::OnRequest,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: PermissionProfile::read_only(),
         token_usage: None,
         first_user_message: None,
         history: None,
@@ -361,6 +390,7 @@ mod tests {
 
     use chrono::Utc;
     use codex_protocol::ThreadId;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_state::ThreadMetadataBuilder;
     use pretty_assertions::assert_eq;

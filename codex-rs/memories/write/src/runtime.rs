@@ -7,12 +7,16 @@ use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::content_items_to_text;
+use codex_core::detached_memory_responses_metadata;
 use codex_core::resolve_installation_id;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
+use codex_model_provider::ModelProvider;
+use codex_model_provider::SharedModelProvider;
+use codex_model_provider::create_model_provider;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
@@ -67,6 +71,7 @@ pub(crate) struct MemoryStartupContext {
     thread: Arc<CodexThread>,
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
+    provider: SharedModelProvider,
     session_telemetry: SessionTelemetry,
 }
 
@@ -78,6 +83,51 @@ impl MemoryStartupContext {
         thread: Arc<CodexThread>,
         config: &Config,
         source: SessionSource,
+    ) -> Self {
+        let provider = create_model_provider(
+            config.model_provider.clone(),
+            Some(Arc::clone(&auth_manager)),
+        );
+        Self::new_with_provider(
+            thread_manager,
+            auth_manager,
+            thread_id,
+            thread,
+            config,
+            source,
+            provider,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_testing(
+        thread_manager: Arc<ThreadManager>,
+        auth_manager: Arc<AuthManager>,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        config: &Config,
+        source: SessionSource,
+        provider: SharedModelProvider,
+    ) -> Self {
+        Self::new_with_provider(
+            thread_manager,
+            auth_manager,
+            thread_id,
+            thread,
+            config,
+            source,
+            provider,
+        )
+    }
+
+    fn new_with_provider(
+        thread_manager: Arc<ThreadManager>,
+        auth_manager: Arc<AuthManager>,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        config: &Config,
+        source: SessionSource,
+        provider: SharedModelProvider,
     ) -> Self {
         let auth = auth_manager.auth_cached();
         let auth = auth.as_ref();
@@ -108,6 +158,7 @@ impl MemoryStartupContext {
             thread,
             thread_manager,
             auth_manager,
+            provider,
             session_telemetry,
         }
     }
@@ -118,6 +169,10 @@ impl MemoryStartupContext {
 
     pub(crate) fn state_db(&self) -> Option<Arc<StateRuntime>> {
         self.thread.state_db()
+    }
+
+    pub(crate) fn provider(&self) -> &dyn ModelProvider {
+        self.provider.as_ref()
     }
 
     pub(crate) fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
@@ -144,15 +199,12 @@ impl MemoryStartupContext {
             .get_models_manager()
             .get_model_info(model_name, &config.to_models_manager_config())
             .await;
-        let turn_metadata_header =
-            codex_core::build_turn_metadata_header(&config.cwd, /*sandbox*/ None).await;
         let reasoning_summary = config
             .model_reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
 
         StageOneRequestContext {
             model_info,
-            turn_metadata_header,
             session_telemetry: self
                 .session_telemetry
                 .clone()
@@ -170,13 +222,15 @@ impl MemoryStartupContext {
         context: &StageOneRequestContext,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let installation_id = resolve_installation_id(&config.codex_home).await?;
-        let session_source = self.thread.config_snapshot().await.session_source;
+        let config_snapshot = self.thread.config_snapshot().await;
+        let session_source = config_snapshot.session_source;
+        let session_id = SessionId::from(self.thread_id);
+        let session_id_string = session_id.to_string();
         let model_client = ModelClient::new(
             Some(Arc::clone(&self.auth_manager)),
             self.thread_id,
-            installation_id,
             config.model_provider.clone(),
-            session_source,
+            session_source.clone(),
             config.model_verbosity,
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
@@ -184,12 +238,23 @@ impl MemoryStartupContext {
         );
 
         let mut client_session = model_client.new_session();
+        let window_id = format!("{}:0", self.thread_id);
+        let responses_metadata = detached_memory_responses_metadata(
+            installation_id,
+            session_id_string,
+            self.thread_id.to_string(),
+            window_id,
+            &session_source,
+            &config.cwd,
+            /*sandbox*/ None,
+        )
+        .await;
         let mut stream = client_session
             .stream(
                 prompt,
                 &context.model_info,
                 &context.session_telemetry,
-                context.reasoning_effort,
+                context.reasoning_effort.clone(),
                 context.reasoning_summary,
                 context.service_tier,
                 context.turn_metadata_header.as_deref(),
@@ -242,10 +307,10 @@ impl MemoryStartupContext {
                     InternalSessionSource::MemoryConsolidation,
                 )),
                 dynamic_tools: Vec::new(),
-                persist_extended_history: false,
                 metrics_service_name: None,
                 parent_trace: None,
                 environments,
+                thread_extension_init: Default::default(),
             })
             .await?;
 
@@ -254,7 +319,6 @@ impl MemoryStartupContext {
             .thread
             .submit(Op::UserInput {
                 items: prompt,
-                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
             })

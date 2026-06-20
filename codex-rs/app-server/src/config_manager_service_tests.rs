@@ -4,12 +4,11 @@ use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AskForApproval;
-use codex_config::CloudRequirementsLoader;
-use codex_config::FeatureRequirementsToml;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 #[test]
@@ -154,6 +153,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                 "app1".to_string(),
                 AppConfig {
                     enabled: false,
+                    approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
                     default_tools_approval_mode: Some(AppToolApproval::Prompt),
@@ -225,7 +225,7 @@ async fn read_includes_origins_and_layers() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -303,7 +303,7 @@ writable_roots = ["~/code"]
         tmp.path().to_path_buf(),
         vec![],
         loader_overrides,
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -343,7 +343,7 @@ async fn write_value_reports_override() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let result = service
@@ -442,7 +442,7 @@ async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let error = service
@@ -502,14 +502,12 @@ async fn write_value_rejects_feature_requirement_conflict() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::without_managed_config_for_tests(),
-        CloudRequirementsLoader::new(async {
-            Ok(Some(ConfigRequirementsToml {
-                feature_requirements: Some(FeatureRequirementsToml {
-                    entries: BTreeMap::from([("personality".to_string(), true)]),
-                }),
-                ..Default::default()
-            }))
-        }),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[features]
+personality = true
+"#,
+        ),
     );
 
     let error = service
@@ -605,7 +603,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
         tmp.path().to_path_buf(),
         cli_overrides,
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -658,7 +656,7 @@ async fn write_value_reports_managed_override() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let result = service

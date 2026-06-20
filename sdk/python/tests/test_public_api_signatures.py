@@ -40,6 +40,15 @@ def test_root_exports_run_result() -> None:
     assert RunResult.__name__ == "RunResult"
 
 
+def test_root_exports_sandbox_presets() -> None:
+    """The friendly sandbox API should expose only obvious named presets."""
+    assert [(sandbox.name, sandbox.value) for sandbox in Sandbox] == [
+        ("read_only", "read-only"),
+        ("workspace_write", "workspace-write"),
+        ("full_access", "full-access"),
+    ]
+
+
 def test_package_and_default_client_versions_follow_project_version() -> None:
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     pyproject = tomllib.loads(pyproject_path.read_text())
@@ -123,7 +132,7 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "output_schema",
             "permission_profile",
             "personality",
-            "sandbox_policy",
+            "sandbox",
             "service_tier",
             "summary",
         ],
@@ -136,7 +145,7 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "output_schema",
             "permission_profile",
             "personality",
-            "sandbox_policy",
+            "sandbox",
             "service_tier",
             "summary",
         ],
@@ -208,7 +217,7 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "output_schema",
             "permission_profile",
             "personality",
-            "sandbox_policy",
+            "sandbox",
             "service_tier",
             "summary",
         ],
@@ -221,7 +230,7 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "output_schema",
             "permission_profile",
             "personality",
-            "sandbox_policy",
+            "sandbox",
             "service_tier",
             "summary",
         ],

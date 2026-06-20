@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -17,6 +17,8 @@ use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::set_project_trust_level;
+use codex_login::AuthKeyringBackendKind;
+use codex_login::login_with_api_key;
 use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
@@ -29,6 +31,7 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+use wiremock::matchers::query_param_is_missing;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -73,7 +76,7 @@ async fn plugin_list_skips_invalid_marketplace_file_and_reports_error() -> Resul
     std::fs::write(marketplace_path.as_path(), "{not json")?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -121,7 +124,7 @@ async fn plugin_list_skips_invalid_marketplace_file_and_reports_error() -> Resul
 #[tokio::test]
 async fn plugin_list_rejects_relative_cwds() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -198,7 +201,7 @@ async fn plugin_list_keeps_valid_marketplaces_when_another_marketplace_fails_to_
     std::fs::write(invalid_marketplace_path.as_path(), "{not json")?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -308,7 +311,7 @@ async fn plugin_list_returns_empty_when_workspace_codex_plugins_disabled() -> Re
         .await;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_without_managed_config_with_env(
+    let mut mcp = TestAppServer::new_without_managed_config_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -397,7 +400,7 @@ async fn plugin_list_reuses_cached_workspace_codex_plugins_setting() -> Result<(
         .await;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_without_managed_config_with_env(
+    let mut mcp = TestAppServer::new_without_managed_config_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -481,7 +484,7 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
     )?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -583,7 +586,7 @@ async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
 }"#,
     )?;
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -659,7 +662,7 @@ enabled = false
 "#,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -805,7 +808,7 @@ enabled = false
 
     let workspace_default = TempDir::new()?;
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("HOME", Some(home.as_str())),
@@ -898,7 +901,7 @@ async fn plugin_list_returns_plugin_interface_with_absolute_asset_paths() -> Res
 }"##,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1010,7 +1013,7 @@ async fn plugin_list_accepts_legacy_string_default_prompt() -> Result<()> {
 }"##,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1159,6 +1162,8 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         "interface": {
           "short_description": "Plan and track work",
           "capabilities": ["Read", "Write"],
+          "default_prompt": "Use the legacy Linear prompt",
+          "default_prompts": ["Create a Linear issue", "Review my Linear projects"],
           "logo_url": "https://example.com/linear.png",
           "screenshot_urls": ["https://example.com/linear-shot.png"]
         },
@@ -1214,6 +1219,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
+        .and(header("oai-product-sku", "codex"))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_directory_body))
         .mount(&server)
         .await;
@@ -1223,6 +1229,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
+        .and(header("oai-product-sku", "codex"))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
@@ -1231,6 +1238,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .and(query_param("scope", "GLOBAL"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
+        .and(header("oai-product-sku", "codex"))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_installed_body))
         .mount(&server)
         .await;
@@ -1239,11 +1247,12 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .and(query_param("scope", "WORKSPACE"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
+        .and(header("oai-product-sku", "codex"))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1384,7 +1393,7 @@ async fn plugin_list_remote_marketplace_replaces_local_marketplace_with_same_nam
             .await;
     }
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1440,7 +1449,7 @@ remote_plugin = true
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1473,7 +1482,7 @@ async fn plugin_list_fetches_featured_plugin_ids_without_chatgpt_auth() -> Resul
         .mount(&server)
         .await;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1509,7 +1518,7 @@ async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() ->
         .mount(&server)
         .await;
 
-    let mut mcp = McpProcess::new_with_plugin_startup_tasks(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_with_plugin_startup_tasks(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
 
@@ -1654,6 +1663,35 @@ fn write_openai_curated_marketplace(
     codex_home: &std::path::Path,
     plugin_names: &[&str],
 ) -> std::io::Result<()> {
+    write_curated_marketplace(
+        codex_home,
+        "marketplace.json",
+        "openai-curated",
+        /*display_name*/ None,
+        plugin_names,
+    )
+}
+
+fn write_openai_api_curated_marketplace(
+    codex_home: &std::path::Path,
+    plugin_names: &[&str],
+) -> std::io::Result<()> {
+    write_curated_marketplace(
+        codex_home,
+        "api_marketplace.json",
+        "openai-api-curated",
+        Some("OpenAI Curated"),
+        plugin_names,
+    )
+}
+
+fn write_curated_marketplace(
+    codex_home: &std::path::Path,
+    manifest_name: &str,
+    marketplace_name: &str,
+    display_name: Option<&str>,
+    plugin_names: &[&str],
+) -> std::io::Result<()> {
     let curated_root = codex_home.join(".tmp/plugins");
     std::fs::create_dir_all(curated_root.join(".git"))?;
     std::fs::create_dir_all(curated_root.join(".agents/plugins"))?;
@@ -1672,11 +1710,21 @@ fn write_openai_curated_marketplace(
         })
         .collect::<Vec<_>>()
         .join(",\n");
+    let interface = display_name
+        .map(|display_name| {
+            format!(
+                r#"
+  "interface": {{
+    "displayName": "{display_name}"
+  }},"#
+            )
+        })
+        .unwrap_or_default();
     std::fs::write(
-        curated_root.join(".agents/plugins/marketplace.json"),
+        curated_root.join(".agents/plugins").join(manifest_name),
         format!(
             r#"{{
-  "name": "openai-curated",
+  "name": "{marketplace_name}",{interface}
   "plugins": [
 {plugins}
   ]

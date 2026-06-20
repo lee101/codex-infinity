@@ -41,6 +41,10 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) agent_nickname: Option<String>,
     /// Agent type shown in brackets when present, for example `worker`.
     pub(crate) agent_role: Option<String>,
+    /// Canonical v2 agent path, when the thread was observed through v2 activity.
+    pub(crate) agent_path: Option<String>,
+    /// Whether the latest liveness refresh says the agent thread is actively working.
+    pub(crate) is_running: bool,
     /// Whether the thread has emitted a close event and should render dimmed.
     pub(crate) is_closed: bool,
 }

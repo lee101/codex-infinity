@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -172,6 +172,7 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
         RolloutRecorderParams::new(
             thread_id,
             /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),

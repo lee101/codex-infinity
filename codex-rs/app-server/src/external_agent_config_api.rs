@@ -1,4 +1,7 @@
 use crate::config::external_agent_config::ExternalAgentConfigDetectOptions;
+use crate::config::external_agent_config::ExternalAgentConfigImportItemResult as CoreImportItemResult;
+use crate::config::external_agent_config::ExternalAgentConfigImportOutcome as CoreImportOutcome;
+use crate::config::external_agent_config::ExternalAgentConfigImportRawError as CoreImportRawError;
 use crate::config::external_agent_config::ExternalAgentConfigMigrationItem as CoreMigrationItem;
 use crate::config::external_agent_config::ExternalAgentConfigMigrationItemType as CoreMigrationItemType;
 use crate::config::external_agent_config::ExternalAgentConfigService;
@@ -195,12 +198,18 @@ impl ExternalAgentConfigApi {
     pub(crate) async fn import(
         &self,
         params: ExternalAgentConfigImportParams,
-    ) -> Result<Vec<PendingPluginImport>, JSONRPCErrorError> {
+    ) -> Result<CoreImportOutcome, JSONRPCErrorError> {
         self.migration_service
             .import(
                 params
                     .migration_items
                     .into_iter()
+                    .filter(|migration_item| {
+                        !matches!(
+                            migration_item.item_type,
+                            ExternalAgentConfigMigrationItemType::Sessions
+                        )
+                    })
                     .map(|migration_item| CoreMigrationItem {
                         item_type: match migration_item.item_type {
                             ExternalAgentConfigMigrationItemType::Config => {
@@ -290,14 +299,13 @@ impl ExternalAgentConfigApi {
     pub(crate) async fn complete_pending_plugin_import(
         &self,
         pending_plugin_import: PendingPluginImport,
-    ) -> Result<(), JSONRPCErrorError> {
+    ) -> Result<PluginImportOutcome, JSONRPCErrorError> {
         self.migration_service
             .import_plugins(
                 pending_plugin_import.cwd.as_deref(),
                 Some(pending_plugin_import.details),
             )
             .await
-            .map(|_| ())
             .map_err(|err| internal_error(err.to_string()))
     }
 }

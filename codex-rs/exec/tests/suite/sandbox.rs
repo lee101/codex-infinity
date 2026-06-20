@@ -44,6 +44,7 @@ async fn spawn_command_under_sandbox(
         },
         &PermissionProfile::from_legacy_sandbox_policy(sandbox_policy),
         sandbox_cwd,
+        std::slice::from_ref(sandbox_cwd),
         &codex_linux_sandbox_exe,
         /*use_legacy_landlock*/ false,
     )
@@ -516,7 +517,6 @@ async fn allow_unix_socketpair_recvfrom() {
 
 const IN_SANDBOX_ENV_VAR: &str = "IN_SANDBOX";
 
-#[expect(clippy::expect_used)]
 pub async fn run_code_under_sandbox<F, Fut>(
     test_selector: &str,
     policy: &SandboxPolicy,

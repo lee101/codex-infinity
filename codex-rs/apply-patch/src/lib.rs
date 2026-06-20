@@ -15,6 +15,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::RemoveOptions;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 pub use parser::Hunk;
 pub use parser::ParseError;
 use parser::ParseError::*;
@@ -28,9 +29,6 @@ pub use invocation::maybe_parse_apply_patch_verified;
 pub use standalone_executable::main;
 
 use crate::invocation::ExtractHeredocError;
-
-/// Detailed instructions for gpt-4.1 on how to use the `apply_patch` tool.
-pub const APPLY_PATCH_TOOL_INSTRUCTIONS: &str = include_str!("../apply_patch_tool_instructions.md");
 
 /// Special argv[1] flag used when the Codex executable self-invokes to run the
 /// internal `apply_patch` path.
@@ -273,6 +271,7 @@ async fn apply_hunks_to_files(
     for hunk in hunks {
         let affected_path = hunk.path().to_path_buf();
         let path_abs = hunk.resolve_path(cwd);
+        let path_uri = PathUri::from_abs_path(&path_abs);
         match hunk {
             Hunk::AddFile { contents, .. } => {
                 write_file_with_missing_parent_retry(
@@ -366,12 +365,14 @@ async fn write_file_with_missing_parent_retry(
     contents: Vec<u8>,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> anyhow::Result<()> {
-    match fs.write_file(path_abs, contents.clone(), sandbox).await {
+    let path_uri = PathUri::from_abs_path(path_abs);
+    match fs.write_file(&path_uri, contents.clone(), sandbox).await {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if let Some(parent_abs) = path_abs.parent() {
+                let parent_uri = PathUri::from_abs_path(&parent_abs);
                 fs.create_directory(
-                    &parent_abs,
+                    &parent_uri,
                     CreateDirectoryOptions { recursive: true },
                     sandbox,
                 )
@@ -383,7 +384,7 @@ async fn write_file_with_missing_parent_retry(
                     )
                 })?;
             }
-            fs.write_file(path_abs, contents, sandbox)
+            fs.write_file(&path_uri, contents, sandbox)
                 .await
                 .with_context(|| format!("Failed to write file {}", path_abs.display()))?;
             Ok(())
@@ -407,7 +408,8 @@ async fn derive_new_contents_from_chunks(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
-    let original_contents = fs.read_file_text(path_abs, sandbox).await.map_err(|err| {
+    let path_uri = PathUri::from_abs_path(path_abs);
+    let original_contents = fs.read_file_text(&path_uri, sandbox).await.map_err(|err| {
         ApplyPatchError::IoError(IoError {
             context: format!("Failed to read file to update {}", path_abs.display()),
             source: err,
@@ -523,7 +525,7 @@ fn compute_replacements(
         }
     }
 
-    replacements.sort_by(|(lhs_idx, _, _), (rhs_idx, _, _)| lhs_idx.cmp(rhs_idx));
+    replacements.sort_by_key(|(index, _, _)| *index);
 
     Ok(replacements)
 }

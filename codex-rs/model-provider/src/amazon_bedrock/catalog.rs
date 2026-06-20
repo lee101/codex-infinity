@@ -18,21 +18,20 @@ const GPT_5_4_MAX_CONTEXT_WINDOW: i64 = 1_000_000;
 const GPT_5_4_CMB_MODEL_ID: &str = "openai.gpt-5.4";
 
 pub(crate) fn static_model_catalog() -> ModelsResponse {
-    ModelsResponse {
+    with_default_only_service_tier(ModelsResponse {
         models: vec![
-            gpt_5_4_cmb_bedrock_model(/*priority*/ 0),
-            bedrock_oss_model(
-                "openai.gpt-oss-120b",
-                "GPT OSS 120B on Bedrock",
+            gpt_5_bedrock_model(
+                GPT_5_5_OPENAI_MODEL_ID,
+                AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
+                /*priority*/ 0,
+            ),
+            gpt_5_bedrock_model(
+                GPT_5_4_OPENAI_MODEL_ID,
+                AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
                 /*priority*/ 1,
             ),
-            bedrock_oss_model(
-                "openai.gpt-oss-20b",
-                "GPT OSS 20B on Bedrock",
-                /*priority*/ 2,
-            ),
         ],
-    }
+    })
 }
 
 fn gpt_5_4_cmb_bedrock_model(priority: i32) -> ModelInfo {
@@ -69,6 +68,7 @@ fn gpt_5_4_cmb_bedrock_model(priority: i32) -> ModelInfo {
         used_fallback_model_metadata: false,
         supports_search_tool: true,
     }
+    catalog
 }
 
 fn bedrock_oss_model(slug: &str, display_name: &str, priority: i32) -> ModelInfo {
@@ -111,32 +111,18 @@ fn bedrock_oss_model(slug: &str, display_name: &str, priority: i32) -> ModelInfo
     }
 }
 
-fn gpt_5_4_cmb_reasoning_levels() -> Vec<ReasoningEffortPreset> {
-    vec![
-        reasoning_effort_preset(ReasoningEffort::Minimal),
-        reasoning_effort_preset(ReasoningEffort::Low),
-        reasoning_effort_preset(ReasoningEffort::Medium),
-        reasoning_effort_preset(ReasoningEffort::High),
-    ]
-}
-
-fn reasoning_effort_preset(effort: ReasoningEffort) -> ReasoningEffortPreset {
-    ReasoningEffortPreset {
-        effort,
-        description: match effort {
-            ReasoningEffort::None => "No reasoning",
-            ReasoningEffort::Minimal => "Minimal reasoning",
-            ReasoningEffort::Low => "Fast responses with lighter reasoning",
-            ReasoningEffort::Medium => "Balances speed and reasoning depth for everyday tasks",
-            ReasoningEffort::High => "Greater reasoning depth for complex problems",
-            ReasoningEffort::XHigh => "Extra high reasoning depth for complex problems",
-        }
-        .to_string(),
-    }
+fn bundled_openai_model(slug: &str) -> ModelInfo {
+    bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"))
+        .models
+        .into_iter()
+        .find(|model| model.slug == slug)
+        .unwrap_or_else(|| panic!("bundled models.json should include {slug}"))
 }
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -152,17 +138,52 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_4_cmb_advertises_only_bedrock_supported_reasoning_levels() {
+    fn gpt_5_bedrock_models_use_bedrock_context_window() {
         let catalog = static_model_catalog();
-        let cmb_model = catalog
+        let gpt_5_5 = catalog
+            .models
+            .iter()
+            .find(|model| model.slug == AMAZON_BEDROCK_GPT_5_5_MODEL_ID)
+            .expect("Bedrock catalog should include GPT-5.5");
+        let gpt_5_4 = catalog
             .models
             .iter()
             .find(|model| model.slug == GPT_5_4_CMB_MODEL_ID)
             .expect("Bedrock catalog should include GPT-5.4 CMB");
 
         assert_eq!(
-            cmb_model.supported_reasoning_levels,
-            gpt_5_4_cmb_reasoning_levels()
+            (gpt_5_5.context_window, gpt_5_5.max_context_window),
+            (
+                Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                Some(GPT_5_BEDROCK_CONTEXT_WINDOW)
+            )
         );
+        assert_eq!(
+            (gpt_5_4.context_window, gpt_5_4.max_context_window),
+            (
+                Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                Some(GPT_5_BEDROCK_CONTEXT_WINDOW)
+            )
+        );
+    }
+
+    #[test]
+    fn gpt_5_bedrock_models_only_allow_default_service_tier() {
+        let catalog = static_model_catalog();
+
+        for model in catalog.models {
+            assert_eq!(model.additional_speed_tiers, Vec::<String>::new());
+            assert_eq!(model.service_tiers, Vec::new());
+            assert_eq!(model.default_service_tier, None);
+            assert_eq!(
+                model.service_tier_for_request(Some("priority".to_string())),
+                None
+            );
+            assert_eq!(
+                model
+                    .service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
+                None
+            );
+        }
     }
 }

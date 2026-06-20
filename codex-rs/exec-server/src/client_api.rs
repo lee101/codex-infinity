@@ -6,6 +6,8 @@ use crate::ExecServerError;
 use crate::HttpRequestParams;
 use crate::HttpRequestResponse;
 use crate::HttpResponseBodyStream;
+use crate::NoiseChannelIdentity;
+use crate::NoiseChannelPublicKey;
 
 /// Connection options for any exec-server client transport.
 #[derive(Debug, Clone, PartialEq, Eq)]

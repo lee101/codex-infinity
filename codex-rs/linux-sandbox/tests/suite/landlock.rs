@@ -57,7 +57,6 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
     }
 }
 
-#[expect(clippy::expect_used)]
 async fn run_cmd_output(
     cmd: &[&str],
     writable_roots: &[PathBuf],
@@ -103,7 +102,6 @@ async fn run_cmd_result_with_writable_roots(
         .await
 }
 
-#[expect(clippy::expect_used)]
 async fn run_cmd_result_with_permission_profile(
     cmd: &[&str],
     permission_profile: PermissionProfile,
@@ -132,6 +130,7 @@ async fn run_cmd_result_with_permission_profile(
         params,
         &permission_profile,
         &sandbox_cwd,
+        std::slice::from_ref(&sandbox_cwd),
         &codex_linux_sandbox_exe,
         use_legacy_landlock,
         /*stdout_stream*/ None,
@@ -364,7 +363,6 @@ async fn test_timeout() {
 /// does NOT succeed (i.e. returns a non‑zero exit code) **unless** the binary
 /// is missing in which case we silently treat it as an accepted skip so the
 /// suite remains green on leaner CI images.
-#[expect(clippy::expect_used)]
 async fn assert_network_blocked(cmd: &[&str]) {
     let cwd = AbsolutePathBuf::current_dir().expect("cwd should exist");
     let sandbox_cwd = cwd.clone();
@@ -391,6 +389,7 @@ async fn assert_network_blocked(cmd: &[&str]) {
         params,
         &permission_profile,
         &sandbox_cwd,
+        std::slice::from_ref(&sandbox_cwd),
         &codex_linux_sandbox_exe,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,

@@ -45,6 +45,9 @@ const HOOK_RUN_REVEAL_DELAY: Duration = Duration::from_millis(300);
 /// enough to read instead of removing it immediately when the success event arrives.
 const QUIET_HOOK_MIN_VISIBLE: Duration = Duration::from_millis(600);
 
+const HOOK_OUTPUT_INDENT: &str = "  ";
+const HOOK_OUTPUT_BODY_INDENT: &str = "    ";
+
 #[derive(Debug)]
 struct HookRunCell {
     /// Stable protocol id used to match begin/end updates for the same hook invocation.
@@ -436,10 +439,18 @@ impl HookRunCell {
                     .into(),
                 );
                 for entry in entries {
-                    // Output entries are already short hook-authored strings; keep their prefixes
-                    // explicit so warnings/stops/errors remain easy to scan in history.
-                    lines
-                        .push(format!("  {}{}", hook_output_prefix(entry.kind), entry.text).into());
+                    let prefix = hook_output_prefix(entry.kind);
+                    let mut output_lines = entry.text.split('\n');
+                    if let Some(first_line) = output_lines.next() {
+                        lines.push(format!("{HOOK_OUTPUT_INDENT}{prefix}{first_line}").into());
+                    }
+                    for line in output_lines {
+                        if line.is_empty() {
+                            lines.push("".into());
+                        } else {
+                            lines.push(format!("{HOOK_OUTPUT_BODY_INDENT}{line}").into());
+                        }
+                    }
                 }
             }
             HookRunState::PendingReveal { .. } => {}
@@ -729,6 +740,50 @@ mod tests {
         assert_eq!(bullet.content.as_ref(), "•");
         assert_eq!(bullet.style.fg, None);
         assert!(bullet.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn completed_hook_multiline_context_preserves_display_and_raw_lines() {
+        let cell = completed_hook_cell(
+            HookEventName::SessionStart,
+            HookRunStatus::Completed,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Context,
+                text: "## Working Memory Recall\n\nSource: Codex compaction\nScope: Durable workspace memory"
+                    .to_string(),
+            }],
+        );
+        let expected = vec![
+            "• SessionStart hook (completed)".to_string(),
+            "  hook context: ## Working Memory Recall".to_string(),
+            "".to_string(),
+            "    Source: Codex compaction".to_string(),
+            "    Scope: Durable workspace memory".to_string(),
+        ];
+
+        assert_eq!(line_texts(&cell.display_lines(/*width*/ 80)), expected);
+        assert_eq!(line_texts(&cell.raw_lines()), expected);
+    }
+
+    #[test]
+    fn completed_hook_multiline_warning_prefixes_first_line_only() {
+        let cell = completed_hook_cell(
+            HookEventName::PostToolUse,
+            HookRunStatus::Completed,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Warning,
+                text: "Heads up\nReview generated files".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            line_texts(&cell.display_lines(/*width*/ 80)),
+            vec![
+                "• PostToolUse hook (completed)".to_string(),
+                "  warning: Heads up".to_string(),
+                "    Review generated files".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use tracing::warn;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
+use super::compression;
 use super::list::Cursor;
 use super::list::SortDirection;
 use super::list::ThreadItem;
@@ -55,6 +56,7 @@ use codex_git_utils::collect_git_info;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -88,6 +90,7 @@ pub enum RolloutRecorderParams {
     Create {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
+        parent_thread_id: Option<ThreadId>,
         source: SessionSource,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
@@ -164,6 +167,7 @@ impl RolloutRecorderParams {
     pub fn new(
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
+        parent_thread_id: Option<ThreadId>,
         source: SessionSource,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
@@ -172,6 +176,7 @@ impl RolloutRecorderParams {
         Self::Create {
             conversation_id,
             forked_from_id,
+            parent_thread_id,
             source,
             base_instructions,
             dynamic_tools,
@@ -385,6 +390,7 @@ impl RolloutRecorder {
                 allowed_sources,
                 model_providers,
                 cwd_filters,
+                /*parent_thread_id*/ None,
                 archived,
                 search_term,
             )
@@ -488,6 +494,7 @@ impl RolloutRecorder {
             allowed_sources,
             model_providers,
             cwd_filters,
+            /*parent_thread_id*/ None,
             archived,
             search_term,
         )
@@ -516,6 +523,7 @@ impl RolloutRecorder {
                     allowed_sources,
                     model_providers,
                     cwd_filters,
+                    /*parent_thread_id*/ None,
                     archived,
                     search_term,
                 )
@@ -600,6 +608,7 @@ impl RolloutRecorder {
                     allowed_sources,
                     model_providers,
                     cwd_filter.as_ref().map(std::slice::from_ref),
+                    /*parent_thread_id*/ None,
                     /*archived*/ false,
                     /*search_term*/ None,
                 )
@@ -758,8 +767,10 @@ impl RolloutRecorder {
                 // This is the terminal background-task failure path. Normal I/O failures stay inside
                 // `rollout_writer`, are reported through command acks, and leave items buffered for retry.
                 error!(
-                    "rollout writer task failed for {}: {err}",
-                    rollout_path_for_spawn.display()
+                    "rollout writer task failed for {}: {err}; error_kind={:?}; raw_os_error={:?}",
+                    rollout_path_for_spawn.display(),
+                    err.kind(),
+                    err.raw_os_error()
                 );
                 writer_task_for_spawn.mark_failed(&err);
             }
@@ -855,19 +866,17 @@ impl RolloutRecorder {
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
-        let text = tokio::fs::read_to_string(path).await?;
-        if text.trim().is_empty() {
-            return Err(IoError::other("empty session file"));
-        }
-
         let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
-        for line in text.lines() {
+        let mut reader = compression::open_rollout_line_reader(path).await?;
+        let mut saw_non_empty_line = false;
+        while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut v: Value = match serde_json::from_str(line) {
+            saw_non_empty_line = true;
+            let mut v: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("failed to parse line as JSON: {line:?}, error: {e}");
@@ -882,33 +891,25 @@ impl RolloutRecorder {
 
             // Parse the rollout line structure
             match serde_json::from_value::<RolloutLine>(v.clone()) {
-                Ok(rollout_line) => match rollout_line.item {
-                    RolloutItem::SessionMeta(session_meta_line) => {
-                        // Use the FIRST SessionMeta encountered in the file as the canonical
-                        // thread id and main session information. Keep all items intact.
-                        if thread_id.is_none() {
-                            thread_id = Some(session_meta_line.meta.id);
-                        }
-                        items.push(RolloutItem::SessionMeta(session_meta_line));
+                Ok(rollout_line) => {
+                    let item = rollout_line.item;
+                    // Use the FIRST SessionMeta encountered in the file as the canonical
+                    // thread id and main session information. Keep all items intact.
+                    if thread_id.is_none()
+                        && let RolloutItem::SessionMeta(session_meta_line) = &item
+                    {
+                        thread_id = Some(session_meta_line.meta.id);
                     }
-                    RolloutItem::ResponseItem(item) => {
-                        items.push(RolloutItem::ResponseItem(item));
-                    }
-                    RolloutItem::Compacted(item) => {
-                        items.push(RolloutItem::Compacted(item));
-                    }
-                    RolloutItem::TurnContext(item) => {
-                        items.push(RolloutItem::TurnContext(item));
-                    }
-                    RolloutItem::EventMsg(_ev) => {
-                        items.push(RolloutItem::EventMsg(_ev));
-                    }
-                },
+                    items.push(item);
+                }
                 Err(e) => {
                     trace!("failed to parse rollout line: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                 }
             }
+        }
+        if !saw_non_empty_line {
+            return Err(IoError::other("empty session file"));
         }
 
         tracing::debug!(
@@ -933,7 +934,7 @@ impl RolloutRecorder {
         Ok(InitialHistory::Resumed(ResumedHistory {
             conversation_id,
             history: items,
-            rollout_path: Some(path.to_path_buf()),
+            rollout_path: Some(compression::plain_rollout_path(path)),
         }))
     }
 
@@ -1059,6 +1060,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         git_sha,
         git_origin_url,
         source,
+        parent_thread_id,
         agent_nickname,
         agent_role,
         model_provider,
@@ -1084,6 +1086,9 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
     }
     if item.source.is_none() {
         item.source = source;
+    }
+    if item.parent_thread_id.is_none() {
+        item.parent_thread_id = parent_thread_id;
     }
     if item.agent_nickname.is_none() {
         item.agent_nickname = agent_nickname;
@@ -1393,6 +1398,7 @@ fn precompute_log_file_info(
 }
 
 fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let path = compression::materialize_rollout_for_append_blocking(path)?;
     let Some(parent) = path.parent() else {
         return Err(IoError::other(format!(
             "rollout path has no parent: {}",
@@ -1522,8 +1528,11 @@ impl RolloutWriterState {
         let message = err.to_string();
         if self.last_logged_error.as_ref() != Some(&message) {
             error!(
-                "rollout writer failed for {}; buffered rollout items will be retried: {err}",
-                self.rollout_path.display()
+                "rollout writer failed for {}; buffered rollout items will be retried: {err}; \
+                 error_kind={:?}; raw_os_error={:?}",
+                self.rollout_path.display(),
+                err.kind(),
+                err.raw_os_error()
             );
         }
         self.last_logged_error = Some(message);
@@ -1763,6 +1772,7 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
+    let rollout_path = compression::materialize_rollout_for_append(rollout_path).await?;
     let file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(rollout_path)
@@ -1836,6 +1846,7 @@ fn thread_item_from_state_metadata(item: codex_state::ThreadMetadata) -> ThreadI
                 .or_else(|_| serde_json::from_value(Value::String(item.source)))
                 .unwrap_or(SessionSource::Unknown),
         ),
+        parent_thread_id: None,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,
         model_provider: Some(item.model_provider),
@@ -1885,6 +1896,7 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::TurnContext(turn_context) => Some(turn_context.cwd.as_path()),
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::EventMsg(_) => None,
         })

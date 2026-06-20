@@ -15,6 +15,7 @@ use ratatui::widgets::Widget;
 use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
+use crate::clipboard_paste::normalize_pasted_search_query;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::ListKeymap;
@@ -197,6 +198,9 @@ pub(crate) struct SelectionViewParams {
     /// Receives the *actual* item index, not the filtered/visible index.
     pub on_selection_changed: OnSelectionChangedCallback,
 
+    /// Whether cancellation keys can dismiss the picker.
+    pub allow_cancel: bool,
+
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     pub on_cancel: OnCancelCallback,
 }
@@ -225,6 +229,7 @@ impl Default for SelectionViewParams {
             stacked_side_content: None,
             preserve_side_content_bg: false,
             on_selection_changed: None,
+            allow_cancel: true,
             on_cancel: None,
         }
     }
@@ -264,6 +269,8 @@ pub(crate) struct ListSelectionView {
 
     /// Called when the highlighted item changes (navigation, filter, number-key).
     on_selection_changed: OnSelectionChangedCallback,
+
+    allow_cancel: bool,
 
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     on_cancel: OnCancelCallback,
@@ -336,6 +343,7 @@ impl ListSelectionView {
             stacked_side_content: params.stacked_side_content,
             preserve_side_content_bg: params.preserve_side_content_bg,
             on_selection_changed: params.on_selection_changed,
+            allow_cancel: params.allow_cancel,
             on_cancel: params.on_cancel,
             keymap,
         };
@@ -858,7 +866,7 @@ impl BottomPaneView for ListSelectionView {
             } if self.is_searchable
                 && self.search_query.is_empty()
                 && self.selected_item_has_toggle_placeholder() => {}
-            _ if self.keymap.cancel.is_pressed(key_event) => {
+            _ if self.allow_cancel && self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
             _ if self.keymap.accept.is_pressed(key_event) => self.accept(),
@@ -907,6 +915,18 @@ impl BottomPaneView for ListSelectionView {
         }
     }
 
+    fn handle_paste(&mut self, pasted: String) -> bool {
+        if !self.is_searchable {
+            return false;
+        }
+        let Some(pasted) = normalize_pasted_search_query(&pasted) else {
+            return false;
+        };
+        self.search_query.push_str(&pasted);
+        self.apply_filter();
+        true
+    }
+
     fn is_complete(&self) -> bool {
         self.completion.is_some()
     }
@@ -940,6 +960,9 @@ impl BottomPaneView for ListSelectionView {
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
+        if !self.allow_cancel {
+            return CancellationEvent::NotHandled;
+        }
         if let Some(cb) = &self.on_cancel {
             cb(&self.app_event_tx);
         }
@@ -1558,6 +1581,61 @@ mod tests {
             lines.contains("filters"),
             "expected search query line to include rendered query, got {lines:?}"
         );
+    }
+
+    #[test]
+    fn paste_appends_to_search_query_and_filters_items() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = new_view(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "main -> feature/other".to_string(),
+                        search_value: Some("feature/other".to_string()),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "main -> feature/paste-support".to_string(),
+                        search_value: Some("feature/paste-support".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+        );
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+
+        assert!(view.handle_paste("eature/paste-support\n".to_string()));
+
+        assert_eq!(view.search_query, "feature/paste-support");
+        assert_eq!(view.filtered_indices, vec![1]);
+        assert_eq!(view.selected_actual_idx(), Some(1));
+    }
+
+    #[test]
+    fn whitespace_only_paste_is_ignored() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = new_view(
+            SelectionViewParams {
+                items: vec![SelectionItem {
+                    name: "main".to_string(),
+                    search_value: Some("main".to_string()),
+                    ..Default::default()
+                }],
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        assert!(!view.handle_paste(" \n\t ".to_string()));
+
+        assert_eq!(view.search_query, "");
+        assert_eq!(view.filtered_indices, vec![0]);
     }
 
     #[test]

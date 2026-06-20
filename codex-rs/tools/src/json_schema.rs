@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 ///
 /// This mirrors the OpenAI Structured Outputs subset for JSON Schema `type`:
 /// string, number, boolean, integer, object, array, and null.
-/// Keywords such as `enum`, `const`, and `anyOf` are modeled separately.
+/// Keywords such as `enum`, `const`, `anyOf`, `oneOf`, and `allOf` are modeled
+/// separately.
 /// See <https://developers.openai.com/api/docs/guides/structured-outputs#supported-schemas>.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +38,9 @@ pub struct JsonSchema {
     pub schema_type: Option<JsonSchemaType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Responses-only marker for reviewed encrypted tool parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
     #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<JsonValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,12 +76,33 @@ impl JsonSchema {
         }
     }
 
+    pub fn one_of(variants: Vec<JsonSchema>, description: Option<String>) -> Self {
+        Self {
+            description,
+            one_of: Some(variants),
+            ..Default::default()
+        }
+    }
+
+    pub fn all_of(variants: Vec<JsonSchema>, description: Option<String>) -> Self {
+        Self {
+            description,
+            all_of: Some(variants),
+            ..Default::default()
+        }
+    }
+
     pub fn boolean(description: Option<String>) -> Self {
         Self::typed(JsonSchemaPrimitiveType::Boolean, description)
     }
 
     pub fn string(description: Option<String>) -> Self {
         Self::typed(JsonSchemaPrimitiveType::String, description)
+    }
+
+    pub fn with_encrypted(mut self) -> Self {
+        self.encrypted = Some(true);
+        self
     }
 
     pub fn number(description: Option<String>) -> Self {
@@ -147,6 +172,19 @@ impl From<JsonSchema> for AdditionalProperties {
 
 /// Parse the tool `input_schema` or return an error for invalid schema.
 pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, serde_json::Error> {
+    let mut input_schema = prepare_tool_input_schema(input_schema);
+    compact_large_tool_schema(&mut input_schema);
+    deserialize_tool_input_schema(input_schema)
+}
+
+/// Parse a trusted tool `input_schema` without running large-schema compaction.
+pub fn parse_tool_input_schema_without_compaction(
+    input_schema: &JsonValue,
+) -> Result<JsonSchema, serde_json::Error> {
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema))
+}
+
+fn prepare_tool_input_schema(input_schema: &JsonValue) -> JsonValue {
     let mut input_schema = input_schema.clone();
     sanitize_json_schema(&mut input_schema);
     let schema: JsonSchema = serde_json::from_value(input_schema)?;
@@ -196,8 +234,10 @@ fn sanitize_json_schema(value: &mut JsonValue) {
             if let Some(value) = map.get_mut("prefixItems") {
                 sanitize_json_schema(value);
             }
-            if let Some(value) = map.get_mut("anyOf") {
-                sanitize_json_schema(value);
+            for key in COMPOSITION_SCHEMA_KEYS {
+                if let Some(value) = map.get_mut(key) {
+                    sanitize_json_schema(value);
+                }
             }
 
             if let Some(const_value) = map.remove("const") {

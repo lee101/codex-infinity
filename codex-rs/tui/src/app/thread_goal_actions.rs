@@ -6,6 +6,7 @@ use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::goal_display::GOAL_USAGE;
 use crate::goal_display::goal_status_label;
 use crate::goal_display::goal_usage_summary;
 use codex_app_server_protocol::ThreadGoalStatus;
@@ -33,7 +34,7 @@ impl App {
 
         let Some(goal) = response.goal else {
             self.chat_widget.add_info_message(
-                "Usage: /goal <objective>".to_string(),
+                GOAL_USAGE.to_string(),
                 Some("No goal is currently set.".to_string()),
             );
             return;
@@ -46,7 +47,7 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
-        objective: String,
+        draft: goal_files::GoalDraft,
         mode: ThreadGoalSetMode,
     ) {
         if mode == ThreadGoalSetMode::ConfirmIfExists {
@@ -77,9 +78,6 @@ impl App {
                 /*token_budget*/ None,
             )
             .await;
-        if self.current_displayed_thread_id() != Some(thread_id) {
-            return;
-        }
 
         match result {
             Ok(response) => self.chat_widget.add_info_message(
@@ -149,12 +147,17 @@ impl App {
         }
     }
 
-    fn show_replace_thread_goal_confirmation(&mut self, thread_id: ThreadId, objective: String) {
-        let replace_objective = objective.clone();
+    pub(super) fn show_replace_thread_goal_confirmation(
+        &mut self,
+        thread_id: ThreadId,
+        draft: goal_files::GoalDraft,
+    ) {
+        let objective = draft.objective.clone();
+        let replace_draft = draft;
         let replace_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::SetThreadGoalObjective {
+            tx.send(AppEvent::SetThreadGoalDraft {
                 thread_id,
-                objective: replace_objective.clone(),
+                draft: replace_draft.clone(),
                 mode: ThreadGoalSetMode::ReplaceExisting,
             });
         })];
@@ -175,7 +178,10 @@ impl App {
         ];
         self.chat_widget.show_selection_view(SelectionViewParams {
             title: Some("Replace goal?".to_string()),
-            subtitle: Some(format!("New objective: {objective}")),
+            subtitle: Some(format!(
+                "New objective: {}",
+                truncate_text(&objective, /*max_graphemes*/ 200)
+            )),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             ..Default::default()

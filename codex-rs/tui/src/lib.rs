@@ -32,8 +32,8 @@ use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
-use codex_cloud_requirements::cloud_requirements_loader_for_storage;
-use codex_config::CloudRequirementsLoader;
+use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
@@ -93,22 +93,6 @@ mod app_event_sender;
 mod app_server_approval_conversions;
 mod app_server_session;
 mod ascii_animation;
-#[cfg(not(target_os = "linux"))]
-mod audio_device;
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-mod audio_device {
-    use crate::app_event::RealtimeAudioDeviceKind;
-
-    pub(crate) fn list_realtime_audio_device_names(
-        kind: RealtimeAudioDeviceKind,
-    ) -> Result<Vec<String>, String> {
-        Err(format!(
-            "Failed to load realtime {} devices: voice input is unavailable in this build",
-            kind.noun()
-        ))
-    }
-}
 mod bottom_pane;
 mod chatwidget;
 mod cli;
@@ -125,12 +109,14 @@ mod diff_render;
 mod exec_cell;
 mod exec_command;
 mod external_agent_config_migration;
-mod external_agent_config_migration_startup;
+mod external_agent_config_migration_flow;
+mod external_agent_config_migration_model;
 mod external_editor;
 mod file_search;
 mod frames;
 mod get_git_diff;
 mod goal_display;
+mod goal_files;
 mod history_cell;
 pub(crate) mod insert_history;
 pub use insert_history::insert_history_lines;
@@ -144,6 +130,7 @@ mod local_chatgpt_auth;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod markdown_text_merge;
 mod mention_codec;
 mod model_catalog;
 mod model_migration;
@@ -168,8 +155,10 @@ mod status;
 mod status_indicator_widget;
 mod streaming;
 mod style;
+mod terminal_hyperlinks;
 mod terminal_palette;
 mod terminal_title;
+mod terminal_visualization_instructions;
 mod text_formatting;
 mod theme_picker;
 mod tooltips;
@@ -184,9 +173,9 @@ mod update_prompt;
 #[cfg(any(not(debug_assertions), test))]
 mod update_versions;
 mod updates;
+#[cfg(any(not(debug_assertions), test))]
+mod updates_cache;
 mod version;
-#[cfg(not(target_os = "linux"))]
-mod voice;
 mod width;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
@@ -526,6 +515,17 @@ fn session_target_from_app_server_thread(
     }
 }
 
+pub(crate) fn resume_source_kinds(include_non_interactive: bool) -> Vec<ThreadSourceKind> {
+    let mut source_kinds = vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode];
+    if include_non_interactive {
+        // `thread/list` treats omitted and empty `sourceKinds` as interactive-only,
+        // so include-non-interactive has to name the user-resumable non-interactive
+        // sources explicitly until the API grows an unfiltered request.
+        source_kinds.extend([ThreadSourceKind::Exec, ThreadSourceKind::AppServer]);
+    }
+    source_kinds
+}
+
 async fn lookup_session_target_by_name_with_app_server(
     app_server: &mut AppServerSession,
     name: &str,
@@ -541,6 +541,7 @@ async fn lookup_session_target_by_name_with_app_server(
                 model_providers: None,
                 source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
                 archived: Some(false),
+                parent_thread_id: None,
                 cwd: None,
                 use_state_db_only: false,
                 search_term: Some(name.to_string()),
@@ -620,6 +621,7 @@ fn latest_session_lookup_params(
     config: &Config,
     cwd_filter: Option<&Path>,
     include_non_interactive: bool,
+    lookup_mode: LatestSessionLookupMode,
 ) -> ThreadListParams {
     ThreadListParams {
         cursor: None,
@@ -631,11 +633,14 @@ fn latest_session_lookup_params(
         } else {
             Some(vec![config.model_provider_id.clone()])
         },
-        source_kinds: (!include_non_interactive)
-            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
+        parent_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
-        use_state_db_only: false,
+        use_state_db_only: match lookup_mode {
+            LatestSessionLookupMode::StateDbOnly => true,
+            LatestSessionLookupMode::ScanAndRepair => false,
+        },
         search_term: None,
     }
 }
@@ -791,25 +796,8 @@ pub async fn run_main(
         config_cwd.as_ref(),
         cli_kv_overrides.clone(),
     )
-    .await
-    {
-        Ok(config_toml) => config_toml,
-        Err(err) => {
-            let config_error = err
-                .get_ref()
-                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
-                .map(ConfigLoadError::config_error);
-            if let Some(config_error) = config_error {
-                eprintln!(
-                    "Error loading config.toml:\n{}",
-                    format_config_error_with_source(config_error)
-                );
-            } else {
-                eprintln!("Error loading config.toml: {err}");
-            }
-            std::process::exit(1);
-        }
-    };
+    .await;
+    let bootstrap_config_toml = &bootstrap_config.config_toml;
 
     if let Err(err) = crate::legacy_core::personality_migration::maybe_migrate_personality(
         &codex_home,
@@ -824,14 +812,24 @@ pub async fn run_main(
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    let cloud_requirements = cloud_requirements_loader_for_storage(
+    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
-        config_toml.cli_auth_credentials_store.unwrap_or_default(),
+        bootstrap_config_toml
+            .cli_auth_credentials_store
+            .unwrap_or_default(),
+        resolve_bootstrap_auth_keyring_backend_kind(&bootstrap_config)?,
         chatgpt_base_url,
     )
     .await;
 
+    let cwd_override = if app_server_target.uses_remote_workspace() {
+        None
+    } else {
+        cwd.clone()
+    };
+
+    let mut manually_selected_oss_provider = None;
     let model_provider_override = if cli.oss {
         let resolved = resolve_oss_provider(
             cli.oss_provider.as_deref(),
@@ -843,11 +841,15 @@ pub async fn run_main(
             Some(provider)
         } else {
             // No provider configured, prompt the user
-            let provider = oss_selection::select_oss_provider(&codex_home).await?;
+            let selection = oss_selection::select_oss_provider().await?;
+            let provider = selection.provider;
             if provider == "__CANCELLED__" {
                 return Err(std::io::Error::other(
                     "OSS provider selection was cancelled by user",
                 ));
+            }
+            if selection.manually_selected {
+                manually_selected_oss_provider = Some(provider.clone());
             }
             Some(provider)
         }
@@ -1000,7 +1002,7 @@ pub async fn run_main(
     }
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::legacy_core::otel_init::build_provider(
+        codex_app_server_client::build_otel_provider(
             &config,
             env!("CARGO_PKG_VERSION"),
             /*service_name_override*/ None,
@@ -1049,9 +1051,10 @@ pub async fn run_main(
         app_server_target,
         remote_cwd_override,
         config,
+        manually_selected_oss_provider,
         overrides,
         cli_kv_overrides,
-        cloud_requirements,
+        cloud_config_bundle,
         feedback,
         log_db,
         remote_url,
@@ -1070,9 +1073,10 @@ async fn run_ratatui_app(
     app_server_target: AppServerTarget,
     remote_cwd_override: Option<PathBuf>,
     initial_config: Config,
+    manually_selected_oss_provider: Option<String>,
     overrides: ConfigOverrides,
     cli_kv_overrides: Vec<(String, toml::Value)>,
-    mut cloud_requirements: CloudRequirementsLoader,
+    mut cloud_config_bundle: CloudConfigBundleLoader,
     feedback: codex_feedback::CodexFeedback,
     log_db: Option<log_db::LogDbLayer>,
     remote_url: Option<String>,
@@ -1112,7 +1116,7 @@ async fn run_ratatui_app(
                     return Ok(AppExitInfo {
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
-                        thread_name: None,
+                        resume_hint: None,
                         update_action: Some(action),
                         exit_reason: ExitReason::UserRequested,
                     });
@@ -1189,7 +1193,7 @@ async fn run_ratatui_app(
             return Ok(AppExitInfo {
                 token_usage: codex_protocol::protocol::TokenUsage::default(),
                 thread_id: None,
-                thread_name: None,
+                resume_hint: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
             });
@@ -1203,6 +1207,7 @@ async fn run_ratatui_app(
                 initial_config.codex_home.to_path_buf(),
                 /*enable_codex_api_key_env*/ false,
                 initial_config.cli_auth_credentials_store_mode,
+                initial_config.auth_keyring_backend_kind(),
                 initial_config.chatgpt_base_url.clone(),
             )
             .await;
@@ -1234,7 +1239,7 @@ async fn run_ratatui_app(
         Ok(AppExitInfo {
             token_usage: codex_protocol::protocol::TokenUsage::default(),
             thread_id: None,
-            thread_name: None,
+            resume_hint: None,
             update_action: None,
             exit_reason: ExitReason::Fatal(format!(
                 "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
@@ -1295,7 +1300,7 @@ async fn run_ratatui_app(
                     return Ok(AppExitInfo {
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
-                        thread_name: None,
+                        resume_hint: None,
                         update_action: None,
                         exit_reason: ExitReason::UserRequested,
                     });
@@ -1356,7 +1361,7 @@ async fn run_ratatui_app(
                 return Ok(AppExitInfo {
                     token_usage: codex_protocol::protocol::TokenUsage::default(),
                     thread_id: None,
-                    thread_name: None,
+                    resume_hint: None,
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
                 });
@@ -1401,7 +1406,7 @@ async fn run_ratatui_app(
                         return Ok(AppExitInfo {
                             token_usage: codex_protocol::protocol::TokenUsage::default(),
                             thread_id: None,
-                            thread_name: None,
+                            resume_hint: None,
                             update_action: None,
                             exit_reason: ExitReason::UserRequested,
                         });
@@ -1465,9 +1470,24 @@ async fn run_ratatui_app(
     set_default_client_residency_requirement(config.enforce_residency.value());
     let active_profile = config.active_profile.clone();
     let should_show_trust_screen = should_show_trust_screen(&config);
-    let should_prompt_windows_sandbox_nux_at_startup = cfg!(target_os = "windows")
-        && trust_decision_was_made
-        && WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
+    #[cfg(target_os = "windows")]
+    let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
+    #[cfg(target_os = "windows")]
+    let required_elevated_sandbox_needs_setup = windows_sandbox_level
+        == WindowsSandboxLevel::Elevated
+        && config
+            .config_layer_stack
+            .requirements()
+            .windows_sandbox_mode
+            .source
+            .is_some()
+        && !crate::windows_sandbox::sandbox_setup_is_complete(config.codex_home.as_path());
+    #[cfg(target_os = "windows")]
+    let should_prompt_windows_sandbox_nux_at_startup = (trust_decision_was_made
+        && windows_sandbox_level == WindowsSandboxLevel::Disabled)
+        || required_elevated_sandbox_needs_setup;
+    #[cfg(not(target_os = "windows"))]
+    let should_prompt_windows_sandbox_nux_at_startup = false;
 
     let Cli {
         prompt,
@@ -1519,7 +1539,6 @@ async fn run_ratatui_app(
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
-        should_show_trust_screen_flag, // Preserve the startup-time trust NUX signal before onboarding
         should_prompt_windows_sandbox_nux_at_startup,
         remote_url,
         remote_auth_token,
@@ -1753,7 +1772,7 @@ async fn get_login_status(
     Ok(match account.account {
         Some(AppServerAccount::ApiKey {}) => LoginStatus::AuthMode(AppServerAuthMode::ApiKey),
         Some(AppServerAccount::Chatgpt { .. }) => LoginStatus::AuthMode(AppServerAuthMode::Chatgpt),
-        Some(AppServerAccount::AmazonBedrock {}) => LoginStatus::NotAuthenticated,
+        Some(AppServerAccount::AmazonBedrock { .. }) => LoginStatus::NotAuthenticated,
         None => LoginStatus::NotAuthenticated,
     })
 }
@@ -1790,6 +1809,46 @@ async fn load_config_or_exit_with_fallback_cwd(
         Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(clippy::print_stderr)]
+async fn load_bootstrap_config_or_exit(
+    codex_home: &Path,
+    cwd: Option<&AbsolutePathBuf>,
+    cli_kv_overrides: Vec<(String, codex_config::TomlValue)>,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    cloud_config_bundle: CloudConfigBundleLoader,
+) -> ConfigTomlLoadResult {
+    match load_config_toml_with_layer_stack(
+        codex_home,
+        cwd,
+        cli_kv_overrides,
+        codex_config::ConfigLoadOptions {
+            loader_overrides,
+            strict_config,
+            cloud_config_bundle,
+        },
+    )
+    .await
+    {
+        Ok(config_toml) => config_toml,
+        Err(err) => {
+            let config_error = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
+                .map(ConfigLoadError::config_error);
+            if let Some(config_error) = config_error {
+                eprintln!(
+                    "Error loading config.toml:\n{}",
+                    format_config_error_with_source(config_error)
+                );
+            } else {
+                eprintln!("Error loading config.toml: {err}");
+            }
             std::process::exit(1);
         }
     }
@@ -1968,6 +2027,7 @@ mod tests {
             &config,
             Some(cwd.as_path()),
             /*include_non_interactive*/ false,
+            LatestSessionLookupMode::StateDbOnly,
         );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
@@ -1987,10 +2047,37 @@ mod tests {
         let params = latest_session_lookup_params(
             /*is_remote*/ true, &config, /*cwd_filter*/ None,
             /*include_non_interactive*/ false,
+            LatestSessionLookupMode::StateDbOnly,
         );
 
         assert_eq!(params.model_providers, None);
         assert_eq!(params.cwd, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_session_lookup_params_can_include_non_interactive_sources()
+    -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        let params = latest_session_lookup_params(
+            /*uses_remote_workspace*/ true,
+            &config,
+            /*cwd_filter*/ None,
+            /*include_non_interactive*/ true,
+            LatestSessionLookupMode::StateDbOnly,
+        );
+
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+            ])
+        );
         Ok(())
     }
 
@@ -2006,6 +2093,7 @@ mod tests {
             &config,
             Some(cwd),
             /*include_non_interactive*/ false,
+            LatestSessionLookupMode::StateDbOnly,
         );
 
         assert_eq!(params.model_providers, None);

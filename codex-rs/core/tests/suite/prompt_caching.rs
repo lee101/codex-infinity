@@ -4,6 +4,7 @@ use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_core::shell::Shell;
 use codex_core::shell::default_user_shell;
 use codex_features::Feature;
+use codex_prompts::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -25,11 +26,17 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+
+fn write_global_instructions(home: &Path) {
+    fs::write(home.join("AGENTS.md"), "be consistent and helpful")
+        .expect("write global instructions");
+}
 
 fn text_user_input(text: String) -> serde_json::Value {
     text_user_input_parts(vec![text])
@@ -59,6 +66,13 @@ fn assert_default_env_context(text: &str, cwd: &str, shell: &Shell) {
     assert!(
         text.contains(&format!("<shell>{shell_name}</shell>")),
         "expected shell in environment context: {text}"
+    );
+}
+
+fn assert_env_context_fragment(text: &str) {
+    assert!(
+        text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG),
+        "expected environment context fragment: {text}"
     );
     assert!(
         text.contains("<current_date>") && text.contains("</current_date>"),
@@ -119,8 +133,8 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         thread_manager,
         ..
     } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config.model = Some("gpt-5.2".to_string());
             // Keep tool expectations stable when the default web_search mode changes.
             config
@@ -148,7 +162,6 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -161,7 +174,6 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -231,8 +243,8 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
     .await;
 
     let TestCodex { codex, .. } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .disable(Feature::ApplyPatchFreeform)
@@ -248,7 +260,6 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -261,7 +272,6 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -313,8 +323,8 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     .await;
 
     let TestCodex { codex, config, .. } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -325,7 +335,6 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -338,7 +347,6 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -408,8 +416,8 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     .await;
 
     let TestCodex { codex, config, .. } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -421,7 +429,6 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     // First turn
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -462,7 +469,6 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     // Second turn after overrides
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
@@ -498,8 +504,24 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
         expected_permissions_msg_2, expected_permissions_msg,
         "expected updated permissions message after override"
     );
+    let expected_env_msg_2 = body2["input"][body1_input.len() + 1].clone();
+    assert_eq!(expected_env_msg_2["role"].as_str(), Some("user"));
+    let env_text = expected_env_msg_2["content"][0]["text"]
+        .as_str()
+        .expect("environment context text");
+    assert_env_context_fragment(env_text);
+    assert!(
+        env_text.contains("<permission_profile type=\"managed\">")
+            && env_text.contains("<file_system type=\"restricted\">")
+            && env_text.contains(&format!(
+                "<entry access=\"write\"><path>{}</path></entry>",
+                writable.abs().display()
+            )),
+        "expected workspace-write filesystem profile in environment context: {env_text}"
+    );
     let mut expected_body2 = body1_input.to_vec();
     expected_body2.push(expected_permissions_msg_2);
+    expected_body2.push(expected_env_msg_2);
     expected_body2.push(expected_user_message_2);
     assert_eq!(body2["input"], serde_json::Value::Array(expected_body2));
 
@@ -547,7 +569,6 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "first message".into(),
                 text_elements: Vec::new(),
@@ -687,8 +708,8 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     .await;
 
     let TestCodex { codex, .. } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -700,7 +721,6 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     // First turn
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
@@ -820,8 +840,8 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
         session_configured,
         ..
     } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -834,7 +854,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_sandbox_policy = &config.legacy_sandbox_policy();
     let default_model = session_configured.model;
-    let default_effort = config.model_reasoning_effort;
+    let default_effort = config.model_reasoning_effort.clone();
     let default_summary = config.model_reasoning_summary;
 
     codex
@@ -950,8 +970,8 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         session_configured,
         ..
     } = test_codex()
+        .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
-            config.user_instructions = Some("be consistent and helpful".to_string());
             config
                 .features
                 .enable(Feature::CollaborationModes)
@@ -964,7 +984,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_sandbox_policy = &config.legacy_sandbox_policy();
     let default_model = session_configured.model;
-    let default_effort = config.model_reasoning_effort;
+    let default_effort = config.model_reasoning_effort.clone();
     let default_summary = config.model_reasoning_summary;
 
     codex
@@ -1060,12 +1080,25 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         }),
         "expected model switch section after model override: {expected_settings_update_msg:?}"
     );
+    let expected_env_update_msg = body2["input"][body1_input.len() + 1].clone();
+    assert_eq!(expected_env_update_msg["role"].as_str(), Some("user"));
+    let expected_env_update_text = expected_env_update_msg["content"][0]["text"]
+        .as_str()
+        .expect("environment context text");
+    assert_env_context_fragment(expected_env_update_text);
+    assert!(
+        expected_env_update_text.contains(
+            "<permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile>",
+        ),
+        "expected disabled filesystem profile in environment context: {expected_env_update_text}"
+    );
     let expected_user_message_2 = text_user_input("hello 2".to_string());
     let expected_input_2 = serde_json::Value::Array(vec![
         expected_permissions_msg,
         expected_contextual_user_msg_1,
         expected_user_message_1,
         expected_settings_update_msg,
+        expected_env_update_msg,
         expected_user_message_2,
     ]);
     assert_eq!(body2["input"], expected_input_2);

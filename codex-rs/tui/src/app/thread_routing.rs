@@ -209,9 +209,9 @@ impl App {
         &self,
         thread_id: ThreadId,
         request: &ServerRequest,
-    ) -> Option<ThreadInteractiveRequest> {
+    ) -> std::io::Result<Option<ThreadInteractiveRequest>> {
         let thread_label = Some(self.thread_label(thread_id));
-        match request {
+        Ok(match request {
             ServerRequest::CommandExecutionRequestApproval { params, .. } => {
                 let network_approval_context = params
                     .network_approval_context
@@ -310,17 +310,28 @@ impl App {
                     ))
                 }
             }
-            ServerRequest::PermissionsRequestApproval { params, .. } => Some(
-                ThreadInteractiveRequest::Approval(ApprovalRequest::Permissions {
-                    thread_id,
-                    thread_label,
-                    call_id: params.item_id.clone(),
-                    reason: params.reason.clone(),
-                    permissions: params.permissions.clone().into(),
-                }),
-            ),
+            ServerRequest::PermissionsRequestApproval { params, .. } => {
+                // TODO(anp): Remove this native-path localization error path once core permission
+                // paths remain PathUri after crossing the app-server boundary.
+                let permissions = params.permissions.clone().try_into().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("failed to localize requested filesystem paths: {err}"),
+                    )
+                })?;
+                Some(ThreadInteractiveRequest::Approval(
+                    ApprovalRequest::Permissions {
+                        thread_id,
+                        thread_label,
+                        call_id: params.item_id.clone(),
+                        environment_id: params.environment_id.clone(),
+                        reason: params.reason.clone(),
+                        permissions,
+                    },
+                ))
+            }
             _ => None,
-        }
+        })
     }
 
     pub(super) fn push_thread_interactive_request(&mut self, request: ThreadInteractiveRequest) {
@@ -377,20 +388,23 @@ impl App {
         requests
     }
 
-    pub(super) async fn surface_pending_inactive_thread_interactive_requests(&mut self) {
+    pub(super) async fn surface_pending_inactive_thread_interactive_requests(
+        &mut self,
+    ) -> Result<()> {
         if self.active_side_parent_thread_id().is_some() {
-            return;
+            return Ok(());
         }
 
         let requests = self.pending_inactive_thread_requests().await;
         for (thread_id, request) in requests {
             if let Some(request) = self
                 .interactive_request_for_thread_request(thread_id, &request)
-                .await
+                .await?
             {
                 self.push_thread_interactive_request(request);
             }
         }
+        Ok(())
     }
 
     pub(super) async fn submit_active_thread_op(
@@ -519,9 +533,39 @@ impl App {
         match op.view() {
             AppCommandView::Interrupt => {
                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
-                    app_server.turn_interrupt(thread_id, turn_id).await?;
+                    let mut interrupt_turn_id = turn_id;
+                    for retried_after_turn_mismatch in [false, true] {
+                        match app_server
+                            .turn_interrupt(thread_id, interrupt_turn_id.clone())
+                            .await
+                        {
+                            Ok(()) => return Ok(true),
+                            Err(error) if !retried_after_turn_mismatch => {
+                                let Some(actual_turn_id) = active_turn_interrupt_race(&error)
+                                else {
+                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
+                                };
+                                if actual_turn_id == interrupt_turn_id {
+                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
+                                }
+                                // Review flows can swap the active turn before the TUI processes
+                                // the corresponding notification. Retry once with the
+                                // server-reported turn id so Ctrl+C/Esc do not fatally exit on that
+                                // stale cache, but let lifecycle notifications own the cached
+                                // active turn id.
+                                interrupt_turn_id = actual_turn_id;
+                            }
+                            Err(error) => {
+                                return Err(error).wrap_err("turn/interrupt failed in TUI");
+                            }
+                        }
+                    }
+                    unreachable!("interrupt retry loop should return");
                 } else {
-                    app_server.startup_interrupt(thread_id).await?;
+                    app_server
+                        .startup_interrupt(thread_id)
+                        .await
+                        .wrap_err("turn/interrupt failed in TUI")?;
                 }
                 Ok(true)
             }
@@ -703,7 +747,6 @@ impl App {
             }
             AppCommandView::ReloadUserConfig => {
                 app_server.reload_user_config().await?;
-                self.refresh_in_memory_config_from_disk().await?;
                 Ok(true)
             }
             AppCommandView::OverrideTurnContext { .. } => Ok(true),
@@ -878,6 +921,14 @@ impl App {
         app_server: &mut AppServerSession,
         notification: &ServerNotification,
     ) {
+        if let Some(activity) =
+            sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
+        {
+            self.agent_navigation.record_sub_agent_activity(activity);
+            self.sync_active_agent_label();
+            return;
+        }
+
         let Some(receiver_thread_ids) = collab_receiver_thread_ids(notification) else {
             return;
         };
@@ -962,7 +1013,7 @@ impl App {
     ) -> Result<()> {
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
             self.interactive_request_for_thread_request(thread_id, &request)
-                .await
+                .await?
         } else {
             None
         };
@@ -1069,8 +1120,7 @@ impl App {
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
         self.chat_widget.handle_thread_session(session);
-        let should_buffer_initial_replay =
-            self.terminal_resize_reflow_enabled() && !turns.is_empty();
+        let should_buffer_initial_replay = !turns.is_empty();
         if should_buffer_initial_replay {
             self.app_event_tx
                 .send(AppEvent::BeginInitialHistoryReplayBuffer);
@@ -1321,6 +1371,7 @@ impl App {
         let response = list_skills_response_to_core(response);
         let cwd = self.chat_widget.config_ref().cwd.clone();
         let errors = errors_for_cwd(&cwd, &response);
+        let errors = self.skill_load_warnings.newly_active_errors(&errors);
         emit_skill_load_warnings(&self.app_event_tx, &errors);
         self.chat_widget.handle_skills_list_response(response);
     }

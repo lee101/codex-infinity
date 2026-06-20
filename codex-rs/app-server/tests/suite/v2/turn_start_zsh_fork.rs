@@ -7,7 +7,7 @@
 // network access are required the first time the artifact is fetched.
 
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
@@ -117,6 +117,7 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run echo hi".to_string(),
                 text_elements: Vec::new(),
@@ -235,6 +236,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run python".to_string(),
                 text_elements: Vec::new(),
@@ -367,6 +369,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run python".to_string(),
                 text_elements: Vec::new(),
@@ -525,6 +528,7 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "remove both files".to_string(),
                 text_elements: Vec::new(),
@@ -740,10 +744,10 @@ async fn create_zsh_test_mcp_process(
     codex_home: &Path,
     zdotdir: &Path,
     zsh_path: &Path,
-) -> Result<McpProcess> {
+) -> Result<TestAppServer> {
     let app_server = create_test_package_app_server(codex_home, zsh_path)?;
     let zdotdir = zdotdir.to_string_lossy().into_owned();
-    McpProcess::new_with_program_and_env(
+    TestAppServer::new_with_program_and_env(
         codex_home,
         &app_server,
         &[("ZDOTDIR", Some(zdotdir.as_str()))],
@@ -807,7 +811,7 @@ fn create_config_toml(
                 .iter()
                 .find(|spec| spec.id == feature)
                 .map(|spec| spec.key)
-                .unwrap_or_else(|| panic!("missing feature key for {feature:?}"));
+                .expect("feature should have a config key");
             format!("{key} = {enabled}")
         })
         .collect::<Vec<_>>()

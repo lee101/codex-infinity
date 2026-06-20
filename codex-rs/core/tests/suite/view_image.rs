@@ -28,7 +28,9 @@ use core_test_support::responses::mount_models_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event_with_timeout;
@@ -108,9 +110,10 @@ fn png_bytes(width: u32, height: u32, rgba: [u8; 4]) -> anyhow::Result<Vec<u8>> 
 
 async fn create_workspace_directory(test: &TestCodex, rel_path: &str) -> anyhow::Result<PathBuf> {
     let abs_path = test.config.cwd.join(rel_path);
+    let abs_path_uri = PathUri::from_path(&abs_path)?;
     test.fs()
         .create_directory(
-            &abs_path,
+            &abs_path_uri,
             CreateDirectoryOptions { recursive: true },
             /*sandbox*/ None,
         )
@@ -125,16 +128,18 @@ async fn write_workspace_file(
 ) -> anyhow::Result<PathBuf> {
     let abs_path = test.config.cwd.join(rel_path);
     if let Some(parent) = abs_path.parent() {
+        let parent_uri = PathUri::from_path(&parent)?;
         test.fs()
             .create_directory(
-                &parent,
+                &parent_uri,
                 CreateDirectoryOptions { recursive: true },
                 /*sandbox*/ None,
             )
             .await?;
     }
+    let abs_path_uri = PathUri::from_path(&abs_path)?;
     test.fs()
-        .write_file(&abs_path, contents, /*sandbox*/ None)
+        .write_file(&abs_path_uri, contents, /*sandbox*/ None)
         .await?;
     Ok(abs_path.into_path_buf())
 }
@@ -152,6 +157,7 @@ async fn write_workspace_png(
 async fn assert_user_turn_local_image_resizes_to(
     original_dimensions: (u32, u32),
     expected_dimensions: (u32, u32),
+    resize_policy: TestImageResizePolicy,
 ) -> anyhow::Result<()> {
     let server = start_mock_server().await;
 
@@ -228,18 +234,42 @@ async fn assert_user_turn_local_image_resizes_to(
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TestImageResizePolicy {
+    Legacy,
+    AllImages,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_user_turn_local_image_resizes_to((2304, 864), (2048, 768)).await
+    assert_user_turn_local_image_resizes_to((2304, 864), (2048, 768), TestImageResizePolicy::Legacy)
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_with_vertical_local_image_resizes_to_square_bounds() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_user_turn_local_image_resizes_to((1024, 4096), (512, 2048)).await
+    assert_user_turn_local_image_resizes_to(
+        (1024, 4096),
+        (512, 2048),
+        TestImageResizePolicy::Legacy,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_all_images_applies_patch_budget_to_local_user_image() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to(
+        (2048, 2048),
+        (1600, 1600),
+        TestImageResizePolicy::AllImages,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -957,6 +987,72 @@ async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_all_images_turns_invalid_view_image_into_placeholder() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::ResizeAllImages);
+    });
+    let test = builder.build_with_remote_env(&server).await?;
+    let TestCodex {
+        codex,
+        session_configured,
+        ..
+    } = &test;
+
+    let rel_path = "assets/invalid-image.json";
+    write_workspace_file(&test, rel_path, br#"{ "message": "hello" }"#.to_vec()).await?;
+    let call_id = "view-image-invalid-placeholder";
+    let arguments = serde_json::json!({ "path": rel_path }).to_string();
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "view_image", &arguments),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    codex
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "please inspect the image".into(),
+                text_elements: Vec::new(),
+            }],
+            session_configured.model.clone(),
+        ))
+        .await?;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+
+    let request = second_mock.single_request();
+    assert_eq!(
+        request.function_call_output(call_id).get("output"),
+        Some(&serde_json::json!([{
+            "type": "input_text",
+            "text": "image content omitted because it could not be processed"
+        }]))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1058,6 +1154,10 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         input_modalities: vec![InputModality::Text],
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         upgrade: None,
@@ -1076,6 +1176,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     };

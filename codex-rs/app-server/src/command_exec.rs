@@ -707,12 +707,13 @@ mod tests {
         let cwd = AbsolutePathBuf::current_dir().expect("current dir");
         ExecRequest::new(
             vec!["cmd".to_string()],
-            cwd,
+            cwd.clone(),
             HashMap::new(),
             /*network*/ None,
             ExecExpiration::DefaultTimeout,
             codex_core::exec::ExecCapturePolicy::ShellTool,
             SandboxType::WindowsRestrictedToken,
+            vec![cwd],
             WindowsSandboxLevel::Disabled,
             /*windows_sandbox_private_desktop*/ false,
             PermissionProfile::read_only(),
@@ -820,6 +821,7 @@ mod tests {
                     ExecExpiration::Cancellation(CancellationToken::new()),
                     codex_core::exec::ExecCapturePolicy::ShellTool,
                     SandboxType::None,
+                    vec![cwd.clone()],
                     WindowsSandboxLevel::Disabled,
                     /*windows_sandbox_private_desktop*/ false,
                     PermissionProfile::read_only(),

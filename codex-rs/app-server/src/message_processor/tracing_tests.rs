@@ -27,7 +27,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
-use codex_config::CloudRequirementsLoader;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -746,11 +746,13 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 params: TurnStartParams {
                     environments: None,
                     thread_id,
+                    client_user_message_id: None,
                     input: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
                     }],
                     responsesapi_client_metadata: None,
+                    additional_context: None,
                     cwd: None,
                     approval_policy: None,
                     sandbox_policy: None,

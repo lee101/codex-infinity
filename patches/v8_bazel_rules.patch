@@ -3,11 +3,11 @@
 # Scope: Bazel BUILD/defs/BUILD.icu integration only, including dependency
 # wiring, generated sources, and visibility; no standalone V8 source patching.
 
-diff --git a/orig/v8-14.6.202.11/bazel/defs.bzl b/mod/v8-14.6.202.11/bazel/defs.bzl
-index 9648e4a..88efd41 100644
---- a/orig/v8-14.6.202.11/bazel/defs.bzl
-+++ b/mod/v8-14.6.202.11/bazel/defs.bzl
-@@ -33,9 +33,21 @@
+diff --git a/orig/v8-14.9.207.2/bazel/defs.bzl b/mod/v8-14.9.207.2/bazel/defs.bzl
+index bbe1495..6673518 100644
+--- a/orig/v8-14.9.207.2/bazel/defs.bzl
++++ b/mod/v8-14.9.207.2/bazel/defs.bzl
+@@ -33,9 +33,21 @@ _create_option_int = rule(
  )
  
  def v8_flag(name, default = False):
@@ -32,7 +32,7 @@ index 9648e4a..88efd41 100644
  
  def v8_string(name, default = ""):
      _create_option_string(name = name, build_setting_default = default)
-@@ -97,7 +109,13 @@
+@@ -97,7 +109,13 @@ v8_config = rule(
  
  def _default_args():
      return struct(
@@ -47,7 +47,7 @@ index 9648e4a..88efd41 100644
          defines = select({
              "@v8//bazel/config:is_windows": [
                  "UNICODE",
-@@ -127,12 +145,15 @@
+@@ -127,12 +145,15 @@ def _default_args():
              ],
              "//conditions:default": [],
          }) + select({
@@ -56,20 +56,19 @@ index 9648e4a..88efd41 100644
 -                "-Wno-deprecated-this-capture",
 -                "-Wno-deprecated-declarations",
 -                "-std=c++20",
--            ],
 +            "@v8//:is_v8_use_rusty_v8_custom_libcxx": [
 +                "-nostdinc++",
 +                "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
 +                "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
 +                "-D_LIBCPP_INSTRUMENTED_WITH_ASAN=0",
 +                "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
-+            ],
+             ],
 +            "//conditions:default": [],
 +        }) + select({
              "@v8//bazel/config:is_gcc": [
                  "-Wno-extra",
                  "-Wno-array-bounds",
-@@ -152,9 +173,17 @@
+@@ -152,9 +173,17 @@ def _default_args():
                  "-std=gnu++2a",
              ],
              "@v8//bazel/config:is_windows": [
@@ -78,18 +77,18 @@ index 9648e4a..88efd41 100644
 +                "-Wno-deprecated-this-capture",
 +                "-Wno-deprecated-declarations",
 +                "-std=c++20",
-             ],
--            "//conditions:default": [],
++            ],
 +            "//conditions:default": [
 +                "-Wno-invalid-offsetof",
 +                "-Wno-deprecated-this-capture",
 +                "-Wno-deprecated-declarations",
 +                "-std=c++20",
-+            ],
+             ],
+-            "//conditions:default": [],
          }) + select({
              "@v8//bazel/config:is_gcc_fastbuild": [
                  # Non-debug builds without optimizations fail because
-@@ -178,12 +207,12 @@
+@@ -178,12 +207,12 @@ def _default_args():
          includes = ["include"],
          linkopts = select({
              "@v8//bazel/config:is_windows": [
@@ -288,7 +287,7 @@ index 85f31b7..7314584 100644
      ],
  )
  
-@@ -4772,9 +4784,15 @@ v8_binary(
+@@ -4791,9 +4823,20 @@ v8_binary(
          ":icu/generated_torque_initializers",
          ":icu/v8_initializers_files",
      ],
@@ -296,19 +295,24 @@ index 85f31b7..7314584 100644
 +    # external-reference helpers together while producing the snapshot, the
 +    # final embedder binary may not fold the same pair and startup
 +    # deserialization will reject the snapshot.
++    # GN also increases the x64 Windows stack reserve because constructing the
++    # snapshot overflows the linker's 1 MiB default.
      linkopts = select({
          "@v8//bazel/config:is_android": ["-llog"],
 -        "//conditions:default": [],
 +        "@v8//bazel/config:is_macos": ["-Wl,-no_deduplicate"],
-+        "@v8//bazel/config:is_windows": ["/OPT:NOICF"],
++        "@v8//bazel/config:is_windows": [
++            "-Wl,/OPT:NOICF",
++            "-Wl,/STACK:2097152",
++        ],
 +        "//conditions:default": ["-Wl,--icf=none"],
      }),
      noicu_deps = [":v8_libshared_noicu"],
      noicu_srcs = [
-diff --git a/orig/v8-14.6.202.11/bazel/BUILD.icu b/mod/v8-14.6.202.11/bazel/BUILD.icu
-index 5fda2f4..9729451 100644
---- a/orig/v8-14.6.202.11/bazel/BUILD.icu
-+++ b/mod/v8-14.6.202.11/bazel/BUILD.icu
+diff --git a/orig/v8-14.9.207.2/bazel/BUILD.icu b/mod/v8-14.9.207.2/bazel/BUILD.icu
+index 5fda2f4..8c3c372 100644
+--- a/orig/v8-14.9.207.2/bazel/BUILD.icu
++++ b/mod/v8-14.9.207.2/bazel/BUILD.icu
 @@ -1,3 +1,24 @@
 +load("@rules_cc//cc:defs.bzl", "cc_library")
 +
@@ -334,7 +338,7 @@ index 5fda2f4..9729451 100644
  # Copyright 2021 the V8 project authors. All rights reserved.
  # Use of this source code is governed by a BSD-style license that can be
  # found in the LICENSE file.
-@@ -16,15 +37,12 @@
+@@ -16,15 +37,12 @@ cc_library(
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -352,7 +356,7 @@ index 5fda2f4..9729451 100644
      data = [":icudata"],
      defines = [
          "HAVE_DLOPEN=0",
-@@ -54,6 +72,7 @@
+@@ -54,6 +72,7 @@ cc_library(
          "U_ICUDATAENTRY_IN_COMMON",
      ],
      tags = ["requires-rtti"],
@@ -360,7 +364,7 @@ index 5fda2f4..9729451 100644
      alwayslink = 1,
  )
  
-@@ -65,19 +84,16 @@
+@@ -65,19 +84,16 @@ cc_library(
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -383,7 +387,7 @@ index 5fda2f4..9729451 100644
      alwayslink = 1,
  )
  
-@@ -93,13 +109,10 @@
+@@ -93,13 +109,10 @@ cc_library(
      ]),
      copts = select({
          "@platforms//os:windows": [
@@ -399,7 +403,7 @@ index 5fda2f4..9729451 100644
      include_prefix = "third_party/icu",
      local_defines = [
          "U_COMMON_IMPLEMENTATION",
-@@ -108,6 +121,6 @@
+@@ -108,6 +121,6 @@ cc_library(
      deps = [
          ":icui18n",
          ":icuuc",

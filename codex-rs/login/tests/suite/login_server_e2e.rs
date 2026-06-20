@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use core_test_support::skip_if_no_network;
@@ -65,7 +66,7 @@ fn start_mock_issuer(chatgpt_account_id: &str) -> (SocketAddr, thread::JoinHandl
                 let mut resp = tiny_http::Response::from_data(data);
                 resp.add_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                        .unwrap_or_else(|_| panic!("header bytes")),
+                        .expect("header bytes should be valid"),
                 );
                 let _ = req.respond(resp);
             } else {

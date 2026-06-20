@@ -1,6 +1,6 @@
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_fake_rollout_with_text_elements;
@@ -36,6 +36,7 @@ use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadResumeInitialTurnsPageParams;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -46,6 +47,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
@@ -64,6 +66,8 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::append_rollout_item_to_path;
+use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses;
@@ -87,6 +91,7 @@ use super::analytics::assert_basic_thread_initialized_event;
 use super::analytics::mount_analytics_capture;
 use super::analytics::thread_initialized_event;
 use super::analytics::wait_for_analytics_payload;
+use super::analytics::wait_for_goal_event;
 
 #[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
@@ -135,7 +140,7 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a thread.
@@ -188,7 +193,7 @@ async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -248,7 +253,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -294,7 +299,7 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -360,7 +365,7 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -395,7 +400,7 @@ async fn thread_resume_emits_active_goal_update_before_continuation() -> Result<
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -414,6 +419,7 @@ async fn thread_resume_emits_active_goal_update_before_continuation() -> Result<
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
@@ -499,7 +505,7 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -518,6 +524,7 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
@@ -589,16 +596,17 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
 async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
-    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT.saturating_mul(2), mcp.initialize()).await??;
 
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -616,6 +624,7 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
@@ -639,7 +648,8 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
             "thread/goal/set",
             Some(json!({
                 "threadId": thread.id,
-                "objective": "keep polishing",
+                "objective": "do not serialize this objective",
+                "tokenBudget": 100,
             })),
         )
         .await?;
@@ -654,6 +664,55 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
         mcp.read_stream_until_notification_message("thread/goal/updated"),
     )
     .await??;
+
+    let created = wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "created", "active").await?;
+    let persisted_goal_id = created["event_params"]["goal_id"]
+        .as_str()
+        .expect("created goal id");
+    assert_eq!(created["event_params"]["thread_id"], thread.id);
+    assert_eq!(created["event_params"]["turn_id"], serde_json::Value::Null);
+    assert_eq!(created["event_params"]["has_token_budget"], true);
+    assert!(created["event_params"]["session_id"].is_string());
+    assert!(created["event_params"]["app_server_client"].is_object());
+    assert!(created["event_params"]["runtime"].is_object());
+    assert!(created["event_params"].get("objective").is_none());
+    assert!(created["event_params"].get("token_budget").is_none());
+
+    let usage = wait_for_goal_event(
+        &server,
+        DEFAULT_READ_TIMEOUT,
+        "usage_accounted",
+        "budget_limited",
+    )
+    .await?;
+    let causal_turn_id = usage["event_params"]["turn_id"]
+        .as_str()
+        .expect("accounted usage turn id");
+    assert_eq!(usage["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(usage["event_params"]["cumulative_tokens_accounted"], 200);
+    assert!(
+        usage["event_params"]["cumulative_time_accounted_seconds"]
+            .as_i64()
+            .is_some()
+    );
+
+    let status = wait_for_goal_event(
+        &server,
+        DEFAULT_READ_TIMEOUT,
+        "status_changed",
+        "budget_limited",
+    )
+    .await?;
+    assert_eq!(status["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(status["event_params"]["turn_id"], causal_turn_id);
+    assert_eq!(
+        status["event_params"]["cumulative_tokens_accounted"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        status["event_params"]["cumulative_time_accounted_seconds"],
+        serde_json::Value::Null
+    );
 
     let clear_id = mcp
         .send_raw_request(
@@ -676,6 +735,11 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
         mcp.read_stream_until_notification_message("thread/goal/cleared"),
     )
     .await??;
+
+    let cleared =
+        wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "cleared", "budget_limited").await?;
+    assert_eq!(cleared["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(cleared["event_params"]["turn_id"], serde_json::Value::Null);
 
     let get_id = mcp
         .send_raw_request(
@@ -757,7 +821,7 @@ async fn thread_resume_emits_restored_token_usage_before_next_turn() -> Result<(
         Some("mock_provider"),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -810,7 +874,7 @@ async fn thread_resume_skips_restored_token_usage_when_turns_are_excluded() -> R
         Some("mock_provider"),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let first_resume_id = mcp
@@ -917,7 +981,7 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1040,7 +1104,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1172,6 +1236,7 @@ stream_max_retries = 0
     let session_meta = SessionMeta {
         id: conversation_id,
         forked_from_id: None,
+        parent_thread_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
         originator: "codex".to_string(),
@@ -1184,6 +1249,7 @@ stream_max_retries = 0
         base_instructions: None,
         dynamic_tools: None,
         memory_mode: None,
+        multi_agent_version: None,
     };
     std::fs::write(
         &rollout_path,
@@ -1227,7 +1293,7 @@ stream_max_retries = 0
         .mark_backfill_complete(/*last_watermark*/ None)
         .await?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let update_id = mcp
@@ -1320,7 +1386,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1388,13 +1454,13 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
 }
 
 #[tokio::test]
-async fn thread_resume_without_overrides_does_not_change_updated_at_or_mtime() -> Result<()> {
+async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri())?;
+    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
     let thread_id = rollout.conversation_id.clone();
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let read_id = mcp
@@ -1432,6 +1498,33 @@ async fn thread_resume_without_overrides_does_not_change_updated_at_or_mtime() -
     let after_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
     assert_eq!(after_modified, rollout.before_modified);
 
+    let unsubscribe_id = mcp
+        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+            thread_id: thread_id.clone(),
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
+    )
+    .await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: "not-a-valid-thread-id".to_string(),
+            path: Some(normalized_existing_path(&rollout.rollout_file_path)?),
+            cwd: Some(codex_home.path().to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { cwd, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(cwd, AbsolutePathBuf::from_absolute_path(codex_home.path())?);
+
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id,
@@ -1465,7 +1558,7 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -1484,6 +1577,7 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -1503,12 +1597,13 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     .await??;
     primary.clear_message_buffer();
 
-    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "respond with docs".to_string(),
                 text_elements: Vec::new(),
@@ -1572,7 +1667,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -1591,6 +1686,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -1614,6 +1710,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let running_turn_request_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
@@ -1644,6 +1741,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
                     text: "history override".to_string(),
                 }],
                 phase: None,
+                metadata: None,
             }]),
             ..Default::default()
         })
@@ -1687,7 +1785,7 @@ async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Resul
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -1706,6 +1804,7 @@ async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Resul
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -1729,6 +1828,7 @@ async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Resul
     let running_turn_request_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
@@ -1793,7 +1893,7 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -1812,6 +1912,7 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -1834,6 +1935,7 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
@@ -1841,11 +1943,13 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
             ..Default::default()
         })
         .await?;
-    timeout(
+    let running_turn_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_response_message(RequestId::Integer(running_turn_id)),
     )
     .await??;
+    let TurnStartResponse { turn: running_turn } =
+        to_response::<TurnStartResponse>(running_turn_resp)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/started"),
@@ -1857,6 +1961,11 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
             thread_id: thread.id.clone(),
             model: Some("not-the-running-model".to_string()),
             cwd: Some("/tmp".to_string()),
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: None,
+                sort_direction: None,
+                items_view: None,
+            }),
             ..Default::default()
         })
         .await?;
@@ -1865,9 +1974,23 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
         primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
-    let ThreadResumeResponse { thread, model, .. } =
-        to_response::<ThreadResumeResponse>(resume_resp)?;
+    let ThreadResumeResponse {
+        thread,
+        model,
+        initial_turns_page,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
     assert_eq!(model, "gpt-5.4");
+    let initial_turns_page = initial_turns_page.expect("resume should include initial turns page");
+    let resumed_running_turn = initial_turns_page
+        .data
+        .first()
+        .expect("resume page should include the running turn");
+    assert_eq!(resumed_running_turn.id, running_turn.id);
+    assert_eq!(resumed_running_turn.items_view, TurnItemsView::Summary);
+    assert_eq!(resumed_running_turn.status, TurnStatus::InProgress);
+    assert!(initial_turns_page.backwards_cursor.is_some());
+    assert_eq!(initial_turns_page.next_cursor, None);
     // The running-thread resume response is queued onto the thread listener task.
     // If the in-flight turn completes before that queued command runs, the response
     // can legitimately observe the thread as idle.
@@ -1901,7 +2024,7 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -1920,6 +2043,7 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -1938,7 +2062,7 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     )
     .await??;
 
-    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let resume_id = secondary
@@ -1984,7 +2108,7 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -2003,6 +2127,7 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -2025,6 +2150,7 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "run command".to_string(),
                 text_elements: Vec::new(),
@@ -2121,7 +2247,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
     create_config_toml(&codex_home, &server.uri())?;
 
-    let mut primary = McpProcess::new(&codex_home).await?;
+    let mut primary = TestAppServer::new(&codex_home).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -2141,6 +2267,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -2164,6 +2291,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "apply patch".to_string(),
                 text_elements: Vec::new(),
@@ -2308,6 +2436,7 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: resumed_thread.id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
@@ -2336,10 +2465,10 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
 async fn thread_resume_fails_when_required_mcp_server_fails_to_initialize() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri())?;
+    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
     create_config_toml_with_required_broken_mcp(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -2371,10 +2500,10 @@ async fn thread_resume_fails_when_required_mcp_server_fails_to_initialize() -> R
 }
 
 #[tokio::test]
-async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
+async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/backend-api/wham/config/requirements"))
+        .and(path("/backend-api/wham/config/bundle"))
         .respond_with(
             ResponseTemplate::new(401)
                 .insert_header("content-type", "text/html")
@@ -2418,7 +2547,7 @@ async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
         /*git_info*/ None,
     )?;
     let refresh_token_url = format!("{}/oauth/token", server.uri());
-    let mut mcp = McpProcess::new_with_env(
+    let mut mcp = TestAppServer::new_with_env(
         codex_home.path(),
         &[
             ("OPENAI_API_KEY", None),
@@ -2451,7 +2580,7 @@ async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
     assert_eq!(
         err.error.data,
         Some(json!({
-            "reason": "cloudRequirements",
+            "reason": "cloudConfigBundle",
             "errorCode": "Auth",
             "action": "relogin",
             "statusCode": 401,
@@ -2550,7 +2679,7 @@ async fn thread_resume_can_load_source_by_external_path() -> Result<()> {
     )?;
     let thread_path = rollout_path(external_home.path(), "2025-01-05T12-00-00", &thread_id);
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -2598,6 +2727,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
             text: history_text.to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
 
     // Resume with explicit history and override the model.
@@ -2629,7 +2759,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
 }
 
 struct RestartedThreadFixture {
-    mcp: McpProcess,
+    mcp: TestAppServer,
     thread_id: String,
     rollout_file_path: PathBuf,
     updated_at: i64,
@@ -2639,7 +2769,7 @@ async fn start_materialized_thread_and_restart(
     codex_home: &Path,
     seed_text: &str,
 ) -> Result<RestartedThreadFixture> {
-    let mut first_mcp = McpProcess::new(codex_home).await?;
+    let mut first_mcp = TestAppServer::new(codex_home).await?;
     timeout(DEFAULT_READ_TIMEOUT, first_mcp.initialize()).await??;
 
     let start_id = first_mcp
@@ -2658,6 +2788,7 @@ async fn start_materialized_thread_and_restart(
     let materialize_turn_id = first_mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: seed_text.to_string(),
                 text_elements: Vec::new(),
@@ -2697,7 +2828,7 @@ async fn start_materialized_thread_and_restart(
 
     drop(first_mcp);
 
-    let mut second_mcp = McpProcess::new(codex_home).await?;
+    let mut second_mcp = TestAppServer::new(codex_home).await?;
     timeout(DEFAULT_READ_TIMEOUT, second_mcp.initialize()).await??;
 
     Ok(RestartedThreadFixture {
@@ -2728,7 +2859,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -2747,6 +2878,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let materialize_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
@@ -2765,7 +2897,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     )
     .await??;
 
-    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let resume_id = secondary
@@ -2787,6 +2919,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let turn_id = secondary
         .send_turn_start_request(TurnStartParams {
             thread_id: resume.thread.id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
@@ -2964,7 +3097,7 @@ struct RolloutFixture {
     before_modified: std::time::SystemTime,
 }
 
-fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<RolloutFixture> {
+async fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<RolloutFixture> {
     create_config_toml(codex_home, server_uri)?;
 
     let preview = "Saved user message";
@@ -2981,6 +3114,10 @@ fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<RolloutF
         /*git_info*/ None,
     )?;
     let rollout_file_path = rollout_path(codex_home, filename_ts, &conversation_id);
+    let mut session_meta = read_session_meta_line(&rollout_file_path).await?;
+    session_meta.meta.multi_agent_version = Some(MultiAgentVersion::V1);
+    append_rollout_item_to_path(&rollout_file_path, &RolloutItem::SessionMeta(session_meta))
+        .await?;
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
     let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
     Ok(RolloutFixture {

@@ -7,14 +7,10 @@ use codex_protocol::models::ShellCommandToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
 use std::path::PathBuf;
 
-pub(crate) async fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool) {
-    let Some((command, _)) = shell_command_for_invocation(invocation) else {
+pub(crate) fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool) {
+    let Some(command) = shell_script_for_invocation(invocation) else {
         return;
     };
-    let kinds = memories_usage_kinds_from_command(&command);
-    if kinds.is_empty() {
-        return;
-    }
 
     let success = if success { "true" } else { "false" };
     let tool_name = invocation.tool_name.display();
@@ -31,7 +27,7 @@ pub(crate) async fn emit_metric_for_tool_read(invocation: &ToolInvocation, succe
     }
 }
 
-fn shell_command_for_invocation(invocation: &ToolInvocation) -> Option<(Vec<String>, PathBuf)> {
+fn shell_script_for_invocation(invocation: &ToolInvocation) -> Option<String> {
     let ToolPayload::Function { arguments } = &invocation.payload else {
         return None;
     };

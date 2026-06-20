@@ -2,6 +2,7 @@ use super::*;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::ResponseItemMetadata;
 use pretty_assertions::assert_eq;
 
 async fn process_compacted_history_with_test_session(
@@ -64,6 +65,7 @@ fn collect_user_messages_extracts_user_text_only() {
                 text: "ignored".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: Some("user".to_string()),
@@ -72,13 +74,14 @@ fn collect_user_messages_extracts_user_text_only() {
                 text: "first".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Other,
     ];
 
     let collected = collect_user_messages(&items);
 
-    assert_eq!(vec!["first".to_string()], collected);
+    assert_eq!(vec![compacted_user_message("first")], collected);
 }
 
 #[test]
@@ -96,6 +99,7 @@ do things
                     .to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -104,6 +108,7 @@ do things
                 text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -112,12 +117,13 @@ do things
                 text: "real user message".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
     ];
 
     let collected = collect_user_messages(&items);
 
-    assert_eq!(vec!["real user message".to_string()], collected);
+    assert_eq!(vec![compacted_user_message("real user message")], collected);
 }
 
 #[test]
@@ -126,9 +132,10 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // that oversized user content is truncated.
     let max_tokens = 16;
     let big = "word ".repeat(200);
+    let user_message = compacted_user_message(&big);
     let history = super::build_compacted_history_with_limit(
         Vec::new(),
-        std::slice::from_ref(&big),
+        std::slice::from_ref(&user_message),
         "SUMMARY",
         max_tokens,
     );
@@ -165,7 +172,7 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
 #[test]
 fn build_token_limited_compacted_history_appends_summary_message() {
     let initial_context: Vec<ResponseItem> = Vec::new();
-    let user_messages = vec!["first user message".to_string()];
+    let user_messages = vec![compacted_user_message("first user message")];
     let summary_text = "summary text";
 
     let history = build_compacted_history(initial_context, &user_messages, summary_text);
@@ -182,6 +189,23 @@ fn build_token_limited_compacted_history_appends_summary_message() {
         other => panic!("expected summary message, found {other:?}"),
     };
     assert_eq!(summary, summary_text);
+}
+
+#[test]
+fn build_compacted_history_preserves_user_message_metadata() {
+    let history = build_compacted_history(
+        Vec::new(),
+        &[CompactedUserMessage {
+            message: "first user message".to_string(),
+            metadata: Some(ResponseItemMetadata {
+                turn_id: Some("turn-1".to_string()),
+            }),
+        }],
+        "summary text",
+    );
+
+    assert_eq!(history[0].turn_id(), Some("turn-1"));
+    assert_eq!(history[1].turn_id(), None);
 }
 
 #[test]
@@ -219,6 +243,7 @@ async fn process_compacted_history_replaces_developer_messages() {
                 text: "stale permissions".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -227,6 +252,7 @@ async fn process_compacted_history_replaces_developer_messages() {
                 text: "summary".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -235,6 +261,7 @@ async fn process_compacted_history_replaces_developer_messages() {
                 text: "stale personality".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
     ];
     let (refreshed, mut expected) = process_compacted_history_with_test_session(
@@ -249,6 +276,7 @@ async fn process_compacted_history_replaces_developer_messages() {
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     });
     assert_eq!(refreshed, expected);
 }
@@ -262,6 +290,7 @@ async fn process_compacted_history_reinjects_full_initial_context() {
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
     let (refreshed, mut expected) = process_compacted_history_with_test_session(
         compacted_history,
@@ -275,6 +304,7 @@ async fn process_compacted_history_reinjects_full_initial_context() {
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     });
     assert_eq!(refreshed, expected);
 }
@@ -294,6 +324,7 @@ keep me updated
                     .to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -306,6 +337,7 @@ keep me updated
                     .to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -318,6 +350,7 @@ keep me updated
                     .to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -326,6 +359,7 @@ keep me updated
                 text: "summary".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -334,6 +368,7 @@ keep me updated
                 text: "stale developer instructions".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
     ];
     let (refreshed, mut expected) = process_compacted_history_with_test_session(
@@ -348,6 +383,7 @@ keep me updated
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     });
     assert_eq!(refreshed, expected);
 }
@@ -362,6 +398,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
                 text: "older user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -370,6 +407,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -378,6 +416,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
                 text: "latest user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
     ];
 
@@ -394,6 +433,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
                 text: "older user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -402,6 +442,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
             phase: None,
+            metadata: None,
         },
     ];
     expected.extend(initial_context);
@@ -412,6 +453,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             text: "latest user".to_string(),
         }],
         phase: None,
+        metadata: None,
     });
     assert_eq!(refreshed, expected);
 }
@@ -425,9 +467,11 @@ async fn process_compacted_history_reinjects_model_switch_message() {
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
     let previous_turn_settings = PreviousTurnSettings {
         model: "previous-regular-model".to_string(),
+        comp_hash: None,
         realtime_active: None,
     };
 
@@ -454,6 +498,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
             text: "summary".to_string(),
         }],
         phase: None,
+        metadata: None,
     });
     assert_eq!(refreshed, expected);
 }
@@ -468,6 +513,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: "older user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -476,6 +522,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: "latest user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -484,6 +531,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
             phase: None,
+            metadata: None,
         },
     ];
     let initial_context = vec![ResponseItem::Message {
@@ -493,6 +541,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             text: "fresh permissions".to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
 
     let refreshed =
@@ -505,6 +554,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: "older user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -513,6 +563,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: "fresh permissions".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -521,6 +572,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: "latest user".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Message {
             id: None,
@@ -529,6 +581,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
             phase: None,
+            metadata: None,
         },
     ];
     assert_eq!(refreshed, expected);
@@ -538,6 +591,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
 fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
     let compacted_history = vec![ResponseItem::Compaction {
         encrypted_content: "encrypted".to_string(),
+        metadata: None,
     }];
     let initial_context = vec![ResponseItem::Message {
         id: None,
@@ -546,6 +600,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             text: "fresh permissions".to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
 
     let refreshed =
@@ -558,9 +613,11 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
                 text: "fresh permissions".to_string(),
             }],
             phase: None,
+            metadata: None,
         },
         ResponseItem::Compaction {
             encrypted_content: "encrypted".to_string(),
+            metadata: None,
         },
     ];
     assert_eq!(refreshed, expected);

@@ -28,7 +28,8 @@
           "type": "string"
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "PreToolUse",
+          "type": "string"
         },
         "permissionDecision": {
           "allOf": [

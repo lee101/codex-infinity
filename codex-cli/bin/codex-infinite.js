@@ -95,16 +95,6 @@ if (!binaryPath) {
 // and guarantees that when either the child terminates or the parent
 // receives a fatal signal, both processes exit in a predictable manner.
 
-function getUpdatedPath(newDirs) {
-  const pathSep = process.platform === "win32" ? ";" : ":";
-  const existingPath = process.env.PATH || "";
-  const updatedPath = [
-    ...newDirs,
-    ...existingPath.split(pathSep).filter(Boolean),
-  ].join(pathSep);
-  return updatedPath;
-}
-
 /**
  * Use heuristics to detect the package manager that was used to install Codex
  * in order to give the user a hint about how to update it.

@@ -5,6 +5,7 @@ use crate::SkillsManager;
 use crate::agent::AgentControl;
 use crate::client::ModelClient;
 use crate::config::StartedNetworkProxy;
+use crate::environment_selection::ThreadEnvironments;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GuardianRejection;
 use crate::guardian::GuardianRejectionCircuitBreaker;
@@ -12,6 +13,7 @@ use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::skills_watcher::SkillsWatcher;
 use crate::tools::code_mode::CodeModeService;
+use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -29,12 +31,11 @@ use codex_thread_store::ThreadStore;
 use std::path::PathBuf;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct SessionServices {
-    pub(crate) mcp_connection_manager: Arc<RwLock<McpConnectionManager>>,
+    /// The latest manager; callers retain an owned handle while performing MCP I/O.
+    pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -45,7 +46,6 @@ pub(crate) struct SessionServices {
     pub(crate) hooks: Hooks,
     pub(crate) rollout_thread_trace: ThreadTraceContext,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
-    pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
     pub(crate) auth_manager: Arc<AuthManager>,
@@ -68,7 +68,21 @@ pub(crate) struct SessionServices {
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
-    /// Shared process-level environment registry. Sessions carry an `Arc` handle so they can pass
-    /// the same manager through child-thread spawn paths without reconstructing it.
-    pub(crate) environment_manager: Arc<EnvironmentManager>,
+    pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
+    pub(crate) turn_environments: Arc<ThreadEnvironments>,
+}
+
+impl SessionServices {
+    /// Installs the manager before validating required servers so startup-time elicitation can
+    /// resolve through the session's manager while validation waits.
+    pub(crate) async fn install_mcp_connection_manager(
+        &self,
+        manager: McpConnectionManager,
+    ) -> Result<()> {
+        self.mcp_connection_manager.store(Arc::new(manager));
+        self.mcp_connection_manager
+            .load_full()
+            .validate_required_servers()
+            .await
+    }
 }

@@ -20,7 +20,12 @@ pub(crate) async fn get_git_diff() -> io::Result<(bool, String)> {
         return Ok((false, String::new()));
     }
 
-    // Run tracked diff and untracked file listing in parallel.
+    // Probe once per `/diff` and reuse the result for all subsequent Git commands.
+    let mut probe_runner = WorkspaceFsmonitorProbeRunner { runner, cwd };
+    let fsmonitor = detect_fsmonitor_override(&mut probe_runner).await;
+
+    // Keep `/diff` informational: repository configuration must not select executable diff helpers.
+    let diff_config_overrides = diff_filter_config_overrides(runner, cwd, fsmonitor).await?;
     let (tracked_diff_res, untracked_output_res) = tokio::join!(
         run_git_capture_diff(&["diff", "--color"]),
         run_git_capture_stdout(&["ls-files", "--others", "--exclude-standard"]),
@@ -101,6 +106,52 @@ async fn run_git_capture_diff(args: &[&str]) -> io::Result<String> {
     }
 }
 
+/// Return Git configuration overrides that prevent configured filter drivers
+/// from executing while generating diffs.
+async fn diff_filter_config_overrides(
+    runner: &dyn WorkspaceCommandExecutor,
+    cwd: &Path,
+    fsmonitor: FsmonitorOverride,
+) -> Result<Vec<(String, String)>, String> {
+    let args = [
+        "config",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        EXECUTABLE_FILTER_CONFIG_PATTERN,
+    ];
+    let output = run_git_command(runner, cwd, fsmonitor, &[], &args).await?;
+    if output.exit_code != 0 && output.exit_code != 1 {
+        return Err(format!(
+            "git {:?} failed with status {}",
+            args, output.exit_code
+        ));
+    }
+
+    let mut drivers = output
+        .stdout
+        .split('\0')
+        .filter_map(|key| {
+            key.strip_suffix(".clean")
+                .or_else(|| key.strip_suffix(".process"))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    drivers.sort();
+    drivers.dedup();
+
+    Ok(drivers
+        .into_iter()
+        .flat_map(|driver| {
+            [
+                (format!("{driver}.clean"), String::new()),
+                (format!("{driver}.process"), String::new()),
+                (format!("{driver}.required"), "false".to_string()),
+            ]
+        })
+        .collect())
+}
+
 /// Determine if the current directory is inside a Git repository.
 async fn inside_git_repo() -> io::Result<bool> {
     let status = Command::new("git")
@@ -115,5 +166,45 @@ async fn inside_git_repo() -> io::Result<bool> {
         Ok(_) => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false), // git not installed
         Err(e) => Err(e),
+    }
+
+    #[cfg(unix)]
+    struct LocalRunner;
+
+    #[cfg(unix)]
+    impl WorkspaceCommandExecutor for LocalRunner {
+        fn run(
+            &self,
+            command: WorkspaceCommand,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<WorkspaceCommandOutput, WorkspaceCommandError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let mut process = ProcessCommand::new(&command.argv[0]);
+                process
+                    .args(&command.argv[1..])
+                    .current_dir(command.cwd.expect("test command cwd"));
+                for (key, value) in command.env {
+                    match value {
+                        Some(value) => {
+                            process.env(key, value);
+                        }
+                        None => {
+                            process.env_remove(key);
+                        }
+                    }
+                }
+                let output = process.output().expect("run test command");
+                Ok(WorkspaceCommandOutput {
+                    exit_code: output.status.code().expect("test command exit code"),
+                    stdout: String::from_utf8(output.stdout).expect("utf8 stdout"),
+                    stderr: String::from_utf8(output.stderr).expect("utf8 stderr"),
+                })
+            })
+        }
     }
 }

@@ -26,6 +26,8 @@ use crate::workspace_acl::is_command_cwd_root;
 use crate::workspace_acl::protect_workspace_agents_dir;
 use crate::workspace_acl::protect_workspace_codex_dir;
 use anyhow::Result;
+use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -95,13 +97,11 @@ fn prepare_spawn_context_common(
     inherit_path: bool,
     add_git_safe_directory: bool,
 ) -> Result<SpawnContext> {
-    let policy = parse_policy(policy_json_or_preset)?;
-    if matches!(
-        &policy,
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-    ) {
-        anyhow::bail!("DangerFullAccess and ExternalSandbox are not supported for sandboxing")
-    }
+    let permissions =
+        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
 
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
@@ -154,7 +154,7 @@ pub(crate) fn prepare_legacy_spawn_context(
 }
 
 pub(crate) fn prepare_legacy_session_security(
-    policy: &SandboxPolicy,
+    uses_write_capabilities: bool,
     codex_home: &Path,
     cwd: &Path,
 ) -> Result<LegacySessionSecurity> {
@@ -182,6 +182,19 @@ pub(crate) fn prepare_legacy_session_security(
             SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
                 unreachable!("dangerous policies rejected before legacy session prep")
             }
+            let base = get_current_token_for_restriction()?;
+            let cap_ptrs: Vec<*mut c_void> = write_root_sids
+                .iter()
+                .map(|root| root.sid.as_ptr())
+                .collect();
+            let h_token = create_workspace_write_token_with_caps_from(base, cap_ptrs.as_slice());
+            CloseHandle(base);
+            let h_token = h_token?;
+            (h_token, None, None, write_root_sids)
+        } else {
+            let psid = LocalSid::from_string(&caps.readonly)?;
+            let (h_token, _psid) = create_readonly_token_with_cap(psid.as_ptr())?;
+            (h_token, Some(psid), Some(caps.readonly), Vec::new())
         }
     };
 
@@ -341,20 +354,18 @@ mod tests {
     #[test]
     fn no_network_env_rewrite_applies_for_workspace_write() {
         assert!(should_apply_network_block(
-            &SandboxPolicy::new_workspace_write_policy(),
+            &PermissionProfile::workspace_write()
         ));
     }
 
     #[test]
     fn no_network_env_rewrite_skips_when_network_access_is_allowed() {
-        assert!(!should_apply_network_block(
-            &SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access: true,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            },
-        ));
+        assert!(!should_apply_network_block(&workspace_profile(
+            NetworkSandboxPolicy::Enabled,
+            &[],
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ false,
+        )));
     }
 
     #[test]
@@ -362,6 +373,7 @@ mod tests {
         let codex_home = TempDir::new().expect("tempdir");
         let cwd = TempDir::new().expect("tempdir");
         let mut env_map = HashMap::new();
+        let workspace_roots = workspace_roots_for(cwd.path());
 
         let _context = prepare_legacy_spawn_context(
             "workspace-write",
@@ -389,6 +401,7 @@ mod tests {
             "HTTP_PROXY".to_string(),
             "http://user.proxy:8080".to_string(),
         )]);
+        let workspace_roots = workspace_roots_for(cwd.path());
 
         let context = prepare_spawn_context_common(
             "workspace-write",
@@ -400,7 +413,7 @@ mod tests {
             /*add_git_safe_directory*/ true,
         )
         .expect("preserve existing env prep");
-        assert_eq!(context.policy, SandboxPolicy::new_workspace_write_policy());
+        assert!(context.uses_write_capabilities);
 
         assert_eq!(env_map.get("SBX_NONET_ACTIVE"), None);
         assert_eq!(

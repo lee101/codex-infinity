@@ -29,6 +29,7 @@ use std::sync::Weak;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_tools::UnifiedExecShellMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use rand::Rng;
 use rand::rng;
@@ -57,6 +58,7 @@ pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
+pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 // Minimum yield time for an empty `write_stdin`.
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
@@ -148,6 +150,8 @@ struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
     call_id: String,
     process_id: i32,
+    cwd: AbsolutePathBuf,
+    initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,
     tty: bool,
     network_approval_id: Option<String>,
@@ -156,6 +160,11 @@ struct ProcessEntry {
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
+    let yield_time_ms = if cfg!(windows) {
+        yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
+    } else {
+        yield_time_ms
+    };
     yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
 }
 

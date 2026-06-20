@@ -4,6 +4,15 @@ pub use runtime::McpRuntimeEnvironment;
 pub use runtime::SandboxState;
 pub use tools::ToolInfo;
 
+pub use catalog::McpCatalogBuilder;
+pub use catalog::McpPluginAttribution;
+pub use catalog::McpServerConflict;
+pub use catalog::McpServerConflictAction;
+pub use catalog::McpServerRegistration;
+pub use catalog::McpServerSource;
+pub use catalog::ResolvedMcpCatalog;
+pub use catalog::ResolvedMcpServer;
+
 pub use mcp::CODEX_APPS_MCP_SERVER_NAME;
 pub use mcp::McpConfig;
 pub use mcp::ToolPluginProvenance;
@@ -14,7 +23,10 @@ pub use codex_apps::codex_apps_tools_cache_key;
 pub use mcp::configured_mcp_servers;
 pub use mcp::effective_mcp_servers;
 pub use mcp::tool_plugin_provenance;
-pub use mcp::with_codex_apps_mcp;
+pub use plugin_config::PluginMcpConfigParseOutcome;
+pub use plugin_config::PluginMcpServerParseError;
+pub use plugin_config::PluginMcpServerPlacement;
+pub use plugin_config::parse_plugin_mcp_config;
 
 pub use mcp::McpServerStatusSnapshot;
 pub use mcp::McpSnapshotDetail;
@@ -42,6 +54,8 @@ pub(crate) mod codex_apps;
 pub(crate) mod connection_manager;
 pub(crate) mod elicitation;
 pub(crate) mod mcp;
+mod plugin_config;
+mod resource_client;
 pub(crate) mod rmcp_client;
 pub(crate) mod runtime;
 pub(crate) mod tools;

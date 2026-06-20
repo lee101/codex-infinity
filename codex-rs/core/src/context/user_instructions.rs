@@ -2,7 +2,7 @@ use super::ContextualUserFragment;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserInstructions {
-    pub(crate) directory: String,
+    pub(crate) directory: Option<String>,
     pub(crate) text: String,
 }
 
@@ -12,6 +12,11 @@ impl ContextualUserFragment for UserInstructions {
     const END_MARKER: &'static str = "</INSTRUCTIONS>";
 
     fn body(&self) -> String {
-        format!("{}\n\n<INSTRUCTIONS>\n{}\n", self.directory, self.text)
+        let directory = self
+            .directory
+            .as_ref()
+            .map(|directory| format!(" for {directory}"))
+            .unwrap_or_default();
+        format!("{directory}\n\n<INSTRUCTIONS>\n{}\n", self.text)
     }
 }

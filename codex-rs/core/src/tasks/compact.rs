@@ -35,10 +35,10 @@ impl SessionTask for CompactTask {
             );
             crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
         } else {
-            session.services.session_telemetry.counter(
-                "codex.task.compact",
-                /*inc*/ 1,
-                &[("type", "local")],
+            emit_compact_metric(
+                &session.services.session_telemetry,
+                "local",
+                /*manual*/ true,
             );
             crate::compact::run_compact_task(session.clone(), ctx, input).await
         };

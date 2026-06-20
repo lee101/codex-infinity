@@ -1,10 +1,11 @@
 use super::process::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecError;
-use async_trait::async_trait;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
+use codex_exec_server::ExecProcessFuture;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::ProcessId;
+use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
@@ -21,29 +22,12 @@ struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
+    terminate_error: Option<String>,
     wake_tx: watch::Sender<u64>,
 }
 
-#[async_trait]
-impl ExecProcess for MockExecProcess {
-    fn process_id(&self) -> &ProcessId {
-        &self.process_id
-    }
-
-    fn subscribe_wake(&self) -> watch::Receiver<u64> {
-        self.wake_tx.subscribe()
-    }
-
-    fn subscribe_events(&self) -> ExecProcessEventReceiver {
-        ExecProcessEventReceiver::empty()
-    }
-
-    async fn read(
-        &self,
-        _after_seq: Option<u64>,
-        _max_bytes: Option<usize>,
-        _wait_ms: Option<u64>,
-    ) -> Result<ReadResponse, ExecServerError> {
+impl MockExecProcess {
+    async fn read(&self) -> Result<ReadResponse, ExecServerError> {
         Ok(self
             .read_responses
             .lock()
@@ -59,16 +43,53 @@ impl ExecProcess for MockExecProcess {
             }))
     }
 
-    async fn write(&self, _chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
-        Ok(self.write_response.clone())
-    }
-
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        if let Some(message) = &self.terminate_error {
+            return Err(ExecServerError::Protocol(message.clone()));
+        }
         Ok(())
     }
 }
 
-async fn remote_process(write_status: WriteStatus) -> UnifiedExecProcess {
+impl ExecProcess for MockExecProcess {
+    fn process_id(&self) -> &ProcessId {
+        &self.process_id
+    }
+
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        self.wake_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        ExecProcessEventReceiver::empty()
+    }
+
+    fn read(
+        &self,
+        _after_seq: Option<u64>,
+        _max_bytes: Option<usize>,
+        _wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(MockExecProcess::read(self))
+    }
+
+    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async { Ok(self.write_response.clone()) })
+    }
+
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(MockExecProcess::terminate(self))
+    }
+}
+
+async fn remote_process(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+) -> UnifiedExecProcess {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
@@ -77,6 +98,7 @@ async fn remote_process(write_status: WriteStatus) -> UnifiedExecProcess {
                 status: write_status,
             },
             read_responses: Mutex::new(VecDeque::new()),
+            terminate_error,
             wake_tx,
         }),
     };
@@ -88,7 +110,7 @@ async fn remote_process(write_status: WriteStatus) -> UnifiedExecProcess {
 
 #[tokio::test]
 async fn remote_write_unknown_process_marks_process_exited() {
-    let process = remote_process(WriteStatus::UnknownProcess).await;
+    let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 
     let err = process
         .write(b"hello")
@@ -101,7 +123,7 @@ async fn remote_write_unknown_process_marks_process_exited() {
 
 #[tokio::test]
 async fn remote_write_closed_stdin_marks_process_exited() {
-    let process = remote_process(WriteStatus::StdinClosed).await;
+    let process = remote_process(WriteStatus::StdinClosed, /*terminate_error*/ None).await;
 
     let err = process
         .write(b"hello")
@@ -129,6 +151,7 @@ async fn remote_process_waits_for_early_exit_event() {
                 closed: true,
                 failure: None,
             }])),
+            terminate_error: None,
             wake_tx: wake_tx.clone(),
         }),
     };

@@ -1,3 +1,5 @@
+use crate::app_mcp_routing::apply_app_mcp_routing_policy;
+use crate::loader::plugin_app_declarations_from_value;
 use crate::store::PLUGINS_CACHE_DIR;
 use crate::store::PluginStore;
 use codex_app_server_protocol::PluginAuthPolicy;
@@ -6,11 +8,14 @@ use codex_app_server_protocol::PluginInterface;
 use codex_app_server_protocol::SkillInterface;
 use codex_login::CodexAuth;
 use codex_login::default_client::build_reqwest_client;
+use codex_plugin::AppConnectorId;
+use codex_plugin::AppDeclaration;
 use codex_plugin::PluginId;
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -24,7 +29,12 @@ pub const REMOTE_GLOBAL_MARKETPLACE_DISPLAY_NAME: &str = "ChatGPT Plugins";
 pub const REMOTE_WORKSPACE_MARKETPLACE_DISPLAY_NAME: &str = "ChatGPT Workspace Plugins";
 
 const REMOTE_PLUGIN_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const RECOMMENDED_PLUGINS_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PLUGIN_LIST_PAGE_LIMIT: u32 = 200;
+const MAX_RECOMMENDED_PLUGINS: usize = 50;
+const MAX_RECOMMENDED_PLUGIN_NAME_LEN: usize = 64;
+const MAX_RECOMMENDED_PLUGIN_DISPLAY_NAME_LEN: usize = 64;
+const MAX_REMOTE_DEFAULT_PROMPT_COUNT: usize = 3;
 const MAX_REMOTE_DEFAULT_PROMPT_LEN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,11 +65,34 @@ pub struct RemotePluginDetail {
     pub marketplace_name: String,
     pub marketplace_display_name: String,
     pub summary: RemotePluginSummary,
+    pub share_url: Option<String>,
     pub description: Option<String>,
     pub release_version: Option<String>,
     pub bundle_download_url: Option<String>,
     pub skills: Vec<RemotePluginSkill>,
     pub app_ids: Vec<String>,
+    pub app_templates: Vec<RemoteAppTemplate>,
+    pub mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAppTemplate {
+    pub template_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub canonical_connector_id: Option<String>,
+    pub logo_url: Option<String>,
+    pub logo_url_dark: Option<String>,
+    pub materialized_app_ids: Vec<String>,
+    pub reason: Option<RemoteAppTemplateUnavailableReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RemoteAppTemplateUnavailableReason {
+    NotConfiguredForWorkspace,
+    NoActiveWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +172,8 @@ pub enum RemotePluginCatalogError {
 enum RemotePluginScope {
     #[serde(rename = "GLOBAL")]
     Global,
+    #[serde(rename = "USER")]
+    User,
     #[serde(rename = "WORKSPACE")]
     Workspace,
 }
@@ -151,6 +186,7 @@ impl RemotePluginScope {
     fn api_value(self) -> &'static str {
         match self {
             Self::Global => "GLOBAL",
+            Self::User => "USER",
             Self::Workspace => "WORKSPACE",
         }
     }
@@ -158,6 +194,7 @@ impl RemotePluginScope {
     fn marketplace_name(self) -> &'static str {
         match self {
             Self::Global => REMOTE_GLOBAL_MARKETPLACE_NAME,
+            Self::User => REMOTE_CREATED_BY_ME_MARKETPLACE_NAME,
             Self::Workspace => REMOTE_WORKSPACE_MARKETPLACE_NAME,
         }
     }
@@ -165,6 +202,7 @@ impl RemotePluginScope {
     fn marketplace_display_name(self) -> &'static str {
         match self {
             Self::Global => REMOTE_GLOBAL_MARKETPLACE_DISPLAY_NAME,
+            Self::User => REMOTE_CREATED_BY_ME_MARKETPLACE_DISPLAY_NAME,
             Self::Workspace => REMOTE_WORKSPACE_MARKETPLACE_DISPLAY_NAME,
         }
     }
@@ -183,7 +221,7 @@ struct RemotePluginPagination {
     next_page_token: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct RemotePluginSkillInterfaceResponse {
     display_name: Option<String>,
     short_description: Option<String>,
@@ -193,7 +231,7 @@ struct RemotePluginSkillInterfaceResponse {
     icon_large_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct RemotePluginSkillResponse {
     name: String,
     description: String,
@@ -213,13 +251,14 @@ struct RemotePluginReleaseInterfaceResponse {
     terms_of_service_url: Option<String>,
     brand_color: Option<String>,
     default_prompt: Option<String>,
+    default_prompts: Option<Vec<String>>,
     composer_icon_url: Option<String>,
     logo_url: Option<String>,
     #[serde(default)]
     screenshot_urls: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct RemotePluginReleaseResponse {
     #[serde(default)]
     version: Option<String>,
@@ -232,9 +271,36 @@ struct RemotePluginReleaseResponse {
     interface: RemotePluginReleaseInterfaceResponse,
     #[serde(default)]
     skills: Vec<RemotePluginSkillResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_servers: Vec<RemotePluginMcpServerResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct RemotePluginMcpServerResponse {
+    key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct RemoteAppTemplateResponse {
+    template_id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    canonical_connector_id: Option<String>,
+    #[serde(default)]
+    logo_url: Option<String>,
+    #[serde(default)]
+    logo_url_dark: Option<String>,
+    #[serde(default)]
+    materialized_app_ids: Vec<String>,
+    #[serde(default)]
+    reason: Option<RemoteAppTemplateUnavailableReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct RemotePluginDirectoryItem {
     id: String,
     name: String,
@@ -260,6 +326,32 @@ struct RemotePluginListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RecommendedPluginsResponse {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    plugins: Vec<RecommendedPluginItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RecommendedPluginItem {
+    id: String,
+    name: String,
+    #[serde(default)]
+    status: Option<PluginAvailability>,
+    #[serde(default)]
+    installation_policy: Option<PluginInstallPolicy>,
+    release: RecommendedPluginRelease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RecommendedPluginRelease {
+    display_name: String,
+    #[serde(default)]
+    app_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RemotePluginInstalledResponse {
     plugins: Vec<RemotePluginInstalledItem>,
     pagination: RemotePluginPagination,
@@ -269,6 +361,12 @@ struct RemotePluginInstalledResponse {
 struct RemotePluginMutationResponse {
     id: String,
     enabled: bool,
+    app_ids_needing_auth: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePluginInstallResult {
+    pub app_ids_needing_auth: Option<Vec<String>>,
 }
 
 pub async fn fetch_remote_marketplaces(
@@ -296,6 +394,11 @@ pub async fn fetch_remote_marketplaces(
             fetch_installed_plugins_for_scope(config, auth, scope),
         )?;
         Ok::<_, RemotePluginCatalogError>((scope, directory_plugins, installed_plugins))
+    };
+    let user = async {
+        let scope = RemotePluginScope::User;
+        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
+        Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
     };
 
     let (global, workspace) = tokio::try_join!(global, workspace)?;
@@ -493,6 +596,31 @@ async fn build_remote_plugin_detail(
             enabled: !disabled_skill_names.contains(&skill.name),
         })
         .collect();
+    let mut app_declarations = plugin
+        .release
+        .app_manifest
+        .as_ref()
+        .map(plugin_app_declarations_from_value)
+        .unwrap_or_else(|| app_declarations_from_remote_app_ids(&plugin.release.app_ids));
+    let mut mcp_servers = plugin
+        .release
+        .mcp_servers
+        .iter()
+        .map(|server| (server.key.clone(), ()))
+        .collect::<HashMap<_, _>>();
+    apply_app_mcp_routing_policy(
+        &mut app_declarations,
+        &mut mcp_servers,
+        Some(auth.api_auth_mode()),
+        /*plugin_active*/ true,
+    );
+    let app_ids = app_connector_ids_from_declarations(&app_declarations)
+        .into_iter()
+        .map(|app_id| app_id.0)
+        .collect();
+    let mut mcp_servers = mcp_servers.into_keys().collect::<Vec<_>>();
+    mcp_servers.sort_unstable();
+    mcp_servers.dedup();
 
     Ok(RemotePluginDetail {
         marketplace_name,
@@ -502,8 +630,36 @@ async fn build_remote_plugin_detail(
         release_version: plugin.release.version,
         bundle_download_url: plugin.release.bundle_download_url,
         skills,
-        app_ids: plugin.release.app_ids,
+        app_ids,
+        app_templates: plugin
+            .release
+            .app_templates
+            .into_iter()
+            .map(|template| RemoteAppTemplate {
+                template_id: template.template_id,
+                name: template.name,
+                description: template.description,
+                category: template.category,
+                canonical_connector_id: template.canonical_connector_id,
+                logo_url: template.logo_url,
+                logo_url_dark: template.logo_url_dark,
+                materialized_app_ids: template.materialized_app_ids,
+                reason: template.reason,
+            })
+            .collect(),
+        mcp_servers,
     })
+}
+
+fn app_declarations_from_remote_app_ids(app_ids: &[String]) -> Vec<AppDeclaration> {
+    app_ids
+        .iter()
+        .map(|app_id| AppDeclaration {
+            name: app_id.clone(),
+            connector_id: AppConnectorId(app_id.clone()),
+            category: None,
+        })
+        .collect()
 }
 
 pub async fn install_remote_plugin(
@@ -511,7 +667,7 @@ pub async fn install_remote_plugin(
     auth: Option<&CodexAuth>,
     marketplace_name: &str,
     plugin_id: &str,
-) -> Result<(), RemotePluginCatalogError> {
+) -> Result<RemotePluginInstallResult, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     if RemotePluginScope::from_marketplace_name(marketplace_name).is_none() {
         return Err(RemotePluginCatalogError::UnknownMarketplace {
@@ -522,7 +678,12 @@ pub async fn install_remote_plugin(
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{plugin_id}/install");
     let client = build_reqwest_client();
-    let request = authenticated_request(client.post(&url), auth)?;
+    let request = authenticated_request(
+        client
+            .post(&url)
+            .query(&[("includeAppsNeedingAuth", "true")]),
+        auth,
+    )?;
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
     if response.id != plugin_id {
         return Err(RemotePluginCatalogError::UnexpectedPluginId {
@@ -538,7 +699,9 @@ pub async fn install_remote_plugin(
         });
     }
 
-    Ok(())
+    Ok(RemotePluginInstallResult {
+        app_ids_needing_auth: response.app_ids_needing_auth,
+    })
 }
 
 pub async fn uninstall_remote_plugin(
@@ -550,7 +713,7 @@ pub async fn uninstall_remote_plugin(
     let auth = ensure_chatgpt_auth(auth)?;
 
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/plugins/{plugin_id}/uninstall");
+    let url = format!("{base_url}/ps/plugins/{plugin_id}/uninstall");
     let client = build_reqwest_client();
     let request = authenticated_request(client.post(&url), auth)?;
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
@@ -675,9 +838,16 @@ fn remote_plugin_interface_to_info(plugin: &RemotePluginDirectoryItem) -> Option
     let interface = &plugin.release.interface;
     let display_name = non_empty_string(Some(&plugin.release.display_name));
     let default_prompt = interface
-        .default_prompt
-        .as_ref()
-        .and_then(|prompt| normalize_remote_default_prompt(prompt));
+        .default_prompts
+        .as_deref()
+        .and_then(normalize_remote_default_prompts)
+        .or_else(|| {
+            interface
+                .default_prompt
+                .as_deref()
+                .and_then(normalize_remote_default_prompt)
+                .map(|prompt| vec![prompt])
+        });
     let result = PluginInterface {
         display_name,
         short_description: interface.short_description.clone(),
@@ -749,12 +919,21 @@ fn non_empty_string(value: Option<&str>) -> Option<String> {
     })
 }
 
-fn normalize_remote_default_prompt(prompt: &str) -> Option<Vec<String>> {
+fn normalize_remote_default_prompts(prompts: &[String]) -> Option<Vec<String>> {
+    let prompts = prompts
+        .iter()
+        .filter_map(|prompt| normalize_remote_default_prompt(prompt))
+        .take(MAX_REMOTE_DEFAULT_PROMPT_COUNT)
+        .collect::<Vec<_>>();
+    (!prompts.is_empty()).then_some(prompts)
+}
+
+fn normalize_remote_default_prompt(prompt: &str) -> Option<String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > MAX_REMOTE_DEFAULT_PROMPT_LEN {
         return None;
     }
-    Some(vec![prompt.to_string()])
+    Some(prompt.to_string())
 }
 
 async fn fetch_directory_plugins_for_scope(
@@ -862,7 +1041,8 @@ fn authenticated_request(
 ) -> Result<RequestBuilder, RemotePluginCatalogError> {
     Ok(request
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
-        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers()))
+        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())
+        .header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU))
 }
 
 async fn send_and_decode<T: for<'de> Deserialize<'de>>(

@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -8,9 +6,13 @@ use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_shell_command_call;
 use core_test_support::test_codex::ApplyPatchModelOutput;
 use pretty_assertions::assert_eq;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
@@ -19,6 +21,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 #[cfg(target_os = "linux")]
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
@@ -31,11 +34,15 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call_with_args;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
+use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
 use serde_json::json;

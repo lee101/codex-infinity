@@ -88,6 +88,9 @@ jobs:
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30
+    environment:
+      name: bazel
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -99,8 +102,8 @@ jobs:
           - name: Windows
             runner: windows-x64
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-bazel-ci
@@ -155,8 +158,6 @@ jobs:
       USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
-      # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
-      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
 
     strategy:
       fail-fast: false
@@ -172,38 +173,38 @@ jobs:
             target: x86_64-unknown-linux-musl
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
           # Also run representative release builds on Mac and Linux because
           # there could be release-only build errors we want to catch.
@@ -216,26 +217,26 @@ jobs:
             target: x86_64-unknown-linux-musl
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -246,13 +247,9 @@ jobs:
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            packages=(pkg-config libcap-dev)
-            if [[ "${{ matrix.target }}" == 'x86_64-unknown-linux-musl' || "${{ matrix.target }}" == 'aarch64-unknown-linux-musl' ]]; then
-              packages+=(libubsan1)
-            fi
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
           fi
-      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: ${{ matrix.target }}
           components: clippy
@@ -335,14 +332,6 @@ jobs:
             sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Disable sccache wrapper (musl)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
-
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Prepare APT cache directories (musl)
         shell: bash
         run: |
@@ -374,58 +363,6 @@ jobs:
           APT_INSTALL_ARGS: --no-install-recommends
         shell: bash
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
-
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Configure rustc UBSan wrapper (musl host)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ubsan=""
-          if command -v ldconfig >/dev/null 2>&1; then
-            ubsan="$(ldconfig -p | grep -m1 'libubsan\.so\.1' | sed -E 's/.*=> (.*)$/\1/')"
-          fi
-          wrapper_root="${RUNNER_TEMP:-/tmp}"
-          wrapper="${wrapper_root}/rustc-ubsan-wrapper"
-          cat > "${wrapper}" <<EOF
-          #!/usr/bin/env bash
-          set -euo pipefail
-          if [[ -n "${ubsan}" ]]; then
-            export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
-          fi
-          exec "\$1" "\${@:2}"
-          EOF
-          chmod +x "${wrapper}"
-          echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
-          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
-
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Clear sanitizer flags (musl)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Clear global Rust flags so host/proc-macro builds don't pull in UBSan.
-          echo "RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_ENCODED_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "RUSTDOCFLAGS=" >> "$GITHUB_ENV"
-          # Override any runner-level Cargo config rustflags as well.
-          echo "CARGO_BUILD_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
-
-          sanitize_flags() {
-            local input="$1"
-            input="${input//-fsanitize=undefined/}"
-            input="${input//-fno-sanitize-recover=undefined/}"
-            input="${input//-fno-sanitize-trap=undefined/}"
-            echo "$input"
-          }
-
-          cflags="$(sanitize_flags "${CFLAGS-}")"
-          cxxflags="$(sanitize_flags "${CXXFLAGS-}")"
-          echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
-          echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
       - if: ${{ !contains(matrix.target, 'windows') }}
         name: Configure rusty_v8 artifact overrides and verify checksums
@@ -528,8 +465,8 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: ubuntu-24.04
-      runner_group: codex-runners
-      runner_labels: codex-linux-x64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-linux-x64
       target: x86_64-unknown-linux-gnu
       profile: ci-test
       artifact_id: linux-x64-remote
@@ -554,8 +491,8 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: windows-x64
-      runner_group: codex-runners
-      runner_labels: codex-windows-x64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-windows-x64
       target: x86_64-pc-windows-msvc
       profile: ci-test
       artifact_id: windows-x64

@@ -16,7 +16,6 @@ path = "examples/generate-proto.rs"
 workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-git-utils = { workspace = true }
 codex-protocol = { workspace = true }

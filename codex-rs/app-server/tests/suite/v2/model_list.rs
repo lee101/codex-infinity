@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use anyhow::Error;
 use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
@@ -39,11 +40,11 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
             .supported_reasoning_efforts
             .iter()
             .map(|preset| ReasoningEffortOption {
-                reasoning_effort: preset.effort,
+                reasoning_effort: preset.effort.clone(),
                 description: preset.description.clone(),
             })
             .collect(),
-        default_reasoning_effort: preset.default_reasoning_effort,
+        default_reasoning_effort: preset.default_reasoning_effort.clone(),
         input_modalities: preset.input_modalities.clone(),
         // `write_models_cache()` round-trips through a simplified ModelInfo fixture that does not
         // preserve personality placeholders in base instructions, so app-server list results from
@@ -76,7 +77,7 @@ fn expected_visible_models() -> Vec<Model> {
 async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
@@ -110,7 +111,7 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 async fn list_models_includes_hidden_models() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
@@ -142,7 +143,7 @@ async fn list_models_includes_hidden_models() -> Result<()> {
 async fn list_models_pagination_works() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
@@ -191,7 +192,7 @@ async fn list_models_pagination_works() -> Result<()> {
 async fn list_models_rejects_invalid_cursor() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 

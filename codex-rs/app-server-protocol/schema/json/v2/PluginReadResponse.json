@@ -8,6 +8,12 @@
     "AppSummary": {
       "description": "EXPERIMENTAL - app metadata summary for plugin responses.",
       "properties": {
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "description": {
           "type": [
             "string",
@@ -25,15 +31,11 @@
         },
         "name": {
           "type": "string"
-        },
-        "needsAuth": {
-          "type": "boolean"
         }
       },
       "required": [
         "id",
-        "name",
-        "needsAuth"
+        "name"
       ],
       "type": "object"
     },
@@ -46,6 +48,12 @@
     },
     "PluginDetail": {
       "properties": {
+        "appTemplates": {
+          "items": {
+            "$ref": "#/definitions/AppTemplateSummary"
+          },
+          "type": "array"
+        },
         "apps": {
           "items": {
             "$ref": "#/definitions/AppSummary"
@@ -77,6 +85,12 @@
           },
           "type": "array"
         },
+        "shareUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "skills": {
           "items": {
             "$ref": "#/definitions/SkillSummary"
@@ -88,6 +102,7 @@
         }
       },
       "required": [
+        "appTemplates",
         "apps",
         "marketplaceName",
         "mcpServers",

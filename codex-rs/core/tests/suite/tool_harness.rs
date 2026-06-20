@@ -1,5 +1,6 @@
 #![cfg(not(target_os = "windows"))]
 
+use core_test_support::test_codex::local_selections;
 use std::fs;
 
 use assert_matches::assert_matches;
@@ -10,6 +11,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::TempDirExt;
 use core_test_support::assert_regex_match;
 use core_test_support::responses;
 use core_test_support::responses::ResponsesRequest;
@@ -35,14 +37,10 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> (String, Option<bool>) 
         Some(call_id),
         "mismatched call_id in function_call_output"
     );
-    let (content_opt, success) = match req.function_call_output_content_and_success(call_id) {
-        Some(values) => values,
-        None => panic!("function_call_output present"),
-    };
-    let content = match content_opt {
-        Some(c) => c,
-        None => panic!("function_call_output content present"),
-    };
+    let (content_opt, success) = req
+        .function_call_output_content_and_success(call_id)
+        .expect("function_call_output present");
+    let content = content_opt.expect("function_call_output content present");
     (content, success)
 }
 
@@ -76,7 +74,7 @@ async fn shell_tool_executes_command_and_streams_output() -> anyhow::Result<()> 
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
+    let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 
@@ -152,7 +150,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
+    let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 
@@ -238,7 +236,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
+    let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 
@@ -339,7 +337,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
+    let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 
@@ -448,7 +446,7 @@ async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
+    let cwd_path = cwd.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 

@@ -68,7 +68,7 @@ url = "{mcp_server_url}/mcp"
     ));
     std::fs::write(config_path, config_toml)?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_start_id = mcp
@@ -135,7 +135,7 @@ url = "{mcp_server_url}/mcp"
 #[tokio::test]
 async fn mcp_server_tool_call_returns_error_for_unknown_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -166,10 +166,7 @@ struct ToolAppsMcpServer;
 
 impl ServerHandler for ToolAppsMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..ServerInfo::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(

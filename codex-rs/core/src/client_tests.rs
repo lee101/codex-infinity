@@ -40,6 +40,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 
+const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
@@ -52,6 +54,26 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+    )
+}
+
+fn test_responses_metadata_for_client(
+    client: &ModelClient,
+    turn_id: Option<&str>,
+    window_id: String,
+    parent_thread_id: Option<ThreadId>,
+    request_kind: TestCodexResponsesRequestKind,
+) -> CodexResponsesMetadata {
+    let thread_id = client.state.thread_id.to_string();
+    test_responses_metadata(
+        TEST_INSTALLATION_ID,
+        &thread_id,
+        &thread_id,
+        turn_id,
+        window_id,
+        &client.state.session_source,
+        parent_thread_id,
+        request_kind,
     )
 }
 
@@ -144,6 +166,7 @@ fn output_message(id: &str, text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
+        metadata: None,
     }
 }
 

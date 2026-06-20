@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional workflow URL to reuse for native artifacts.",
     )
     parser.add_argument(
+        "--artifacts-dir",
+        type=Path,
+        help="Directory containing previously downloaded workflow artifacts.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -96,7 +101,9 @@ def resolve_release_workflow(version: str) -> dict:
     )
     workflow = json.loads(stdout or "null")
     if not workflow:
-        raise RuntimeError(f"Unable to find rust-release workflow for version {version}.")
+        raise RuntimeError(
+            f"Unable to find rust-release workflow for version {version}."
+        )
     return workflow
 
 
@@ -153,8 +160,7 @@ def main() -> int:
     vendor_temp_root: Path | None = None
     vendor_src: Path | None = None
     resolved_head_sha: str | None = None
-
-    final_messages = []
+    staging_jobs: list[tuple[Path, list[str], str]] = []
 
     try:
         if native_components:
@@ -187,13 +193,22 @@ def main() -> int:
             if vendor_src is not None:
                 cmd.extend(["--vendor-src", str(vendor_src)])
 
-            try:
-                run_command(cmd)
-            finally:
-                if not args.keep_staging_dirs:
-                    shutil.rmtree(staging_dir, ignore_errors=True)
+            staging_jobs.append(
+                (staging_dir, cmd, f"Staged {package} at {pack_output}")
+            )
 
-            final_messages.append(f"Staged {package} at {pack_output}")
+        max_workers = min(len(staging_jobs), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(run_command, cmd): staging_dir
+                for staging_dir, cmd, _message in staging_jobs
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                finally:
+                    if not args.keep_staging_dirs:
+                        shutil.rmtree(futures[future], ignore_errors=True)
     finally:
         if vendor_temp_root is not None and not args.keep_staging_dirs:
             shutil.rmtree(vendor_temp_root, ignore_errors=True)

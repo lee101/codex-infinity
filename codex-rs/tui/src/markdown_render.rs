@@ -5,6 +5,8 @@
 //! transcripts show the real file target (including normalized location suffixes) and can shorten
 //! absolute paths relative to a known working directory.
 
+use crate::markdown_text_merge::DecodedTextMerge;
+use crate::render::highlight::foreground_style_for_scopes;
 use crate::render::highlight::highlight_code_to_lines;
 use crate::render::line_utils::line_to_static;
 use crate::wrapping::RtOptions;
@@ -28,6 +30,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use url::Url;
+
+mod table_key_value;
+
+const TABLE_COLUMN_GAP: usize = 2;
+const TABLE_CELL_PADDING: usize = 1;
+const TABLE_HEADER_SEPARATOR_CHAR: char = '━';
+const TABLE_BODY_SEPARATOR_CHAR: char = '─';
 
 struct MarkdownStyles {
     h1: Style,
@@ -106,6 +115,16 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Text<'static> {
+    Text::from(visible_lines(render_markdown_lines_with_width_and_cwd(
+        input, width, cwd,
+    )))
+}
+
+pub(crate) fn render_markdown_lines_with_width_and_cwd(
+    input: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+) -> Vec<HyperlinkLine> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     let parser = Parser::new_ext(input, options);
@@ -149,13 +168,13 @@ where
     I: Iterator<Item = Event<'a>>,
 {
     iter: I,
-    text: Text<'static>,
+    text: Vec<HyperlinkLine>,
     styles: MarkdownStyles,
     inline_styles: Vec<Style>,
     indent_stack: Vec<IndentContext>,
     list_indices: Vec<Option<u64>>,
     list_needs_blank_before_next_item: Vec<bool>,
-    list_item_contains_code_block: Vec<bool>,
+    list_item_start_line_counts: Vec<usize>,
     link: Option<LinkState>,
     needs_newline: bool,
     pending_marker_line: bool,
@@ -167,7 +186,7 @@ where
     cwd: Option<PathBuf>,
     line_ends_with_local_link_target: bool,
     pending_local_link_soft_break: bool,
-    current_line_content: Option<Line<'static>>,
+    current_line_content: Option<HyperlinkLine>,
     current_initial_indent: Vec<Span<'static>>,
     current_subsequent_indent: Vec<Span<'static>>,
     current_line_style: Style,
@@ -181,13 +200,13 @@ where
     fn new(iter: I, wrap_width: Option<usize>, cwd: Option<&Path>) -> Self {
         Self {
             iter,
-            text: Text::default(),
+            text: Vec::new(),
             styles: MarkdownStyles::default(),
             inline_styles: Vec::new(),
             indent_stack: Vec::new(),
             list_indices: Vec::new(),
             list_needs_blank_before_next_item: Vec::new(),
-            list_item_contains_code_block: Vec::new(),
+            list_item_start_line_counts: Vec::new(),
             link: None,
             needs_newline: false,
             pending_marker_line: false,
@@ -225,7 +244,7 @@ where
             Event::HardBreak => self.hard_break(),
             Event::Rule => {
                 self.flush_current_line();
-                if !self.text.lines.is_empty() {
+                if !self.text.is_empty() {
                     self.push_blank_line();
                 }
                 self.push_line(Line::from("———"));
@@ -296,7 +315,9 @@ where
             TagEnd::CodeBlock => self.end_codeblock(),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
-                if self.list_item_contains_code_block.pop().unwrap_or(false)
+                self.flush_current_line();
+                let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
+                if self.text.len().saturating_sub(start_line_count) > 1
                     && let Some(needs_blank) = self.list_needs_blank_before_next_item.last_mut()
                 {
                     *needs_blank = true;
@@ -396,12 +417,11 @@ where
             let has_content = self
                 .current_line_content
                 .as_ref()
-                .map(|line| !line.spans.is_empty())
+                .map(|line| !line.line.spans.is_empty())
                 .unwrap_or_else(|| {
                     self.text
-                        .lines
                         .last()
-                        .map(|line| !line.spans.is_empty())
+                        .map(|line| !line.line.spans.is_empty())
                         .unwrap_or(false)
                 });
             if has_content {
@@ -417,11 +437,8 @@ where
                 self.push_line(Line::default());
             }
             let content = line.to_string();
-            let span = Span::styled(
-                content,
-                self.inline_styles.last().copied().unwrap_or_default(),
-            );
-            self.push_span(span);
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            self.push_text_spans(&content, style);
         }
         self.needs_newline = false;
     }
@@ -503,8 +520,9 @@ where
         {
             self.push_blank_line();
         }
+        self.flush_current_line();
+        self.list_item_start_line_counts.push(self.text.len());
         self.pending_marker_line = true;
-        self.list_item_contains_code_block.push(false);
         let depth = self.list_indices.len();
         let is_ordered = self
             .list_indices
@@ -544,11 +562,8 @@ where
     }
 
     fn start_codeblock(&mut self, lang: Option<String>, indent: Option<Span<'static>>) {
-        for item_contains_code_block in &mut self.list_item_contains_code_block {
-            *item_contains_code_block = true;
-        }
         self.flush_current_line();
-        if !self.text.lines.is_empty() {
+        if !self.text.is_empty() {
             self.push_blank_line();
         }
         self.in_code_block = true;
@@ -648,7 +663,7 @@ where
     }
 
     fn flush_current_line(&mut self) {
-        if let Some(line) = self.current_line_content.take() {
+        if let Some(mut line) = self.current_line_content.take() {
             let style = self.current_line_style;
             // NB we don't wrap code in code blocks, in order to preserve whitespace for copy/paste.
             if !self.current_line_in_code_block
@@ -690,19 +705,60 @@ where
         self.current_initial_indent = self.prefix_spans(was_pending);
         self.current_subsequent_indent = self.prefix_spans(/*pending_marker_line*/ false);
         self.current_line_style = style;
-        self.current_line_content = Some(line);
+        self.current_line_content = Some(HyperlinkLine::new(line));
         self.current_line_in_code_block = self.in_code_block;
         self.line_ends_with_local_link_target = false;
 
         self.pending_marker_line = false;
     }
 
+    fn push_hyperlink_line(&mut self, line: HyperlinkLine) {
+        let hyperlinks = line.hyperlinks;
+        self.push_line(line.line);
+        if let Some(current) = self.current_line_content.as_mut() {
+            current.hyperlinks = hyperlinks;
+        }
+    }
+
     fn push_span(&mut self, span: Span<'static>) {
         if let Some(line) = self.current_line_content.as_mut() {
-            line.push_span(span);
+            line.line.push_span(span);
         } else {
             self.push_line(Line::from(vec![span]));
         }
+    }
+
+    fn push_annotated(&mut self, mut appended: HyperlinkLine) {
+        if self.current_line_content.is_none() {
+            self.push_line(Line::default());
+        }
+        if let Some(line) = self.current_line_content.as_mut() {
+            let shift = line.width();
+            line.line.spans.append(&mut appended.line.spans);
+            line.hyperlinks
+                .extend(appended.hyperlinks.into_iter().map(|mut link| {
+                    link.columns = link.columns.start + shift..link.columns.end + shift;
+                    link
+                }));
+        }
+    }
+
+    fn push_text_spans(&mut self, text: &str, style: Style) {
+        let span = Span::styled(text.to_string(), style);
+        let destination = self
+            .link
+            .as_ref()
+            .and_then(|link| web_destination(&link.destination));
+        let annotated = if let Some(destination) = destination {
+            let mut annotated = HyperlinkLine::new(Line::default());
+            annotated.push_span(span, Some(&destination));
+            annotated
+        } else if self.link.is_some() || self.in_code_block {
+            HyperlinkLine::new(Line::from(span))
+        } else {
+            annotate_web_urls_in_line(Line::from(span))
+        };
+        self.push_annotated(annotated);
     }
 
     fn push_blank_line(&mut self) {

@@ -888,6 +888,7 @@ mod tests {
         Thread {
             id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
             model_provider: "mock-provider".to_string(),

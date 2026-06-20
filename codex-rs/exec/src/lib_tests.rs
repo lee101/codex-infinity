@@ -206,6 +206,35 @@ fn lagged_event_warning_message_is_explicit() {
     );
 }
 
+#[test]
+fn runtime_warnings_are_filtered_to_the_primary_thread() {
+    let primary_thread_id = "thread-1";
+    let turn_id = "turn-1";
+    let outcomes = [
+        codex_app_server_protocol::WarningNotification {
+            thread_id: None,
+            message: "global warning".to_string(),
+        },
+        codex_app_server_protocol::WarningNotification {
+            thread_id: Some(primary_thread_id.to_string()),
+            message: "primary warning".to_string(),
+        },
+        codex_app_server_protocol::WarningNotification {
+            thread_id: Some("thread-2".to_string()),
+            message: "other warning".to_string(),
+        },
+    ]
+    .map(|warning| {
+        should_process_notification(
+            &ServerNotification::Warning(warning),
+            primary_thread_id,
+            turn_id,
+        )
+    });
+
+    assert_eq!(outcomes, [true, true, false]);
+}
+
 #[tokio::test]
 async fn resume_lookup_model_providers_filters_only_last_lookup() {
     let codex_home = tempdir().expect("create temp codex home");
@@ -245,6 +274,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
     let thread = AppServerThread {
         id: "thread-1".to_string(),
         forked_from_id: None,
+        parent_thread_id: None,
         preview: String::new(),
         ephemeral: false,
         model_provider: "openai".to_string(),
@@ -397,6 +427,7 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
         thread: codex_app_server_protocol::Thread {
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
             model_provider: "openai".to_string(),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::items::ImageGenerationItem;
 use codex_protocol::items::TurnItem;
 use codex_utils_stream_parser::strip_citations;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +35,8 @@ use tracing::instrument;
 
 const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
 
-pub(crate) fn image_generation_artifact_path(
+/// Returns the host-owned default artifact path for a generated image.
+pub fn image_generation_artifact_path(
     codex_home: &AbsolutePathBuf,
     session_id: &str,
     call_id: &str,
@@ -122,6 +124,66 @@ async fn save_image_generation_result(
     Ok(path)
 }
 
+pub(crate) async fn persist_image_generation_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    image_item: &mut ImageGenerationItem,
+) -> Option<AbsolutePathBuf> {
+    image_item.saved_path = None;
+    let session_id = sess.thread_id.to_string();
+    match save_image_generation_result(
+        &turn_context.config.codex_home,
+        &session_id,
+        &image_item.id,
+        &image_item.result,
+    )
+    .await
+    {
+        Ok(path) => {
+            image_item.saved_path = Some(path.clone());
+            Some(path)
+        }
+        Err(err) => {
+            let output_path = image_generation_artifact_path(
+                &turn_context.config.codex_home,
+                &session_id,
+                &image_item.id,
+            );
+            let output_dir = output_path
+                .parent()
+                .unwrap_or_else(|| turn_context.config.codex_home.clone());
+            tracing::warn!(
+                call_id = %image_item.id,
+                output_dir = %output_dir.display(),
+                "failed to save generated image: {err}"
+            );
+            None
+        }
+    }
+}
+
+async fn record_image_generation_instructions(
+    sess: &Session,
+    turn_context: &TurnContext,
+    image_item: &ImageGenerationItem,
+) {
+    if image_item.saved_path.is_none() {
+        return;
+    }
+    let session_id = sess.thread_id.to_string();
+    let image_output_path =
+        image_generation_artifact_path(&turn_context.config.codex_home, &session_id, "<image_id>");
+    let image_output_dir = image_output_path
+        .parent()
+        .unwrap_or_else(|| turn_context.config.codex_home.clone());
+    let message: ResponseItem = ContextualUserFragment::into(ImageGenerationInstructions::new(
+        image_output_dir.display(),
+        image_output_path.display(),
+    ));
+    sess.record_conversation_items(turn_context, &[message])
+        .await;
+}
+
 /// Persist a completed model response item and record any cited memory usage.
 pub(crate) async fn record_completed_response_item(
     sess: &Session,
@@ -167,7 +229,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
     }
     state_db::mark_thread_memory_mode_polluted(
         sess.services.state_db.as_deref(),
-        sess.conversation_id,
+        sess.thread_id,
         "record_completed_response_item",
     )
     .await;
@@ -234,7 +296,7 @@ pub(crate) async fn handle_output_item_done(
 
             let payload_preview = call.payload.log_payload().into_owned();
             tracing::info!(
-                thread_id = %ctx.sess.conversation_id,
+                thread_id = %ctx.sess.thread_id,
                 "ToolCall: {} {}",
                 call.tool_name.display(),
                 payload_preview
@@ -430,6 +492,39 @@ pub(crate) async fn handle_non_tool_response_item(
     }
 }
 
+pub(crate) async fn finalize_turn_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    contributor_policy: TurnItemContributorPolicy<'_>,
+    turn_item: &mut TurnItem,
+    plan_mode: bool,
+) {
+    if let TurnItemContributorPolicy::Run(turn_store) = contributor_policy {
+        apply_turn_item_contributors(sess, turn_store, turn_item).await;
+    }
+    if let TurnItem::AgentMessage(agent_message) = &mut *turn_item {
+        let combined = agent_message
+            .content
+            .iter()
+            .map(|entry| match entry {
+                codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
+            })
+            .collect::<String>();
+        let (stripped, memory_citation) =
+            strip_hidden_assistant_markup_and_parse_memory_citation(&combined, plan_mode);
+        agent_message.content =
+            vec![codex_protocol::items::AgentMessageContent::Text { text: stripped }];
+        if agent_message.memory_citation.is_none() {
+            agent_message.memory_citation = memory_citation;
+        }
+    }
+    if let TurnItem::ImageGeneration(image_item) = &mut *turn_item
+        && image_item.status == "completed"
+    {
+        persist_image_generation_item(sess, turn_context, image_item).await;
+    }
+}
+
 pub(crate) fn last_assistant_message_from_item(
     item: &ResponseItem,
     plan_mode: bool,
@@ -471,6 +566,7 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),
                 output: output.clone(),
+                metadata: None,
             })
         }
         ResponseInputItem::CustomToolCallOutput {
@@ -481,12 +577,14 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             call_id: call_id.clone(),
             name: name.clone(),
             output: output.clone(),
+            metadata: None,
         }),
         ResponseInputItem::McpToolCallOutput { call_id, output } => {
             let output = output.as_function_call_output_payload();
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),
                 output,
+                metadata: None,
             })
         }
         ResponseInputItem::ToolSearchOutput {
@@ -499,6 +597,7 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             status: status.clone(),
             execution: execution.clone(),
             tools: tools.clone(),
+            metadata: None,
         }),
         _ => None,
     }

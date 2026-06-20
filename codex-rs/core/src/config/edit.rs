@@ -23,6 +23,8 @@ use toml_edit::value;
 
 const NOTICE_TABLE_KEY: &str = "notice";
 
+mod document_helpers;
+
 /// Discrete config mutations supported by the persistence engine.
 #[derive(Clone, Debug)]
 pub enum ConfigEdit {
@@ -158,7 +160,7 @@ pub fn keymap_binding_clear_edit(context: &str, action: &str) -> ConfigEdit {
 
 pub fn model_availability_nux_count_edits(shown_count: &HashMap<String, u32>) -> Vec<ConfigEdit> {
     let mut shown_count_entries: Vec<_> = shown_count.iter().collect();
-    shown_count_entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    shown_count_entries.sort_unstable_by_key(|(left, _)| *left);
 
     let mut edits = vec![ConfigEdit::ClearPath {
         segments: vec!["tui".to_string(), "model_availability_nux".to_string()],
@@ -513,7 +515,7 @@ impl ConfigDocument {
                 );
                 mutated |= self.write_profile_value(
                     &["model_reasoning_effort"],
-                    effort.map(|effort| value(effort.to_string())),
+                    effort.as_ref().map(|effort| value(effort.to_string())),
                 );
                 mutated
             }),

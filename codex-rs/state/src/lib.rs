@@ -4,6 +4,12 @@
 //! from JSONL rollouts and mirrors it into a local SQLite database. Backfill
 //! orchestration and rollout scanning live in `codex-core`.
 
+const _: () = assert!(
+    libsqlite3_sys::SQLITE_VERSION_NUMBER >= 3_051_003,
+    "bundled SQLite must include the WAL-reset corruption fix",
+);
+
+mod audit;
 mod extract;
 pub mod log_db;
 mod migrations;
@@ -18,6 +24,8 @@ pub use model::Phase2JobClaimOutcome;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
 
+pub use audit::ThreadStateAuditRow;
+pub use audit::read_thread_state_audit_rows;
 /// Low-level storage engine: useful for focused tests.
 ///
 /// Most consumers should prefer [`StateRuntime`].

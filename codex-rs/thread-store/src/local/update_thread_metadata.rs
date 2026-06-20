@@ -52,6 +52,7 @@ pub(super) async fn update_thread_metadata(
     if let Some(memory_mode) = params.patch.memory_mode {
         apply_thread_memory_mode(resolved_rollout_path.path.as_path(), thread_id, memory_mode)
             .await?;
+        refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
     }
 
     let state_db_ctx = store.state_db().await;
@@ -194,6 +195,7 @@ fn rollout_path_is_archived(store: &LocalThreadStore, path: &std::path::Path) ->
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::models::PermissionProfile;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use tempfile::TempDir;

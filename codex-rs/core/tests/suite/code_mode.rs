@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
 use base64::Engine;
@@ -8,7 +8,11 @@ use codex_config::types::McpServerTransportConfig;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
@@ -16,7 +20,12 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_web_search_extension::install as install_web_search_extension;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::AppsTestToolLoading;
+use core_test_support::apps_test_server::DIRECT_CALENDAR_APP_ONLY_TOOL;
+use core_test_support::apps_test_server::recorded_apps_tool_calls;
+use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::assert_regex_match;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
@@ -27,21 +36,33 @@ use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_mcp_server;
+use image::DynamicImage;
+use image::GenericImageView;
+use image::ImageBuffer;
+use image::Rgba;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn custom_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
     match req.custom_tool_call_output(call_id).get("output") {
@@ -177,6 +198,108 @@ async fn run_code_mode_turn(
     Ok((test, second_mock))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_can_call_standalone_web_search() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/alpha/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": "Search result",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-1",
+                "exec",
+                r#"
+const result = await tools.web__run({
+  search_query: [{ q: "standalone web search" }],
+});
+text(result);
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let auth = CodexAuth::from_api_key("dummy");
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
+    let mut extension_builder = ExtensionRegistryBuilder::<Config>::new();
+    install_web_search_extension(&mut extension_builder, auth_manager);
+    let mut builder = test_codex()
+        .with_auth(auth)
+        .with_extensions(Arc::new(extension_builder.build()))
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code mode should be enabled");
+            config
+                .features
+                .enable(Feature::StandaloneWebSearch)
+                .expect("standalone web search should be enabled");
+            config
+                .web_search_mode
+                .set(WebSearchMode::Live)
+                .expect("web search mode should be accepted");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("Search the web from code mode").await?;
+
+    let search_request = server
+        .received_requests()
+        .await
+        .expect("received requests should be available")
+        .into_iter()
+        .find(|request| request.url.path() == "/v1/alpha/search")
+        .expect("standalone search request should be sent");
+    let search_body = search_request
+        .body_json::<Value>()
+        .expect("search request body should be JSON");
+    assert_eq!(
+        search_body["model"],
+        serde_json::json!("test-gpt-5.1-codex")
+    );
+    assert_eq!(
+        search_body["commands"],
+        serde_json::json!({
+            "search_query": [{"q": "standalone web search"}],
+        })
+    );
+    assert_eq!(
+        search_body["settings"],
+        serde_json::json!({
+            "allowed_callers": ["direct"],
+            "external_web_access": true,
+        })
+    );
+    assert_eq!(
+        custom_tool_output_last_non_empty_text(&follow_up_mock.single_request(), "call-1"),
+        Some("Search result".to_string())
+    );
+
+    Ok(())
+}
+
 async fn run_code_mode_turn_with_rmcp(
     server: &MockServer,
     prompt: &str,
@@ -191,7 +314,11 @@ async fn run_code_mode_turn_with_rmcp_model(
     code: &str,
     model: &'static str,
 ) -> Result<(TestCodex, ResponseMock)> {
-    run_code_mode_turn_with_rmcp_config(server, prompt, code, model, /*code_mode_only*/ false).await
+    run_code_mode_turn_with_rmcp_config(
+        server, prompt, code, model, /*code_mode_only*/ false,
+        /*non_prefixed_mcp_tool_names*/ false,
+    )
+    .await
 }
 
 async fn run_code_mode_turn_with_rmcp_mode(
@@ -200,8 +327,15 @@ async fn run_code_mode_turn_with_rmcp_mode(
     code: &str,
     code_mode_only: bool,
 ) -> Result<(TestCodex, ResponseMock)> {
-    run_code_mode_turn_with_rmcp_config(server, prompt, code, "test-gpt-5.1-codex", code_mode_only)
-        .await
+    run_code_mode_turn_with_rmcp_config(
+        server,
+        prompt,
+        code,
+        "test-gpt-5.1-codex",
+        code_mode_only,
+        /*non_prefixed_mcp_tool_names*/ false,
+    )
+    .await
 }
 
 async fn run_code_mode_turn_with_rmcp_config(
@@ -210,6 +344,7 @@ async fn run_code_mode_turn_with_rmcp_config(
     code: &str,
     model: &'static str,
     code_mode_only: bool,
+    non_prefixed_mcp_tool_names: bool,
 ) -> Result<(TestCodex, ResponseMock)> {
     let rmcp_test_server_bin = stdio_server_bin()?;
     let mut builder = test_codex().with_model(model).with_config(move |config| {
@@ -218,6 +353,9 @@ async fn run_code_mode_turn_with_rmcp_config(
         } else {
             config.features.enable(Feature::CodeMode)
         };
+        if non_prefixed_mcp_tool_names {
+            let _ = config.features.enable(Feature::NonPrefixedMcpToolNames);
+        }
 
         let mut servers = config.mcp_servers.get().clone();
         servers.insert(
@@ -254,6 +392,7 @@ async fn run_code_mode_turn_with_rmcp_config(
             .expect("test mcp servers should accept any configuration");
     });
     let test = builder.build(server).await?;
+    wait_for_mcp_server(&test.codex, "rmcp").await?;
 
     responses::mount_sse_once(
         server,
@@ -346,7 +485,12 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
         tool_names(&first_body),
-        vec!["exec".to_string(), "wait".to_string()]
+        vec![
+            "exec".to_string(),
+            "wait".to_string(),
+            "request_user_input".to_string(),
+            "web_search".to_string()
+        ]
     );
 
     Ok(())
@@ -414,8 +558,8 @@ if (!tool) {
                 .features
                 .enable(Feature::CodeModeOnly)
                 .expect("test config should allow feature update");
-            let mut model_catalog = bundled_models_response()
-                .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+            let mut model_catalog =
+                bundled_models_response().expect("bundled models.json should parse");
             let model = model_catalog
                 .models
                 .iter_mut()
@@ -432,7 +576,13 @@ if (!tool) {
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
         tool_names(&first_body),
-        vec!["exec".to_string(), "wait".to_string()]
+        vec![
+            "exec".to_string(),
+            "wait".to_string(),
+            "request_user_input".to_string(),
+            "web_search".to_string(),
+            "image_generation".to_string()
+        ]
     );
 
     let exec_description = first_body
@@ -471,6 +621,92 @@ if (!tool) {
             "isError": false,
             "text": "called calendar_timezone_option_99 for  at  with ",
         })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_only_tools_are_not_visible_or_runnable_by_code_mode_model() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let apps_server =
+        AppsTestServer::mount_with_app_only_tool(&server, AppsTestToolLoading::Searchable).await?;
+    let code = format!(
+        r#"
+const visibleTool = ALL_TOOLS.find(({{ name }}) => name === {visible_tool_name:?});
+const tool = ALL_TOOLS.find(({{ name }}) => name === {tool_name:?});
+let error = null;
+try {{
+  await tools[{tool_name:?}]({{}});
+}} catch (caught) {{
+  error = String(caught);
+}}
+text(JSON.stringify({{
+  visibleListed: visibleTool !== undefined,
+  listed: tool !== undefined,
+  callable: typeof tools[{tool_name:?}] === "function",
+  error,
+}}));
+"#,
+        visible_tool_name = "mcp__codex_apps__calendar_timezone_option_99",
+        tool_name = DIRECT_CALENDAR_APP_ONLY_TOOL,
+    );
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call("call-1", "exec", &code),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::CodeModeOnly)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+    test.submit_turn("try to call the app-only calendar tool through exec")
+        .await?;
+
+    let req = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "code mode visibility check should complete successfully: {output}"
+    );
+    let parsed: Value = serde_json::from_str(&output)?;
+    assert_eq!(parsed["visibleListed"], true);
+    assert_eq!(parsed["listed"], false);
+    assert_eq!(parsed["callable"], false);
+    assert!(
+        parsed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("is not a function")),
+        "app-only code mode call should fail before MCP dispatch: {parsed:?}"
+    );
+    assert!(
+        recorded_apps_tool_calls(&server).await.is_empty(),
+        "app-only code mode call should not reach the MCP server"
     );
 
     Ok(())
@@ -554,6 +790,47 @@ text(JSON.stringify(result));
 
     let parsed: Value = serde_json::from_str(&output)?;
     assert_eq!(parsed, serde_json::json!({}));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_get_context_remaining_returns_structured_result() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_config(
+        &server,
+        "use exec to get remaining context",
+        r#"
+const result = await tools.get_context_remaining({});
+text(JSON.stringify(result));
+"#,
+        |config| {
+            config.model_context_window = Some(10_000);
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("test config should allow token budget");
+        },
+    )
+    .await?;
+
+    let req = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "exec get_context_remaining call failed unexpectedly: {output}"
+    );
+
+    let parsed: Value = serde_json::from_str(&output)?;
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "tokens_left": 9500,
+        })
+    );
 
     Ok(())
 }
@@ -922,7 +1199,7 @@ text("phase 3");
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_yield_timeout_works_for_busy_loop() -> Result<()> {
+async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -931,8 +1208,12 @@ async fn code_mode_yield_timeout_works_for_busy_loop() -> Result<()> {
     });
     let test = builder.build(&server).await?;
 
-    let code = r#"// @exec: {"yield_time_ms": 100}
-text("phase 1");
+    // Exact controller arbitration is covered by deterministic code-mode contract tests. Keep
+    // this end-to-end load bounded while exercising a substantial runtime output backlog.
+    let code = r#"// @exec: {"yield_time_ms": 0, "max_output_tokens": 16}
+for (let index = 0; index < 16_384; index++) {
+    text(`event ${index}`);
+}
 while (true) {}
 "#;
 
@@ -962,7 +1243,7 @@ while (true) {}
 
     let first_request = first_completion.single_request();
     let first_items = custom_tool_output_items(&first_request, "call-1");
-    assert_eq!(first_items.len(), 2);
+    assert_eq!(first_items.len(), 1);
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -970,7 +1251,6 @@ while (true) {}
         ),
         text_item(&first_items, /*index*/ 0),
     );
-    assert_eq!(text_item(&first_items, /*index*/ 1), "phase 1");
     let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
 
     responses::mount_sse_once(
@@ -1002,7 +1282,7 @@ while (true) {}
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 1);
+    assert!(!second_items.is_empty());
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -1900,6 +2180,7 @@ text("token one token two token three token four token five token six token seve
     );
     let expected_pattern = r#"(?sx)
 \A
+Warning:\ truncated\ output\ \(original\ token\ count:\ \d+\)\n
 Total\ output\ lines:\ 1\n
 \n
 .*…\d+\ tokens\ truncated….*
@@ -2096,7 +2377,6 @@ async fn code_mode_can_output_images_via_global_helper() -> Result<()> {
         &server,
         "use exec to return images",
         r#"
-image("https://example.com/image.jpg");
 image("data:image/png;base64,AAA");
 "#,
         /*include_apply_patch*/ false,
@@ -2111,7 +2391,7 @@ image("data:image/png;base64,AAA");
         Some(false),
         "code_mode image output failed unexpectedly"
     );
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 2);
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -2123,17 +2403,135 @@ image("data:image/png;base64,AAA");
         items[1],
         serde_json::json!({
             "type": "input_image",
-            "image_url": "https://example.com/image.jpg",
-            "detail": "high"
-        }),
-    );
-    assert_eq!(
-        items[2],
-        serde_json::json!({
-            "type": "input_image",
             "image_url": "data:image/png;base64,AAA",
             "detail": "high"
         }),
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_all_images_replaces_malformed_code_mode_image() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_config(
+        &server,
+        "use exec to return an image",
+        r#"image("data:image/png;base64,AAA");"#,
+        |config| {
+            let _ = config.features.enable(Feature::ResizeAllImages);
+        },
+    )
+    .await?;
+
+    let req = second_mock.single_request();
+    let items = custom_tool_output_items(&req, "call-1");
+    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(success, Some(false));
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[1],
+        serde_json::json!({
+            "type": "input_text",
+            "text": "image content omitted because it could not be processed"
+        })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_all_images_resizes_explicit_original_code_mode_image() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let original_dimensions = (6401, 100);
+    let image = ImageBuffer::from_pixel(
+        original_dimensions.0,
+        original_dimensions.1,
+        Rgba([20, 40, 60, 255]),
+    );
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image).write_to(&mut encoded, image::ImageFormat::Png)?;
+    let image_data_url = format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(encoded.into_inner())
+    );
+    let code = format!(
+        "image({}, \"original\");",
+        serde_json::to_string(&image_data_url)?
+    );
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
+        &server,
+        "use exec to return a large original-detail image",
+        &code,
+        "gpt-5.3-codex",
+        |config| {
+            config
+                .features
+                .enable(Feature::ResizeAllImages)
+                .expect("resize_all_images should be enabled");
+        },
+    )
+    .await?;
+
+    let req = second_mock.single_request();
+    let items = custom_tool_output_items(&req, "call-1");
+    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(success, Some(false));
+    let resized_url = items[1]["image_url"]
+        .as_str()
+        .expect("code mode image output should contain a data URL");
+    assert_eq!(items[1]["detail"], "original");
+    let (_, resized_base64) = resized_url
+        .split_once(',')
+        .expect("resized image should contain a data URL prefix");
+    let resized_bytes = BASE64_STANDARD.decode(resized_base64)?;
+    let resized = image::load_from_memory(&resized_bytes)?;
+    let resized_dimensions = resized.dimensions();
+    assert_eq!(resized_dimensions, (6000, 94));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "use exec to return a remote image",
+        r#"image("https://example.com/image.jpg");"#,
+    )
+    .await?;
+
+    let req = second_mock.single_request();
+    let items = custom_tool_output_items(&req, "call-1");
+    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(
+        success,
+        Some(true),
+        "code_mode remote image URL unexpectedly succeeded"
+    );
+    assert_eq!(items.len(), 2);
+    assert_regex_match(
+        concat!(
+            r"(?s)\A",
+            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
+        ),
+        text_item(&items, /*index*/ 0),
+    );
+    assert_eq!(
+        text_item(&items, /*index*/ 1),
+        concat!(
+            "Script error:\n",
+            "Tool call failed: remote image URLs are not supported in tool outputs. ",
+            "Pass a base64 data URI instead"
+        )
     );
 
     Ok(())
@@ -2433,6 +2831,50 @@ contentLength=0"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_uses_non_prefixed_mcp_tool_names_when_feature_enabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let code = r#"
+const result = await tools.rmcp__echo({ message: "ping" });
+text(JSON.stringify({
+  hasNonPrefixedEcho: typeof tools.rmcp__echo === "function",
+  hasPrefixedEcho: typeof tools.mcp__rmcp__echo === "function",
+  echo: result.structuredContent?.echo ?? "missing",
+}));
+"#;
+
+    let (_test, second_mock) = run_code_mode_turn_with_rmcp_config(
+        &server,
+        "use exec to inspect non-prefixed MCP names",
+        code,
+        "test-gpt-5.1-codex",
+        /*code_mode_only*/ false,
+        /*non_prefixed_mcp_tool_names*/ true,
+    )
+    .await?;
+
+    let req = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "exec non-prefixed rmcp access failed unexpectedly: {output}"
+    );
+    let parsed: Value = serde_json::from_str(&output)?;
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "hasNonPrefixedEcho": true,
+            "hasPrefixedEcho": false,
+            "echo": "ECHOING: ping",
+        })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_namespaced_mcp_tools_on_global_tools_object() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2584,6 +3026,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "escape",
         "exit",
         "eval",
+        "generatedImage",
         "globalThis",
         "image",
         "isFinite",
@@ -2683,6 +3126,7 @@ text(JSON.stringify(tool));
         serde_json::json!({
             "name": "mcp__rmcp__echo",
             "description": concat!(
+                "Use these tools to exercise the rmcp test server.\n\n",
                 "Echo back the provided message and include environment data.\n\n",
                 "exec tool declaration:\n",
                 "```ts\n",
@@ -2709,21 +3153,25 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
         .thread_manager
         .start_thread_with_tools(
             base_test.config.clone(),
-            vec![DynamicToolSpec {
-                namespace: Some("codex_app".to_string()),
-                name: "hidden_dynamic_tool".to_string(),
-                description: "A hidden dynamic tool.".to_string(),
-                input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "city": { "type": "string" }
-                        },
-                    "required": ["city"],
-                    "additionalProperties": false,
-                }),
-                defer_loading: true,
-            }],
-            /*persist_extended_history*/ false,
+            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                name: "codex_app".to_string(),
+                description: "Codex app tools.".to_string(),
+                tools: vec![DynamicToolNamespaceTool::Function(
+                    DynamicToolFunctionSpec {
+                        name: "hidden_dynamic_tool".to_string(),
+                        description: "A hidden dynamic tool.".to_string(),
+                        input_schema: serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "city": { "type": "string" }
+                                },
+                            "required": ["city"],
+                            "additionalProperties": false,
+                        }),
+                        defer_loading: true,
+                    },
+                )],
+            })],
         )
         .await?;
     let mut test = base_test;
@@ -2731,8 +3179,8 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
     test.session_configured = new_thread.session_configured;
 
     let code = r#"
-const tool = ALL_TOOLS.find(({ name }) => name === "codex_app_hidden_dynamic_tool");
-const out = await tools.codex_app_hidden_dynamic_tool({ city: "Paris" });
+const tool = ALL_TOOLS.find(({ name }) => name === "codex_app__hidden_dynamic_tool");
+const out = await tools.codex_app__hidden_dynamic_tool({ city: "Paris" });
 text(
   JSON.stringify({
     name: tool?.name ?? null,
@@ -2761,7 +3209,7 @@ text(
     )
     .await;
 
-    let cwd = test.cwd.path().to_path_buf();
+    let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
@@ -2831,7 +3279,7 @@ text(
     )?;
     assert_eq!(
         parsed.get("name"),
-        Some(&Value::String("codex_app_hidden_dynamic_tool".to_string()))
+        Some(&Value::String("codex_app__hidden_dynamic_tool".to_string()))
     );
     assert_eq!(
         parsed.get("out"),
@@ -2842,10 +3290,103 @@ text(
             .get("description")
             .and_then(Value::as_str)
             .is_some_and(|description| {
-                description.contains("A hidden dynamic tool.")
+                description.contains("Codex app tools.")
+                    && description.contains("A hidden dynamic tool.")
                     && description.contains("declare const tools:")
-                    && description.contains("codex_app_hidden_dynamic_tool(args:")
+                    && description.contains("codex_app__hidden_dynamic_tool(args:")
             })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeMode);
+        config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()];
+    });
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(
+            base_test.config.clone(),
+            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                name: "excluded".to_string(),
+                description: "Excluded tools.".to_string(),
+                tools: vec![DynamicToolNamespaceTool::Function(
+                    DynamicToolFunctionSpec {
+                        name: "lookup".to_string(),
+                        description: "An excluded dynamic tool.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false,
+                        }),
+                        defer_loading: false,
+                    },
+                )],
+            })],
+        )
+        .await?;
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    let first_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-1",
+                "exec",
+                r#"
+text(JSON.stringify({
+  excludedType: typeof tools.excluded__lookup,
+  excludedMetadata: ALL_TOOLS.some(({ name }) => name === "excluded__lookup"),
+  allowedType: typeof tools.update_plan,
+  allowedMetadata: ALL_TOOLS.some(({ name }) => name === "update_plan"),
+}));
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("use exec to inspect nested tool namespaces")
+        .await?;
+
+    assert!(
+        tool_names(&first_mock.single_request().body_json()).contains(&"excluded".to_string()),
+        "excluded namespace should remain directly exposed in mixed code mode"
+    );
+    let request = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&request, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "exec configured namespace exclusion failed unexpectedly: {output}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)?,
+        serde_json::json!({
+            "excludedType": "undefined",
+            "excludedMetadata": false,
+            "allowedType": "function",
+            "allowedMetadata": true,
+        })
     );
 
     Ok(())

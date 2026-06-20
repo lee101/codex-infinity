@@ -13,9 +13,13 @@ use crate::guardian::review_approval_request;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
+use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
+use crate::tools::runtimes::RuntimePathPrepends;
+#[cfg(unix)]
+use crate::tools::runtimes::apply_zsh_fork_path_prepend;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
@@ -205,8 +209,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         req: &UnifiedExecRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
+        let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
+        let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
+            req.sandbox_permissions,
+            &file_system_sandbox_policy,
+        );
         let network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), req.sandbox_permissions)?;
+            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions)?;
         Some(NetworkApprovalSpec {
             network: Some(network.clone()),
             mode: NetworkApprovalMode::Deferred,
@@ -232,9 +241,22 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
     ) -> Result<UnifiedExecProcess, ToolError> {
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
-        let managed_network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), req.sandbox_permissions);
-        let mut env = exec_env_for_sandbox_permissions(&req.env, req.sandbox_permissions);
+        let shell = req
+            .turn_environment
+            .shell
+            .as_ref()
+            .unwrap_or(session_shell.as_ref());
+        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd);
+        let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
+        let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
+            req.sandbox_permissions,
+            &file_system_sandbox_policy,
+        );
+        let managed_network = managed_network_for_sandbox_permissions(
+            req.network.as_ref(),
+            launch_sandbox_permissions,
+        );
+        let mut env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
         if let Some(network) = managed_network {
             network.apply_to_env(&mut env);
         }
@@ -248,10 +270,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         } else {
             maybe_wrap_shell_lc_with_snapshot(
                 base_command,
-                session_shell.as_ref(),
-                &req.cwd,
-                &req.explicit_env_overrides,
+                shell,
+                shell_snapshot_location.as_ref(),
+                &explicit_env_overrides,
                 &env,
+                &runtime_path_prepends,
             )
         };
         let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
@@ -270,7 +293,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
             };
             let mut exec_env = attempt
                 .env_for(command, options, managed_network)
-                .map_err(|err| ToolError::Codex(err.into()))?;
+                .map_err(ToolError::Codex)?;
             exec_env.exec_server_env_config = req.exec_server_env_config.clone();
             match zsh_fork_backend::maybe_prepare_unified_exec(
                 req,
@@ -328,7 +351,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         };
         let mut exec_env = attempt
             .env_for(command, options, managed_network)
-            .map_err(|err| ToolError::Codex(err.into()))?;
+            .map_err(ToolError::Codex)?;
         exec_env.exec_server_env_config = req.exec_server_env_config.clone();
         let Some(environment) = ctx.turn.environment.as_ref() else {
             return Err(ToolError::Rejected(

@@ -428,8 +428,8 @@ impl OutgoingMessageSender {
     ) -> Vec<ServerRequest> {
         let request_id_to_callback = self.request_id_to_callback.lock().await;
         let mut requests = request_id_to_callback
-            .iter()
-            .filter_map(|(_, entry)| {
+            .values()
+            .filter_map(|entry| {
                 (entry.thread_id == Some(thread_id)).then_some(entry.request.clone())
             })
             .collect::<Vec<_>>();
@@ -676,6 +676,7 @@ mod tests {
     use codex_app_server_protocol::RateLimitSnapshot;
     use codex_app_server_protocol::RateLimitWindow;
     use codex_app_server_protocol::ToolRequestUserInputParams;
+    use codex_app_server_protocol::TurnModerationMetadataNotification;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -749,6 +750,7 @@ mod tests {
                     }),
                     secondary: None,
                     credits: None,
+                    individual_limit: None,
                     plan_type: Some(PlanType::Plus),
                     rate_limit_reached_type: None,
                 },
@@ -769,6 +771,7 @@ mod tests {
                         },
                         "secondary": null,
                         "credits": null,
+                        "individualLimit": null,
                         "planType": "plus",
                         "rateLimitReachedType": null
                     }
@@ -1140,6 +1143,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    auto_resolution_ms: None,
                 },
             ))
             .await;
@@ -1198,6 +1202,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    auto_resolution_ms: None,
                 },
             ))
             .await;

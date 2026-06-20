@@ -8,6 +8,8 @@ mod mcp_resource;
 pub(crate) mod multi_agents;
 pub(crate) mod multi_agents_common;
 pub(crate) mod multi_agents_v2;
+mod new_context_window;
+pub(crate) mod new_context_window_spec;
 mod plan;
 mod request_permissions;
 mod request_user_input;
@@ -168,7 +170,8 @@ pub(super) fn implicit_granted_permissions(
 
 pub(super) async fn apply_granted_turn_permissions(
     session: &Session,
-    cwd: &std::path::Path,
+    environment_id: &str,
+    cwd: &Path,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> EffectiveAdditionalPermissions {
@@ -180,8 +183,8 @@ pub(super) async fn apply_granted_turn_permissions(
         };
     }
 
-    let granted_session_permissions = session.granted_session_permissions().await;
-    let granted_turn_permissions = session.granted_turn_permissions().await;
+    let granted_session_permissions = session.granted_session_permissions(environment_id).await;
+    let granted_turn_permissions = session.granted_turn_permissions(environment_id).await;
     let granted_permissions = merge_permission_profiles(
         granted_session_permissions.as_ref(),
         granted_turn_permissions.as_ref(),

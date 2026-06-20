@@ -1,5 +1,5 @@
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -35,7 +35,7 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -56,6 +56,7 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
     let turn_start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize".to_string(),
                 text_elements: Vec::new(),

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use codex_file_system::ExecutorFileSystem;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use futures::future::join_all;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -159,7 +160,10 @@ pub async fn get_head_commit_hash(cwd: &Path) -> Option<GitSha> {
 }
 
 pub async fn get_has_changes(cwd: &Path) -> Option<bool> {
-    let output = run_git_command_with_timeout(&["status", "--porcelain"], cwd).await?;
+    let git = Path::new("git");
+    let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
+    let output =
+        run_git_command_with_timeout_from(git, &["status", "--porcelain"], cwd, fsmonitor).await?;
     if !output.status.success() {
         return None;
     }
@@ -270,7 +274,47 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
 
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
-    let mut command = Command::new("git");
+    // These callers only inspect repository metadata. Worktree workflows probe
+    // once and pass their override directly to the lower-level runner.
+    run_git_command_with_timeout_from(
+        Path::new("git"),
+        args,
+        cwd,
+        crate::FsmonitorOverride::Disabled,
+    )
+    .await
+}
+
+struct LocalFsmonitorProbeRunner<'a> {
+    git: &'a Path,
+    cwd: &'a Path,
+}
+
+impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
+    async fn run_probe(&mut self, args: &[&str]) -> Option<Vec<u8>> {
+        // Both probes are fast, bounded metadata queries that do not inspect the
+        // worktree or index, so do not reduce the requested command's timeout.
+        let mut command = Command::new(self.git);
+        command.args(args).current_dir(self.cwd).kill_on_drop(true);
+        match timeout(GIT_COMMAND_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => Some(output.stdout),
+            _ => None,
+        }
+    }
+}
+
+async fn detect_local_fsmonitor_override(git: &Path, cwd: &Path) -> crate::FsmonitorOverride {
+    let mut runner = LocalFsmonitorProbeRunner { git, cwd };
+    crate::detect_fsmonitor_override(&mut runner).await
+}
+
+async fn run_git_command_with_timeout_from(
+    git: &Path,
+    args: &[&str],
+    cwd: &Path,
+    fsmonitor: crate::FsmonitorOverride,
+) -> Option<std::process::Output> {
+    let mut command = Command::new(git);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
@@ -561,9 +605,15 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
 }
 
 async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
-    let output =
-        run_git_command_with_timeout(&["diff", "--no-textconv", "--no-ext-diff", &sha.0], cwd)
-            .await?;
+    let git = Path::new("git");
+    let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
+    let output = run_git_command_with_timeout_from(
+        git,
+        &["diff", "--no-textconv", "--no-ext-diff", &sha.0],
+        cwd,
+        fsmonitor,
+    )
+    .await?;
     // 0 is success and no diff.
     // 1 is success but there is a diff.
     let exit_ok = output.status.code().is_some_and(|c| c == 0 || c == 1);
@@ -572,8 +622,13 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     }
     let mut diff = String::from_utf8(output.stdout).ok()?;
 
-    if let Some(untracked_output) =
-        run_git_command_with_timeout(&["ls-files", "--others", "--exclude-standard"], cwd).await
+    if let Some(untracked_output) = run_git_command_with_timeout_from(
+        git,
+        &["ls-files", "--others", "--exclude-standard"],
+        cwd,
+        fsmonitor,
+    )
+    .await
         && untracked_output.status.success()
     {
         let untracked: Vec<String> = String::from_utf8(untracked_output.stdout)
@@ -599,7 +654,7 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
                     null_device,
                     &file_owned,
                 ];
-                run_git_command_with_timeout(&args_vec, cwd).await
+                run_git_command_with_timeout_from(git, &args_vec, cwd, fsmonitor).await
             });
             let results = join_all(futures_iter).await;
             for extra in results.into_iter().flatten() {
@@ -629,7 +684,7 @@ pub async fn resolve_root_git_project_for_trust(
     };
     let (repo_root, dot_git) = find_ancestor_git_entry_with_fs(fs, &base).await?;
     if fs
-        .get_metadata(&dot_git, /*sandbox*/ None)
+        .get_metadata(&dot_git_uri, /*sandbox*/ None)
         .await
         .ok()?
         .is_directory
@@ -637,7 +692,10 @@ pub async fn resolve_root_git_project_for_trust(
         return Some(repo_root);
     }
 
-    let git_dir_s = fs.read_file_text(&dot_git, /*sandbox*/ None).await.ok()?;
+    let git_dir_s = fs
+        .read_file_text(&dot_git_uri, /*sandbox*/ None)
+        .await
+        .ok()?;
     let git_dir_rel = git_dir_s.trim().strip_prefix("gitdir:")?.trim();
     if git_dir_rel.is_empty() {
         return None;
@@ -678,7 +736,12 @@ async fn find_ancestor_git_entry_with_fs(
 ) -> Option<(AbsolutePathBuf, AbsolutePathBuf)> {
     for dir in base_dir.ancestors() {
         let dot_git = dir.join(".git");
-        if fs.get_metadata(&dot_git, /*sandbox*/ None).await.is_ok() {
+        let dot_git_uri = PathUri::from_abs_path(&dot_git);
+        if fs
+            .get_metadata(&dot_git_uri, /*sandbox*/ None)
+            .await
+            .is_ok()
+        {
             return Some((dir, dot_git));
         }
     }

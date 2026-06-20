@@ -6,6 +6,10 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 
 pub(crate) fn default_thread_environment_selections(
     environment_manager: &EnvironmentManager,
@@ -61,13 +65,30 @@ pub(crate) fn selected_primary_environment(
 
 #[cfg(test)]
 mod tests {
+    use codex_exec_server::Environment;
     use codex_exec_server::ExecServerRuntimePaths;
     use codex_exec_server::REMOTE_ENVIRONMENT_ID;
     use codex_protocol::protocol::TurnEnvironmentSelection;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    async fn resolve_turn_environments(
+        environment_manager: Arc<EnvironmentManager>,
+        selections: &[TurnEnvironmentSelection],
+    ) -> Arc<ThreadEnvironments> {
+        let turn_environments = Arc::new(ThreadEnvironments::new(
+            environment_manager,
+            crate::shell::default_user_shell(),
+            ShellSnapshot::disabled(),
+            TurnEnvironmentSnapshot::default(),
+        ));
+        turn_environments.update_selections(selections);
+        turn_environments.snapshot().await;
+        turn_environments
+    }
 
     fn test_runtime_paths() -> ExecServerRuntimePaths {
         ExecServerRuntimePaths::new(
@@ -80,6 +101,7 @@ mod tests {
     #[tokio::test]
     async fn default_thread_environment_selections_use_manager_default_id() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
+        let cwd_uri = PathUri::from_abs_path(&cwd);
         let manager = EnvironmentManager::create_for_tests(
             Some("ws://127.0.0.1:8765".to_string()),
             test_runtime_paths(),
@@ -90,7 +112,7 @@ mod tests {
             default_thread_environment_selections(&manager, &cwd),
             vec![TurnEnvironmentSelection {
                 environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-                cwd,
+                cwd: cwd_uri,
             }]
         );
     }

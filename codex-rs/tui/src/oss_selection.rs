@@ -287,7 +287,12 @@ fn get_status_symbol_and_color(status: &ProviderStatus) -> (&'static str, Color)
     }
 }
 
-pub async fn select_oss_provider(codex_home: &std::path::Path) -> io::Result<String> {
+pub(crate) struct OssProviderSelection {
+    pub(crate) provider: String,
+    pub(crate) manually_selected: bool,
+}
+
+pub async fn select_oss_provider() -> io::Result<OssProviderSelection> {
     // Check provider statuses first
     let lmstudio_status = check_lmstudio_status().await;
     let ollama_status = check_ollama_status().await;
@@ -296,11 +301,17 @@ pub async fn select_oss_provider(codex_home: &std::path::Path) -> io::Result<Str
     match (&lmstudio_status, &ollama_status) {
         (ProviderStatus::Running, ProviderStatus::NotRunning) => {
             let provider = LMSTUDIO_OSS_PROVIDER_ID.to_string();
-            return Ok(provider);
+            return Ok(OssProviderSelection {
+                provider,
+                manually_selected: false,
+            });
         }
         (ProviderStatus::NotRunning, ProviderStatus::Running) => {
             let provider = OLLAMA_OSS_PROVIDER_ID.to_string();
-            return Ok(provider);
+            return Ok(OssProviderSelection {
+                provider,
+                manually_selected: false,
+            });
         }
         _ => {
             // Both running or both not running - show UI
@@ -324,20 +335,15 @@ pub async fn select_oss_provider(codex_home: &std::path::Path) -> io::Result<Str
         if let Event::Key(key_event) = event::read()?
             && let Some(selection) = widget.handle_key_event(key_event)
         {
-            break Ok(selection);
+            break Ok(OssProviderSelection {
+                provider: selection,
+                manually_selected: true,
+            });
         }
     };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    // If the user manually selected an OSS provider, we save it as the
-    // default one to use later.
-    if let Ok(ref provider) = result
-        && let Err(e) = set_default_oss_provider(codex_home, provider)
-    {
-        tracing::warn!("Failed to save OSS provider preference: {e}");
-    }
 
     result
 }

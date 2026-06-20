@@ -15,6 +15,9 @@ use crate::history_cell::{self};
 use crate::markdown::append_markdown;
 use crate::render::line_utils::prefix_lines;
 use crate::style::proposed_plan_style;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::plain_hyperlink_lines;
+use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use ratatui::prelude::Stylize;
 use ratatui::text::Line;
 use std::path::Path;
@@ -293,11 +296,13 @@ impl StreamController {
         if lines.is_empty() {
             return None;
         }
-        Some(Box::new(history_cell::AgentMessageCell::new(lines, {
-            let header_emitted = self.header_emitted;
-            self.header_emitted = true;
-            !header_emitted
-        })))
+        Some(Box::new(
+            history_cell::AgentMessageCell::new_hyperlink_lines(lines, {
+                let header_emitted = self.header_emitted;
+                self.header_emitted = true;
+                !header_emitted
+            }),
+        ))
     }
 }
 
@@ -387,7 +392,7 @@ impl PlanStreamController {
 
     fn emit(
         &mut self,
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         include_bottom_padding: bool,
     ) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() && !include_bottom_padding {
@@ -402,18 +407,18 @@ impl PlanStreamController {
             self.header_emitted = true;
         }
 
-        let mut plan_lines: Vec<Line<'static>> = Vec::with_capacity(4);
+        let mut plan_lines: Vec<HyperlinkLine> = Vec::with_capacity(/*capacity*/ 4);
         if !self.top_padding_emitted {
             plan_lines.push(Line::from(" "));
             self.top_padding_emitted = true;
         }
         plan_lines.extend(lines);
         if include_bottom_padding {
-            plan_lines.push(Line::from(" "));
+            plan_lines.push(HyperlinkLine::new(Line::from(" ")));
         }
 
         let plan_style = proposed_plan_style();
-        let plan_lines = prefix_lines(plan_lines, "  ".into(), "  ".into())
+        let plan_lines = prefix_hyperlink_lines(plan_lines, "  ".into(), "  ".into())
             .into_iter()
             .map(|line| line.style(plan_style))
             .collect::<Vec<_>>();
@@ -429,6 +434,7 @@ impl PlanStreamController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_hyperlinks::visible_lines;
     use pretty_assertions::assert_eq;
 
     fn test_cwd() -> PathBuf {
@@ -453,6 +459,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn hyperlink_lines_to_plain_strings(lines: &[HyperlinkLine]) -> Vec<String> {
+        lines_to_plain_strings(&visible_lines(lines.to_vec()))
     }
 
     fn collect_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {

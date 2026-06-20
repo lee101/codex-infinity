@@ -29,11 +29,11 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ConfiguredToolSpec;
 use codex_tools::ToolName;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use codex_utils_readiness::Readiness;
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolKind {
@@ -183,6 +183,10 @@ where
 
     fn is_mutating<'a>(&'a self, invocation: &'a ToolInvocation) -> BoxFuture<'a, bool> {
         Box::pin(ToolHandler::is_mutating(self, invocation))
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.handler.waits_for_runtime_cancellation()
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -410,7 +414,7 @@ impl ToolRegistry {
             Ok((preview, success)) => (preview.clone(), *success),
             Err(err) => (err.to_string(), false),
         };
-        emit_metric_for_tool_read(&invocation, success).await;
+        emit_metric_for_tool_read(&invocation, success);
         let post_tool_use_payload = if success {
             let guard = response_cell.lock().await;
             guard
@@ -495,9 +499,28 @@ impl ToolRegistry {
         match result {
             Ok(_) => {
                 let mut guard = response_cell.lock().await;
-                let result = guard.take().ok_or_else(|| {
+                let mut result = guard.take().ok_or_else(|| {
                     FunctionCallError::Fatal("tool produced no output".to_string())
                 })?;
+                if let Some(outcome) = post_tool_use_outcome {
+                    if outcome.should_block {
+                        let message = outcome.feedback_message.unwrap_or_else(|| {
+                            "PostToolUse hook blocked the tool result".to_string()
+                        });
+                        let err = FunctionCallError::RespondToModel(message);
+                        dispatch_trace.record_failed(&err);
+                        return Err(err);
+                    }
+                    if let Some(feedback_message) = outcome.feedback_message {
+                        result.result = Box::new(PostToolUseFeedbackOutput {
+                            original: result.result,
+                            model_visible: FunctionToolOutput::from_text(
+                                feedback_message,
+                                /*success*/ None,
+                            ),
+                        });
+                    }
+                }
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,

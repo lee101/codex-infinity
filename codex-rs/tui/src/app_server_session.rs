@@ -6,8 +6,10 @@ use crate::legacy_core::message_history_metadata;
 use crate::permission_compat::legacy_compatible_permission_profile;
 use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
+use crate::terminal_visualization_instructions::with_terminal_visualization_instructions;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
+use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
@@ -38,10 +40,14 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
 use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
+use codex_app_server_protocol::ThreadDeleteParams;
+use codex_app_server_protocol::ThreadDeleteResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadGoalClearParams;
@@ -82,6 +88,8 @@ use codex_app_server_protocol::ThreadShellCommandResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
+use codex_app_server_protocol::ThreadUnarchiveParams;
+use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::Turn;
@@ -125,6 +133,7 @@ use std::path::PathBuf;
 /// fetched asynchronously after bootstrap returns so that the TUI can render
 /// its first frame without waiting for the rate-limit round-trip.
 pub(crate) struct AppServerBootstrap {
+    pub(crate) duration: Duration,
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
@@ -211,7 +220,26 @@ impl AppServerSession {
         matches!(self.client, AppServerClient::Remote(_))
     }
 
+    pub(crate) fn uses_embedded_app_server(&self) -> bool {
+        matches!(&self.client, AppServerClient::InProcess(_))
+    }
+
+    pub(crate) fn codex_home_path(
+        &self,
+        local_codex_home: &AbsolutePathBuf,
+    ) -> Option<AppServerPath> {
+        self.client.codex_home(local_codex_home)
+    }
+
+    pub(crate) fn server_version(&self) -> Option<&str> {
+        let AppServerClient::Remote(client) = &self.client else {
+            return None;
+        };
+        client.server_version()
+    }
+
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
+        let started_at = Instant::now();
         let account = self.read_account().await?;
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
@@ -277,12 +305,13 @@ impl AppServerSession {
                     true,
                 )
             }
-            Some(Account::AmazonBedrock {}) => {
+            Some(Account::AmazonBedrock { .. }) => {
                 (None, None, None, None, FeedbackAudience::External, false)
             }
             None => (None, None, None, None, FeedbackAudience::External, false),
         };
         Ok(AppServerBootstrap {
+            duration: started_at.elapsed(),
             account_email,
             auth_mode,
             status_account_display,
@@ -320,21 +349,48 @@ impl AppServerSession {
         self.client
             .request_typed(ClientRequest::ExternalAgentConfigDetect { request_id, params })
             .await
-            .wrap_err("externalAgentConfig/detect failed during TUI startup")
+            .wrap_err("externalAgentConfig/detect failed during Claude Code import")
     }
 
     pub(crate) async fn external_agent_config_import(
         &mut self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
-    ) -> Result<ExternalAgentConfigImportResponse> {
+    ) -> Result<()> {
+        // Mark the import active before sending the request so a fast completion notification
+        // cannot arrive before the TUI records it.
+        if self
+            .external_agent_config_import_completion_pending
+            .swap(true, Ordering::Relaxed)
+        {
+            color_eyre::eyre::bail!(EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE);
+        }
         let request_id = self.next_request_id();
-        self.client
+        let response: Result<ExternalAgentConfigImportResponse> = self
+            .client
             .request_typed(ClientRequest::ExternalAgentConfigImport {
                 request_id,
                 params: ExternalAgentConfigImportParams { migration_items },
             })
             .await
-            .wrap_err("externalAgentConfig/import failed during TUI startup")
+            .wrap_err("externalAgentConfig/import failed during Claude Code import");
+        match response {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.external_agent_config_import_completion_pending
+                    .store(false, Ordering::Relaxed);
+                Err(err)
+            }
+        }
+    }
+
+    pub(crate) fn external_agent_config_import_in_progress(&self) -> bool {
+        self.external_agent_config_import_completion_pending
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn consume_external_agent_config_import_completion(&self) -> bool {
+        self.external_agent_config_import_completion_pending
+            .swap(false, Ordering::Relaxed)
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
@@ -569,6 +625,7 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     input: items.into_iter().map(Into::into).collect(),
                     responsesapi_client_metadata: None,
+                    additional_context: None,
                     environments: None,
                     cwd: Some(cwd),
                     approval_policy: Some(approval_policy.into()),
@@ -592,7 +649,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         turn_id: String,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), TypedRequestError> {
         let request_id = self.next_request_id();
         let _: TurnInterruptResponse = self
             .client
@@ -603,12 +660,14 @@ impl AppServerSession {
                     turn_id,
                 },
             })
-            .await
-            .wrap_err("turn/interrupt failed in TUI")?;
+            .await?;
         Ok(())
     }
 
-    pub(crate) async fn startup_interrupt(&mut self, thread_id: ThreadId) -> Result<()> {
+    pub(crate) async fn startup_interrupt(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> std::result::Result<(), TypedRequestError> {
         self.turn_interrupt(thread_id, String::new()).await
     }
 
@@ -626,6 +685,7 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     input: items.into_iter().map(Into::into).collect(),
                     responsesapi_client_metadata: None,
+                    additional_context: None,
                     expected_turn_id: turn_id,
                 },
             })
@@ -1032,10 +1092,12 @@ pub(crate) fn status_account_display_from_auth_mode(
         Some(AuthMode::ApiKey) => Some(StatusAccountDisplay::ApiKey),
         Some(AuthMode::Chatgpt)
         | Some(AuthMode::ChatgptAuthTokens)
-        | Some(AuthMode::AgentIdentity) => Some(StatusAccountDisplay::ChatGpt {
+        | Some(AuthMode::AgentIdentity)
+        | Some(AuthMode::PersonalAccessToken) => Some(StatusAccountDisplay::ChatGpt {
             email: None,
             plan: plan_type.map(plan_type_display_name),
         }),
+        Some(AuthMode::BedrockApiKey) => None,
         None => None,
     }
 }
@@ -1045,7 +1107,6 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
         let upgrade_info = model.upgrade_info.clone();
         ModelUpgrade {
             id: upgrade_id,
-            reasoning_effort_mapping: None,
             migration_config_key: model.model.clone(),
             model_link: upgrade_info
                 .as_ref()
@@ -1228,7 +1289,10 @@ fn thread_fork_params_from_config(
         permission_profile,
         config: config_request_overrides_from_config(&config),
         base_instructions: config.base_instructions.clone(),
-        developer_instructions: config.developer_instructions.clone(),
+        developer_instructions: with_terminal_visualization_instructions(
+            &config,
+            config.developer_instructions.clone(),
+        ),
         ephemeral: config.ephemeral,
         persist_extended_history: true,
         ..ThreadForkParams::default()
@@ -1313,7 +1377,7 @@ async fn thread_session_state_from_thread_start_response(
             }),
         response.cwd.clone(),
         response.instruction_sources.clone(),
-        response.reasoning_effort,
+        response.reasoning_effort.clone(),
         config,
     )
     .await
@@ -1345,7 +1409,7 @@ async fn thread_session_state_from_thread_resume_response(
             }),
         response.cwd.clone(),
         response.instruction_sources.clone(),
-        response.reasoning_effort,
+        response.reasoning_effort.clone(),
         config,
     )
     .await
@@ -1377,7 +1441,7 @@ async fn thread_session_state_from_thread_fork_response(
             }),
         response.cwd.clone(),
         response.instruction_sources.clone(),
-        response.reasoning_effort,
+        response.reasoning_effort.clone(),
         config,
     )
     .await
@@ -1732,6 +1796,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_visualization_instructions_are_gated_for_all_tui_thread_flows() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.developer_instructions = Some("Developer override.".to_string());
+        let thread_id = ThreadId::new();
+
+        let control_start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+        let control_resume = thread_resume_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+        let control_fork = thread_fork_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(control_start.developer_instructions, None);
+        assert_eq!(control_resume.developer_instructions, None);
+        assert_eq!(
+            control_fork.developer_instructions.as_deref(),
+            Some("Developer override.")
+        );
+
+        let _ = config
+            .features
+            .enable(Feature::TerminalVisualizationInstructions);
+        let treatment_start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+        let treatment_resume = thread_resume_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+        let treatment_fork = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+        let expected = format!(
+            "Developer override.\n\n{}",
+            crate::terminal_visualization_instructions::TERMINAL_VISUALIZATION_INSTRUCTIONS
+        );
+
+        assert_eq!(
+            treatment_start.developer_instructions.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            treatment_resume.developer_instructions.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            treatment_fork.developer_instructions.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn resume_response_restores_turns_from_thread_items() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
@@ -1742,6 +1879,7 @@ mod tests {
             thread: codex_app_server_protocol::Thread {
                 id: thread_id.to_string(),
                 forked_from_id: Some(forked_from_id.to_string()),
+                parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
                 model_provider: "openai".to_string(),
@@ -1761,6 +1899,7 @@ mod tests {
                     items: vec![
                         codex_app_server_protocol::ThreadItem::UserMessage {
                             id: "user-1".to_string(),
+                            client_id: None,
                             content: vec![codex_app_server_protocol::UserInput::Text {
                                 text: "hello from history".to_string(),
                                 text_elements: Vec::new(),
@@ -1793,6 +1932,7 @@ mod tests {
                 .into(),
             permission_profile: Some(read_only_profile.into()),
             reasoning_effort: None,
+            initial_turns_page: None,
         };
 
         let started = started_thread_from_resume_response(response.clone(), &config)

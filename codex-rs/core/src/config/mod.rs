@@ -1,4 +1,3 @@
-use crate::agents_md::AgentsMdManager;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::path_utils::normalize_for_native_workdir;
@@ -7,7 +6,7 @@ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
 use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
-use codex_config::CloudRequirementsLoader;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
@@ -65,6 +64,9 @@ use codex_features::MultiAgentV2ConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_login::AuthManagerConfig;
 use codex_mcp::McpConfig;
+use codex_mcp::McpPluginAttribution;
+use codex_mcp::McpServerRegistration;
+use codex_mcp::ResolvedMcpCatalog;
 use codex_memories_read::memory_root;
 use codex_model_provider_info::GEMINI_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
@@ -95,7 +97,9 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SandboxPolicy;
+pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::Deserialize;
@@ -118,6 +122,7 @@ use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
 pub(crate) mod agent_roles;
+mod auth_keyring;
 pub mod edit;
 mod managed_features;
 mod network_proxy_spec;
@@ -415,9 +420,6 @@ pub struct Config {
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: bool,
 
-    /// User-provided instructions from AGENTS.md.
-    pub user_instructions: Option<String>,
-
     /// Base instructions override.
     pub base_instructions: Option<String>,
 
@@ -569,7 +571,7 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
-    /// Maximum number of agent threads that can be open concurrently.
+    /// User-configured maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
     /// Maximum runtime in seconds for agent job workers before they are failed.
     pub agent_job_max_runtime_seconds: Option<u64>,
@@ -662,6 +664,9 @@ pub struct Config {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Overrides only the WebRTC realtime call
+    /// creation base URL.
+    pub experimental_realtime_webrtc_call_base_url: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -703,6 +708,12 @@ pub struct Config {
 
     /// Additional parameters for the web search tool when it is enabled.
     pub web_search_config: Option<WebSearchConfig>,
+
+    /// Whether to register the experimental request_user_input tool.
+    pub experimental_request_user_input_enabled: bool,
+
+    /// Configuration for the experimental code-mode tool surface.
+    pub code_mode: CodeModeConfig,
 
     /// If set to `true`, used only the experimental unified exec tool.
     pub use_experimental_unified_exec_tool: bool,
@@ -773,11 +784,10 @@ pub struct MultiAgentV2Config {
     pub hide_spawn_agent_metadata: bool,
 }
 
-impl Default for MultiAgentV2Config {
-    fn default() -> Self {
+impl MultiAgentV2Config {
+    fn defaults_for_max_concurrency(max_concurrent_threads_per_session: usize) -> Self {
         Self {
-            max_concurrent_threads_per_session:
-                DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            max_concurrent_threads_per_session,
             min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
             usage_hint_enabled: true,
             usage_hint_text: None,
@@ -785,6 +795,14 @@ impl Default for MultiAgentV2Config {
             subagent_usage_hint_text: None,
             hide_spawn_agent_metadata: false,
         }
+    }
+}
+
+impl Default for MultiAgentV2Config {
+    fn default() -> Self {
+        Self::defaults_for_max_concurrency(
+            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )
     }
 }
 
@@ -948,6 +966,43 @@ impl ConfigBuilder {
 }
 
 impl Config {
+    pub(crate) fn multi_agent_version_from_features(&self) -> MultiAgentVersion {
+        if self.features.enabled(Feature::MultiAgentV2) {
+            MultiAgentVersion::V2
+        } else if self.features.enabled(Feature::Collab) {
+            MultiAgentVersion::V1
+        } else {
+            MultiAgentVersion::Disabled
+        }
+    }
+
+    pub(crate) fn validate_multi_agent_v2_config(&self) -> std::io::Result<()> {
+        if self.features.enabled(Feature::MultiAgentV2) && self.agent_max_threads.is_some() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agents.max_threads cannot be set when features.multi_agent_v2 is enabled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn effective_agent_max_threads(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+    ) -> Option<usize> {
+        match multi_agent_version {
+            MultiAgentVersion::V2 => Some(
+                self.multi_agent_v2
+                    .max_concurrent_threads_per_session
+                    .saturating_sub(1),
+            ),
+            MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
+                self.agent_max_threads.or(DEFAULT_AGENT_MAX_THREADS)
+            }
+        }
+    }
+
     pub fn legacy_sandbox_policy(&self) -> SandboxPolicy {
         self.permissions.legacy_sandbox_policy(self.cwd.as_path())
     }
@@ -986,6 +1041,7 @@ impl Config {
             chatgpt_base_url: self.chatgpt_base_url.clone(),
             codex_home: self.codex_home.to_path_buf(),
             mcp_oauth_credentials_store_mode: self.mcp_oauth_credentials_store_mode,
+            auth_keyring_backend_kind: self.auth_keyring_backend_kind(),
             mcp_oauth_callback_port: self.mcp_oauth_callback_port,
             mcp_oauth_callback_url: self.mcp_oauth_callback_url.clone(),
             skill_mcp_dependency_install_enabled: self
@@ -1108,7 +1164,10 @@ pub async fn load_config_as_toml_with_cli_and_loader_overrides(
         e
     })?;
 
-    Ok(cfg)
+    Ok(ConfigTomlLoadResult {
+        config_toml: cfg,
+        config_layer_stack,
+    })
 }
 
 pub fn deserialize_config_toml_with_base(
@@ -1278,7 +1337,6 @@ pub async fn load_global_mcp_servers(
         cwd,
         &cli_overrides,
         LoaderOverrides::default(),
-        CloudRequirementsLoader::default(),
         &codex_config::NoopThreadConfigLoader,
     )
     .await?;
@@ -1424,6 +1482,12 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomPermissionProfileSummary {
+    pub id: String,
+    pub description: Option<String>,
 }
 
 fn resolve_tool_suggest_config(
@@ -1788,8 +1852,19 @@ fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalRe
     }
 }
 
-fn multi_agent_v2_toml_config(features: Option<&FeaturesToml>) -> Option<&MultiAgentV2ConfigToml> {
-    match features?.multi_agent_v2.as_ref()? {
+fn resolve_optional_prompt_text(
+    configured: Option<&Option<String>>,
+    default: Option<String>,
+) -> Option<String> {
+    match configured {
+        Some(Some(value)) if value.is_empty() => None,
+        Some(Some(value)) => Some(value.clone()),
+        Some(None) | None => default,
+    }
+}
+
+fn code_mode_toml_config(features: Option<&FeaturesToml>) -> Option<&CodeModeConfigToml> {
+    match features?.code_mode.as_ref()? {
         FeatureToml::Enabled(_) => None,
         FeatureToml::Config(config) => Some(config),
     }
@@ -1903,6 +1978,7 @@ impl Config {
             approval_policy: mut constrained_approval_policy,
             approvals_reviewer: mut constrained_approvals_reviewer,
             permission_profile: mut constrained_permission_profile,
+            windows_sandbox_mode: mut constrained_windows_sandbox_mode,
             web_search_mode: mut constrained_web_search_mode,
             feature_requirements,
             managed_hooks: _,
@@ -2054,11 +2130,12 @@ impl Config {
             ));
         }
 
-        let windows_sandbox_level = match windows_sandbox_mode {
+        let windows_sandbox_level = match effective_windows_sandbox_mode {
             Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
             Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
-            None => WindowsSandboxLevel::from_features(&features),
+            None => WindowsSandboxLevel::Disabled,
         };
+        let memories_config: MemoriesConfig = cfg.memories.clone().unwrap_or_default().into();
         let memories_root = memory_root(&codex_home);
         std::fs::create_dir_all(&memories_root)?;
         if !additional_writable_roots
@@ -2206,7 +2283,7 @@ impl Config {
                 );
                 permission_profile = PermissionProfile::read_only();
             }
-            let (mut file_system_sandbox_policy, network_sandbox_policy) =
+            let (file_system_sandbox_policy, _network_sandbox_policy) =
                 permission_profile.to_runtime_permissions();
             // `additional_writable_roots` is a legacy workspace-write knob. It
             // only applies when the derived managed profile has workspace-style
@@ -2657,6 +2734,9 @@ impl Config {
             zsh_path.as_ref(),
             main_execve_wrapper_exe.as_ref(),
         );
+        if features.enabled(Feature::MemoryTool) && memories_config.use_memories {
+            helper_readable_roots.push(memories_root);
+        }
         let effective_permission_profile = constrained_permission_profile.value.get().clone();
         let (mut effective_file_system_sandbox_policy, effective_network_sandbox_policy) =
             effective_permission_profile.to_runtime_permissions();
@@ -2708,7 +2788,6 @@ impl Config {
             approvals_reviewer: constrained_approvals_reviewer.value(),
             enforce_residency: enforce_residency.value,
             notify: cfg.notify,
-            user_instructions,
             base_instructions,
             personality,
             developer_instructions,
@@ -2752,7 +2831,7 @@ impl Config {
             agent_max_threads,
             agent_max_depth,
             agent_roles,
-            memories: cfg.memories.unwrap_or_default().into(),
+            memories: memories_config,
             agent_job_max_runtime_seconds,
             agent_interrupt_message_enabled,
             codex_home,
@@ -2796,12 +2875,15 @@ impl Config {
                     speaker: audio.speaker,
                 }),
             experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
+            experimental_realtime_webrtc_call_base_url: cfg
+                .experimental_realtime_webrtc_call_base_url,
             experimental_realtime_ws_model: cfg.experimental_realtime_ws_model,
             realtime: cfg
                 .realtime
                 .map_or_else(RealtimeConfig::default, |realtime| {
                     let defaults = RealtimeConfig::default();
                     RealtimeConfig {
+                        architecture: realtime.architecture.unwrap_or(defaults.architecture),
                         version: realtime.version.unwrap_or(defaults.version),
                         session_type: realtime.session_type.unwrap_or(defaults.session_type),
                         transport: realtime.transport.unwrap_or(defaults.transport),
@@ -2821,6 +2903,8 @@ impl Config {
             include_apply_patch_tool: include_apply_patch_tool_flag,
             web_search_mode: constrained_web_search_mode.value,
             web_search_config,
+            experimental_request_user_input_enabled,
+            code_mode,
             use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
             ghost_snapshot,
@@ -2907,8 +2991,9 @@ impl Config {
             return Ok(None);
         };
 
+        let path_uri = PathUri::from_abs_path(path);
         let contents = fs
-            .read_file_text(path, /*sandbox*/ None)
+            .read_file_text(&path_uri, /*sandbox*/ None)
             .await
             .map_err(|e| {
                 std::io::Error::new(

@@ -150,6 +150,7 @@ fn filter_tool_suggest_discoverable_tools_for_codex_tui_omits_plugins() {
         })),
         DiscoverableTool::Plugin(Box::new(DiscoverablePluginInfo {
             id: "slack@openai-curated".to_string(),
+            remote_plugin_id: None,
             name: "Slack".to_string(),
             description: Some("Search Slack messages".to_string()),
             has_skills: true,

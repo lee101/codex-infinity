@@ -24,6 +24,7 @@ pub(crate) enum StatusSurfacePreviewItem {
     FastMode,
     Model,
     ModelWithReasoning,
+    Reasoning,
     TaskProgress,
 }
 
@@ -50,6 +51,7 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::FastMode => "Fast on",
             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
+            StatusSurfacePreviewItem::Reasoning => "medium",
             StatusSurfacePreviewItem::TaskProgress => "Tasks 0/0",
         }
     }
@@ -76,6 +78,7 @@ impl StatusSurfacePreviewItem {
             Self::FastMode,
             Self::Model,
             Self::ModelWithReasoning,
+            Self::Reasoning,
             Self::TaskProgress,
         ]
         .into_iter()

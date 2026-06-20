@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app_event_sender::AppEventSender;
 use crate::exec_cell::spinner;
 use crate::key_hint;
+use crate::key_hint::KeyBinding;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::capitalize_first;
@@ -47,6 +48,7 @@ pub(crate) struct StatusIndicatorWidget {
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
     show_interrupt_hint: bool,
+    interrupt_binding: Option<KeyBinding>,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
@@ -84,6 +86,7 @@ impl StatusIndicatorWidget {
             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
             inline_message: None,
             show_interrupt_hint: true,
+            interrupt_binding: Some(key_hint::plain(KeyCode::Esc)),
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
             is_paused: false,
@@ -94,7 +97,8 @@ impl StatusIndicatorWidget {
     }
 
     pub(crate) fn interrupt(&self) {
-        self.app_event_tx.interrupt();
+        self.app_event_tx
+            .interrupt_and_restore_prompt_if_no_output();
     }
 
     /// Update the animated header label (left of the brackets).
@@ -121,7 +125,7 @@ impl StatusIndicatorWidget {
             });
     }
 
-    /// Update the inline suffix text shown after `({elapsed} • esc to interrupt)`.
+    /// Update the inline suffix text shown after the elapsed/interrupt hint.
     ///
     /// Callers should provide plain, already-contextualized text. Passing
     /// verbose status prose here can cause frequent width truncation and hide
@@ -267,7 +271,7 @@ impl Renderable for StatusIndicatorWidget {
         if self.show_interrupt_hint {
             spans.extend(vec![
                 format!("({pretty_elapsed} • ").dim(),
-                key_hint::plain(KeyCode::Esc).into(),
+                interrupt_binding.into(),
                 " to interrupt)".dim(),
             ]);
         } else {

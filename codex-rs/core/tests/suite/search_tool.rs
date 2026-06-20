@@ -1,5 +1,5 @@
 #![cfg(not(target_os = "windows"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
@@ -9,6 +9,9 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -19,6 +22,7 @@ use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::AppsTestToolLoading;
 use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_MCP_APP_RESOURCE_URI;
 use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_RESOURCE_URI;
 use core_test_support::responses::ResponsesRequest;
@@ -36,6 +40,7 @@ use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -185,7 +190,7 @@ async fn search_tool_enabled_by_default_adds_tool_search() -> Result<()> {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query for deferred tools."},
-                    "limit": {"type": "number", "description": "Maximum number of tools to return (defaults to 8)."},
+                    "limit": {"type": "number", "description": "Maximum number of tools to return. Defaults to 8."},
                 },
                 "required": ["query"],
                 "additionalProperties": false,
@@ -502,7 +507,6 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     let test = builder.build(&server).await?;
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "Find the calendar create tool".to_string(),
                 text_elements: Vec::new(),
@@ -779,23 +783,24 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         "required": ["mode"],
         "additionalProperties": false,
     });
-    let dynamic_tool = DynamicToolSpec {
-        namespace: Some("codex_app".to_string()),
-        name: tool_name.to_string(),
-        description: tool_description.to_string(),
-        input_schema: input_schema.clone(),
-        defer_loading: true,
-    };
+    let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Automation tools.".to_string(),
+        tools: vec![DynamicToolNamespaceTool::Function(
+            DynamicToolFunctionSpec {
+                name: tool_name.to_string(),
+                description: tool_description.to_string(),
+                input_schema: input_schema.clone(),
+                defer_loading: true,
+            },
+        )],
+    });
 
     let mut builder = test_codex().with_config(configure_search_capable_model);
     let base_test = builder.build(&server).await?;
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![dynamic_tool],
-            /*persist_extended_history*/ false,
-        )
+        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
         .await?;
     let mut test = base_test;
     test.codex = new_thread.thread;
@@ -803,7 +808,6 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
 
     test.codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "Use the automation tool".to_string(),
                 text_elements: Vec::new(),
@@ -864,7 +868,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         vec![json!({
             "type": "namespace",
             "name": "codex_app",
-            "description": "Tools in the codex_app namespace.",
+            "description": "Automation tools.",
             "tools": [{
                 "type": "function",
                 "name": tool_name,
@@ -977,6 +981,7 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
                 .expect("test mcp servers should accept any configuration");
         });
     let test = builder.build(&server).await?;
+    wait_for_mcp_server(&test.codex, "rmcp").await?;
 
     test.submit_turn_with_approval_and_permission_profile(
         "Find the rmcp echo and image tools.",
@@ -1002,13 +1007,13 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
         "non-app MCP tools should be hidden before search in large-search mode: {first_request_tools:?}"
     );
     assert!(
-        !first_request_tools.iter().any(|name| name == "mcp__rmcp__"),
+        !first_request_tools.iter().any(|name| name == "mcp__rmcp"),
         "non-app MCP namespace should be hidden before search in large-search mode: {first_request_tools:?}"
     );
 
     let echo_tools = tool_search_output_tools(&requests[1], echo_call_id);
     let echo_output = json!({ "tools": echo_tools });
-    let rmcp_echo_tool = namespace_child_tool(&echo_output, "mcp__rmcp__", "echo")
+    let rmcp_echo_tool = namespace_child_tool(&echo_output, "mcp__rmcp", "echo")
         .expect("tool_search should return rmcp echo as a namespace child tool");
     assert_eq!(
         rmcp_echo_tool.get("type").and_then(Value::as_str),
@@ -1018,7 +1023,7 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
     let image_tools = tool_search_output_tools(&requests[1], image_call_id);
     let found_rmcp_image_tool = image_tools
         .iter()
-        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some("mcp__rmcp__"))
+        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some("mcp__rmcp"))
         .flat_map(|namespace| namespace.get("tools").and_then(Value::as_array))
         .flatten()
         .any(|tool| tool.get("name").and_then(Value::as_str).is_some());

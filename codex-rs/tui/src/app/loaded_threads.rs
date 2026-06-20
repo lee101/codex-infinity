@@ -28,6 +28,7 @@ pub(crate) struct LoadedSubagentThread {
     pub(crate) thread_id: ThreadId,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+    pub(crate) agent_path: Option<String>,
 }
 
 /// Walks the spawn tree rooted at `primary_thread_id` and returns every descendant subagent.
@@ -89,6 +90,7 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
                     thread_id,
                     agent_nickname: thread.agent_nickname,
                     agent_role: thread.agent_role,
+                    agent_path: thread_spawn_agent_path(&thread.source),
                 })
         })
         .collect();
@@ -113,6 +115,7 @@ mod tests {
         Thread {
             id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
             model_provider: "openai".to_string(),
@@ -198,11 +201,13 @@ mod tests {
                     thread_id: child_thread_id,
                     agent_nickname: Some("Scout".to_string()),
                     agent_role: Some("explorer".to_string()),
+                    agent_path: None,
                 },
                 LoadedSubagentThread {
                     thread_id: grandchild_thread_id,
                     agent_nickname: Some("Atlas".to_string()),
                     agent_role: Some("worker".to_string()),
+                    agent_path: None,
                 },
             ]
         );

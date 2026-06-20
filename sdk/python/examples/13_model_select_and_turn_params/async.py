@@ -108,7 +108,7 @@ async def main() -> None:
             model=selected_model.model,
             output_schema=OUTPUT_SCHEMA,
             personality=Personality.pragmatic,
-            sandbox_policy=SANDBOX_POLICY,
+            sandbox=Sandbox.read_only,
             summary=ReasoningSummary.model_validate("concise"),
         )
         second = await second_turn.run()

@@ -30,14 +30,15 @@ pub fn create_create_goal_tool() -> ToolSpec {
         (
             "objective".to_string(),
             JsonSchema::string(Some(
-                "Required. The concrete objective to start pursuing. This starts a new active goal only when no goal is currently defined; if a goal already exists, this tool fails."
+                "Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete."
                     .to_string(),
             )),
         ),
         (
             "token_budget".to_string(),
             JsonSchema::integer(Some(
-                "Optional positive token budget for the new active goal.".to_string(),
+                "Positive token budget for the new goal. Omit unless explicitly requested."
+                    .to_string(),
             )),
         ),
     ]);
@@ -46,7 +47,7 @@ pub fn create_create_goal_tool() -> ToolSpec {
         name: CREATE_GOAL_TOOL_NAME.to_string(),
         description: format!(
             r#"Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.
-Set token_budget only when an explicit token budget is requested. Fails if a goal exists; use {UPDATE_GOAL_TOOL_NAME} only for status."#
+Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use {UPDATE_GOAL_TOOL_NAME} only for status."#
         ),
         strict: false,
         defer_loading: None,
@@ -77,7 +78,7 @@ pub fn create_update_goal_tool() -> ToolSpec {
 Use this tool only to mark the goal achieved.
 Set status to `complete` only when the objective has actually been achieved and no required work remains.
 Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
-You cannot use this tool to pause, resume, or budget-limit a goal; those status changes are controlled by the user or system.
+You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
 When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user."#
             .to_string(),
         strict: false,

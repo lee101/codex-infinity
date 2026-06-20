@@ -103,7 +103,7 @@ impl ToolHandler for Handler {
                         .send_event(
                             &turn,
                             CollabWaitingEndEvent {
-                                sender_thread_id: session.conversation_id,
+                                sender_thread_id: session.thread_id,
                                 call_id: call_id.clone(),
                                 agent_statuses: build_wait_agent_statuses(
                                     &statuses,
@@ -171,7 +171,7 @@ impl ToolHandler for Handler {
             .send_event(
                 &turn,
                 CollabWaitingEndEvent {
-                    sender_thread_id: session.conversation_id,
+                    sender_thread_id: session.thread_id,
                     call_id,
                     agent_statuses,
                     statuses: statuses_by_id,

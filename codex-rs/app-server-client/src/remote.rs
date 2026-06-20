@@ -103,7 +103,7 @@ pub(crate) fn websocket_url_supports_auth_token(url: &Url) -> bool {
 
 enum RemoteClientCommand {
     Request {
-        request: Box<ClientRequest>,
+        request: Box<JSONRPCRequest>,
         response_tx: oneshot::Sender<IoResult<RequestResult>>,
     },
     Notify {
@@ -129,6 +129,8 @@ pub struct RemoteAppServerClient {
     command_tx: mpsc::Sender<RemoteClientCommand>,
     event_rx: mpsc::UnboundedReceiver<AppServerEvent>,
     pending_events: VecDeque<AppServerEvent>,
+    server_version: Option<String>,
+    codex_home: Option<String>,
     worker_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -199,7 +201,7 @@ impl RemoteAppServerClient {
             ))
         })?;
         let mut stream = stream;
-        let pending_events = initialize_remote_connection(
+        let (pending_events, server_version, codex_home) = initialize_remote_connection(
             &mut stream,
             &websocket_url,
             args.initialize_params(),
@@ -222,7 +224,7 @@ impl RemoteAppServerClient {
                         };
                         match command {
                             RemoteClientCommand::Request { request, response_tx } => {
-                                let request_id = request_id_from_client_request(&request);
+                                let request_id = request.id.clone();
                                 if pending_requests.contains_key(&request_id) {
                                     let _ = response_tx.send(Err(IoError::new(
                                         ErrorKind::InvalidInput,
@@ -471,6 +473,8 @@ impl RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: pending_events.into(),
+            server_version,
+            codex_home,
             worker_handle,
         })
     }
@@ -482,25 +486,7 @@ impl RemoteAppServerClient {
     }
 
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(RemoteClientCommand::Request {
-                request: Box::new(request),
-                response_tx,
-            })
-            .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "remote app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "remote app-server request channel is closed",
-            )
-        })?
+        self.request_handle().request(request).await
     }
 
     pub async fn request_typed<T>(&self, request: ClientRequest) -> Result<T, TypedRequestError>
@@ -611,6 +597,8 @@ impl RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: _pending_events,
+            server_version: _server_version,
+            codex_home: _codex_home,
             worker_handle,
         } = self;
         let mut worker_handle = worker_handle;
@@ -635,6 +623,11 @@ impl RemoteAppServerClient {
 
 impl RemoteAppServerRequestHandle {
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
+        self.request_json_rpc(jsonrpc_request_from_client_request(request))
+            .await
+    }
+
+    pub async fn request_json_rpc(&self, request: JSONRPCRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::Request {
@@ -685,6 +678,8 @@ async fn initialize_remote_connection(
 ) -> IoResult<Vec<AppServerEvent>> {
     let initialize_request_id = RequestId::String("initialize".to_string());
     let mut pending_events = Vec::new();
+    let mut server_version = None;
+    let mut codex_home = None;
     write_jsonrpc_message(
         stream,
         JSONRPCMessage::Request(jsonrpc_request_from_client_request(
@@ -708,6 +703,20 @@ async fn initialize_remote_connection(
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
+                            server_version = response
+                                .result
+                                .get("userAgent")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|user_agent| {
+                                    let (_, rest) = user_agent.split_once('/')?;
+                                    rest.split_whitespace().next().map(str::to_string)
+                                });
+                            codex_home = response
+                                .result
+                                .get("codexHome")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|codex_home| !codex_home.is_empty())
+                                .map(str::to_string);
                             break Ok(());
                         }
                         JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
@@ -799,7 +808,7 @@ async fn initialize_remote_connection(
     )
     .await?;
 
-    Ok(pending_events)
+    Ok((pending_events, server_version, codex_home))
 }
 
 fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
@@ -819,10 +828,6 @@ fn deliver_event(
             "remote app-server event consumer channel is closed",
         )
     })
-}
-
-fn request_id_from_client_request(request: &ClientRequest) -> RequestId {
-    jsonrpc_request_from_client_request(request.clone()).id
 }
 
 fn jsonrpc_request_from_client_request(request: ClientRequest) -> JSONRPCRequest {
@@ -879,6 +884,8 @@ mod tests {
             command_tx,
             event_rx,
             pending_events: VecDeque::new(),
+            server_version: None,
+            codex_home: None,
             worker_handle,
         };
 

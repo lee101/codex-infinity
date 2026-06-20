@@ -3,6 +3,8 @@ use super::windows_common::make_runner_resizer;
 use super::windows_common::start_runner_pipe_writer;
 use super::windows_common::start_runner_stdin_writer;
 use super::windows_common::start_runner_stdout_reader;
+use crate::identity::SandboxCreds;
+use crate::identity::refresh_logon_sandbox_creds;
 use crate::ipc_framed::EmptyPayload;
 use crate::ipc_framed::FramedMessage;
 use crate::ipc_framed::Message;
@@ -18,6 +20,26 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+async fn spawn_runner_transport_task(
+    codex_home: PathBuf,
+    cwd: PathBuf,
+    sandbox_creds: SandboxCreds,
+    logs_base_dir: Option<PathBuf>,
+    spawn_request: SpawnRequest,
+) -> Result<RunnerTransport> {
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        spawn_runner_transport(
+            &codex_home,
+            &cwd,
+            &sandbox_creds,
+            logs_base_dir.as_deref(),
+            spawn_request,
+        )
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))?
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_windows_sandbox_session_elevated(
     policy_json_or_preset: &str,
@@ -26,6 +48,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated(
     command: Vec<String>,
     cwd: &Path,
     mut env_map: HashMap<String, String>,
+    proxy_enforced: bool,
     timeout_ms: Option<u64>,
     tty: bool,
     stdin_open: bool,
@@ -66,7 +89,32 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated(
         Ok(transport)
     })
     .await
-    .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))??;
+    {
+        Ok(transport) => transport,
+        Err(err) if is_stale_sandbox_creds_error(&err) => {
+            let sandbox_creds = refresh_logon_sandbox_creds(
+                &permissions,
+                &cwd,
+                &env_map,
+                &codex_home,
+                read_roots_override,
+                read_roots_include_platform_defaults,
+                write_roots_override,
+                &deny_read_paths_override,
+                &deny_write_paths_override,
+                /*proxy_enforced*/ false,
+            )?;
+            spawn_runner_transport_task(
+                codex_home,
+                cwd,
+                sandbox_creds,
+                logs_base_dir,
+                spawn_request,
+            )
+            .await?
+        }
+        Err(err) => return Err(err),
+    };
     let (pipe_write, pipe_read) = transport.into_files();
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);

@@ -29,8 +29,11 @@ pub enum SlashCommand {
     Review,
     Rename,
     New,
+    Archive,
+    Delete,
     Resume,
     Fork,
+    App,
     Init,
     Compact,
     Plan,
@@ -43,6 +46,7 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    Usage,
     DebugConfig,
     Title,
     Statusline,
@@ -60,8 +64,6 @@ pub enum SlashCommand {
     Stop,
     Clear,
     Personality,
-    Realtime,
-    Settings,
     TestApproval,
     #[strum(serialize = "subagents")]
     MultiAgents,
@@ -83,6 +85,8 @@ impl SlashCommand {
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Archive => "archive this session and exit",
+            SlashCommand::Delete => "permanently delete this session and exit",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
             // SlashCommand::Undo => "ask Codex to undo a turn",
@@ -92,6 +96,7 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Usage => "view account usage or use a rate-limit reset",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
@@ -105,8 +110,6 @@ impl SlashCommand {
                 "toggle Fast mode to enable fastest inference with increased plan usage"
             }
             SlashCommand::Personality => "choose a communication style for Codex",
-            SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
-            SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Collab => "change collaboration mode (experimental)",
@@ -165,6 +168,8 @@ impl SlashCommand {
     pub fn available_during_task(self) -> bool {
         match self {
             SlashCommand::New
+            | SlashCommand::Archive
+            | SlashCommand::Delete
             | SlashCommand::Resume
             | SlashCommand::Fork
             | SlashCommand::Init
@@ -179,6 +184,7 @@ impl SlashCommand {
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
             | SlashCommand::Memories
+            | SlashCommand::Import
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Clear
@@ -192,9 +198,11 @@ impl SlashCommand {
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::Usage
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
+            | SlashCommand::App
             | SlashCommand::Goal
             | SlashCommand::Mcp
             | SlashCommand::Apps
@@ -220,6 +228,7 @@ impl SlashCommand {
         match self {
             SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
             SlashCommand::Copy => !cfg!(target_os = "android"),
+            SlashCommand::App => cfg!(any(target_os = "macos", target_os = "windows")),
             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
             _ => true,
         }

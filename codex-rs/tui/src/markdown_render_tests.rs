@@ -1,4 +1,5 @@
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -7,8 +8,10 @@ use std::path::Path;
 
 use crate::markdown_render::COLON_LOCATION_SUFFIX_RE;
 use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
+use crate::markdown_render::render_markdown_lines_with_width_and_cwd;
 use crate::markdown_render::render_markdown_text;
 use crate::markdown_render::render_markdown_text_with_width_and_cwd;
+use insta::assert_debug_snapshot;
 use insta::assert_snapshot;
 
 fn render_markdown_text_for_cwd(input: &str, cwd: &Path) -> Text<'static> {
@@ -25,6 +28,92 @@ fn plain_lines(text: &Text<'_>) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+#[test]
+fn bare_url_with_tilde_keeps_complete_hyperlink() {
+    let destination =
+        "https://www.cs.tufts.edu/~nr/cs257/archive/olin-shivers/dissertation.pdf";
+    let lines = render_markdown_lines_with_width_and_cwd(
+        destination,
+        /*width*/ Some(80),
+        /*cwd*/ None,
+    );
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            let text = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let hyperlinks = line
+                .hyperlinks
+                .iter()
+                .map(|link| (link.columns.clone(), link.destination.as_str()))
+                .collect::<Vec<_>>();
+            (text, hyperlinks)
+        })
+        .collect::<Vec<_>>();
+
+    assert_debug_snapshot!(rendered);
+}
+
+#[test]
+fn table_url_with_tilde_keeps_complete_hyperlink() {
+    let destination =
+        "https://www.cs.tufts.edu/~nr/cs257/archive/olin-shivers/dissertation.pdf";
+    let markdown = format!("| URL |\n| --- |\n| {destination} |\n");
+    let lines = render_markdown_lines_with_width_and_cwd(
+        &markdown,
+        /*width*/ Some(32),
+        /*cwd*/ None,
+    );
+    let destinations = lines
+        .iter()
+        .flat_map(|line| line.hyperlinks.iter())
+        .map(|link| link.destination.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(!destinations.is_empty());
+    assert_eq!(destinations, vec![destination; destinations.len()]);
+}
+
+#[test]
+fn merged_text_events_preserve_entity_decoding() {
+    let source = "https://example.com/a&amp;b~c";
+    let destination = "https://example.com/a&b~c";
+    let lines = render_markdown_lines_with_width_and_cwd(
+        source,
+        /*width*/ Some(80),
+        /*cwd*/ None,
+    );
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            let text = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let hyperlinks = line
+                .hyperlinks
+                .iter()
+                .map(|link| (link.columns.clone(), link.destination.as_str()))
+                .collect::<Vec<_>>();
+            (text, hyperlinks)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rendered,
+        vec![(
+            destination.to_string(),
+            vec![(0..destination.len(), destination)],
+        )],
+    );
 }
 
 #[test]
@@ -530,6 +619,7 @@ fn nested_unordered_in_ordered() {
         Line::from_iter(["1. ".light_blue(), "Outer".into()]),
         Line::from_iter(["    - ", "Inner A"]),
         Line::from_iter(["    - ", "Inner B"]),
+        Line::default(),
         Line::from_iter(["2. ".light_blue(), "Next".into()]),
     ]);
     assert_eq!(text, expected);
@@ -543,6 +633,7 @@ fn nested_ordered_in_unordered() {
         Line::from_iter(["- ", "Outer"]),
         Line::from_iter(["    1. ".light_blue(), "One".into()]),
         Line::from_iter(["    2. ".light_blue(), "Two".into()]),
+        Line::default(),
         Line::from_iter(["- ", "Last"]),
     ]);
     assert_eq!(text, expected);
@@ -556,6 +647,7 @@ fn loose_list_item_multiple_paragraphs() {
         Line::from_iter(["1. ".light_blue(), "First paragraph".into()]),
         Line::default(),
         Line::from_iter(["   ", "Second paragraph of same item"]),
+        Line::default(),
         Line::from_iter(["2. ".light_blue(), "Next item".into()]),
     ]);
     assert_eq!(text, expected);
@@ -580,6 +672,7 @@ fn deeply_nested_mixed_three_levels() {
         Line::from_iter(["1. ".light_blue(), "A".into()]),
         Line::from_iter(["    - ", "B"]),
         Line::from_iter(["        1. ".light_blue(), "C".into()]),
+        Line::default(),
         Line::from_iter(["2. ".light_blue(), "D".into()]),
     ]);
     assert_eq!(text, expected);
@@ -1383,6 +1476,7 @@ fn nested_item_continuation_paragraph_is_indented() {
         Line::from_iter(["    - ", "B"]),
         Line::default(),
         Line::from_iter(["      ", "Continuation for B"]),
+        Line::default(),
         Line::from_iter(["2. ".light_blue(), "C".into()]),
     ]);
     assert_eq!(text, expected);

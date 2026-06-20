@@ -618,7 +618,10 @@ fn normalize_required_string(field: &str, value: String) -> Result<String, Funct
     }
 }
 
-fn serialize_function_output<T>(payload: T) -> Result<FunctionToolOutput, FunctionCallError>
+fn serialize_function_output<T>(
+    payload: T,
+    truncation_policy: TruncationPolicy,
+) -> Result<FunctionToolOutput, FunctionCallError>
 where
     T: Serialize,
 {
@@ -627,6 +630,9 @@ where
             "failed to serialize MCP resource response: {err}"
         ))
     })?;
+    // Match regular MCP tool outputs by bounding the copy persisted to the
+    // rollout and injected into model context.
+    let content = truncate_text(&content, truncation_policy * 1.2);
 
     Ok(FunctionToolOutput::from_text(content, Some(true)))
 }

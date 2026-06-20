@@ -14,6 +14,18 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _load_root_format_script_module():
+    """Load the root formatter driver so tests exercise its real command graph."""
+    script_path = ROOT.parents[1] / "scripts" / "format.py"
+    spec = importlib.util.spec_from_file_location("format_repo", script_path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Failed to load script module: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_update_script_module():
     script_path = ROOT / "scripts" / "update_sdk_artifacts.py"
     spec = importlib.util.spec_from_file_location("update_sdk_artifacts", script_path)
@@ -347,14 +359,14 @@ def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> Non
     )
 
     pyproject = (staged / "pyproject.toml").read_text()
-    assert 'platform-tag = "musllinux_1_1_x86_64"' in pyproject
+    assert 'platform-tag = "manylinux_2_17_x86_64"' in pyproject
 
 
 def test_stage_sdk_release_injects_exact_runtime_pin(tmp_path: Path) -> None:
     script = _load_update_script_module()
     staged = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
-        "rust-v0.116.0-alpha.1",
+        "0.1.0b1",
     )
 
     pyproject = (staged / "pyproject.toml").read_text()
@@ -379,20 +391,20 @@ def test_stage_sdk_release_replaces_existing_staging_dir(tmp_path: Path) -> None
     old_file.parent.mkdir(parents=True)
     old_file.write_text("stale")
 
-    staged = script.stage_python_sdk_package(staging_dir, "0.116.0a1")
+    staged = script.stage_python_sdk_package(staging_dir, "0.1.0b1")
 
     assert staged == staging_dir
     assert not old_file.exists()
 
 
-def test_staged_sdk_and_runtime_versions_match(tmp_path: Path) -> None:
+def test_sdk_beta_release_can_pin_stable_runtime(tmp_path: Path) -> None:
     script = _load_update_script_module()
     fake_binary = tmp_path / script.runtime_binary_name()
     fake_binary.write_text("fake codex\n")
 
     sdk_stage = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
-        "rust-v0.116.0-alpha.1",
+        "0.1.0b1",
     )
     runtime_stage = script.stage_python_runtime_package(
         tmp_path / "runtime-stage",
@@ -419,16 +431,16 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
         [
             "stage-sdk",
             str(tmp_path / "sdk-stage"),
-            "--codex-version",
-            "rust-v0.116.0-alpha.1",
+            "--sdk-version",
+            "0.1.0b1",
         ]
     )
 
     def fake_generate_types() -> None:
         calls.append("generate_types")
 
-    def fake_stage_sdk_package(_staging_dir: Path, codex_version: str) -> Path:
-        calls.append(f"stage_sdk:{codex_version}")
+    def fake_stage_sdk_package(_staging_dir: Path, sdk_version: str) -> Path:
+        calls.append(f"stage_sdk:{sdk_version}")
         return tmp_path / "sdk-stage"
 
     def fake_stage_runtime_package(
@@ -451,26 +463,7 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
 
     script.run_command(args, ops)
 
-    assert calls == ["generate_types", "stage_sdk:0.116.0a1"]
-
-
-def test_stage_sdk_rejects_mismatched_legacy_versions(tmp_path: Path) -> None:
-    script = _load_update_script_module()
-    args = script.parse_args(
-        [
-            "stage-sdk",
-            str(tmp_path / "sdk-stage"),
-            "--codex-version",
-            "0.116.0a1",
-            "--runtime-version",
-            "0.116.0a1",
-            "--sdk-version",
-            "0.115.0",
-        ]
-    )
-
-    with pytest.raises(RuntimeError, match="versions must match"):
-        script.run_command(args, script.default_cli_ops())
+    assert calls == ["generate_types", "stage_sdk:0.1.0b1"]
 
 
 def test_stage_runtime_stages_binary_without_type_generation(tmp_path: Path) -> None:
@@ -486,7 +479,7 @@ def test_stage_runtime_stages_binary_without_type_generation(tmp_path: Path) -> 
             "--codex-version",
             "rust-v0.116.0-alpha.1",
             "--platform-tag",
-            "musllinux_1_1_x86_64",
+            "manylinux_2_17_x86_64",
         ]
     )
 
@@ -532,7 +525,7 @@ def test_default_runtime_is_resolved_from_installed_runtime_package(
         path_exists=lambda path: path == fake_binary,
     )
 
-    config = client_module.AppServerConfig()
+    config = client_module.CodexConfig()
     assert config.codex_bin is None
     assert client_module.resolve_codex_bin(config, ops) == fake_binary
 
@@ -551,7 +544,7 @@ def test_explicit_codex_bin_override_takes_priority(tmp_path: Path) -> None:
         path_exists=lambda path: path == explicit_binary,
     )
 
-    config = client_module.AppServerConfig(codex_bin=str(explicit_binary))
+    config = client_module.CodexConfig(codex_bin=str(explicit_binary))
     assert client_module.resolve_codex_bin(config, ops) == explicit_binary
 
 
@@ -566,7 +559,7 @@ def test_missing_runtime_package_requires_explicit_codex_bin() -> None:
     )
 
     with pytest.raises(FileNotFoundError, match="missing packaged runtime"):
-        client_module.resolve_codex_bin(client_module.AppServerConfig(), ops)
+        client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
 
 
 def test_broken_runtime_package_does_not_fall_back() -> None:
@@ -580,6 +573,6 @@ def test_broken_runtime_package_does_not_fall_back() -> None:
     )
 
     with pytest.raises(FileNotFoundError) as exc_info:
-        client_module.resolve_codex_bin(client_module.AppServerConfig(), ops)
+        client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
 
     assert str(exc_info.value) == ("missing packaged binary")

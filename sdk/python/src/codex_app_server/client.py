@@ -1,10 +1,13 @@
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
+from _thread import LockType
 from collections import deque
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, TypeVar
 
@@ -20,6 +23,7 @@ from .generated.v2_all import (
     ChatgptLoginAccountResponse,
     GetAccountParams as V2GetAccountParams,
     GetAccountResponse,
+    IdleThreadStatus,
     LoginAccountParams as V2LoginAccountParams,
     LoginAccountResponse,
     LogoutAccountResponse,
@@ -28,6 +32,9 @@ from .generated.v2_all import (
     ThreadCompactStartResponse,
     ThreadForkParams as V2ThreadForkParams,
     ThreadForkResponse,
+    ThreadGoalClearResponse,
+    ThreadGoalSetResponse,
+    ThreadGoalStatus,
     ThreadListParams as V2ThreadListParams,
     ThreadListResponse,
     ThreadReadResponse,
@@ -56,6 +63,18 @@ from ._version import __version__ as SDK_VERSION
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ApprovalHandler = Callable[[str, JsonObject | None], JsonObject]
 RUNTIME_PKG_NAME = "openai-codex-cli-bin"
+_GOAL_START_TIMEOUT_S = 30.0
+
+
+@dataclass(slots=True)
+class _ThreadStartLock:
+    lock: LockType = field(default_factory=threading.Lock)
+    users: int = 0
+
+
+def _active_turn_id_from_error(exc: InvalidRequestError) -> str | None:
+    match = re.search(r" but found `?([^`]+)`?$", exc.message)
+    return match.group(1) if match is not None else None
 
 
 def _params_dict(
@@ -93,7 +112,7 @@ def _installed_codex_path() -> Path:
     except ImportError as exc:
         raise FileNotFoundError(
             "Unable to locate the pinned Codex runtime. Install the published SDK build "
-            f"with its {RUNTIME_PKG_NAME} dependency, or set AppServerConfig.codex_bin "
+            f"with its {RUNTIME_PKG_NAME} dependency, or set CodexConfig.codex_bin "
             "explicitly."
         ) from exc
 
@@ -152,12 +171,12 @@ def _default_codex_bin_resolver_ops() -> CodexBinResolverOps:
     )
 
 
-def resolve_codex_bin(config: "AppServerConfig", ops: CodexBinResolverOps) -> Path:
+def resolve_codex_bin(config: "CodexConfig", ops: CodexBinResolverOps) -> Path:
     if config.codex_bin is not None:
         codex_bin = Path(config.codex_bin)
         if not ops.path_exists(codex_bin):
             raise FileNotFoundError(
-                f"Codex binary not found at {codex_bin}. Set AppServerConfig.codex_bin "
+                f"Codex binary not found at {codex_bin}. Set CodexConfig.codex_bin "
                 "to a valid binary path."
             )
         return codex_bin
@@ -165,12 +184,18 @@ def resolve_codex_bin(config: "AppServerConfig", ops: CodexBinResolverOps) -> Pa
     return ops.installed_codex_path()
 
 
-def _resolve_codex_bin(config: "AppServerConfig") -> Path:
+def _resolve_codex_bin(config: "CodexConfig") -> Path:
     return resolve_codex_bin(config, _default_codex_bin_resolver_ops())
 
 
 @dataclass(slots=True)
-class AppServerConfig:
+class CodexConfig:
+    """Configuration for launching and identifying the local Codex runtime.
+
+    Most callers can use ``Codex()`` without configuration. Set ``codex_bin``
+    only when intentionally using a specific local Codex executable.
+    """
+
     codex_bin: str | None = None
     launch_args_override: tuple[str, ...] | None = None
     config_overrides: tuple[str, ...] = ()
@@ -182,15 +207,15 @@ class AppServerConfig:
     experimental_api: bool = True
 
 
-class AppServerClient:
+class CodexClient:
     """Synchronous typed JSON-RPC client for `codex app-server` over stdio."""
 
     def __init__(
         self,
-        config: AppServerConfig | None = None,
+        config: CodexConfig | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> None:
-        self.config = config or AppServerConfig()
+        self.config = config or CodexConfig()
         self._approval_handler = approval_handler or self._default_approval_handler
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
@@ -200,7 +225,7 @@ class AppServerClient:
         self._stderr_lines: deque[str] = deque(maxlen=400)
         self._stderr_thread: threading.Thread | None = None
 
-    def __enter__(self) -> "AppServerClient":
+    def __enter__(self) -> "CodexClient":
         self.start()
         return self
 
@@ -287,7 +312,7 @@ class AppServerClient:
     ) -> ModelT:
         result = self._request_raw(method, params)
         if not isinstance(result, dict):
-            raise AppServerError(f"{method} response must be a JSON object")
+            raise CodexError(f"{method} response must be a JSON object")
         return response_model.model_validate(result)
 
     def _request_raw(self, method: str, params: JsonObject | None = None) -> JsonValue:
@@ -402,6 +427,115 @@ class AppServerClient:
             {"threadId": thread_id},
             response_model=ThreadCompactStartResponse,
         )
+
+    def thread_goal_clear(self, thread_id: str) -> ThreadGoalClearResponse:
+        """Clear the persisted goal for a thread before replacing it."""
+        return self.request(
+            "thread/goal/clear",
+            {"threadId": thread_id},
+            response_model=ThreadGoalClearResponse,
+        )
+
+    def thread_goal_set(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None = None,
+        status: ThreadGoalStatus | None = None,
+    ) -> ThreadGoalSetResponse:
+        """Create or update the persisted goal for a thread."""
+        payload: JsonObject = {"threadId": thread_id}
+        if objective is not None:
+            payload["objective"] = objective
+        if status is not None:
+            payload["status"] = status.value
+        return self.request(
+            "thread/goal/set",
+            payload,
+            response_model=ThreadGoalSetResponse,
+        )
+
+    def pause_goal(self, thread_id: str) -> ThreadGoalSetResponse:
+        """Pause the active goal used by a logical goal turn."""
+        return self.thread_goal_set(thread_id, status=ThreadGoalStatus.paused)
+
+    def cancel_goal_operation(self, state: _GoalOperationState) -> None:
+        """Best-effort cleanup after a logical goal operation is cancelled."""
+        try:
+            self.pause_goal(state.thread_id)
+        except Exception:
+            pass
+        self._interrupt_goal_operation(state)
+
+    def _interrupt_goal_operation(self, state: _GoalOperationState) -> None:
+        turn_id = state.turn_for_interrupt()
+        if turn_id is None:
+            return
+        try:
+            self.turn_interrupt(state.thread_id, turn_id)
+        except InvalidRequestError as exc:
+            if not exc.message.startswith("expected active turn id"):
+                return
+            next_turn_id = _active_turn_id_from_error(exc) or state.current_turn()
+            if next_turn_id is None or next_turn_id == turn_id:
+                return
+            try:
+                self.turn_interrupt(state.thread_id, next_turn_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def start_goal_operation(
+        self,
+        thread_id: str,
+        objective: str,
+    ) -> tuple[_GoalOperationState, str]:
+        """Start a logical goal and wait for its runtime-generated first turn."""
+        with self._thread_start_lock(thread_id):
+            return self._start_goal_operation(thread_id, objective)
+
+    def _start_goal_operation(
+        self,
+        thread_id: str,
+        objective: str,
+    ) -> tuple[_GoalOperationState, str]:
+        thread = self.thread_read(thread_id).thread
+        if not isinstance(thread.status.root, IdleThreadStatus):
+            raise InvalidRequestError(
+                -32600,
+                f"thread must be idle before starting a goal: {thread_id}",
+            )
+        if thread.ephemeral or thread.path is None:
+            raise InvalidRequestError(
+                -32600,
+                f"thread must be persisted before starting a goal: {thread_id}",
+            )
+
+        state = self.reserve_goal_operation(thread_id)
+        activated = False
+        try:
+            self.thread_goal_clear(thread_id)
+            state.activate_turn_routing()
+            self.thread_goal_set(
+                thread_id,
+                objective=objective,
+                status=ThreadGoalStatus.active,
+            )
+            activated = True
+            turn_id = state.wait_for_start(_GOAL_START_TIMEOUT_S)
+            if turn_id is None:
+                raise CodexError(
+                    "timed out waiting for goal turn to start after "
+                    f"{int(_GOAL_START_TIMEOUT_S)} seconds"
+                )
+            return state, turn_id
+        except BaseException as exc:
+            if activated or not isinstance(exc, InvalidRequestError):
+                self.cancel_goal_operation(state)
+            state.finish()
+            self.unregister_goal_operation(state)
+            raise
 
     def turn_start(
         self,
@@ -583,28 +717,28 @@ class AppServerClient:
 
     def _write_message(self, payload: JsonObject) -> None:
         if self._proc is None or self._proc.stdin is None:
-            raise TransportClosedError("app-server is not running")
+            raise TransportClosedError("Codex process is not running")
         with self._lock:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
 
     def _read_message(self) -> dict[str, JsonValue]:
         if self._proc is None or self._proc.stdout is None:
-            raise TransportClosedError("app-server is not running")
+            raise TransportClosedError("Codex process is not running")
 
         line = self._proc.stdout.readline()
         if not line:
             raise TransportClosedError(
-                f"app-server closed stdout. stderr_tail={self._stderr_tail()[:2000]}"
+                f"Codex process closed stdout. stderr_tail={self._stderr_tail()[:2000]}"
             )
 
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise AppServerError(f"Invalid JSON-RPC line: {line!r}") from exc
+            raise CodexError(f"Invalid JSON-RPC line: {line!r}") from exc
 
         if not isinstance(message, dict):
-            raise AppServerError(f"Invalid JSON-RPC payload: {message!r}")
+            raise CodexError(f"Invalid JSON-RPC payload: {message!r}")
         return message
 
 

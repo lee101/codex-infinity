@@ -8,6 +8,9 @@ use crate::diff_render::display_path_for;
 use crate::key_hint;
 use crate::legacy_core::config::Config;
 use crate::text_formatting::truncate_text;
+use crate::thread_transcript::RawReasoningVisibility;
+use crate::thread_transcript::TranscriptCells;
+use crate::thread_transcript::load_session_transcript;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -647,7 +650,6 @@ impl PickerState {
                     self.maybe_load_more_for_scroll();
                     self.request_frame();
                 }
-            }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
@@ -666,16 +668,15 @@ impl PickerState {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } => {
+            }
                 // basic text input for search
                 if !modifiers.contains(KeyModifiers::CONTROL)
                     && !modifiers.contains(KeyModifiers::ALT)
-                {
+                => {
                     let mut new_query = self.query.clone();
                     new_query.push(c);
                     self.set_query(new_query);
                 }
-            }
             _ => {}
         }
         Ok(None)
@@ -1013,9 +1014,9 @@ fn thread_list_params(
             ProviderFilter::Any => None,
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
-        source_kinds: (!include_non_interactive)
-            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
         archived: Some(false),
+        parent_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
         use_state_db_only: false,
         search_term: None,
@@ -1628,7 +1629,8 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        assert_eq!(params.source_kinds, None);
+        let source_kinds = crate::resume_source_kinds(/*include_non_interactive*/ true);
+        assert_eq!(params.source_kinds, Some(source_kinds));
     }
 
     #[test]
@@ -2069,6 +2071,7 @@ mod tests {
         let thread = Thread {
             id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::from("remote thread"),
             ephemeral: false,
             model_provider: String::from("openai"),

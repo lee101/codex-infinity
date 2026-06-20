@@ -12,6 +12,7 @@
 //! 4. Apply the guardian's explicit allow/deny outcome.
 
 mod approval_request;
+mod metrics;
 mod prompt;
 mod review;
 mod review_session;
@@ -37,8 +38,10 @@ pub(crate) use review::review_approval_request;
 #[cfg(test)]
 pub(crate) use review::review_approval_request_with_cancel;
 pub(crate) use review::routes_approval_to_guardian;
+pub(crate) use review::routes_approval_to_guardian_with_reviewer;
 pub(crate) use review::spawn_approval_request_review;
 pub(crate) use review_session::GuardianReviewSessionManager;
+pub(crate) use review_session::prompt_cache_key_override_for_review_session;
 
 const GUARDIAN_PREFERRED_MODEL: &str = "codex-auto-review";
 pub(crate) const GUARDIAN_REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
@@ -137,6 +140,8 @@ use prompt::GuardianTranscriptEntryKind;
 #[cfg(test)]
 use prompt::build_guardian_prompt_items;
 #[cfg(test)]
+use prompt::build_guardian_prompt_items_with_parent_turn;
+#[cfg(test)]
 use prompt::collect_guardian_transcript_entries;
 #[cfg(test)]
 use prompt::guardian_output_schema;
@@ -153,7 +158,7 @@ use prompt::render_guardian_transcript_entries;
 #[cfg(test)]
 use review::GuardianReviewOutcome;
 #[cfg(test)]
-use review::run_guardian_review_session as run_guardian_review_session_for_test;
+use review::run_guardian_review_session_with_retry as run_guardian_review_session_for_test;
 #[cfg(test)]
 use review_session::build_guardian_review_session_config as build_guardian_review_session_config_for_test;
 
