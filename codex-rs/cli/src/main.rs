@@ -1921,12 +1921,13 @@ async fn run_debug_prompt_input_command(
         ));
     }
 
-    let approval_policy = if shared.dangerously_bypass_approvals_and_sandbox {
+    let yolo_mode = shared.yolo_mode();
+    let approval_policy = if yolo_mode.bypasses_approvals_and_sandbox() {
         Some(AskForApproval::Never)
     } else {
         interactive.approval_policy.map(Into::into)
     };
-    let sandbox_mode = if shared.dangerously_bypass_approvals_and_sandbox {
+    let sandbox_mode = if yolo_mode.bypasses_approvals_and_sandbox() {
         Some(codex_protocol::config_types::SandboxMode::DangerFullAccess)
     } else {
         shared.sandbox_mode.map(Into::into)
@@ -1942,6 +1943,8 @@ async fn run_debug_prompt_input_command(
         show_raw_agent_reasoning: shared.oss.then_some(true),
         ephemeral: Some(true),
         bypass_hook_trust: shared.bypass_hook_trust.then_some(true),
+        shell_environment_policy: yolo_mode.shell_environment_policy_override(),
+        shell_command_disable_timeout: yolo_mode.disables_command_timeouts().then_some(true),
         additional_writable_roots: shared.add_dir,
         ..Default::default()
     };
@@ -2756,6 +2759,15 @@ mod tests {
             "on-request",
         ])
         .expect_err("conflicting permission flags should be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn numbered_yolo_conflicts_with_approval_policy() {
+        let err =
+            MultitoolCli::try_parse_from(["codex", "--yolo3", "--ask-for-approval", "on-request"])
+                .expect_err("conflicting permission flags should be rejected");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

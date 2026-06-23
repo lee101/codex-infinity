@@ -105,6 +105,7 @@ impl std::ops::DerefMut for Cli {
 pub struct TuiSharedCliOptions(SharedCliOptions);
 
 impl TuiSharedCliOptions {
+    // Includes the shared autonomy aliases: --yolo, --yolo2, --yolo3, --yolo4.
     pub fn into_inner(self) -> SharedCliOptions {
         self.0
     }
@@ -148,4 +149,7 @@ fn mark_tui_args(cmd: clap::Command) -> clap::Command {
     cmd.mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
         arg.conflicts_with("approval_policy")
     })
+    .mut_arg("yolo2", |arg| arg.conflicts_with("approval_policy"))
+    .mut_arg("yolo3", |arg| arg.conflicts_with("approval_policy"))
+    .mut_arg("yolo4", |arg| arg.conflicts_with("approval_policy"))
 }

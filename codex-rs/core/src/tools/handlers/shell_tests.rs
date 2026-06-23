@@ -118,6 +118,36 @@ async fn shell_command_handler_to_exec_params_uses_session_shell_and_turn_contex
     assert_eq!(exec_params.arg0, None);
 }
 
+#[tokio::test]
+async fn shell_command_handler_can_disable_timeouts_from_config() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    let mut config = (*turn_context.config).clone();
+    config.permissions.shell_command_disable_timeout = true;
+    turn_context.config = Arc::new(config);
+
+    let params = ShellCommandToolCallParams {
+        command: "sleep 20".to_string(),
+        workdir: None,
+        login: None,
+        timeout_ms: Some(1234),
+        sandbox_permissions: None,
+        additional_permissions: None,
+        prefix_rule: None,
+        justification: None,
+    };
+
+    let exec_params = ShellCommandHandler::to_exec_params(
+        &params,
+        &session,
+        &turn_context,
+        session.thread_id,
+        /*allow_login_shell*/ true,
+    )
+    .expect("exec params");
+
+    assert_eq!(exec_params.expiration.timeout_ms(), None);
+}
+
 #[test]
 fn shell_command_handler_respects_explicit_login_flag() {
     let shell = Shell {

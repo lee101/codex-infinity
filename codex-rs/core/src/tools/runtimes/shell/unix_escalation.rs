@@ -136,7 +136,7 @@ pub(super) async fn try_run_zsh_fork(
     let command =
         build_sandbox_command(command, &req.cwd, &env, req.additional_permissions.clone())?;
     let options = ExecOptions {
-        expiration: req.timeout_ms.into(),
+        expiration: req.expiration.clone(),
         capture_policy: ExecCapturePolicy::ShellTool,
     };
     let sandbox_exec_request = attempt
@@ -168,10 +168,7 @@ pub(super) async fn try_run_zsh_fork(
         arg0,
     } = sandbox_exec_request;
     let ParsedShellCommand { script, login, .. } = extract_shell_script(&command)?;
-    let effective_timeout = Duration::from_millis(
-        req.timeout_ms
-            .unwrap_or(crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
-    );
+    let effective_timeout = req.expiration.timeout_ms().map(Duration::from_millis);
     let exec_policy = Arc::new(RwLock::new(
         ctx.session.services.exec_policy.current().as_ref().clone(),
     ));
@@ -213,14 +210,14 @@ pub(super) async fn try_run_zsh_fork(
     let exec_params = ExecParams {
         command: script,
         workdir: req.cwd.to_string_lossy().to_string(),
-        timeout_ms: Some(effective_timeout.as_millis() as u64),
+        timeout_ms: effective_timeout.map(|timeout| timeout.as_millis() as u64),
         login: Some(login),
     };
 
     // Note that Stopwatch starts immediately upon creation, so currently we try
     // to minimize the time between creating the Stopwatch and starting the
     // escalation server.
-    let stopwatch = Stopwatch::new(effective_timeout);
+    let stopwatch = effective_timeout.map_or_else(Stopwatch::unlimited, Stopwatch::new);
     let mut cancel_token = stopwatch.cancellation_token();
     if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
         cancel_token = cancel_when_either(cancel_token, cancellation);

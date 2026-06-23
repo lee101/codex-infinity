@@ -45,7 +45,12 @@ pub struct Cli {
         hide = true,
         global = true,
         default_value_t = false,
-        conflicts_with = "dangerously_bypass_approvals_and_sandbox"
+        conflicts_with_all = [
+            "dangerously_bypass_approvals_and_sandbox",
+            "yolo2",
+            "yolo3",
+            "yolo4"
+        ]
     )]
     pub removed_full_auto: bool,
 
@@ -159,6 +164,9 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
         .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
             arg.global(true)
         })
+        .mut_arg("yolo2", |arg| arg.global(true))
+        .mut_arg("yolo3", |arg| arg.global(true))
+        .mut_arg("yolo4", |arg| arg.global(true))
         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
 }
 

@@ -303,6 +303,7 @@ fn turn_completed_recovers_final_message_from_turn_items() {
         final_message_rendered: false,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        stream_command_output_directly: false,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -351,6 +352,7 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        stream_command_output_directly: false,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -400,6 +402,7 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
         final_message_rendered: false,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        stream_command_output_directly: false,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -444,6 +447,7 @@ fn turn_failed_clears_stale_final_message() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: true,
         last_total_token_usage: None,
+        stream_command_output_directly: false,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -489,6 +493,7 @@ fn turn_interrupted_clears_stale_final_message() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: true,
         last_total_token_usage: None,
+        stream_command_output_directly: false,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(

@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
 
 use codex_app_server_protocol::CommandExecutionStatus;
@@ -36,6 +37,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     final_message_rendered: bool,
     emit_final_message_on_shutdown: bool,
     last_total_token_usage: Option<ThreadTokenUsage>,
+    stream_command_output_directly: bool,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -43,6 +45,7 @@ impl EventProcessorWithHumanOutput {
         with_ansi: bool,
         config: &Config,
         last_message_path: Option<PathBuf>,
+        stream_command_output_directly: bool,
     ) -> Self {
         let style = |styled: Style, plain: Style| if with_ansi { styled } else { plain };
         Self {
@@ -61,6 +64,7 @@ impl EventProcessorWithHumanOutput {
             final_message_rendered: false,
             emit_final_message_on_shutdown: false,
             last_total_token_usage: None,
+            stream_command_output_directly,
         }
     }
 
@@ -156,6 +160,7 @@ impl EventProcessorWithHumanOutput {
                 }
                 if let Some(output) = aggregated_output
                     && !output.trim().is_empty()
+                    && !self.stream_command_output_directly
                 {
                     eprintln!("{output}");
                 }
@@ -281,6 +286,13 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.render_item_completed(notification.item);
+                CodexStatus::Running
+            }
+            ServerNotification::CommandExecutionOutputDelta(notification) => {
+                if self.stream_command_output_directly {
+                    eprint!("{}", notification.delta);
+                    let _ = std::io::stderr().flush();
+                }
                 CodexStatus::Running
             }
             ServerNotification::ModelRerouted(notification) => {

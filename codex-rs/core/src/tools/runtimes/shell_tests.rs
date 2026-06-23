@@ -18,7 +18,7 @@ async fn approval_key_includes_environment_id() {
         shell_type: None,
         hook_command: "echo hello".to_string(),
         cwd: cwd.clone(),
-        timeout_ms: None,
+        expiration: crate::exec::ExecExpiration::DefaultTimeout,
         cancellation_token: CancellationToken::new(),
         env: HashMap::new(),
         explicit_env_overrides: HashMap::new(),

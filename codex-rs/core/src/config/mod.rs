@@ -339,6 +339,8 @@ pub struct Permissions {
     pub allow_login_shell: bool,
     /// Policy used to build process environments for shell/unified exec.
     pub shell_environment_policy: ShellEnvironmentPolicy,
+    /// Disable shell-command timeout enforcement for this session.
+    pub shell_command_disable_timeout: bool,
     /// Effective Windows sandbox mode derived from `[windows].sandbox` or
     /// legacy feature keys.
     pub windows_sandbox_mode: Option<WindowsSandboxModeToml>,
@@ -362,6 +364,7 @@ impl Permissions {
             network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
+            shell_command_disable_timeout: false,
             windows_sandbox_mode: None,
             windows_sandbox_private_desktop: true,
         })
@@ -2374,6 +2377,8 @@ pub struct ConfigOverrides {
     pub tools_web_search_request: Option<bool>,
     pub ephemeral: Option<bool>,
     pub bypass_hook_trust: Option<bool>,
+    pub shell_environment_policy: Option<ShellEnvironmentPolicy>,
+    pub shell_command_disable_timeout: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
     /// Explicit absolute runtime workspace roots for this session. When set,
@@ -2881,6 +2886,8 @@ impl Config {
             tools_web_search_request: override_tools_web_search_request,
             ephemeral,
             bypass_hook_trust,
+            shell_environment_policy: shell_environment_policy_override,
+            shell_command_disable_timeout,
             additional_writable_roots,
             workspace_roots: workspace_roots_override,
         } = overrides;
@@ -3319,7 +3326,8 @@ impl Config {
             })?
             .clone();
 
-        let shell_environment_policy = cfg.shell_environment_policy.into();
+        let shell_environment_policy = shell_environment_policy_override
+            .unwrap_or_else(|| cfg.shell_environment_policy.into());
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
         let history = cfg.history.unwrap_or_default();
@@ -3689,6 +3697,7 @@ impl Config {
                 network,
                 allow_login_shell,
                 shell_environment_policy,
+                shell_command_disable_timeout: shell_command_disable_timeout.unwrap_or_default(),
                 windows_sandbox_mode,
                 windows_sandbox_private_desktop,
             },

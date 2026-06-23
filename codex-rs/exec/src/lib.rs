@@ -98,6 +98,7 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
 use codex_utils_cli::SharedCliOptions;
+use codex_utils_cli::YoloMode;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
@@ -205,7 +206,7 @@ struct ExecRunArgs {
     state_db: Option<StateDbHandle>,
     command: Option<ExecCommand>,
     config: Config,
-    dangerously_bypass_approvals_and_sandbox: bool,
+    yolo_mode: YoloMode,
     exec_span: tracing::Span,
     images: Vec<PathBuf>,
     json_mode: bool,
@@ -262,6 +263,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         config_overrides,
     } = cli;
     let shared = shared.into_inner();
+    let yolo_mode = shared.yolo_mode();
     let SharedCliOptions {
         images,
         model: model_cli_arg,
@@ -269,7 +271,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         oss_provider,
         config_profile_v2,
         sandbox_mode: sandbox_mode_cli_arg,
-        dangerously_bypass_approvals_and_sandbox,
+        dangerously_bypass_approvals_and_sandbox: _,
+        yolo2: _,
+        yolo3: _,
+        yolo4: _,
         bypass_hook_trust,
         cwd,
         add_dir,
@@ -290,7 +295,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     let sandbox_mode = if removed_full_auto {
         Some(SandboxMode::WorkspaceWrite)
-    } else if dangerously_bypass_approvals_and_sandbox {
+    } else if yolo_mode.bypasses_approvals_and_sandbox() {
         Some(SandboxMode::DangerFullAccess)
     } else {
         sandbox_mode_cli_arg.map(Into::<SandboxMode>::into)
@@ -434,6 +439,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         bypass_hook_trust: bypass_hook_trust.then_some(true),
+        shell_environment_policy: yolo_mode.shell_environment_policy_override(),
+        shell_command_disable_timeout: yolo_mode.disables_command_timeouts().then_some(true),
         additional_writable_roots: add_dir,
     };
 
@@ -449,7 +456,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
     let config = build_exec_config(
         overrides,
-        dangerously_bypass_approvals_and_sandbox || removed_full_auto,
+        yolo_mode.bypasses_approvals_and_sandbox() || removed_full_auto,
         build_config,
     )
     .await?;
@@ -564,7 +571,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         state_db,
         command,
         config,
-        dangerously_bypass_approvals_and_sandbox,
+        yolo_mode,
         exec_span: exec_span.clone(),
         images,
         json_mode,
@@ -661,7 +668,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         state_db,
         command,
         config,
-        dangerously_bypass_approvals_and_sandbox,
+        yolo_mode,
         exec_span,
         images,
         json_mode,
@@ -680,6 +687,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             stderr_with_ansi,
             &config,
             last_message_file.clone(),
+            yolo_mode.streams_command_output_directly(),
         )),
     };
     if oss {
@@ -763,10 +771,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     };
 
-    // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
+    // When --yolo is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
     if !skip_git_repo_check
-        && !dangerously_bypass_approvals_and_sandbox
+        && !yolo_mode.bypasses_approvals_and_sandbox()
         && get_git_repo_root(&default_cwd).is_none()
     {
         eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");

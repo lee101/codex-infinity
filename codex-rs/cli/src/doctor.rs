@@ -523,12 +523,13 @@ fn config_overrides_from_interactive(
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> ConfigOverrides {
-    let approval_policy = if interactive.dangerously_bypass_approvals_and_sandbox {
+    let yolo_mode = interactive.yolo_mode();
+    let approval_policy = if yolo_mode.bypasses_approvals_and_sandbox() {
         Some(AskForApproval::Never)
     } else {
         interactive.approval_policy.map(Into::into)
     };
-    let sandbox_mode = if interactive.dangerously_bypass_approvals_and_sandbox {
+    let sandbox_mode = if yolo_mode.bypasses_approvals_and_sandbox() {
         Some(codex_protocol::config_types::SandboxMode::DangerFullAccess)
     } else {
         interactive.sandbox_mode.map(Into::into)
@@ -546,6 +547,8 @@ fn config_overrides_from_interactive(
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: interactive.oss.then_some(true),
+        shell_environment_policy: yolo_mode.shell_environment_policy_override(),
+        shell_command_disable_timeout: yolo_mode.disables_command_timeouts().then_some(true),
         additional_writable_roots: interactive.add_dir.clone(),
         ..Default::default()
     }

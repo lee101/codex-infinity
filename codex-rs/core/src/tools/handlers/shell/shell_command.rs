@@ -4,6 +4,7 @@ use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 
 use crate::exec::ExecCapturePolicy;
+use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::function_tool::FunctionCallError;
@@ -94,11 +95,20 @@ impl ShellCommandHandler {
         let command = Self::base_command(shell.as_ref(), &params.command, use_login_shell);
         #[allow(deprecated)]
         let cwd = turn_context.resolve_path(params.workdir.clone());
+        let expiration = if turn_context
+            .config
+            .permissions
+            .shell_command_disable_timeout
+        {
+            ExecExpiration::Cancellation(tokio_util::sync::CancellationToken::new())
+        } else {
+            params.timeout_ms.into()
+        };
 
         Ok(ExecParams {
             command,
             cwd,
-            expiration: params.timeout_ms.into(),
+            expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
             env: create_env(
                 &turn_context.config.permissions.shell_environment_policy,

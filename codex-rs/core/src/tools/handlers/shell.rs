@@ -190,7 +190,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         shell_type,
         hook_command,
         cwd: exec_params.cwd.clone(),
-        timeout_ms: exec_params.expiration.timeout_ms(),
+        expiration: exec_params.expiration.clone(),
         cancellation_token,
         env: exec_params.env.clone(),
         explicit_env_overrides,

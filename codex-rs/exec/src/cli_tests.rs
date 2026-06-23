@@ -83,3 +83,15 @@ fn removed_full_auto_flag_reports_migration_path() {
         Some("warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.")
     );
 }
+
+#[test]
+fn resume_accepts_yolo3_after_subcommand() {
+    let cli = Cli::parse_from(["codex-exec", "resume", "--last", "--yolo3", "summarize"]);
+
+    assert_eq!(cli.shared.yolo_mode(), codex_utils_cli::YoloMode::Yolo3);
+    let Some(Command::Resume(args)) = cli.command else {
+        panic!("expected resume command");
+    };
+    assert!(args.last);
+    assert_eq!(args.prompt.as_deref(), Some("summarize"));
+}

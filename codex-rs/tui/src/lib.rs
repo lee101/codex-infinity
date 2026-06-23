@@ -850,7 +850,8 @@ pub async fn run_main(
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
     let strict_config = cli.strict_config;
-    let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
+    let yolo_mode = cli.yolo_mode();
+    let (sandbox_mode, approval_policy) = if yolo_mode.bypasses_approvals_and_sandbox() {
         (
             Some(SandboxMode::DangerFullAccess),
             Some(AskForApproval::Never.to_core()),
@@ -1044,6 +1045,8 @@ pub async fn run_main(
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
+        shell_environment_policy: yolo_mode.shell_environment_policy_override(),
+        shell_command_disable_timeout: yolo_mode.disables_command_timeouts().then_some(true),
         additional_writable_roots: additional_dirs,
         ..Default::default()
     };

@@ -10,6 +10,7 @@ pub(crate) mod zsh_fork_backend;
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
+use crate::exec::ExecExpiration;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::guardian::review_approval_request;
@@ -58,7 +59,7 @@ pub struct ShellRequest {
     pub shell_type: Option<ShellType>,
     pub hook_command: String,
     pub cwd: AbsolutePathBuf,
-    pub timeout_ms: Option<u64>,
+    pub expiration: ExecExpiration,
     pub cancellation_token: CancellationToken,
     pub env: HashMap<String, String>,
     pub explicit_env_overrides: HashMap<String, String>,
@@ -312,7 +313,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
 
         let command =
             build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
-        let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
+        let mut expiration = req.expiration.clone();
         expiration = expiration.with_cancellation(req.cancellation_token.clone());
         if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
             expiration = expiration.with_cancellation(cancellation);

@@ -50,6 +50,10 @@ pub(super) async fn spawn_review_thread(
         .permissions
         .shell_environment_policy
         .clone();
+    per_turn_config.permissions.shell_command_disable_timeout = parent_turn_context
+        .config
+        .permissions
+        .shell_command_disable_timeout;
     per_turn_config.codex_linux_sandbox_exe =
         parent_turn_context.config.codex_linux_sandbox_exe.clone();
     per_turn_config.compact_prompt = parent_turn_context.config.compact_prompt.clone();

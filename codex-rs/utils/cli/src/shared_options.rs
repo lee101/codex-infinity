@@ -3,7 +3,49 @@
 use crate::SandboxModeCliArg;
 use clap::Args;
 use codex_protocol::config_types::ProfileV2Name;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum YoloMode {
+    #[default]
+    None,
+    Yolo,
+    Yolo2,
+    Yolo3,
+    Yolo4,
+}
+
+impl YoloMode {
+    pub fn bypasses_approvals_and_sandbox(self) -> bool {
+        self >= Self::Yolo
+    }
+
+    pub fn disables_command_timeouts(self) -> bool {
+        self >= Self::Yolo2
+    }
+
+    pub fn uses_full_host_environment(self) -> bool {
+        self >= Self::Yolo3
+    }
+
+    pub fn streams_command_output_directly(self) -> bool {
+        self >= Self::Yolo4
+    }
+
+    pub fn shell_environment_policy_override(self) -> Option<ShellEnvironmentPolicy> {
+        self.uses_full_host_environment()
+            .then(|| ShellEnvironmentPolicy {
+                inherit: ShellEnvironmentPolicyInherit::All,
+                ignore_default_excludes: true,
+                exclude: Vec::new(),
+                r#set: std::collections::HashMap::new(),
+                include_only: Vec::new(),
+                use_profile: false,
+            })
+    }
+}
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct SharedCliOptions {
@@ -48,6 +90,18 @@ pub struct SharedCliOptions {
     )]
     pub dangerously_bypass_approvals_and_sandbox: bool,
 
+    /// Like --yolo, and disable command timeouts.
+    #[arg(long = "yolo2", default_value_t = false)]
+    pub yolo2: bool,
+
+    /// Like --yolo2, and pass through the full host environment.
+    #[arg(long = "yolo3", default_value_t = false)]
+    pub yolo3: bool,
+
+    /// Like --yolo3, and stream command stdout/stderr directly.
+    #[arg(long = "yolo4", default_value_t = false)]
+    pub yolo4: bool,
+
     /// Run enabled hooks without requiring persisted hook trust for this invocation.
     /// DANGEROUS. Intended only for automation that already vets hook sources.
     #[arg(long = "dangerously-bypass-hook-trust", default_value_t = false)]
@@ -63,9 +117,23 @@ pub struct SharedCliOptions {
 }
 
 impl SharedCliOptions {
+    pub fn yolo_mode(&self) -> YoloMode {
+        if self.yolo4 {
+            YoloMode::Yolo4
+        } else if self.yolo3 {
+            YoloMode::Yolo3
+        } else if self.yolo2 {
+            YoloMode::Yolo2
+        } else if self.dangerously_bypass_approvals_and_sandbox {
+            YoloMode::Yolo
+        } else {
+            YoloMode::None
+        }
+    }
+
     pub fn inherit_exec_root_options(&mut self, root: &Self) {
         let self_selected_sandbox_mode =
-            self.sandbox_mode.is_some() || self.dangerously_bypass_approvals_and_sandbox;
+            self.sandbox_mode.is_some() || self.yolo_mode().bypasses_approvals_and_sandbox();
         let Self {
             images,
             model,
@@ -74,6 +142,9 @@ impl SharedCliOptions {
             config_profile_v2,
             sandbox_mode,
             dangerously_bypass_approvals_and_sandbox,
+            yolo2,
+            yolo3,
+            yolo4,
             bypass_hook_trust,
             cwd,
             add_dir,
@@ -86,6 +157,9 @@ impl SharedCliOptions {
             config_profile_v2: root_config_profile_v2,
             sandbox_mode: root_sandbox_mode,
             dangerously_bypass_approvals_and_sandbox: root_dangerously_bypass_approvals_and_sandbox,
+            yolo2: root_yolo2,
+            yolo3: root_yolo3,
+            yolo4: root_yolo4,
             bypass_hook_trust: root_bypass_hook_trust,
             cwd: root_cwd,
             add_dir: root_add_dir,
@@ -109,6 +183,9 @@ impl SharedCliOptions {
         if !self_selected_sandbox_mode {
             *dangerously_bypass_approvals_and_sandbox =
                 *root_dangerously_bypass_approvals_and_sandbox;
+            *yolo2 = *root_yolo2;
+            *yolo3 = *root_yolo3;
+            *yolo4 = *root_yolo4;
         }
         if !*bypass_hook_trust {
             *bypass_hook_trust = *root_bypass_hook_trust;
@@ -130,7 +207,7 @@ impl SharedCliOptions {
 
     pub fn apply_subcommand_overrides(&mut self, subcommand: Self) {
         let subcommand_selected_sandbox_mode = subcommand.sandbox_mode.is_some()
-            || subcommand.dangerously_bypass_approvals_and_sandbox;
+            || subcommand.yolo_mode().bypasses_approvals_and_sandbox();
         let Self {
             images,
             model,
@@ -139,6 +216,9 @@ impl SharedCliOptions {
             config_profile_v2,
             sandbox_mode,
             dangerously_bypass_approvals_and_sandbox,
+            yolo2,
+            yolo3,
+            yolo4,
             bypass_hook_trust,
             cwd,
             add_dir,
@@ -160,6 +240,9 @@ impl SharedCliOptions {
             self.sandbox_mode = sandbox_mode;
             self.dangerously_bypass_approvals_and_sandbox =
                 dangerously_bypass_approvals_and_sandbox;
+            self.yolo2 = yolo2;
+            self.yolo3 = yolo3;
+            self.yolo4 = yolo4;
         }
         if bypass_hook_trust {
             self.bypass_hook_trust = true;
@@ -173,5 +256,47 @@ impl SharedCliOptions {
         if !add_dir.is_empty() {
             self.add_dir.extend(add_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use pretty_assertions::assert_eq;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[clap(flatten)]
+        shared: SharedCliOptions,
+    }
+
+    #[test]
+    fn parses_numbered_yolo_modes() {
+        for (flag, expected) in [
+            ("--yolo", YoloMode::Yolo),
+            ("--yolo2", YoloMode::Yolo2),
+            ("--yolo3", YoloMode::Yolo3),
+            ("--yolo4", YoloMode::Yolo4),
+        ] {
+            let cli = TestCli::parse_from(["test", flag]);
+            assert_eq!(expected, cli.shared.yolo_mode());
+        }
+    }
+
+    #[test]
+    fn highest_yolo_mode_wins_when_multiple_are_supplied() {
+        let cli = TestCli::parse_from(["test", "--yolo", "--yolo3", "--yolo2"]);
+
+        assert_eq!(YoloMode::Yolo3, cli.shared.yolo_mode());
+    }
+
+    #[test]
+    fn yolo_capabilities_are_cumulative() {
+        assert!(YoloMode::Yolo.bypasses_approvals_and_sandbox());
+        assert!(!YoloMode::Yolo.disables_command_timeouts());
+        assert!(YoloMode::Yolo2.disables_command_timeouts());
+        assert!(YoloMode::Yolo3.uses_full_host_environment());
+        assert!(YoloMode::Yolo4.streams_command_output_directly());
     }
 }
