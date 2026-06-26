@@ -199,6 +199,9 @@ pub struct ConfigToml {
     /// Sandbox mode to use.
     pub sandbox_mode: Option<SandboxMode>,
 
+    /// Treat every project directory as trusted.
+    pub trust_all_projects: Option<bool>,
+
     /// Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
     pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
 
@@ -826,6 +829,12 @@ impl ConfigToml {
         resolved_cwd: &Path,
         repo_root: Option<&Path>,
     ) -> Option<ProjectConfig> {
+        if self.trust_all_projects.unwrap_or(false) {
+            return Some(ProjectConfig {
+                trust_level: Some(TrustLevel::Trusted),
+            });
+        }
+
         let projects = self.projects.as_ref()?;
 
         for normalized_cwd in normalized_project_lookup_keys(resolved_cwd) {
@@ -1017,5 +1026,16 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("TOML list of strings"));
         assert!(message.contains("comma-separated strings are not supported"));
+    }
+
+    #[test]
+    fn trust_all_projects_marks_any_directory_trusted() {
+        let config: ConfigToml = toml::from_str("trust_all_projects = true")
+            .expect("trust_all_projects should deserialize");
+        let active_project = config
+            .get_active_project(Path::new("/tmp/anything"), None)
+            .expect("trust_all_projects should always resolve an active project");
+
+        assert_eq!(active_project.trust_level, Some(TrustLevel::Trusted));
     }
 }

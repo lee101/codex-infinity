@@ -65,6 +65,10 @@ pub struct Cli {
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
 
+    /// Trust every project directory and skip directory trust prompts.
+    #[arg(long = "trust-all-projects", default_value_t = false)]
+    pub trust_all_projects: bool,
+
     /// After each Codex response, automatically ask it to continue with the natural next steps.
     #[arg(long = "auto-next-steps", default_value_t = false)]
     pub auto_next_steps: bool,

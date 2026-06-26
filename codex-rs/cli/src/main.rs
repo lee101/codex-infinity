@@ -2455,6 +2455,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         strict_config,
         approval_policy,
         web_search,
+        trust_all_projects,
         prompt,
         config_overrides,
         ..
@@ -2467,6 +2468,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if web_search {
         interactive.web_search = true;
+    }
+    if trust_all_projects {
+        interactive.trust_all_projects = true;
     }
     if strict_config {
         interactive.strict_config = true;
@@ -3289,6 +3293,7 @@ mod tests {
                 "resume",
                 "sid",
                 "--oss",
+                "--trust-all-projects",
                 "--search",
                 "--sandbox",
                 "workspace-write",
@@ -3323,6 +3328,7 @@ mod tests {
             Some(std::path::Path::new("/tmp"))
         );
         assert!(interactive.web_search);
+        assert!(interactive.trust_all_projects);
         assert!(interactive.strict_config);
         let has_a = interactive
             .images

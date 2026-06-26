@@ -5398,6 +5398,10 @@
       ],
       "description": "Nested tools section for feature toggles"
     },
+    "trust_all_projects": {
+      "description": "Treat every project directory as trusted.",
+      "type": "boolean"
+    },
     "tui": {
       "allOf": [
         {

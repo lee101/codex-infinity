@@ -869,6 +869,11 @@ pub async fn run_main(
             .raw_overrides
             .push("web_search=\"live\"".to_string());
     }
+    if cli.trust_all_projects {
+        cli.config_overrides
+            .raw_overrides
+            .push("trust_all_projects=true".to_string());
+    }
 
     // When using `--oss`, let the bootstrapper pick the model (defaulting to
     // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
