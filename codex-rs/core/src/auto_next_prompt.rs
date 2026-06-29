@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::AuthManager;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_info::model_info_from_slug;
@@ -92,9 +93,11 @@ pub async fn generate_auto_next_prompt(
     let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
     let client = ModelClient::new(
         Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
         conversation_id,
         provider,
         SessionSource::Cli,
+        "codex-auto-next".to_string(),
         /*model_verbosity*/ None,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
@@ -121,7 +124,7 @@ pub async fn generate_auto_next_prompt(
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: user_message }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         }],
         base_instructions: BaseInstructions {
             text: INSTRUCTIONS.to_string(),

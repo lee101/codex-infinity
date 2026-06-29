@@ -4,26 +4,27 @@ use crate::proc_thread_attr::ProcThreadAttributeList;
 use crate::winutil::argv_to_command_line;
 use crate::winutil::format_last_error;
 use crate::winutil::to_wide;
-use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
@@ -146,7 +147,7 @@ pub unsafe fn create_process_as_user(
                     creation_flags,
                 );
                 logging::debug_log(&msg, logs_base_dir);
-                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
+                return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
             Ok(CreatedProcess {
                 process_info: pi,
@@ -187,7 +188,7 @@ pub unsafe fn create_process_as_user(
                     creation_flags,
                 );
                 logging::debug_log(&msg, logs_base_dir);
-                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
+                return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
             Ok(CreatedProcess {
                 process_info: pi,

@@ -220,6 +220,32 @@ async fn run_code_mode_turn_with_model_and_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_process_host_returns_a_tool_error() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, follow_up_mock) =
+        run_code_mode_turn_with_config(&server, "Run code mode", "text('unreachable')", |config| {
+            config
+                .features
+                .enable(Feature::CodeModeHost)
+                .expect("code mode host should be enabled");
+        })
+        .await?;
+
+    let output = follow_up_mock
+        .single_request()
+        .custom_tool_call_output("call-1");
+    assert!(
+        output["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("failed to spawn code-mode host"))
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_call_standalone_web_search() -> Result<()> {
     assert_code_mode_standalone_web_search(WebSearchMode::Live, serde_json::json!(true)).await
 }
@@ -395,6 +421,7 @@ async fn run_code_mode_turn_with_rmcp_config(
         servers.insert(
             "rmcp".to_string(),
             McpServerConfig {
+                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -856,7 +883,7 @@ text(JSON.stringify(result));
     assert_eq!(
         parsed,
         serde_json::json!({
-            "tokens_left": 9500,
+            "tokens_left": 9000,
         })
     );
 
@@ -881,8 +908,9 @@ text(JSON.stringify(result));
                 .enable(Feature::CurrentTimeReminder)
                 .expect("test config should allow current-time reminders");
             config.current_time_reminder = Some(CurrentTimeReminderConfig {
-                reminder_interval_model_requests: 50,
+                reminder_interval_seconds: 3_000,
                 clock_source: CurrentTimeSource::System,
+                ..CurrentTimeReminderConfig::default()
             });
         },
     )
@@ -2681,7 +2709,7 @@ async fn code_mode_can_output_images_via_global_helper() -> Result<()> {
         &server,
         "use exec to return images",
         r#"
-image("data:image/png;base64,AAA");
+image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");
 "#,
     )
     .await?;
@@ -2706,7 +2734,7 @@ image("data:image/png;base64,AAA");
         items[1],
         serde_json::json!({
             "type": "input_image",
-            "image_url": "data:image/png;base64,AAA",
+            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
             "detail": "high"
         }),
     );
@@ -2715,17 +2743,14 @@ image("data:image/png;base64,AAA");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resize_all_images_replaces_malformed_code_mode_image() -> Result<()> {
+async fn code_mode_replaces_malformed_image() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn_with_config(
+    let (_test, second_mock) = run_code_mode_turn(
         &server,
         "use exec to return an image",
         r#"image("data:image/png;base64,AAA");"#,
-        |config| {
-            let _ = config.features.enable(Feature::ResizeAllImages);
-        },
     )
     .await?;
 
@@ -2746,7 +2771,7 @@ async fn resize_all_images_replaces_malformed_code_mode_image() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resize_all_images_resizes_explicit_original_code_mode_image() -> Result<()> {
+async fn code_mode_resizes_explicit_original_image() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let original_dimensions = (6401, 100);
@@ -2772,12 +2797,7 @@ async fn resize_all_images_resizes_explicit_original_code_mode_image() -> Result
         "use exec to return a large original-detail image",
         &code,
         "gpt-5.3-codex",
-        |config| {
-            config
-                .features
-                .enable(Feature::ResizeAllImages)
-                .expect("resize_all_images should be enabled");
-        },
+        |_| {},
     )
     .await?;
 

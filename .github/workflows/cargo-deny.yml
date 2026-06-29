@@ -1,10 +1,7 @@
 name: cargo-deny
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
 
 # Cargo's libgit2 transport has been flaky when fetching git dependencies with
 # nested submodules. Prefer the system git CLI across every Cargo invocation.
@@ -29,3 +26,7 @@ jobs:
         with:
           rust-version: stable
           manifest-path: ./codex-rs/Cargo.toml
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

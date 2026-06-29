@@ -146,7 +146,7 @@ fn response_item(message: ConversationMessage) -> ResponseItem {
         },
         content: vec![content],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 

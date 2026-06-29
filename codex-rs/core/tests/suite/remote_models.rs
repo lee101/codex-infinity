@@ -485,6 +485,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
+        include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -738,6 +739,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
         upgrade: None,
         base_instructions: remote_base.to_string(),
         model_messages: None,
+        include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -1059,7 +1061,11 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
     let start = Instant::now();
     let model = timeout(
         Duration::from_secs(7),
-        manager.get_default_model(&None, RefreshStrategy::OnlineIfUncached),
+        manager.get_default_model(
+            &None,
+            /*allow_provider_model_fallback*/ false,
+            RefreshStrategy::OnlineIfUncached,
+        ),
     )
     .await;
     let elapsed = start.elapsed();
@@ -1127,7 +1133,11 @@ async fn remote_models_hide_picker_only_models() -> Result<()> {
     );
 
     let selected = manager
-        .get_default_model(&None, RefreshStrategy::OnlineIfUncached)
+        .get_default_model(
+            &None,
+            /*allow_provider_model_fallback*/ false,
+            RefreshStrategy::OnlineIfUncached,
+        )
         .await;
     assert_eq!(selected, bundled_default_model_slug());
 
@@ -1224,6 +1234,7 @@ fn test_remote_model_with_policy(
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
+        include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,

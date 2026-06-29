@@ -10,6 +10,7 @@ use codex_features::FeatureToml;
 use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::RolloutBudgetConfigToml;
+use codex_features::TokenBudgetConfigToml;
 use codex_protocol::ThreadId;
 
 use crate::config::Config;
@@ -152,6 +153,12 @@ fn save_config_resolved_fields(
         resolved_config_to_toml(&config.multi_agent_v2, "features.multi_agent_v2")?;
     multi_agent_v2.enabled = Some(config.features.enabled(Feature::MultiAgentV2));
     features.multi_agent_v2 = Some(FeatureToml::Config(multi_agent_v2));
+    if let Some(token_budget) = config.token_budget.as_ref() {
+        let mut token_budget: TokenBudgetConfigToml =
+            resolved_config_to_toml(token_budget, "features.token_budget")?;
+        token_budget.enabled = Some(config.features.enabled(Feature::TokenBudget));
+        features.token_budget = Some(FeatureToml::Config(token_budget));
+    }
     if let Some(rollout_budget) = config.rollout_budget.as_ref() {
         let mut rollout_budget: RolloutBudgetConfigToml =
             resolved_config_to_toml(rollout_budget, "features.rollout_budget")?;
@@ -238,9 +245,18 @@ mod tests {
     async fn lock_contains_prompts_and_materializes_features() {
         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
         let mut config = (*sc.original_config_do_not_use).clone();
+        config.token_budget = Some(crate::config::TokenBudgetConfig {
+            reminder_threshold_tokens: Some(16_000),
+            reminder_message_template: "Locked reminder: {n_remaining} tokens.".to_string(),
+            guidance_message: Some("Locked context-window guidance.".to_string()),
+        });
+        config
+            .features
+            .enable(Feature::TokenBudget)
+            .expect("token_budget should be enableable in tests");
         config.rollout_budget = Some(crate::config::RolloutBudgetConfig {
             limit_tokens: 100_000,
-            reminder_interval_tokens: 10_000,
+            reminder_at_remaining_tokens: vec![50_000, 25_000, 10_000],
             sampling_token_weight: 1.0,
             prefill_token_weight: 0.25,
         });
@@ -312,18 +328,29 @@ mod tests {
                 min_wait_timeout_ms: Some(_),
                 max_wait_timeout_ms: Some(_),
                 default_wait_timeout_ms: Some(_),
-                usage_hint_enabled: Some(_),
                 hide_spawn_agent_metadata: Some(_),
                 ..
             })
         ));
 
         assert_eq!(
+            features.token_budget,
+            Some(FeatureToml::Config(TokenBudgetConfigToml {
+                enabled: Some(true),
+                reminder_threshold_tokens: Some(16_000),
+                reminder_message_template: Some(
+                    "Locked reminder: {n_remaining} tokens.".to_string()
+                ),
+                guidance_message: Some("Locked context-window guidance.".to_string()),
+            }))
+        );
+
+        assert_eq!(
             features.rollout_budget,
             Some(FeatureToml::Config(RolloutBudgetConfigToml {
                 enabled: Some(true),
                 limit_tokens: Some(100_000),
-                reminder_interval_tokens: Some(10_000),
+                reminder_at_remaining_tokens: Some(vec![50_000, 25_000, 10_000]),
                 sampling_token_weight: Some(1.0),
                 prefill_token_weight: Some(0.25),
             }))
@@ -332,8 +359,10 @@ mod tests {
             features.current_time_reminder,
             Some(FeatureToml::Config(CurrentTimeReminderConfigToml {
                 enabled: Some(true),
-                reminder_interval_model_requests: Some(1),
+                reminder_interval_seconds: Some(1),
                 clock_source: Some(codex_features::CurrentTimeSource::System),
+                delivery_mode: Some(codex_features::CurrentTimeReminderDeliveryMode::AnyInference),
+                sleep_tool: Some(false),
             }))
         );
 
