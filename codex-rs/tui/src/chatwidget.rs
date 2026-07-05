@@ -476,6 +476,7 @@ const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentia
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
 const MAX_AGENT_COPY_HISTORY: usize = 32;
+const AUTO_NEXT_REVIEW_INTERVAL: usize = 3;
 const AUTO_NEXT_DONE_SUFFIX_STEPS: &str =
     "\n\nWhen there are no more meaningful next steps, create this file exactly: ";
 const AUTO_NEXT_STEPS_TEMPLATES: &[&str] = &[
@@ -483,11 +484,13 @@ const AUTO_NEXT_STEPS_TEMPLATES: &[&str] = &[
     "Inspect the current state, fix the next concrete issue, and verify the result.",
     "Carry the work forward pragmatically: implement the next useful change, then test it.",
 ];
+const AUTO_NEXT_STEPS_REVIEW_TEMPLATE: &str = "Review: Step back and assess the recent reasoning summaries, tool trace, and original task. Decide whether the agent is on track, what code search or context would help, and then take the best next step.";
 const AUTO_NEXT_IDEA_META_TEMPLATES: &[&str] = &[
     "Review the current project state and pursue the highest-value follow-up improvement.",
     "Find a concrete improvement opportunity in this codebase, implement it, and verify it.",
     "Continue productively from the recent work with one focused, useful improvement.",
 ];
+const AUTO_NEXT_IDEA_REVIEW_TEMPLATE: &str = "Review: Step back and assess the recent reasoning summaries, tool trace, and broader system fit. If the current thread is complete, choose a fresh high-value improvement; otherwise pivot or continue with the best next action.";
 
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {

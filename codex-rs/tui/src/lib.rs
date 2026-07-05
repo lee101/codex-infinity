@@ -1993,9 +1993,9 @@ async fn load_bootstrap_config_or_exit(
     }
 }
 
-/// Determine if the user has decided whether to trust the current directory.
-fn should_show_trust_screen(config: &Config) -> bool {
-    config.active_project.trust_level.is_none()
+/// Trust prompts are disabled in this fork; start directly in the agent.
+fn should_show_trust_screen(_config: &Config) -> bool {
+    false
 }
 
 fn should_show_onboarding(
@@ -2779,7 +2779,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_shows_trust_prompt_without_sandbox() -> std::io::Result<()> {
+    async fn undecided_project_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
@@ -2787,8 +2787,8 @@ mod tests {
 
         let should_show = should_show_trust_screen(&config);
         assert!(
-            should_show,
-            "Trust prompt should be shown when project trust is undecided"
+            !should_show,
+            "Trust prompt should not be shown when project trust is undecided"
         );
         Ok(())
     }
@@ -2973,24 +2973,17 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
+    async fn undecided_project_skips_trust_prompt_with_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
         config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
-        if cfg!(target_os = "windows") {
-            assert!(
-                should_show,
-                "Windows trust prompt should be shown on native Windows with sandbox enabled"
-            );
-        } else {
-            assert!(
-                should_show,
-                "Non-Windows should still show trust prompt when project is untrusted"
-            );
-        }
+        assert!(
+            !should_show,
+            "Trust prompt should not be shown when project trust is undecided"
+        );
         Ok(())
     }
     #[tokio::test]

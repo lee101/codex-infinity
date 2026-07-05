@@ -41,12 +41,21 @@ impl ChatWidget {
         } else {
             crate::legacy_core::auto_next_prompt::AutoNextMode::Steps
         };
-        let fallback = self.auto_next_fallback_prompt();
+        let review_prompt = (self.auto_next_counter + 1).is_multiple_of(AUTO_NEXT_REVIEW_INTERVAL);
+        let fallback = self.auto_next_fallback_prompt(review_prompt);
         self.auto_next_counter += 1;
-        self.spawn_auto_next_prompt_generation(mode, fallback);
+        self.spawn_auto_next_prompt_generation(mode, fallback, review_prompt);
     }
 
-    fn auto_next_fallback_prompt(&self) -> String {
+    fn auto_next_fallback_prompt(&self, review_prompt: bool) -> String {
+        if review_prompt {
+            return if self.auto_next_idea {
+                AUTO_NEXT_IDEA_REVIEW_TEMPLATE.to_string()
+            } else {
+                AUTO_NEXT_STEPS_REVIEW_TEMPLATE.to_string()
+            };
+        }
+
         let templates = if self.auto_next_idea {
             AUTO_NEXT_IDEA_META_TEMPLATES
         } else {
@@ -65,6 +74,7 @@ impl ChatWidget {
         &mut self,
         mode: crate::legacy_core::auto_next_prompt::AutoNextMode,
         fallback_prompt: String,
+        review_prompt: bool,
     ) {
         let Some(thread_id) = self.thread_id else {
             return;
@@ -92,9 +102,13 @@ impl ChatWidget {
                 rollout_path,
                 mode,
                 examples,
+                review_prompt,
             )
             .await;
             let mut prompt = generated.unwrap_or(fallback_prompt);
+            if review_prompt && !prompt.trim_start().starts_with("Review:") {
+                prompt = format!("Review: {prompt}");
+            }
             if append_done_suffix && !prompt.contains(&done_path) {
                 prompt.push_str(AUTO_NEXT_DONE_SUFFIX_STEPS);
                 prompt.push_str(&done_path);
@@ -154,6 +168,7 @@ impl ChatWidget {
                 rollout_path,
                 crate::legacy_core::auto_next_prompt::AutoNextMode::Goal,
                 examples,
+                /*review_prompt*/ false,
             )
             .await;
             let objective = generated
