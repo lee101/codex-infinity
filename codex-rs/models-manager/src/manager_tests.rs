@@ -1131,3 +1131,36 @@ fn bundled_models_json_roundtrips() {
         "bundled models.json should contain at least one model"
     );
 }
+
+#[test]
+fn gpt_5_6_prompts_are_concise_and_require_end_to_end_completion() {
+    let response = crate::bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+
+    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let model = response
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"));
+        let instructions = model
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.instructions_template.as_deref())
+            .unwrap_or_else(|| panic!("{slug} should have an instructions template"));
+
+        assert!(
+            instructions.len() < 10_000,
+            "{slug} prompt should stay concise"
+        );
+        assert!(
+            instructions.contains("Run the relevant tests"),
+            "{slug} prompt should require testing"
+        );
+        assert!(
+            instructions.contains("Do not stop at analysis"),
+            "{slug} prompt should require end-to-end completion"
+        );
+        assert_eq!(model.base_instructions, instructions);
+    }
+}
