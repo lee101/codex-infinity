@@ -3279,7 +3279,6 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
             "error": {
                 "type": "usage_limit_reached",
                 "message": "limit reached",
-                "resets_at": 1704067242,
                 "plan_type": "pro"
             }
         }));
@@ -3351,6 +3350,79 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limit_error_auto_retries_after_reset() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let usage_limit_response = ResponseTemplate::new(429).set_body_json(json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "message": "limit reached",
+            "resets_at": chrono::Utc::now().timestamp(),
+            "plan_type": "pro"
+        }
+    }));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(usage_limit_response)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-retry"),
+            ev_completed("resp-retry"),
+        ]),
+    )
+    .await;
+
+    let codex = test_codex().build(&server).await?.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let mut saw_stream_error = false;
+    loop {
+        let event = wait_for_event(&codex, |_| true).await;
+        match event {
+            EventMsg::StreamError(stream_error) => {
+                assert!(
+                    stream_error
+                        .message
+                        .contains("Waiting for usage limit to reset"),
+                    "unexpected stream error: {}",
+                    stream_error.message
+                );
+                saw_stream_error = true;
+            }
+            EventMsg::Error(error) => {
+                panic!("unexpected terminal usage-limit error: {}", error.message);
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(saw_stream_error);
+    assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
 }

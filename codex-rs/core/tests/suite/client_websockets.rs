@@ -1421,9 +1421,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         "error": {
             "type": "usage_limit_reached",
             "message": "The usage limit has been reached",
-            "plan_type": "pro",
-            "resets_at": 1704067242,
-            "resets_in_seconds": 1234
+            "plan_type": "pro"
         },
         "headers": {
             "x-codex-primary-used-percent": "100.0",
