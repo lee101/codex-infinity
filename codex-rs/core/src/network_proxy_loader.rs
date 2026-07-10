@@ -2,9 +2,8 @@ use crate::config::find_codex_home;
 use crate::config::is_builtin_permission_profile_name;
 use crate::config::reject_unknown_builtin_permission_profile;
 use crate::config::resolve_permission_profile;
-use crate::exec_policy::ExecPolicyError;
 use crate::exec_policy::format_exec_policy_error_with_source;
-use crate::exec_policy::load_exec_policy;
+use crate::exec_policy::load_exec_policy_with_warning;
 use anyhow::Context;
 use anyhow::Result;
 use codex_config::CONFIG_TOML_FILE;
@@ -64,13 +63,15 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
     .await
     .context("failed to load Codex config")?;
 
-    let (exec_policy, warning) = match load_exec_policy(&config_layer_stack).await {
-        Ok(policy) => (policy, None),
-        Err(err @ ExecPolicyError::ParsePolicy { .. }) => {
-            (codex_execpolicy::Policy::empty(), Some(err))
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
+    let state = build_config_state_from_layers(&config_layer_stack).await?;
+    Ok((state, layer_mtimes))
+}
+
+async fn build_config_state_from_layers(
+    config_layer_stack: &ConfigLayerStack,
+) -> Result<ConfigState> {
+    let (exec_policy, warning) = load_exec_policy_with_warning(config_layer_stack).await?;
     if let Some(err) = warning.as_ref() {
         tracing::warn!(
             "failed to parse execpolicy while building network proxy state: {}",
@@ -78,12 +79,10 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
         );
     }
 
-    let config = config_from_layers(&config_layer_stack, &exec_policy)?;
+    let config = config_from_layers(config_layer_stack, &exec_policy)?;
 
-    let constraints = enforce_trusted_constraints(&config_layer_stack, &config)?;
-    let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
-    let state = build_config_state(config, constraints)?;
-    Ok((state, layer_mtimes))
+    let constraints = enforce_trusted_constraints(config_layer_stack, &config)?;
+    build_config_state(config, constraints)
 }
 
 fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
@@ -163,14 +162,14 @@ fn apply_network_constraints(network: NetworkToml, constraints: &mut NetworkProx
     if let Some(domains) = network.domains.as_ref() {
         let mut config = NetworkProxyConfig::default();
         if let Some(allowed_domains) = constraints.allowed_domains.take() {
-            config.network.set_allowed_domains(allowed_domains);
+            config.set_allowed_domains(allowed_domains);
         }
         if let Some(denied_domains) = constraints.denied_domains.take() {
-            config.network.set_denied_domains(denied_domains);
+            config.set_denied_domains(denied_domains);
         }
         overlay_network_domain_permissions(&mut config, domains);
-        constraints.allowed_domains = config.network.allowed_domains();
-        constraints.denied_domains = config.network.denied_domains();
+        constraints.allowed_domains = config.allowed_domains();
+        constraints.denied_domains = config.denied_domains();
     }
     if let Some(unix_sockets) = network.unix_sockets.as_ref() {
         let allow_unix_sockets = unix_sockets.allow_unix_sockets();
@@ -257,11 +256,11 @@ impl NetworkConfigAccumulator {
             };
             mitm.validate_action_references(&actions)
                 .map_err(anyhow::Error::msg)?;
-            self.config.network.mitm_hooks = mitm.to_runtime_hooks(Some(&actions));
+            self.config.mitm_hooks = mitm.to_runtime_hooks(Some(&actions));
         }
 
-        self.config.network.mitm = self.config.network.mode == NetworkMode::Limited
-            || !self.config.network.mitm_hooks.is_empty();
+        self.config.mitm =
+            self.config.mode == NetworkMode::Limited || !self.config.mitm_hooks.is_empty();
         Ok(self.config)
     }
 }
@@ -311,9 +310,7 @@ fn upsert_network_domain(
     host: String,
     permission: codex_network_proxy::NetworkDomainPermission,
 ) {
-    config
-        .network
-        .upsert_domain_permission(host, permission, normalize_host);
+    config.upsert_domain_permission(host, permission, normalize_host);
 }
 
 fn is_user_controlled_layer(layer: &ConfigLayerSource) -> bool {

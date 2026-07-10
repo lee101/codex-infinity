@@ -1182,16 +1182,16 @@ fn permissions_profile_network_to_proxy_config_preserves_mitm_hooks() {
 
     let config = network.to_network_proxy_config();
 
-    assert_eq!(config.network.mode, NetworkMode::Full);
-    assert!(config.network.mitm);
-    assert_eq!(config.network.mitm_hooks.len(), 1);
-    assert_eq!(config.network.mitm_hooks[0].host, "api.github.com");
+    assert_eq!(config.mode, NetworkMode::Full);
+    assert!(config.mitm);
+    assert_eq!(config.mitm_hooks.len(), 1);
+    assert_eq!(config.mitm_hooks[0].host, "api.github.com");
     assert_eq!(
-        config.network.mitm_hooks[0].matcher.methods,
+        config.mitm_hooks[0].matcher.methods,
         vec!["POST".to_string()]
     );
     assert_eq!(
-        config.network.mitm_hooks[0].actions.strip_request_headers,
+        config.mitm_hooks[0].actions.strip_request_headers,
         vec!["authorization".to_string()]
     );
 }
@@ -1228,13 +1228,13 @@ action = ["noop"]
 
     let config = network.to_network_proxy_config();
 
-    assert_eq!(config.network.mitm_hooks.len(), 2);
+    assert_eq!(config.mitm_hooks.len(), 2);
     assert_eq!(
-        config.network.mitm_hooks[0].matcher.path_prefixes,
+        config.mitm_hooks[0].matcher.path_prefixes,
         vec!["/repos/openai/".to_string()]
     );
     assert_eq!(
-        config.network.mitm_hooks[1].matcher.path_prefixes,
+        config.mitm_hooks[1].matcher.path_prefixes,
         vec!["/repos/".to_string()]
     );
 }
@@ -1590,6 +1590,10 @@ respect_system_proxy = true
     .await?;
 
     assert!(config.respect_system_proxy);
+    assert_eq!(
+        config.http_client_factory().outbound_proxy_policy(),
+        codex_http_client::OutboundProxyPolicy::RespectSystemProxy
+    );
     Ok(())
 }
 
@@ -6038,17 +6042,17 @@ async fn to_mcp_config_preserves_auth_elicitation_feature_from_config() -> std::
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(
         mcp_config.client_elicitation_capability,
-        ElicitationCapability::default()
-    );
-
-    let _ = config.features.enable(Feature::AuthElicitation);
-    let mcp_config = config.to_mcp_config(&plugins_manager).await;
-    assert_eq!(
-        mcp_config.client_elicitation_capability,
         ElicitationCapability {
             form: Some(FormElicitationCapability::default()),
             url: Some(UrlElicitationCapability::default()),
         }
+    );
+
+    let _ = config.features.disable(Feature::AuthElicitation);
+    let mcp_config = config.to_mcp_config(&plugins_manager).await;
+    assert_eq!(
+        mcp_config.client_elicitation_capability,
+        ElicitationCapability::default()
     );
 
     Ok(())
@@ -10307,6 +10311,7 @@ default_wait_timeout_ms = 30000
 usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
+multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 non_code_mode_only = true
@@ -10342,6 +10347,10 @@ non_code_mode_only = true
     assert_eq!(
         config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
         Some("Subagent guidance.")
+    );
+    assert_eq!(
+        config.multi_agent_v2.multi_agent_mode_hint_text.as_deref(),
+        Some("Custom mode guidance.")
     );
     assert_eq!(
         config.multi_agent_v2.tool_namespace.as_deref(),
@@ -10403,6 +10412,22 @@ max_concurrent_threads_per_session = 17
         .into_iter()
         .all(|hint| hint.is_some_and(|hint| hint.ends_with(expected_suffix.as_str())))
     );
+}
+
+#[test]
+fn multi_agent_v2_preserves_empty_mode_hint_override() {
+    let config_toml = toml::from_str(
+        r#"[features.multi_agent_v2]
+multi_agent_mode_hint_text = ""
+"#,
+    )
+    .expect("multi-agent v2 config should parse");
+
+    let expected = MultiAgentV2Config {
+        multi_agent_mode_hint_text: Some(String::new()),
+        ..Default::default()
+    };
+    assert_eq!(resolve_multi_agent_v2_config(&config_toml), expected);
 }
 
 #[tokio::test]

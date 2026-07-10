@@ -889,6 +889,16 @@ impl App {
                                 snapshots,
                                 rate_limit_reset_credits.ok_or_else(|| {
                                     "account/rateLimits/read response did not include rateLimitResetCredits"
+                                    .to_string()
+                                }),
+                            );
+                        }
+                        RateLimitRefreshOrigin::ResetPicker { request_id } => {
+                            self.chat_widget.finish_rate_limit_reset_credits_refresh(
+                                request_id,
+                                snapshots,
+                                rate_limit_reset_credits.ok_or_else(|| {
+                                    "account/rateLimits/read response did not include rateLimitResetCredits"
                                         .to_string()
                                 }),
                             );
@@ -925,6 +935,13 @@ impl App {
                                 Err(err),
                             );
                         }
+                        RateLimitRefreshOrigin::ResetPicker { request_id } => {
+                            self.chat_widget.finish_rate_limit_reset_credits_refresh(
+                                request_id,
+                                Vec::new(),
+                                Err(err),
+                            );
+                        }
                     }
                 }
             },
@@ -934,38 +951,27 @@ impl App {
             }
             AppEvent::OpenRateLimitResetCredits => {
                 let request_id = self.chat_widget.show_rate_limit_reset_loading_popup();
-                self.refresh_rate_limit_reset_credits(app_server, request_id);
+                self.refresh_rate_limits(
+                    app_server,
+                    RateLimitRefreshOrigin::ResetPicker { request_id },
+                );
             }
-            AppEvent::RateLimitResetCreditsLoaded { request_id, result } => match result {
-                Ok(response) => {
-                    let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
-                    self.chat_widget.finish_rate_limit_reset_credits_refresh(
-                        request_id,
-                        app_server_rate_limit_snapshots(response),
-                        rate_limit_reset_credits.ok_or_else(|| {
-                            "account/rateLimits/read response did not include rateLimitResetCredits"
-                                .to_string()
-                        }),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "account/rateLimits/read failed during reset-credit refresh: {err}"
-                    );
-                    self.chat_widget.finish_rate_limit_reset_credits_refresh(
-                        request_id,
-                        Vec::new(),
-                        Err(err),
-                    );
-                }
-            },
-            AppEvent::ConsumeRateLimitResetCredit { idempotency_key } => {
+            AppEvent::ConsumeRateLimitResetCredit {
+                idempotency_key,
+                credit_id,
+            } => {
                 let request_id = self.chat_widget.show_rate_limit_reset_consuming_popup();
-                self.consume_rate_limit_reset_credit(app_server, request_id, idempotency_key);
+                self.consume_rate_limit_reset_credit(
+                    app_server,
+                    request_id,
+                    idempotency_key,
+                    credit_id,
+                );
             }
             AppEvent::RateLimitResetCreditConsumed {
                 request_id,
                 idempotency_key,
+                credit_id,
                 result,
             } => {
                 if let Err(err) = &result {
@@ -976,6 +982,7 @@ impl App {
                 if self.chat_widget.finish_rate_limit_reset_consume(
                     request_id,
                     idempotency_key,
+                    credit_id,
                     result,
                 ) {
                     self.refresh_rate_limits(

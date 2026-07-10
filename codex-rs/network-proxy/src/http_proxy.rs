@@ -1,3 +1,4 @@
+use crate::attribution::BindConnectionAttribution;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
@@ -39,7 +40,6 @@ use rama_core::error::ErrorExt as _;
 use rama_core::error::OpaqueError;
 use rama_core::extensions::ExtensionsMut;
 use rama_core::extensions::ExtensionsRef;
-use rama_core::layer::AddInputExtensionLayer;
 use rama_core::service::service_fn;
 use rama_core::stream::Stream;
 use rama_http::Body;
@@ -159,7 +159,11 @@ async fn run_http_proxy_with_listener(
     info!("HTTP proxy listening on {addr}");
 
     listener
-        .serve(AddInputExtensionLayer::new(state).into_layer(http_service))
+        .serve(BindConnectionAttribution::new(
+            http_service,
+            state,
+            environment_id,
+        ))
         .await;
     Ok(())
 }
@@ -1083,7 +1087,7 @@ mod tests {
     use super::*;
 
     use crate::config::NetworkMode;
-    use crate::config::NetworkProxySettings;
+    use crate::config::NetworkProxyConfig;
     use crate::runtime::network_proxy_state_for_policy;
     use pretty_assertions::assert_eq;
     use rama_http::Method;
@@ -1102,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = {
-            let mut policy = NetworkProxySettings::default();
+            let mut policy = NetworkProxyConfig::default();
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };
@@ -1132,9 +1136,9 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_allows_allowlisted_host_in_full_mode() {
         let policy = {
-            let mut policy = NetworkProxySettings {
+            let mut policy = NetworkProxyConfig {
                 allow_local_binding: true,
-                ..NetworkProxySettings::default()
+                ..NetworkProxyConfig::default()
             };
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
@@ -1159,9 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_accept_passes_environment_id_to_decider() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
         let seen_environment_id = Arc::new(Mutex::new(None));
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
             let seen_environment_id = seen_environment_id.clone();
@@ -1198,10 +1200,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_accept_defers_brokered_host_mitm_until_protocol_detection() {
-        let mut policy = NetworkProxySettings {
+        let mut policy = NetworkProxyConfig {
             credential_broker: true,
             mitm: true,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
         };
         policy.set_allowed_domains(vec!["github.com".to_string()]);
         let state = Arc::new(network_proxy_state_for_policy(policy));
@@ -1231,10 +1233,10 @@ mod tests {
     #[tokio::test]
     async fn plaintext_credential_injection_requires_explicit_opt_in() {
         let real_token = "ghp-real";
-        let mut disabled_network = NetworkProxySettings {
+        let mut disabled_network = NetworkProxyConfig {
             credential_broker: true,
             mitm: true,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
         };
         disabled_network.set_allowed_domains(vec!["api.github.com".to_string()]);
         let disabled_state = Arc::new(network_proxy_state_for_policy(disabled_network));
@@ -1259,11 +1261,11 @@ mod tests {
             Some(&HeaderValue::from_str(&format!("Bearer {dummy_token}")).unwrap())
         );
 
-        let mut enabled_network = NetworkProxySettings {
+        let mut enabled_network = NetworkProxyConfig {
             credential_broker: true,
             dangerously_allow_plaintext_credential_injection: true,
             mitm: true,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
         };
         enabled_network.set_allowed_domains(vec!["api.github.com".to_string()]);
         let enabled_state = Arc::new(network_proxy_state_for_policy(enabled_network));
@@ -1291,7 +1293,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_accept_blocks_hooked_host_in_full_mode_without_mitm_state() {
-        let mut policy = NetworkProxySettings {
+        let mut policy = NetworkProxyConfig {
             mitm: true,
             mitm_hooks: vec![crate::mitm_hook::MitmHookConfig {
                 host: "api.github.com".to_string(),
@@ -1348,10 +1350,10 @@ mod tests {
         });
 
         let state = Arc::new(network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings {
+            let mut network = NetworkProxyConfig {
                 credential_broker: true,
                 mitm: true,
-                ..NetworkProxySettings::default()
+                ..NetworkProxyConfig::default()
             };
             network.set_allowed_domains(vec!["127.0.0.1".to_string()]);
             network.allow_local_binding = true;
@@ -1412,9 +1414,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_blocks_unix_socket_when_method_not_allowed() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
         state
             .set_network_mode(NetworkMode::Limited)
             .await
@@ -1443,9 +1443,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_rejects_unix_socket_when_not_allowlisted() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
 
         let mut req = Request::builder()
             .method(Method::GET)
@@ -1476,7 +1474,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_attempts_allowed_unix_socket_proxy() {
         let state = Arc::new(network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings::default();
+            let mut network = NetworkProxyConfig::default();
             network.set_allow_unix_sockets(vec!["/tmp/test.sock".to_string()]);
             network
         }));
@@ -1500,7 +1498,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_denies_denylisted_host() {
         let policy = {
-            let mut policy = NetworkProxySettings::default();
+            let mut policy = NetworkProxyConfig::default();
             policy.set_allowed_domains(vec!["**.openai.com".to_string()]);
             policy.set_denied_domains(vec!["api.openai.com".to_string()]);
             policy
@@ -1529,9 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_plain_proxy_rejects_absolute_uri_host_header_mismatch() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
         let mut req = Request::builder()
             .method(Method::GET)
             .uri("http://raw.githubusercontent.com/openai/codex/main/README.md")

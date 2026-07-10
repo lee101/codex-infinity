@@ -25,6 +25,12 @@ use codex_plugin::AppConnectorId;
 
 const LEGACY_CODEX_APPS_REGISTRATION_ID: &str = "legacy_codex_apps";
 
+/// MCP configuration and capability availability derived from the same inputs.
+pub(crate) struct McpRuntimeProjection {
+    pub(crate) config: McpConfig,
+    pub(crate) plugins_available: bool,
+}
+
 enum OrderedMcpOverlay {
     Set {
         contributor_id: &'static str,
@@ -73,8 +79,15 @@ impl McpManager {
     /// Returns the MCP config after applying compatibility built-ins and
     /// runtime-only extension overlays.
     pub async fn runtime_config(&self, config: &Config) -> McpConfig {
-        self.runtime_config_with_context(McpServerContributionContext::global(config))
-            .await
+        self.runtime_config_with_context(
+            McpServerContributionContext::global(config),
+            // Threadless discovery and control-plane paths have no effective thread
+            // originator; active-thread tool calls use runtime_config_for_step below.
+            /*originator*/
+            None,
+        )
+        .await
+        .config
     }
 
     pub(crate) async fn runtime_config_for_step(
@@ -82,22 +95,29 @@ impl McpManager {
         config: &Config,
         thread_init: &ExtensionDataInit,
         thread_store: &ExtensionData,
+        originator: &str,
         available_environment_ids: &[String],
-    ) -> McpConfig {
-        self.runtime_config_with_context(McpServerContributionContext::for_step(
-            config,
-            thread_init,
-            thread_store,
-            available_environment_ids,
-        ))
+    ) -> McpRuntimeProjection {
+        self.runtime_config_with_context(
+            McpServerContributionContext::for_step(
+                config,
+                thread_init,
+                thread_store,
+                originator,
+                available_environment_ids,
+            ),
+            Some(originator),
+        )
         .await
     }
 
     async fn runtime_config_with_context(
         &self,
         context: McpServerContributionContext<'_, Config>,
-    ) -> McpConfig {
+        originator: Option<&str>,
+    ) -> McpRuntimeProjection {
         let config = context.config();
+        let mut selected_plugin_available = false;
         let mut selected_plugin_connector_sources = Vec::new();
         let mut selected_plugin_registrations = Vec::new();
         let mut overlays = Vec::new();
@@ -129,17 +149,22 @@ impl McpManager {
                             *config,
                         ),
                     ),
-                    McpServerContribution::SelectedPluginConnectors {
+                    McpServerContribution::SelectedPluginPackage {
                         plugin_id,
                         plugin_display_name,
                         connector_ids,
-                    } => selected_plugin_connector_sources.push(
-                        PluginConnectorSource::from_connector_ids(
-                            plugin_id,
-                            plugin_display_name,
-                            connector_ids.into_iter().map(AppConnectorId),
-                        ),
-                    ),
+                    } => {
+                        selected_plugin_available = true;
+                        if !connector_ids.is_empty() {
+                            selected_plugin_connector_sources.push(
+                                PluginConnectorSource::from_connector_ids(
+                                    plugin_id,
+                                    plugin_display_name,
+                                    connector_ids.into_iter().map(AppConnectorId),
+                                ),
+                            );
+                        }
+                    }
                     McpServerContribution::Remove { name } => {
                         overlays.push(OrderedMcpOverlay::Remove {
                             contributor_id: contributor.id(),
@@ -152,12 +177,14 @@ impl McpManager {
             }
         }
 
-        let mut mcp_config = config
-            .to_mcp_config_with_plugin_registrations(
-                self.plugins_manager.as_ref(),
-                selected_plugin_registrations,
-            )
+        let loaded_plugins = self
+            .plugins_manager
+            .plugins_for_config(&config.plugins_config_input())
             .await;
+        let plugins_available =
+            selected_plugin_available || !loaded_plugins.capability_summaries().is_empty();
+        let mut mcp_config = config
+            .to_mcp_config_with_loaded_plugins(&loaded_plugins, selected_plugin_registrations);
         let mut catalog = mcp_config.mcp_server_catalog.to_builder();
         if mcp_config.apps_enabled {
             catalog.register(McpServerRegistration::from_compatibility(
@@ -166,6 +193,7 @@ impl McpManager {
                 codex_apps_mcp_server_config(
                     &mcp_config.chatgpt_base_url,
                     mcp_config.apps_mcp_product_sku.as_deref(),
+                    originator,
                 ),
             ));
         } else {
@@ -211,7 +239,10 @@ impl McpManager {
                 .merged_with(&ConnectorSnapshot::from_plugin_sources(
                     selected_plugin_connector_sources,
                 ));
-        mcp_config
+        McpRuntimeProjection {
+            config: mcp_config,
+            plugins_available,
+        }
     }
 
     /// Returns config- and plugin-backed servers without runtime contributions.

@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_apps_cache::CodexAppsToolsCache;
 use crate::codex_apps_cache::CodexAppsToolsCacheContext;
-use crate::declared_openai_file_input_param_names;
+use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
 use crate::elicitation::elicitation_is_rejected_by_policy;
@@ -18,7 +18,6 @@ use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
-use crate::tools::tool_with_model_visible_input_schema;
 use codex_config::AppToolApproval;
 use codex_config::Constrained;
 use codex_config::McpServerConfig;
@@ -39,9 +38,9 @@ use rmcp::model::CreateElicitationRequestParams;
 use rmcp::model::ElicitationAction;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::JsonObject;
-use rmcp::model::Meta;
 use rmcp::model::NumberOrString;
 use rmcp::model::Tool;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -62,6 +61,7 @@ fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
             format!("Test tool: {tool_name}"),
             Arc::new(JsonObject::default()),
         ),
+        openai_file_input_optional_fields: Default::default(),
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
@@ -204,85 +204,6 @@ fn is_code_mode_compatible_tool_name(name: &ToolName) -> bool {
         .flat_map(str::chars)
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
-#[test]
-fn declared_openai_file_fields_treat_names_literally() {
-    let meta = serde_json::json!({
-        "openai/fileParams": ["file", "input_file", "attachments"]
-    });
-    let meta = meta.as_object().expect("meta object");
-
-    assert_eq!(
-        declared_openai_file_input_param_names(Some(meta)),
-        vec![
-            "file".to_string(),
-            "input_file".to_string(),
-            "attachments".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn tool_with_model_visible_input_schema_masks_file_params() {
-    let mut tool = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "upload").tool;
-    tool.input_schema = Arc::new(
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "file": {
-                    "type": "object",
-                    "description": "Original file payload."
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                }
-            }
-        })
-        .as_object()
-        .expect("object")
-        .clone(),
-    );
-    tool.meta = Some(Meta(
-        serde_json::json!({
-            "openai/fileParams": ["file", "files"]
-        })
-        .as_object()
-        .expect("object")
-        .clone(),
-    ));
-
-    let tool = tool_with_model_visible_input_schema(&tool);
-
-    assert_eq!(
-        *tool.input_schema,
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "file": {
-                    "type": "string",
-                    "description": "Original file payload. This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here."
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here."
-                }
-            }
-        })
-        .as_object()
-        .expect("object")
-        .clone()
-    );
-}
-
-#[test]
-fn tool_with_model_visible_input_schema_leaves_tools_without_file_params_unchanged() {
-    let original_tool = create_test_tool("custom", "upload").tool;
-
-    let tool = tool_with_model_visible_input_schema(&original_tool);
-
-    assert_eq!(tool, original_tool);
-}
 
 #[test]
 fn elicitation_granular_policy_defaults_to_prompting() {
@@ -323,6 +244,7 @@ async fn disabled_permissions_auto_accept_elicitation_with_empty_form_schema() {
         AskForApproval::Never,
         PermissionProfile::Disabled,
         /*reviewer*/ None,
+        /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
     let (tx_event, _rx_event) = async_channel::bounded(1);
@@ -359,6 +281,7 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
         AskForApproval::Never,
         PermissionProfile::Disabled,
         /*reviewer*/ None,
+        /*lifecycle*/ None,
         ElicitationRequestRouter::default(),
     );
     let (tx_event, _rx_event) = async_channel::bounded(1);
@@ -395,17 +318,35 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
 
 #[tokio::test]
 async fn shared_elicitation_router_targets_the_exact_pending_request() {
+    struct Registration(Arc<AtomicUsize>);
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     let router = ElicitationRequestRouter::default();
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let lifecycle = ElicitationLifecycle::new({
+        let outstanding = outstanding.clone();
+        move || {
+            outstanding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Registration(outstanding.clone())
+        }
+    });
     let manager_a = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
         /*reviewer*/ None,
+        Some(lifecycle.clone()),
         router.clone(),
     );
     let manager_b = ElicitationRequestManager::new(
         AskForApproval::OnRequest,
         PermissionProfile::default(),
         /*reviewer*/ None,
+        Some(lifecycle),
         router,
     );
     let (tx_event, rx_event) = async_channel::bounded(2);
@@ -435,6 +376,7 @@ async fn shared_elicitation_router_targets_the_exact_pending_request() {
     else {
         panic!("expected elicitation request");
     };
+    assert_eq!(outstanding.load(std::sync::atomic::Ordering::SeqCst), 2);
     let (
         codex_protocol::mcp::RequestId::String(request_a_id),
         codex_protocol::mcp::RequestId::String(request_b_id),
@@ -485,6 +427,7 @@ async fn shared_elicitation_router_targets_the_exact_pending_request() {
             .expect("request B response"),
         response_b
     );
+    assert_eq!(outstanding.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1395,6 +1338,7 @@ fn server_metadata_preserves_tool_approval_policy() {
     let mut config = crate::codex_apps_mcp_server_config(
         "https://docs.example",
         /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
     );
     config.environment_id = "remote".to_string();
     config.default_tools_approval_mode = Some(AppToolApproval::Prompt);
@@ -1439,6 +1383,7 @@ fn host_owned_codex_apps_matches_reserved_name_with_server_metadata() {
     let server = EffectiveMcpServer::configured(crate::codex_apps_mcp_server_config(
         "https://chatgpt.com",
         /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
     ));
     manager.server_metadata.insert(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
@@ -1538,7 +1483,9 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         /*supports_openai_form_elicitation*/ false,
         ToolPluginProvenance::default(),
         /*auth*/ None,
+        /*codex_apps_auth_manager*/ None,
         /*elicitation_reviewer*/ None,
+        /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
     )
     .await;

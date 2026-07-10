@@ -57,15 +57,17 @@ def bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
+    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
     expression = "set(" + " ".join(labels) + ")"
-    result = subprocess.run(
-        [
-            "bazel",
+    bazel_configs = bazel_configs or []
+    output = subprocess.check_output(
+        bazel_command(
             "cquery",
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
+            *[f"--config={config}" for config in bazel_configs],
             "--output=files",
             expression,
         ),
@@ -81,13 +83,19 @@ def bazel_build(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
+    bazel_configs: list[str] | None = None,
+    download_toplevel: bool = False,
 ) -> None:
+    bazel_configs = bazel_configs or []
+    download_args = ["--remote_download_toplevel"] if download_toplevel else []
     subprocess.run(
         bazel_command(
             "build",
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
+            *[f"--config={config}" for config in bazel_configs],
+            *download_args,
             *labels,
         ),
         cwd=ROOT,
@@ -99,13 +107,18 @@ def ensure_bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
+    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
-    outputs = bazel_output_files(platform, labels, compilation_mode)
-    if all(path.exists() for path in outputs):
-        return outputs
-
-    bazel_build(platform, labels, compilation_mode)
-    outputs = bazel_output_files(platform, labels, compilation_mode)
+    # Bazel output paths can be reused across config flips, so existence alone
+    # does not prove the files match the requested flags.
+    bazel_build(
+        platform,
+        labels,
+        compilation_mode,
+        bazel_configs,
+        download_toplevel=True,
+    )
+    outputs = bazel_output_files(platform, labels, compilation_mode, bazel_configs)
     missing = [str(path) for path in outputs if not path.exists()]
     if missing:
         raise SystemExit(f"missing built outputs for {labels}: {missing}")
@@ -195,28 +208,22 @@ def staged_binding_name(target: str, artifact_profile: str) -> str:
     return f"src_binding_{artifact_profile}_{target}.rs"
 
 
-def single_bazel_output_file(
-    platform: str,
-    label: str,
-    compilation_mode: str = "fastbuild",
-) -> Path:
-    outputs = ensure_bazel_output_files(platform, [label], compilation_mode)
-    if len(outputs) != 1:
-        raise SystemExit(f"expected exactly one output for {label}, found {outputs}")
-    return outputs[0]
+def staged_checksums_name(target: str, artifact_profile: str) -> str:
+    return f"rusty_v8_{artifact_profile}_{target}.sha256"
 
 
 def stage_artifacts(
     target: str,
     lib_path: Path,
-    compilation_mode: str = "fastbuild",
-) -> Path:
-    llvm_ar = single_bazel_output_file(platform, LLVM_AR_LABEL, compilation_mode)
-    llvm_ranlib = single_bazel_output_file(platform, LLVM_RANLIB_LABEL, compilation_mode)
-    runtime_archives = [
-        single_bazel_output_file(platform, label, compilation_mode)
-        for label in MUSL_RUNTIME_ARCHIVE_LABELS
+    binding_path: Path,
+    output_dir: Path,
+    sandbox: bool,
+) -> None:
+    missing_paths = [
+        str(path) for path in [lib_path, binding_path] if not path.exists()
     ]
+    if missing_paths:
+        raise SystemExit(f"missing release outputs for {target}: {missing_paths}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_profile = SANDBOX_ARTIFACT_PROFILE if sandbox else RELEASE_ARTIFACT_PROFILE
@@ -251,21 +258,27 @@ def stage_artifacts(
     print(staged_checksums)
 
 
-def upstream_release_pair_paths(source_root: Path, target: str) -> tuple[Path, Path]:
+def upstream_release_pair_paths(
+    target: str,
+    target_dir: Path,
+) -> tuple[Path, Path]:
     lib_name = (
         "rusty_v8.lib" if target.endswith("-pc-windows-msvc") else "librusty_v8.a"
     )
-    gn_out = source_root / "target" / target / "release" / "gn_out"
+    gn_out = target_dir / target / "release" / "gn_out"
     return gn_out / "obj" / lib_name, gn_out / "src_binding.rs"
 
 
 def stage_upstream_release_pair(
-    source_root: Path,
     target: str,
     output_dir: Path,
+    target_dir: Path,
     sandbox: bool = False,
 ) -> None:
-    lib_path, binding_path = upstream_release_pair_paths(source_root, target)
+    lib_path, binding_path = upstream_release_pair_paths(
+        target,
+        target_dir,
+    )
     stage_artifacts(target, lib_path, binding_path, output_dir, sandbox)
 
 
@@ -274,12 +287,15 @@ def stage_release_pair(
     target: str,
     output_dir: Path,
     compilation_mode: str = "fastbuild",
+    bazel_configs: list[str] | None = None,
+    sandbox: bool = False,
 ) -> None:
     bazel_configs = artifact_bazel_configs(bazel_configs)
     outputs = ensure_bazel_output_files(
         platform,
         [release_pair_label(target, sandbox)],
         compilation_mode,
+        bazel_configs,
     )
 
     try:
@@ -292,39 +308,7 @@ def stage_release_pair(
     except StopIteration as exc:
         raise SystemExit(f"missing Rust binding output for {target}") from exc
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    staged_library = output_dir / staged_archive_name(target, lib_path)
-    staged_binding = output_dir / f"src_binding_release_{target}.rs"
-    source_archive = (
-        merged_musl_archive(platform, lib_path, compilation_mode)
-        if is_musl_archive_target(target, lib_path)
-        else lib_path
-    )
-
-    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
-        with gzip.GzipFile(
-            filename="",
-            mode="wb",
-            fileobj=dst,
-            compresslevel=6,
-            mtime=0,
-        ) as gz:
-            shutil.copyfileobj(src, gz)
-
-    shutil.copyfile(binding_path, staged_binding)
-
-    staged_checksums = output_dir / f"rusty_v8_release_{target}.sha256"
-    with staged_checksums.open("w", encoding="utf-8") as checksums:
-        for path in [staged_library, staged_binding]:
-            digest = hashlib.sha256()
-            with path.open("rb") as artifact:
-                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
-
-    print(staged_library)
-    print(staged_binding)
-    print(staged_checksums)
+    stage_artifacts(target, lib_path, binding_path, output_dir, sandbox)
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,6 +321,12 @@ def parse_args() -> argparse.Namespace:
     stage_release_pair_parser.add_argument("--output-dir", required=True)
     stage_release_pair_parser.add_argument("--sandbox", action="store_true")
     stage_release_pair_parser.add_argument(
+        "--bazel-config",
+        action="append",
+        default=[],
+        dest="bazel_configs",
+    )
+    stage_release_pair_parser.add_argument(
         "--compilation-mode",
         default="fastbuild",
         choices=["fastbuild", "opt", "dbg"],
@@ -346,7 +336,7 @@ def parse_args() -> argparse.Namespace:
         "stage-upstream-release-pair"
     )
     stage_upstream_release_pair_parser.add_argument(
-        "--source-root", type=Path, required=True
+        "--target-dir", type=Path, required=True
     )
     stage_upstream_release_pair_parser.add_argument("--target", required=True)
     stage_upstream_release_pair_parser.add_argument("--output-dir", required=True)
@@ -383,6 +373,16 @@ def main() -> int:
             target=args.target,
             output_dir=Path(args.output_dir),
             compilation_mode=args.compilation_mode,
+            bazel_configs=args.bazel_configs,
+            sandbox=args.sandbox,
+        )
+        return 0
+    if args.command == "stage-upstream-release-pair":
+        stage_upstream_release_pair(
+            target=args.target,
+            output_dir=Path(args.output_dir),
+            target_dir=args.target_dir,
+            sandbox=args.sandbox,
         )
         return 0
     if args.command == "resolved-v8-crate-version":
