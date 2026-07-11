@@ -373,6 +373,14 @@ fn write_raw_skill_at(root: &Path, dir: &str, frontmatter: &str) -> PathBuf {
     path
 }
 
+fn write_markdown_skill_at(root: &Path, dir: &str, contents: &str) -> PathBuf {
+    let skill_dir = root.join(dir);
+    fs::create_dir_all(&skill_dir).unwrap();
+    let path = skill_dir.join(SKILLS_FILENAME);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
 fn write_skill_metadata_at(skill_dir: &Path, contents: &str) -> PathBuf {
     let path = skill_dir
         .join(SKILLS_METADATA_DIR)
@@ -1265,6 +1273,72 @@ async fn falls_back_to_directory_name_when_skill_name_is_missing() {
         vec![SkillMetadata {
             name: "directory-derived".to_string(),
             description: "fallback name".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: normalized(&skill_path),
+            scope: SkillScope::User,
+            plugin_id: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn loads_markdown_skill_without_frontmatter() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_markdown_skill_at(
+        &codex_home.path().join("skills"),
+        "ci-autofix",
+        "# CI Autofix\n\nInspect CI failures and apply focused fixes.\n",
+    );
+    let cfg = make_config(&codex_home).await;
+
+    let outcome = load_skills_for_test(&cfg).await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "unexpected errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(
+        outcome.skills,
+        vec![SkillMetadata {
+            name: "ci-autofix".to_string(),
+            description: "CI Autofix".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: normalized(&skill_path),
+            scope: SkillScope::User,
+            plugin_id: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn loads_markdown_skill_without_frontmatter_using_first_body_line() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_markdown_skill_at(
+        &codex_home.path().join("skills"),
+        "plain",
+        "\n\nInspect CI failures and apply focused fixes.\n",
+    );
+    let cfg = make_config(&codex_home).await;
+
+    let outcome = load_skills_for_test(&cfg).await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "unexpected errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(
+        outcome.skills,
+        vec![SkillMetadata {
+            name: "plain".to_string(),
+            description: "Inspect CI failures and apply focused fixes.".to_string(),
             short_description: None,
             interface: None,
             dependencies: None,

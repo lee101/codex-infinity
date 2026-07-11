@@ -72,6 +72,11 @@ fn sqlite_error_detail_classifies_corruption_and_lock_errors() {
     assert!(!sqlite_error_detail_is_corruption("database is locked"));
     assert!(sqlite_error_detail_is_lock("database is locked"));
     assert!(sqlite_error_detail_is_lock("database is busy"));
+    assert!(sqlite_error_detail_is_full("database or disk is full"));
+    assert!(sqlite_error_detail_is_full("No space left on device"));
+    assert!(sqlite_error_detail_is_full(
+        "error returned from database: (code: 13) database or disk is full"
+    ));
 }
 
 #[tokio::test]

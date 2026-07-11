@@ -104,6 +104,14 @@ pub fn is_sqlite_corruption_error(err: &anyhow::Error) -> bool {
     err.chain().any(sqlite_error_source_is_corruption)
 }
 
+pub fn is_sqlite_lock_error(err: &anyhow::Error) -> bool {
+    err.chain().any(sqlite_error_source_is_lock)
+}
+
+pub fn is_sqlite_full_error(err: &anyhow::Error) -> bool {
+    err.chain().any(sqlite_error_source_is_full)
+}
+
 fn sqlite_error_source_is_corruption(source: &(dyn std::error::Error + 'static)) -> bool {
     let Some(err) = source.downcast_ref::<sqlx::Error>() else {
         return false;
@@ -124,6 +132,64 @@ fn sqlite_database_code_is_corruption(code: Cow<'_, str>) -> bool {
     )
 }
 
+fn sqlite_error_source_is_lock(source: &(dyn std::error::Error + 'static)) -> bool {
+    let Some(err) = source.downcast_ref::<sqlx::Error>() else {
+        return false;
+    };
+    let sqlx::Error::Database(database_error) = err else {
+        return false;
+    };
+    sqlite_error_detail_is_lock(database_error.message())
+        || database_error
+            .code()
+            .is_some_and(sqlite_database_code_is_lock)
+}
+
+fn sqlite_database_code_is_lock(code: Cow<'_, str>) -> bool {
+    matches!(
+        code.as_ref().to_ascii_lowercase().as_str(),
+        "5" | "6" | "sqlite_busy" | "sqlite_locked"
+    )
+}
+
+fn sqlite_error_source_is_full(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(err) = source.downcast_ref::<std::io::Error>()
+        && (err.raw_os_error() == Some(28)
+            || err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("no space left"))
+    {
+        return true;
+    }
+    let Some(err) = source.downcast_ref::<sqlx::Error>() else {
+        return false;
+    };
+    match err {
+        sqlx::Error::Database(database_error) => {
+            sqlite_error_detail_is_full(database_error.message())
+                || database_error
+                    .code()
+                    .is_some_and(sqlite_database_code_is_full)
+        }
+        sqlx::Error::Io(err) => {
+            err.raw_os_error() == Some(28)
+                || err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no space left")
+        }
+        _ => false,
+    }
+}
+
+fn sqlite_database_code_is_full(code: Cow<'_, str>) -> bool {
+    matches!(
+        code.as_ref().to_ascii_lowercase().as_str(),
+        "13" | "sqlite_full"
+    )
+}
+
 pub fn sqlite_error_detail_is_corruption(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("database disk image is malformed")
@@ -139,6 +205,15 @@ pub fn sqlite_error_detail_is_corruption(detail: &str) -> bool {
 pub fn sqlite_error_detail_is_lock(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("database is locked") || detail.contains("database is busy")
+}
+
+pub fn sqlite_error_detail_is_full(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("database or disk is full")
+        || detail.contains("disk is full")
+        || detail.contains("no space left")
+        || detail.contains("sqlite_full")
+        || detail.contains("(code: 13)")
 }
 
 async fn backup_runtime_db_files(db_path: &Path) -> std::io::Result<Vec<RuntimeDbBackup>> {

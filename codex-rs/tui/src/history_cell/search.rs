@@ -51,9 +51,7 @@ pub(crate) struct WebSearchCell {
     call_id: String,
     query: String,
     action: Option<WebSearchAction>,
-    start_time: Instant,
     completed: bool,
-    animations_enabled: bool,
 }
 
 impl WebSearchCell {
@@ -61,15 +59,13 @@ impl WebSearchCell {
         call_id: String,
         query: String,
         action: Option<WebSearchAction>,
-        animations_enabled: bool,
+        _animations_enabled: bool,
     ) -> Self {
         Self {
             call_id,
             query,
             action,
-            start_time: Instant::now(),
             completed: false,
-            animations_enabled,
         }
     }
 
@@ -89,16 +85,7 @@ impl WebSearchCell {
 
 impl HistoryCell for WebSearchCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let bullet = if self.completed {
-            "•".dim()
-        } else {
-            activity_indicator(
-                Some(self.start_time),
-                MotionMode::from_animations_enabled(self.animations_enabled),
-                ReducedMotionIndicator::StaticBullet,
-            )
-            .unwrap_or_else(|| "•".dim())
-        };
+        let bullet = "•".dim();
         let header = web_search_header(self.completed);
         let detail = web_search_detail(self.action.as_ref(), &self.query);
         let text: Text<'static> = if detail.is_empty() {

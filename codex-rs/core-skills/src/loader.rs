@@ -642,21 +642,26 @@ async fn parse_skill_file(
         .await
         .map_err(SkillParseError::Read)?;
 
-    let frontmatter = extract_frontmatter(&contents).ok_or(SkillParseError::MissingFrontmatter)?;
-
-    let parsed: SkillFrontmatter = match serde_yaml::from_str(&frontmatter) {
-        Ok(parsed) => Ok(parsed),
-        Err(original_error) => match repair_frontmatter_scalar_fields(&frontmatter) {
-            // Some third-party skills use prose like `description: Build for AWS: ECS`
-            // or `argument-hint: <duration: e.g. 7d>`. Keep the repair line-oriented
-            // so unrelated invalid YAML still surfaces.
-            Some(repaired_frontmatter) => {
-                serde_yaml::from_str(&repaired_frontmatter).map_err(|_| original_error)
-            }
-            None => Err(original_error),
+    let parsed: SkillFrontmatter = match extract_frontmatter(&contents)? {
+        Some(frontmatter) => match serde_yaml::from_str(&frontmatter) {
+            Ok(parsed) => Ok(parsed),
+            Err(original_error) => match repair_frontmatter_scalar_fields(&frontmatter) {
+                // Some third-party skills use prose like `description: Build for AWS: ECS`
+                // or `argument-hint: <duration: e.g. 7d>`. Keep the repair line-oriented
+                // so unrelated invalid YAML still surfaces.
+                Some(repaired_frontmatter) => {
+                    serde_yaml::from_str(&repaired_frontmatter).map_err(|_| original_error)
+                }
+                None => Err(original_error),
+            },
+        }
+        .map_err(SkillParseError::InvalidYaml)?,
+        None => SkillFrontmatter {
+            name: None,
+            description: inferred_description_from_markdown(&contents),
+            metadata: SkillFrontmatterMetadata::default(),
         },
-    }
-    .map_err(SkillParseError::InvalidYaml)?;
+    };
 
     let base_name = parsed
         .name
@@ -1000,6 +1005,22 @@ fn sanitize_single_line(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn inferred_description_from_markdown(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            let candidate = if line.starts_with('#') {
+                line.trim_start_matches('#').trim_start()
+            } else {
+                line
+            };
+            sanitize_single_line(candidate)
+        })
+        .filter(|value| !value.is_empty())
+}
+
 fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
     let mut changed = false;
     let mut block_scalar_indent: Option<usize> = None;
@@ -1144,10 +1165,10 @@ fn resolve_color_str(value: Option<String>, field: &'static str) -> Option<Strin
     }
 }
 
-fn extract_frontmatter(contents: &str) -> Option<String> {
+fn extract_frontmatter(contents: &str) -> Result<Option<String>, SkillParseError> {
     let mut lines = contents.lines();
     if !matches!(lines.next(), Some(line) if line.trim() == "---") {
-        return None;
+        return Ok(None);
     }
 
     let mut frontmatter_lines: Vec<&str> = Vec::new();
@@ -1161,10 +1182,10 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
     }
 
     if frontmatter_lines.is_empty() || !found_closing {
-        return None;
+        return Err(SkillParseError::MissingFrontmatter);
     }
 
-    Some(frontmatter_lines.join("\n"))
+    Ok(Some(frontmatter_lines.join("\n")))
 }
 #[cfg(test)]
 pub(crate) async fn skill_roots_from_layer_stack(

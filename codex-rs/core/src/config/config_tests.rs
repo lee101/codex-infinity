@@ -6668,6 +6668,34 @@ async fn set_model_updates_defaults() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn set_feature_enabled_canonicalizes_legacy_aliases() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+    tokio::fs::write(
+        &config_path,
+        r#"
+[features]
+collab = true
+"#,
+    )
+    .await?;
+
+    ConfigEditsBuilder::new(codex_home.path())
+        .set_feature_enabled("collab", /*enabled*/ true)
+        .apply()
+        .await?;
+
+    let serialized = tokio::fs::read_to_string(config_path).await?;
+    let parsed: ConfigToml = toml::from_str(&serialized)?;
+    let features = parsed.features.expect("features table");
+    let entries = features.entries();
+
+    assert_eq!(entries, BTreeMap::from([("multi_agent".to_string(), true)]));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn for_config_writes_selected_user_config_file() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let base_config = codex_home.path().join(CONFIG_TOML_FILE);

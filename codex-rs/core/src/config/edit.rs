@@ -6,6 +6,8 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_features::FEATURES;
+use codex_features::feature_for_key;
+use codex_features::legacy_feature_keys;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -882,6 +884,8 @@ impl ConfigEditsBuilder {
     /// persisting `false`, so the config does not pin the feature once it
     /// graduates to globally enabled.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
+        let feature = feature_for_key(key);
+        let key = feature.map_or(key, |feature| feature.key());
         let segments = vec!["features".to_string(), key.to_string()];
         let is_default_false_feature = FEATURES
             .iter()
@@ -894,6 +898,15 @@ impl ConfigEditsBuilder {
             });
         } else {
             self.edits.push(ConfigEdit::ClearPath { segments });
+        }
+        if let Some(feature) = feature {
+            for legacy_key in legacy_feature_keys() {
+                if legacy_key != key && feature_for_key(legacy_key) == Some(feature) {
+                    self.edits.push(ConfigEdit::ClearPath {
+                        segments: vec!["features".to_string(), legacy_key.to_string()],
+                    });
+                }
+            }
         }
         self
     }

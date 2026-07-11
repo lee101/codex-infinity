@@ -1,8 +1,8 @@
 //! A live task status row rendered above the composer while the agent is busy.
 //!
-//! The row owns spinner timing, the optional interrupt hint, and short inline
-//! context (for example, the unified-exec background-process summary). Keeping
-//! these pieces on one line avoids vertical layout churn in the bottom pane.
+//! The row owns the optional interrupt hint and short inline context (for
+//! example, the unified-exec background-process summary). Keeping these pieces
+//! on one line avoids vertical layout churn in the bottom pane.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -22,10 +22,6 @@ use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
-use crate::motion::MotionMode;
-use crate::motion::ReducedMotionIndicator;
-use crate::motion::activity_indicator;
-use crate::motion::shimmer_text;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
@@ -43,7 +39,7 @@ pub(crate) enum StatusDetailsCapitalization {
 
 /// Displays a single-line in-progress status with optional wrapped details.
 pub(crate) struct StatusIndicatorWidget {
-    /// Animated header text (defaults to "Working").
+    /// Header text (defaults to "Working").
     header: String,
     details: Option<String>,
     details_max_lines: usize,
@@ -57,7 +53,6 @@ pub(crate) struct StatusIndicatorWidget {
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
-    animations_enabled: bool,
 }
 
 // Format elapsed seconds into a compact human-friendly form used by the status line.
@@ -81,7 +76,7 @@ impl StatusIndicatorWidget {
     pub(crate) fn new(
         app_event_tx: AppEventSender,
         frame_requester: FrameRequester,
-        animations_enabled: bool,
+        _animations_enabled: bool,
     ) -> Self {
         Self {
             header: String::from("Working"),
@@ -96,7 +91,6 @@ impl StatusIndicatorWidget {
 
             app_event_tx,
             frame_requester,
-            animations_enabled,
         }
     }
 
@@ -105,7 +99,7 @@ impl StatusIndicatorWidget {
             .interrupt_and_restore_prompt_if_no_output();
     }
 
-    /// Update the animated header label (left of the brackets).
+    /// Update the header label (left of the brackets).
     pub(crate) fn update_header(&mut self, header: String) {
         self.header = header;
     }
@@ -242,26 +236,12 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        if self.animations_enabled {
-            // Schedule next animation frame.
-            self.frame_requester
-                .schedule_frame_in(Duration::from_millis(32));
-        }
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
-        let motion_mode = MotionMode::from_animations_enabled(self.animations_enabled);
 
         let mut spans = Vec::with_capacity(5);
-        if let Some(indicator) = activity_indicator(
-            Some(self.last_resume_at),
-            motion_mode,
-            ReducedMotionIndicator::Hidden,
-        ) {
-            spans.push(indicator);
-            spans.push(" ".into());
-        }
-        spans.extend(shimmer_text(&self.header, motion_mode));
+        spans.push(self.header.clone().into());
         if !spans.is_empty() {
             spans.push(" ".into());
         }

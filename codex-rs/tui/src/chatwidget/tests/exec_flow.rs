@@ -394,7 +394,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
 
     begin_exec(&mut chat, "call-exploring", "cat /dev/null");
     assert!(drain_insert_history(&mut rx).is_empty());
-    assert!(active_blob(&chat).contains("Read null"));
+    assert!(active_blob(&chat).contains("cat /dev/null"));
 
     let orphan =
         begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
@@ -421,7 +421,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
         "expected unrelated exploring call to remain active: {active:?}"
     );
     assert!(
-        active.contains("Read null"),
+        active.contains("cat /dev/null"),
         "expected active exploring command to remain visible: {active:?}"
     );
     assert!(
@@ -456,7 +456,7 @@ async fn exec_end_without_begin_flushes_completed_unrelated_exploring_cell() {
         "expected flushed exploring cell: {first:?}"
     );
     assert!(
-        first.contains("List ls -la"),
+        first.contains("ls -la"),
         "expected flushed exploring cell: {first:?}"
     );
     assert!(
@@ -486,11 +486,11 @@ async fn overlapping_exploring_exec_end_is_not_misclassified_as_orphan() {
     );
     let active = active_blob(&chat);
     assert!(
-        active.contains("List ls -la"),
+        active.contains("ls -la"),
         "expected first command still grouped: {active:?}"
     );
     assert!(
-        active.contains("Read foo.txt"),
+        active.contains("cat foo.txt"),
         "expected second running command to stay in the same active cell: {active:?}"
     );
     assert!(
@@ -548,7 +548,7 @@ async fn exec_history_shows_unified_exec_tool_calls() {
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
 
     let blob = active_blob(&chat);
-    assert_eq!(blob, "• Explored\n  └ List ls\n");
+    assert_eq!(blob, "• Explored\n  └ ls\n");
 }
 
 #[tokio::test]

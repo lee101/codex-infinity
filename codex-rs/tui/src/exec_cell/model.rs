@@ -124,17 +124,6 @@ impl ExecCell {
         self.calls.iter().any(|c| c.output.is_none())
     }
 
-    pub(crate) fn active_start_time(&self) -> Option<Instant> {
-        self.calls
-            .iter()
-            .find(|c| c.output.is_none())
-            .and_then(|c| c.start_time)
-    }
-
-    pub(crate) fn animations_enabled(&self) -> bool {
-        self.animations_enabled
-    }
-
     pub(crate) fn iter_calls(&self) -> impl Iterator<Item = &ExecCall> {
         self.calls.iter()
     }

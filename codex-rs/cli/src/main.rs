@@ -76,6 +76,7 @@ use codex_core::config::find_codex_home;
 use codex_core::config::resolve_profile_v2_config_path;
 use codex_features::FEATURES;
 use codex_features::Stage;
+use codex_features::feature_for_key;
 use codex_features::is_known_feature_key;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
@@ -903,13 +904,19 @@ impl FeatureToggles {
         let mut v = Vec::new();
         for feature in &self.enable {
             Self::validate_feature(feature)?;
+            let feature = Self::canonical_feature_key(feature);
             v.push(format!("features.{feature}=true"));
         }
         for feature in &self.disable {
             Self::validate_feature(feature)?;
+            let feature = Self::canonical_feature_key(feature);
             v.push(format!("features.{feature}=false"));
         }
         Ok(v)
+    }
+
+    fn canonical_feature_key(feature: &str) -> &str {
+        feature_for_key(feature).map_or(feature, |feature| feature.key())
     }
 
     fn validate_feature(feature: &str) -> anyhow::Result<()> {
@@ -3966,7 +3973,7 @@ mod tests {
     #[test]
     fn feature_toggles_known_features_generate_overrides() {
         let toggles = FeatureToggles {
-            enable: vec!["web_search_request".to_string()],
+            enable: vec!["web_search_request".to_string(), "collab".to_string()],
             disable: vec!["unified_exec".to_string()],
         };
         let overrides = toggles.to_overrides().expect("valid features");
@@ -3974,6 +3981,7 @@ mod tests {
             overrides,
             vec![
                 "features.web_search_request=true".to_string(),
+                "features.multi_agent=true".to_string(),
                 "features.unified_exec=false".to_string(),
             ]
         );

@@ -323,6 +323,8 @@ pub struct ConfigToml {
 
     /// Directory where Codex stores the SQLite state DB.
     /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
+    /// If that location is full, Codex may use `$CODEX_SQLITE_FALLBACK_HOME`
+    /// or a temp/cache fallback for SQLite runtime data.
     pub sqlite_home: Option<AbsolutePathBuf>,
 
     /// Directory where Codex writes log files. Setting this value explicitly

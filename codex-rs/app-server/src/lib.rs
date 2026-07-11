@@ -1229,6 +1229,17 @@ async fn init_sqlite_state_db_with_fresh_start_on_corruption(
         if !codex_state::is_sqlite_corruption_error(&err)
             && !sqlite_home_is_blocking_file(database_path.as_path())
         {
+            if codex_state::is_sqlite_lock_error(&err) || codex_state::is_sqlite_full_error(&err) {
+                emit_state_db_backup_warning(&format!(
+                    "Codex local database at {} is temporarily unavailable. Continuing without sqlite-backed local state for this process.",
+                    database_path.display()
+                ));
+                emit_state_db_backup_warning(&format!("SQLite startup error: {err:#}"));
+                return Ok(StateDbInitResult {
+                    state_db: None,
+                    recovery_notice: None,
+                });
+            }
             return Err(err);
         }
 

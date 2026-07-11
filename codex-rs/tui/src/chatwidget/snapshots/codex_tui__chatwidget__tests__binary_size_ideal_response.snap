@@ -15,8 +15,8 @@ expression: "lines[start_idx..].join(\"\\n\")"
   dependencies that impact binary size. Then I’ll summarize the main causes.
 
 • Explored
-  └ List ls -la
-    Read Cargo.toml
+  └ ls -la
+    cat Cargo.toml
 
 • I'm reviewing the workspace's release profile, which has settings like
   lto=fat, strip=symbols, and codegen-units=1 to reduce binary size. However, it
@@ -37,7 +37,7 @@ expression: "lines[start_idx..].join(\"\\n\")"
     tracing = { version
 
 • Explored
-  └ Read Cargo.toml
+  └ cat Cargo.toml
 
 • I’m evaluating how binary size is influenced by various factors. There are
   many binaries, such as codex and codex-exec, which include dependencies by

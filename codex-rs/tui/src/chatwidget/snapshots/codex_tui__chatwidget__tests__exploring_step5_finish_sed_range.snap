@@ -3,5 +3,6 @@ source: tui/src/chatwidget/tests.rs
 expression: active_blob(&chat)
 ---
 • Explored
-  └ List ls -la
-    Read foo.txt
+  └ ls -la
+    cat foo.txt
+    sed -n 100,200p foo.txt

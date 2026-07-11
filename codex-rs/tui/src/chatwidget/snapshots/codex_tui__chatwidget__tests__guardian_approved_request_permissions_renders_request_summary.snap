@@ -8,7 +8,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 ✔ Request approved for permission request: Need write access for generated
   report assets.
 
-• Working (0s • esc to interrupt)
+Working (0s • esc to interrupt)
 
 
 › Ask Codex to do anything

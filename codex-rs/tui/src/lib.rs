@@ -283,14 +283,26 @@ async fn init_state_db_for_app_server_target(
     app_server_target: &AppServerTarget,
 ) -> std::io::Result<Option<StateDbHandle>> {
     match app_server_target {
-        AppServerTarget::Embedded => state_db::try_init(config).await.map(Some).map_err(|err| {
-            let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-                .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
-            std::io::Error::other(LocalStateDbStartupError::new(
-                database_path,
-                format!("{err:#}"),
-            ))
-        }),
+        AppServerTarget::Embedded => match state_db::try_init(config).await {
+            Ok(state_db) => Ok(Some(state_db)),
+            Err(err)
+                if codex_state::is_sqlite_lock_error(&err)
+                    || codex_state::is_sqlite_full_error(&err) =>
+            {
+                tracing::warn!(
+                    "continuing without sqlite state db after startup contention or disk pressure: {err:#}"
+                );
+                Ok(None)
+            }
+            Err(err) => {
+                let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
+                    .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
+                Err(std::io::Error::other(LocalStateDbStartupError::new(
+                    database_path,
+                    format!("{err:#}"),
+                )))
+            }
+        },
         AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. } => {
             Ok(state_db::get_state_db(config).await)
         }
@@ -1972,9 +1984,11 @@ async fn load_bootstrap_config_or_exit(
     }
 }
 
-/// Determine if the user has decided whether to trust the current directory.
-fn should_show_trust_screen(config: &Config) -> bool {
-    config.active_project.trust_level.is_none()
+/// Directory trust no longer blocks startup. Undecided projects continue with
+/// project-local config, hooks, and exec policies disabled until explicitly
+/// trusted in config.
+fn should_show_trust_screen(_config: &Config) -> bool {
+    false
 }
 
 fn should_show_onboarding(
@@ -2757,7 +2771,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_shows_trust_prompt_without_sandbox() -> std::io::Result<()> {
+    async fn undecided_project_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
@@ -2765,8 +2779,8 @@ mod tests {
 
         let should_show = should_show_trust_screen(&config);
         assert!(
-            should_show,
-            "Trust prompt should be shown when project trust is undecided"
+            !should_show,
+            "Trust prompt should not be shown when project trust is undecided"
         );
         Ok(())
     }
@@ -2951,24 +2965,17 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
+    async fn undecided_project_skips_trust_prompt_with_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
         config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
-        if cfg!(target_os = "windows") {
-            assert!(
-                should_show,
-                "Windows trust prompt should be shown on native Windows with sandbox enabled"
-            );
-        } else {
-            assert!(
-                should_show,
-                "Non-Windows should still show trust prompt when project is untrusted"
-            );
-        }
+        assert!(
+            !should_show,
+            "Trust prompt should not be shown when project trust is undecided"
+        );
         Ok(())
     }
     #[tokio::test]
