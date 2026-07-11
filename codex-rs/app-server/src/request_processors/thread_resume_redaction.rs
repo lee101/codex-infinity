@@ -32,7 +32,7 @@ pub(super) fn redact_thread_resume_payloads(turns: &mut [Turn]) {
                 }
                 true
             }
-            ThreadItem::ImageGeneration { .. } => false,
+            ThreadItem::ImageGeneration(_) => false,
             _ => true,
         });
     }
@@ -52,6 +52,7 @@ fn redacted_mcp_tool_call_result() -> McpToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ImageGenerationItem;
     use codex_app_server_protocol::McpToolCallAppContext;
     use codex_app_server_protocol::McpToolCallError;
     use codex_app_server_protocol::McpToolCallStatus;
@@ -83,6 +84,9 @@ mod tests {
                     connector_id: "calendar".to_string(),
                     link_id: Some("link_calendar".to_string()),
                     resource_uri: Some("ui://widget/lookup.html".to_string()),
+                    app_name: Some("Calendar".to_string()),
+                    template_id: Some("calendar_template".to_string()),
+                    action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
                 plugin_id: Some("sample@test".to_string()),
@@ -97,13 +101,13 @@ mod tests {
                 error: None,
                 duration_ms: Some(8),
             },
-            ThreadItem::ImageGeneration {
+            ThreadItem::ImageGeneration(ImageGenerationItem {
                 id: "ig-1".to_string(),
                 status: "completed".to_string(),
                 revised_prompt: Some("revised".to_string()),
                 result: "base64-result".to_string(),
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
-            },
+            }),
         ]);
 
         redact_thread_resume_payloads(&mut thread.turns);
@@ -130,6 +134,9 @@ mod tests {
                     connector_id: "calendar".to_string(),
                     link_id: Some("link_calendar".to_string()),
                     resource_uri: Some("ui://widget/lookup.html".to_string()),
+                    app_name: Some("Calendar".to_string()),
+                    template_id: Some("calendar_template".to_string()),
+                    action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
                 plugin_id: Some("sample@test".to_string()),
@@ -183,11 +190,13 @@ mod tests {
     fn test_thread(items: Vec<ThreadItem>) -> Thread {
         Thread {
             id: "thread-1".to_string(),
+            extra: None,
             session_id: "session-1".to_string(),
             forked_from_id: None,
             parent_thread_id: None,
             preview: "preview".to_string(),
             ephemeral: false,
+            history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
             created_at: 0,
             updated_at: 0,

@@ -23,11 +23,9 @@ use crate::local_file_system::LocalFileSystem;
 use crate::local_process::LocalProcess;
 use crate::process::ExecBackend;
 use crate::protocol::EnvironmentInfo;
-use crate::protocol::ShellInfo;
 use crate::remote::NoiseRendezvousEnvironmentConfig;
 use crate::remote_file_system::RemoteFileSystem;
 use crate::remote_process::RemoteProcess;
-use codex_shell_command::shell_detect::DetectedShell;
 use tokio_util::task::AbortOnDropHandle;
 
 pub const CODEX_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_EXEC_SERVER_URL";
@@ -56,7 +54,7 @@ pub const CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR: &str =
 #[derive(Debug)]
 pub struct EnvironmentManager {
     default_environment: Option<String>,
-    environments: RwLock<HashMap<String, Arc<Environment>>>,
+    pub(super) environments: RwLock<HashMap<String, Arc<Environment>>>,
     local_environment: Option<Arc<Environment>>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
 }
@@ -488,7 +486,9 @@ impl Environment {
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
-            exec_backend: Arc::new(LocalProcess::default()),
+            exec_backend: Arc::new(LocalProcess::with_local_runtime_paths(
+                local_runtime_paths.clone(),
+            )),
             filesystem: Arc::new(LocalFileSystem::with_runtime_paths(
                 local_runtime_paths.clone(),
             )),
@@ -574,6 +574,25 @@ impl Environment {
         }
     }
 
+    /// Starts the initial connection after an environment is actually selected for use.
+    pub(crate) fn start_connecting_for_use(environment: &Arc<Self>) {
+        if environment.remote_client.is_none() {
+            return;
+        }
+        let mut startup_task = environment
+            .startup_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if startup_task.is_none() {
+            let environment = Arc::clone(environment);
+            *startup_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                if let Err(error) = environment.wait_until_ready().await {
+                    tracing::debug!(%error, "exec-server environment startup failed");
+                }
+            })));
+        }
+    }
+
     /// Returns whether initial startup has either succeeded or permanently failed.
     pub fn startup_finished(&self) -> bool {
         self.remote_client
@@ -589,6 +608,14 @@ impl Environment {
         }
     }
 
+    /// Returns whether the environment can serve a request without waiting or reconnecting.
+    pub(crate) fn readiness_result(&self) -> Option<Result<(), ExecServerError>> {
+        match &self.remote_client {
+            Some(client) => client.readiness_result(),
+            None => Some(Ok(())),
+        }
+    }
+
     pub fn get_exec_backend(&self) -> Arc<dyn ExecBackend> {
         Arc::clone(&self.exec_backend)
     }
@@ -600,21 +627,12 @@ impl Environment {
     pub fn get_filesystem(&self) -> Arc<dyn ExecutorFileSystem> {
         Arc::clone(&self.filesystem)
     }
-}
 
-impl EnvironmentInfo {
-    pub(crate) fn local() -> Self {
-        Self {
-            shell: codex_shell_command::shell_detect::default_user_shell().into(),
-        }
-    }
-}
-
-impl From<DetectedShell> for ShellInfo {
-    fn from(shell: DetectedShell) -> Self {
-        Self {
-            name: shell.name().to_string(),
-            path: shell.shell_path.to_string_lossy().into_owned(),
+    /// Returns a filesystem view that fails instead of starting or waiting for a connection.
+    pub fn get_filesystem_without_reconnect(&self) -> Arc<dyn ExecutorFileSystem> {
+        match &self.remote_client {
+            Some(client) => Arc::new(RemoteFileSystem::new(client.fail_fast())),
+            None => Arc::clone(&self.filesystem),
         }
     }
 }
@@ -651,6 +669,19 @@ mod tests {
 
     fn assert_local_environment_unavailable(manager: &EnvironmentManager) {
         assert!(manager.try_local_environment().is_none());
+    }
+
+    #[test]
+    fn local_environment_info_includes_current_directory() {
+        let info = super::EnvironmentInfo::local();
+
+        assert_eq!(
+            info.cwd,
+            Some(
+                PathUri::from_host_native_path(std::env::current_dir().expect("current directory"))
+                    .expect("cwd URI")
+            )
+        );
     }
 
     #[tokio::test]
@@ -1069,6 +1100,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_capability_inspection_keeps_stdio_environment_lazy() {
+        use codex_protocol::capabilities::CapabilityRootLocation;
+        use codex_protocol::capabilities::SelectedCapabilityRoot;
+
+        let environment = Environment::remote_with_transport(
+            ExecServerTransportParams::StdioCommand {
+                command: StdioExecServerCommand {
+                    program: "codex-missing-exec-server-for-test".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    cwd: None,
+                },
+                initialize_timeout: Duration::from_secs(1),
+            },
+            /*local_runtime_paths*/ None,
+        );
+        let manager = EnvironmentManager::from_snapshot(
+            EnvironmentProviderSnapshot {
+                environments: vec![("stdio".to_string(), environment)],
+                default: EnvironmentDefault::Disabled,
+                include_local: false,
+            },
+            /*local_runtime_paths*/ None,
+        )
+        .expect("environment manager");
+        let environment = manager.get_environment("stdio").expect("stdio environment");
+        let selected_root = SelectedCapabilityRoot {
+            id: "demo@1".to_string(),
+            location: CapabilityRootLocation::Environment {
+                environment_id: "stdio".to_string(),
+                path: PathUri::parse("file:///plugins/demo").expect("plugin path URI"),
+            },
+        };
+
+        let status =
+            manager.inspect_selected_capability_roots(std::slice::from_ref(&selected_root));
+        assert!(status.ready_roots.is_empty());
+        assert_eq!(status.warnings, Vec::<String>::new());
+        assert!(!environment.startup_finished());
+
+        let missing_root = SelectedCapabilityRoot {
+            id: "missing@1".to_string(),
+            location: CapabilityRootLocation::Environment {
+                environment_id: "missing".to_string(),
+                path: PathUri::parse("file:///plugins/missing").expect("missing plugin path URI"),
+            },
+        };
+        let status = manager.inspect_selected_capability_roots(&[missing_root]);
+        assert!(status.ready_roots.is_empty());
+        assert_eq!(
+            status.warnings,
+            vec![
+                "selected capability root `missing@1` references unavailable environment `missing`"
+                    .to_string()
+            ]
+        );
+
+        assert!(environment.wait_until_ready().await.is_err());
+
+        let status = manager.inspect_selected_capability_roots(&[selected_root]);
+        assert!(status.ready_roots.is_empty());
+        assert_eq!(status.warnings.len(), 1);
+        assert!(status.warnings[0].contains("environment `stdio` is unavailable"));
+    }
+
+    #[tokio::test]
     async fn replacing_environment_stops_its_startup_task() {
         let first_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1149,18 +1246,70 @@ mod tests {
             .start(crate::ExecParams {
                 process_id: ProcessId::from("default-env-proc"),
                 argv: vec!["true".to_string()],
-                cwd: PathUri::from_path(std::env::current_dir().expect("read current dir"))
-                    .expect("cwd URI"),
+                cwd: PathUri::from_host_native_path(
+                    std::env::current_dir().expect("read current dir"),
+                )
+                .expect("cwd URI"),
                 env_policy: None,
                 env: Default::default(),
                 tty: false,
                 pipe_stdin: false,
                 arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
             })
             .await
             .expect("start process");
 
         assert_eq!(response.process.process_id().as_str(), "default-env-proc");
+    }
+
+    #[tokio::test]
+    async fn local_environment_passes_runtime_paths_to_exec_backend() {
+        let environment = Environment::local(test_runtime_paths());
+        #[cfg(unix)]
+        let uri = "file://server/share/checkout";
+        #[cfg(windows)]
+        let uri = "file:///usr/local/checkout";
+        let sandbox_cwd = PathUri::parse(uri).expect("non-native sandbox cwd URI");
+        let source = sandbox_cwd
+            .to_abs_path()
+            .expect_err("sandbox cwd should not be native to this host");
+        let sandbox = crate::FileSystemSandboxContext::from_permission_profile_with_cwd(
+            codex_protocol::models::PermissionProfile::workspace_write(),
+            sandbox_cwd.clone(),
+        );
+
+        let result = environment
+            .get_exec_backend()
+            .start(crate::ExecParams {
+                process_id: ProcessId::from("local-sandbox-proc"),
+                argv: vec!["true".to_string()],
+                cwd: PathUri::from_host_native_path(
+                    std::env::current_dir().expect("read current dir"),
+                )
+                .expect("cwd URI"),
+                env_policy: None,
+                env: Default::default(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: Some(sandbox),
+                enforce_managed_network: false,
+                managed_network: None,
+            })
+            .await;
+        let Err(err) = result else {
+            panic!("sandbox cwd should be rejected after resolving runtime paths");
+        };
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "exec-server rejected request (-32602): sandbox cwd URI `{sandbox_cwd}` is not valid on this exec-server host: {source}"
+            )
+        );
     }
 
     #[tokio::test]

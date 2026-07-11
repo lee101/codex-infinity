@@ -151,8 +151,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
 
-    /// Controls whether multi-agent v2 delegation requires an explicit user request.
-    /// Omitted keeps the loaded session's current mode.
+    /// @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
     #[experimental("turn/start.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,

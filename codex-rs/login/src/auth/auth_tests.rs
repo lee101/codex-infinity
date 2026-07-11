@@ -2,8 +2,8 @@ use super::*;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
-use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::protocol::SessionSource;
@@ -122,6 +122,7 @@ async fn login_with_access_token_writes_agent_identity_jwt() {
         /*forced_chatgpt_workspace_id*/ None,
         Some(&chatgpt_base_url),
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect("login_with_access_token should succeed");
@@ -161,7 +162,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
     save_auth(
         codex_home.path(),
         &AuthDotJson {
-            auth_mode: Some(ApiAuthMode::AgentIdentity),
+            auth_mode: Some(AuthMode::AgentIdentity),
             openai_api_key: None,
             tokens: None,
             last_refresh: None,
@@ -181,6 +182,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
         Some(&chatgpt_base_url),
         AuthKeyringBackendKind::Direct,
         Some(&authapi_base_url),
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -226,6 +228,7 @@ async fn login_with_access_token_writes_only_personal_access_token() {
         Some(&allowed_workspaces),
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect("personal access token login should succeed");
@@ -278,6 +281,7 @@ async fn login_with_access_token_rejects_personal_access_token_workspace_mismatc
         Some(&allowed_workspaces),
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect_err("personal access token workspace mismatch should fail");
@@ -310,6 +314,7 @@ async fn login_with_access_token_rejects_invalid_personal_access_token() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect_err("invalid personal access token should fail");
@@ -333,6 +338,7 @@ async fn login_with_access_token_rejects_invalid_jwt() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect_err("invalid access token should fail");
@@ -364,6 +370,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -373,6 +380,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
             AgentIdentityAuthPolicy::JwtOnly,
             /*agent_identity_authapi_base_url*/ None,
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await?
@@ -403,6 +411,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await?
@@ -412,6 +421,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await?
@@ -442,6 +452,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should reload");
@@ -450,6 +461,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await?
@@ -482,6 +494,7 @@ async fn chatgpt_auth_retries_transient_agent_identity_registration() -> anyhow:
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -510,6 +523,7 @@ async fn chatgpt_auth_retries_transient_agent_identity_registration() -> anyhow:
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await?
@@ -546,6 +560,7 @@ async fn chatgpt_auth_registration_retry_exhaustion_is_fallback_eligible() -> an
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -563,12 +578,13 @@ async fn chatgpt_auth_registration_retry_exhaustion_is_fallback_eligible() -> an
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await
         .expect_err("retry exhaustion should return an error");
 
-    assert!(AgentIdentityAuthError::is_bootstrap_unavailable(&err));
+    assert!(AgentIdentityAuthError::bootstrap_unavailable(&err).is_some());
     assert!(
         auth.stored_managed_chatgpt_agent_identity_record("account-123")
             .is_none()
@@ -591,7 +607,7 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
     )?;
     let mut record = agent_identity_record("account-123");
     record.chatgpt_user_id = "user-12345".to_string();
-    record.email = "user@example.com".to_string();
+    record.email = Some("user@example.com".to_string());
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_path = get_auth_file(codex_home.path());
     let mut auth_json = storage.try_read_auth_json(&auth_path)?;
@@ -605,6 +621,7 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -625,12 +642,13 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await
         .expect_err("task retry exhaustion should return an error");
 
-    assert!(AgentIdentityAuthError::is_bootstrap_unavailable(&err));
+    assert!(AgentIdentityAuthError::bootstrap_unavailable(&err).is_some());
     record.task_id = None;
     assert_eq!(
         auth.stored_managed_chatgpt_agent_identity_record("account-123"),
@@ -659,6 +677,7 @@ async fn chatgpt_auth_non_retryable_registration_error_is_hard_failure() -> anyh
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await?
     .expect("auth should load");
@@ -676,12 +695,13 @@ async fn chatgpt_auth_non_retryable_registration_error_is_hard_failure() -> anyh
             AgentIdentityAuthPolicy::ChatGptAuth,
             Some(&server.uri()),
             /*forced_chatgpt_workspace_id*/ None,
+            /*auth_route_config*/ None,
             SessionSource::Cli,
         )
         .await
         .expect_err("hard registration failure should return an error");
 
-    assert!(!AgentIdentityAuthError::is_bootstrap_unavailable(&err));
+    assert!(AgentIdentityAuthError::bootstrap_unavailable(&err).is_none());
     assert!(
         auth.stored_managed_chatgpt_agent_identity_record("account-123")
             .is_none()
@@ -717,11 +737,12 @@ async fn agent_identity_jwt_task_registration_retry_exhaustion_is_strict() -> an
         &agent_identity,
         Some(&chatgpt_base_url),
         &authapi_base_url,
+        /*auth_route_config*/ None,
     )
     .await
     .expect_err("agent identity jwt task retry exhaustion should fail");
 
-    assert!(!AgentIdentityAuthError::is_bootstrap_unavailable(&err));
+    assert!(AgentIdentityAuthError::bootstrap_unavailable(&err).is_none());
     Ok(())
 }
 
@@ -747,6 +768,7 @@ async fn login_with_access_token_rejects_unsigned_jwt() {
         /*forced_chatgpt_workspace_id*/ None,
         Some(&chatgpt_base_url),
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect_err("unsigned access token should fail");
@@ -768,6 +790,7 @@ async fn missing_auth_json_returns_none() {
         AuthCredentialsStoreMode::File,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect("call should succeed");
@@ -797,6 +820,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .unwrap()
@@ -858,6 +882,7 @@ async fn loads_api_key_from_auth_json() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .unwrap()
@@ -872,7 +897,7 @@ async fn loads_api_key_from_auth_json() {
 fn logout_removes_auth_file() -> Result<(), std::io::Error> {
     let dir = tempdir()?;
     let auth_dot_json = AuthDotJson {
-        auth_mode: Some(ApiAuthMode::ApiKey),
+        auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
         last_refresh: None,
@@ -908,6 +933,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await;
     let managed = UnauthorizedRecovery {
@@ -952,6 +978,7 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")
@@ -972,6 +999,7 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("updated auth should parse");
@@ -985,19 +1013,6 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
 
     assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
-}
-
-#[test]
-fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
-    let err = AuthDotJson::from_external_tokens(&ExternalAuthTokens::access_token_only(
-        "test-access-token",
-    ))
-    .expect_err("bearer-only external auth should not seed ChatGPT auth");
-
-    assert_eq!(
-        err.to_string(),
-        "external auth tokens are missing ChatGPT metadata"
-    );
 }
 
 #[tokio::test]
@@ -1017,7 +1032,7 @@ async fn external_bearer_only_auth_manager_uses_cached_provider_token() {
     assert_eq!(first.as_deref(), Some("provider-token"));
     assert_eq!(second.as_deref(), Some("provider-token"));
     assert_eq!(manager.auth_mode(), Some(AuthMode::ApiKey));
-    assert_eq!(manager.get_api_auth_mode(), Some(ApiAuthMode::ApiKey));
+    assert_eq!(manager.get_api_auth_mode(), Some(AuthMode::ApiKey));
 }
 
 #[tokio::test]
@@ -1054,11 +1069,11 @@ async fn unauthorized_recovery_uses_external_refresh_for_bearer_manager() {
     let mut auth_config = script.auth_config();
     auth_config.refresh_interval_ms = 0;
     let manager = AuthManager::external_bearer_only(auth_config);
+    let mut recovery = manager.unauthorized_recovery();
     let initial_token = manager
         .auth()
         .await
         .and_then(|auth| auth.api_key().map(str::to_string));
-    let mut recovery = manager.unauthorized_recovery();
 
     assert!(recovery.has_next());
     assert_eq!(recovery.mode_name(), "external");
@@ -1076,6 +1091,61 @@ async fn unauthorized_recovery_uses_external_refresh_for_bearer_manager() {
         .and_then(|auth| auth.api_key().map(str::to_string));
     assert_eq!(initial_token.as_deref(), Some("provider-token"));
     assert_eq!(refreshed_token.as_deref(), Some("refreshed-provider-token"));
+}
+
+#[derive(Clone)]
+struct StaticExternalAuth(CodexAuth);
+
+impl ExternalAuth for StaticExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+}
+
+#[tokio::test]
+async fn external_auth_provider_can_install_headers() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_static("Bearer external"),
+    );
+    headers.insert(
+        "x-external-auth",
+        reqwest::header::HeaderValue::from_static("enabled"),
+    );
+    let auth = CodexAuth::Headers(AuthHeaders::new(headers));
+    let codex_home = tempdir().expect("tempdir");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
+    )
+    .await;
+
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(auth.clone())))
+        .await
+        .expect("external auth should install");
+
+    assert_eq!(manager.auth_cached(), Some(auth));
+    assert!(
+        manager
+            .auth_cached()
+            .is_some_and(|auth| auth.uses_codex_backend())
+    );
+    assert!(
+        !manager
+            .auth_cached()
+            .is_some_and(|auth| auth.is_chatgpt_auth())
+    );
 }
 
 struct ProviderAuthScript {
@@ -1277,6 +1347,7 @@ async fn build_config(
         forced_login_method,
         forced_chatgpt_workspace_id,
         chatgpt_base_url: None,
+        auth_route_config: None,
     }
 }
 
@@ -1359,6 +1430,7 @@ async fn load_auth_reads_access_token_from_env() {
         Some(&chatgpt_base_url),
         AuthKeyringBackendKind::Direct,
         Some(&authapi_base_url),
+        /*auth_route_config*/ None,
     )
     .await
     .expect("env auth should load")
@@ -1406,6 +1478,7 @@ async fn load_auth_reads_personal_access_token_from_env() {
             /*chatgpt_base_url*/ None,
             AuthKeyringBackendKind::default(),
             /*agent_identity_authapi_base_url*/ None,
+            /*auth_route_config*/ None,
         )
         .await
         .expect("env auth should load")
@@ -1459,6 +1532,7 @@ async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await;
 
@@ -1498,6 +1572,7 @@ async fn auth_manager_rejects_stored_personal_access_token_workspace_mismatch() 
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
             AuthKeyringBackendKind::default(),
+            /*auth_route_config*/ None,
         )
         .await
         .expect("personal access token login should succeed");
@@ -1509,6 +1584,7 @@ async fn auth_manager_rejects_stored_personal_access_token_workspace_mismatch() 
             Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
             /*chatgpt_base_url*/ None,
             AuthKeyringBackendKind::default(),
+            /*auth_route_config*/ None,
         )
         .await;
 
@@ -1542,6 +1618,7 @@ async fn personal_access_token_does_not_offer_unauthorized_recovery() {
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
             AuthKeyringBackendKind::default(),
+            /*auth_route_config*/ None,
         )
         .await,
     );
@@ -1574,6 +1651,7 @@ async fn load_auth_keeps_codex_api_key_env_precedence() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("env auth should load")
@@ -1670,6 +1748,7 @@ async fn enforce_login_restrictions_logs_out_for_personal_access_token_workspace
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
     )
     .await
     .expect("personal access token login should succeed");
@@ -1681,6 +1760,7 @@ async fn enforce_login_restrictions_logs_out_for_personal_access_token_workspace
         forced_login_method: None,
         forced_chatgpt_workspace_id: Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
         chatgpt_base_url: None,
+        auth_route_config: None,
     };
 
     let err = super::enforce_login_restrictions(&config)
@@ -1784,7 +1864,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
     save_auth(
         codex_home.path(),
         &AuthDotJson {
-            auth_mode: Some(ApiAuthMode::AgentIdentity),
+            auth_mode: Some(AuthMode::AgentIdentity),
             openai_api_key: None,
             tokens: None,
             last_refresh: None,
@@ -1804,6 +1884,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
         forced_login_method: None,
         forced_chatgpt_workspace_id: Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
         chatgpt_base_url: Some(chatgpt_base_url),
+        auth_route_config: None,
     };
 
     let err = super::enforce_login_restrictions_with_agent_identity_authapi_base_url(
@@ -1887,7 +1968,7 @@ fn agent_identity_record(account_id: &str) -> AgentIdentityAuthRecord {
         agent_private_key: key_material.private_key_pkcs8_base64,
         account_id: account_id.to_string(),
         chatgpt_user_id: "user-id".to_string(),
-        email: "user@example.com".to_string(),
+        email: Some("user@example.com".to_string()),
         plan_type: AccountPlanType::Pro,
         chatgpt_account_is_fedramp: false,
         task_id: None,
@@ -2056,6 +2137,7 @@ async fn assert_agent_identity_plan_alias(
         &jwt,
         Some(&chatgpt_base_url),
         &authapi_base_url,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("agent identity auth");
@@ -2087,6 +2169,7 @@ async fn plan_type_maps_known_plan() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")
@@ -2118,6 +2201,7 @@ async fn plan_type_maps_self_serve_business_usage_based_plan() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")
@@ -2152,6 +2236,7 @@ async fn plan_type_maps_enterprise_cbp_usage_based_plan() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")
@@ -2186,6 +2271,7 @@ async fn plan_type_maps_unknown_to_unknown() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")
@@ -2217,6 +2303,7 @@ async fn missing_plan_type_maps_to_unknown() {
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
+        /*auth_route_config*/ None,
     )
     .await
     .expect("load auth")

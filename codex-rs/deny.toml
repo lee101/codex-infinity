@@ -70,7 +70,7 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    # Reviewed 2026-06-07. Keep this list in sync with .cargo/audit.toml.
+    # Reviewed 2026-07-02. Keep this list in sync with .cargo/audit.toml.
     # Each exception must identify the dependency path and removal condition.
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via starlark/starlark_syntax v0.14.2 used by execpolicy/cli/core; no fixed starlark release yet" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained; pulled in via starlark_map under starlark v0.14.2 used by execpolicy/cli/core and bm25 used by core; remove when upstream dependencies drop fxhash" },
@@ -79,6 +79,11 @@ ignore = [
     # TODO(fcoury): remove this exception when syntect drops yaml-rust and bincode, or updates to versions that have fixed the vulnerabilities.
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
     { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; DNSSEC features are not enabled; remove when rama updates to hickory 0.26.1 or hickory-net" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; no fixed rama release is available yet; remove when rama updates to hickory 0.26.1 or hickory-net" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained; pulled in via i18n-embed-fl/age used by codex-secrets local storage; remove when codex-secrets migrates off age or age drops i18n-embed-fl" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml v0.39.4 remains via plist/syntect and wayland-scanner; plist does not exercise the affected APIs and wayland-scanner parses trusted build-time XML; remove when rust-plist#191 and wayland-rs#938 are released" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml v0.39.4 remains via plist/syntect and wayland-scanner; plist does not exercise the affected APIs and wayland-scanner parses trusted build-time XML; remove when rust-plist#191 and wayland-rs#938 are released" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -119,7 +124,7 @@ allow = [
     # Used by: transitive only
     "ISC",
     # MIT - https://opensource.org/license/mit
-    # Used by: allocative, ansi-to-tui, anyhow, arboard, assert_cmd, assert_matches, async-channel, async-stream, async-trait, axum, base64, bytes, chardetng, chrono, clap, clap_complete, color-eyre, crossterm, ctor, derive_more, diffy, dirs, dotenvy, encoding_rs, env-flags, env_logger, escargot, eventsource-stream, futures, http, ignore, image, indexmap, itertools, keyring, landlock, lazy_static, libc, log, lru, maplit, mime_guess, multimap, once_cell, openssl-sys, os_info, owo-colors, path-absolutize, pathdiff, portable-pty, predicates, pretty_assertions, pulldown-cmark, rand, ratatui, ratatui-macros, regex-lite, reqwest, rmcp, schemars, serde, serde_json, serde_with, serial_test, sha1, sha2, shlex, socket2, strum, strum_macros, sys-locale, tempfile, test-log, textwrap, thiserror, time, tiny_http, tokio, tokio-stream, tokio-test, tokio-util, toml, toml_edit, tonic, tracing, tracing-appender, tracing-subscriber, tracing-test, tree-sitter, tree-sitter-bash, tree-sitter-highlight, ts-rs, uds_windows, unicode-segmentation, unicode-width, url, urlencoding, uuid, vt100, walkdir, webbrowser, which, wildmatch, wiremock, zeroize
+    # Used by: allocative, ansi-to-tui, anyhow, arboard, assert_cmd, assert_matches, async-channel, async-stream, async-trait, axum, base64, bytes, chardetng, chrono, clap, clap_complete, color-eyre, crossterm, ctor, derive_more, diffy, dirs, dotenvy, encoding_rs, env_logger, escargot, eventsource-stream, futures, http, ignore, image, indexmap, itertools, keyring, landlock, lazy_static, libc, log, lru, maplit, mime_guess, multimap, once_cell, openssl-sys, os_info, owo-colors, path-absolutize, pathdiff, portable-pty, predicates, pretty_assertions, pulldown-cmark, rand, ratatui, ratatui-macros, regex-lite, reqwest, rmcp, schemars, serde, serde_json, serde_with, serial_test, sha1, sha2, shlex, socket2, strum, strum_macros, sys-locale, tempfile, test-log, textwrap, thiserror, time, tiny_http, tokio, tokio-stream, tokio-test, tokio-util, toml, toml_edit, tonic, tracing, tracing-appender, tracing-subscriber, tracing-test, tree-sitter, tree-sitter-bash, tree-sitter-highlight, ts-rs, uds_windows, unicode-segmentation, unicode-width, url, urlencoding, uuid, vt100, walkdir, webbrowser, which, wildmatch, wiremock, zeroize
     "MIT",
     # MIT-0 - https://opensource.org/license/mit-0
     # Used by: dunce
@@ -228,6 +233,39 @@ deny = [
         "tonic",
         "zbus",
     ], reason = "first-party traits must use native async trait methods with explicit Send bounds" },
+    # Migration ratchet: `codex-http-client` is the intended reqwest owner. Remove each temporary
+    # wrapper when that crate's direct reqwest dependency is migrated to the shared abstraction.
+    { crate = "reqwest", wrappers = [
+        # Intended owner.
+        "codex-http-client",
+        # Temporary migration exceptions.
+        "codex-agent-identity",
+        "codex-api",
+        "codex-app-server",
+        "codex-app-server-daemon",
+        "codex-backend-client",
+        "codex-cloud-tasks",
+        "codex-core",
+        "codex-core-plugins",
+        "codex-exec-server",
+        "codex-lmstudio",
+        "codex-login",
+        "codex-ollama",
+        "codex-otel",
+        "codex-protocol",
+        "codex-responses-api-proxy",
+        "codex-rmcp-client",
+        "codex-tui",
+        "core_test_support",
+        # Third-party crates that own their reqwest integration. These are not part of the
+        # first-party migration count above.
+        "oauth2",
+        "opentelemetry-http",
+        "opentelemetry-otlp",
+        "rmcp",
+        "sentry",
+        "webrtc-sys-build",
+    ], reason = "new direct reqwest dependencies must use codex-http-client; temporary wrappers track migration debt" },
 ]
 
 # List of features to allow/deny

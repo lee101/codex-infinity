@@ -8,7 +8,9 @@ use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_features::Feature;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_otel::MetricsClient;
@@ -60,7 +62,7 @@ use tempfile::TempDir;
 use tracing::Instrument;
 use tracing_test::traced_test;
 
-const MODEL: &str = "gpt-5.3-codex";
+const MODEL: &str = "gpt-5.4";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const USER_AGENT_HEADER: &str = "user-agent";
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
@@ -101,6 +103,7 @@ fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTr
 struct WebsocketTestHarness {
     _codex_home: TempDir,
     client: ModelClient,
+    outbound_proxy_policy: OutboundProxyPolicy,
     session_id: SessionId,
     thread_id: ThreadId,
     model_info: ModelInfo,
@@ -218,6 +221,38 @@ async fn responses_websocket_streams_without_feature_flag_when_provider_supports
     .await;
 
     let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ false).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    assert_eq!(server.handshakes().len(), 1);
+    assert_eq!(server.single_connection().len(), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_streams_with_system_proxy_feature() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness_with_provider_options(
+        websocket_provider(&server),
+        /*runtime_metrics_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*enabled_features*/ &[Feature::RespectSystemProxy],
+    )
+    .await;
+    assert_eq!(
+        harness.outbound_proxy_policy,
+        OutboundProxyPolicy::RespectSystemProxy
+    );
     let mut client_session = harness.client.new_session();
     let prompt = prompt_with_input(vec![message_item("hello")]);
 
@@ -385,7 +420,15 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     ]])
     .await;
 
-    let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ true).await;
+    let mut provider = websocket_provider(&server);
+    provider.name = ModelProviderInfo::create_openai_provider(/*base_url*/ None).name;
+    let harness = websocket_harness_with_provider_options(
+        provider,
+        /*runtime_metrics_enabled*/ true,
+        /*concurrent_reasoning_summaries_enabled*/ true,
+        /*enabled_features*/ &[],
+    )
+    .await;
     let mut client_session = harness.client.new_session();
     let prompt = prompt_with_input(vec![message_item("hello")]);
     let responses_metadata = prewarm_metadata(&harness, /*turn_id*/ None);
@@ -421,6 +464,10 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
 
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
+    assert_eq!(
+        warmup["stream_options"]["reasoning_summary_delivery"].as_str(),
+        Some("sequential_cutoff")
+    );
     assert_eq!(warmup["tools"], serde_json::json!([]));
     let warmup_turn_metadata: serde_json::Value = serde_json::from_str(
         warmup["client_metadata"]["x-codex-turn-metadata"]
@@ -435,6 +482,10 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     assert_eq!(follow_up["type"].as_str(), Some("response.create"));
     assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
     assert_eq!(follow_up["input"], serde_json::json!([]));
+    assert_eq!(
+        follow_up["stream_options"]["reasoning_summary_delivery"].as_str(),
+        Some("sequential_cutoff")
+    );
 
     server.shutdown().await;
 }
@@ -965,41 +1016,97 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
 async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
     skip_if_no_network!();
 
+    let mut assistant_output_with_turn_id = ev_assistant_message("msg-1", "assistant output");
+    assistant_output_with_turn_id["item"]["internal_chat_message_metadata_passthrough"] =
+        json!({ "turn_id": "turn-1" });
+
+    let assistant_output_without_turn_id = ev_assistant_message("msg-2", "second assistant output");
+
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            assistant_output_with_turn_id,
             ev_completed("resp-1"),
         ],
-        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+        vec![
+            ev_response_created("resp-2"),
+            assistant_output_without_turn_id,
+            ev_completed("resp-2"),
+        ],
+        vec![ev_response_created("resp-3"), ev_completed("resp-3")],
     ]])
     .await;
 
-    let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ false).await;
-    let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let prompt_two = prompt_with_input(vec![
-        message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
-        message_item("second"),
-    ]);
+    // use OpenAI provider to check metadata logic
+    let mut provider = websocket_provider(&server);
+    provider.name = ModelProviderInfo::create_openai_provider(/*base_url*/ None).name;
+    let harness = websocket_harness_with_provider_options(
+        provider,
+        /*runtime_metrics_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*enabled_features*/ &[],
+    )
+    .await;
 
+    // Turn one: initiate
+    let prompt_one = prompt_with_input(vec![message_item("hello")]);
     {
         let mut client_session = harness.client.new_session();
         stream_until_complete(&mut client_session, &harness, &prompt_one).await;
     }
 
-    let mut client_session = harness.client.new_session();
-    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
+    // Turn two: the response and reconstructed history have matching metadata.
+    let mut first_assistant_output = assistant_message_item("msg-1", "assistant output");
+    first_assistant_output.set_turn_id_if_missing("turn-1");
+
+    let prompt_two = prompt_with_input(vec![
+        message_item("hello"),
+        first_assistant_output.clone(),
+        message_item("second"),
+    ]);
+
+    {
+        let mut client_session = harness.client.new_session();
+        stream_until_complete(&mut client_session, &harness, &prompt_two).await;
+    }
+
+    // Turn three: the reconstructed history has metadata that the response omitted.
+    let mut second_assistant_output = assistant_message_item("msg-2", "second assistant output");
+    second_assistant_output.set_turn_id_if_missing("turn-2");
+
+    let prompt_three = prompt_with_input(vec![
+        message_item("hello"),
+        first_assistant_output,
+        message_item("second"),
+        second_assistant_output,
+        message_item("third"),
+    ]);
+
+    {
+        let mut client_session = harness.client.new_session();
+        stream_until_complete(&mut client_session, &harness, &prompt_three).await;
+    }
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
-    assert_eq!(connection.len(), 2);
+    assert_eq!(connection.len(), 3);
+
+    // validate second turn
     let second = connection.get(1).expect("missing request").body_json();
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
     assert_eq!(
         second["input"],
         serde_json::to_value(&prompt_two.input[2..]).unwrap()
+    );
+
+    // validate third turn
+    let third = connection.get(2).expect("missing request").body_json();
+    assert_eq!(third["type"].as_str(), Some("response.create"));
+    assert_eq!(third["previous_response_id"].as_str(), Some("resp-2"));
+    assert_eq!(
+        third["input"],
+        serde_json::to_value(&prompt_three.input[4..]).unwrap()
     );
 
     server.shutdown().await;
@@ -1314,9 +1421,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         "error": {
             "type": "usage_limit_reached",
             "message": "The usage limit has been reached",
-            "plan_type": "pro",
-            "resets_at": 1704067242,
-            "resets_in_seconds": 1234
+            "plan_type": "pro"
         },
         "headers": {
             "x-codex-primary-used-percent": "100.0",
@@ -1564,10 +1669,13 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
 async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create() {
     skip_if_no_network!();
 
+    let mut first_output_item = ev_assistant_message("msg-1", "assistant output");
+    first_output_item["item"]["internal_chat_message_metadata_passthrough"] =
+        json!({"turn_id": "turn-123"});
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            first_output_item,
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -1577,9 +1685,11 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
+    let mut prior_assistant_output = assistant_message_item("msg-1", "assistant output");
+    prior_assistant_output.set_turn_id_if_missing("turn-123");
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        prior_assistant_output,
         message_item("second"),
     ]);
     let first_responses_metadata = turn_metadata(&harness, Some("turn-123"));
@@ -2059,7 +2169,7 @@ fn message_item(text: &str) -> ResponseItem {
         role: "user".into(),
         content: vec![ContentItem::InputText { text: text.into() }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -2069,7 +2179,7 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
         role: "assistant".into(),
         content: vec![ContentItem::OutputText { text: text.into() }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -2138,13 +2248,20 @@ async fn websocket_harness_with_options(
     server: &WebSocketTestServer,
     runtime_metrics_enabled: bool,
 ) -> WebsocketTestHarness {
-    websocket_harness_with_provider_options(websocket_provider(server), runtime_metrics_enabled)
-        .await
+    websocket_harness_with_provider_options(
+        websocket_provider(server),
+        runtime_metrics_enabled,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*enabled_features*/ &[],
+    )
+    .await
 }
 
 async fn websocket_harness_with_provider_options(
     provider: ModelProviderInfo,
     runtime_metrics_enabled: bool,
+    concurrent_reasoning_summaries_enabled: bool,
+    enabled_features: &[Feature],
 ) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
@@ -2155,6 +2272,21 @@ async fn websocket_harness_with_provider_options(
             .enable(Feature::RuntimeMetrics)
             .expect("test config should allow feature update");
     }
+    if concurrent_reasoning_summaries_enabled {
+        config
+            .features
+            .enable(Feature::ConcurrentReasoningSummaries)
+            .expect("test config should allow feature update");
+    }
+    for feature in enabled_features {
+        config
+            .features
+            .enable(*feature)
+            .expect("test config should allow feature update");
+    }
+    config.respect_system_proxy = config.features.enabled(Feature::RespectSystemProxy);
+    let http_client_factory = config.http_client_factory();
+    let outbound_proxy_policy = http_client_factory.outbound_proxy_policy();
     let config = Arc::new(config);
     let model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
     let thread_id = ThreadId::new();
@@ -2184,20 +2316,28 @@ async fn websocket_harness_with_provider_options(
     let summary = ReasoningSummary::Auto;
     let client = ModelClient::new(
         /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider.clone(),
         SessionSource::Exec,
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
+        /*concurrent_reasoning_summaries_enabled*/
+        config
+            .features
+            .enabled(Feature::ConcurrentReasoningSummaries),
         /*attestation_provider*/ None,
+        http_client_factory,
     );
 
     WebsocketTestHarness {
         _codex_home: codex_home,
         client,
+        outbound_proxy_policy,
         session_id,
         thread_id,
         model_info,

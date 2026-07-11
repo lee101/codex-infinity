@@ -42,6 +42,7 @@ mod cli_stream;
 mod client;
 mod client_websockets;
 mod code_mode;
+mod code_mode_elicitation;
 mod codex_delegate;
 mod collaboration_instructions;
 mod compact;
@@ -54,6 +55,7 @@ mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;
+mod external_auth;
 mod fork_thread;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
@@ -65,6 +67,10 @@ mod image_rollout;
 mod items;
 mod json_result;
 mod live_cli;
+mod mcp_auth_elicitation;
+mod mcp_auth_refresh;
+#[cfg(unix)]
+mod mcp_refresh_cleanup;
 mod mcp_tool_exposure;
 mod mcp_turn_metadata;
 mod model_overrides;
@@ -104,6 +110,7 @@ mod review;
 mod rmcp_client;
 mod rollout_budget;
 mod rollout_list_find;
+mod safety_buffering;
 mod safety_check_downgrade;
 mod search_tool;
 mod shell_command;
@@ -123,6 +130,7 @@ mod tools;
 mod truncation;
 mod turn_state;
 mod unified_exec;
+mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;

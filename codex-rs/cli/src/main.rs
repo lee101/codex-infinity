@@ -1700,9 +1700,7 @@ async fn run_exec_server_command(
             .environment_id
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
         let config = load_exec_server_config(root_config_overrides, strict_config).await?;
-        let _otel = exec_server_telemetry::init(Some(&config))
-            .inspect_err(|err| eprintln!("Could not create otel exporter: {err}"))
-            .ok();
+        let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
         let auth_provider =
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
                 .await?;
@@ -1714,7 +1712,11 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
-        codex_exec_server::run_remote_environment(remote_config, runtime_paths).await?;
+        let remote_config = remote_config.with_telemetry(telemetry);
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_remote_environment(remote_config, runtime_paths).await
+        })
+        .await?;
         Ok(())
     } else {
         let config_result = load_exec_server_config(root_config_overrides, strict_config).await;
@@ -1723,16 +1725,15 @@ async fn run_exec_server_command(
         } else {
             config_result.ok()
         };
-        let _otel = exec_server_telemetry::init(config.as_ref())
-            .inspect_err(|err| eprintln!("Could not create otel exporter: {err}"))
-            .ok();
+        let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
         let listen_url = cmd
             .listen
-            .as_deref()
-            .unwrap_or(codex_exec_server::DEFAULT_LISTEN_URL);
-        codex_exec_server::run_main(listen_url, runtime_paths)
-            .await
-            .map_err(anyhow::Error::from_boxed)
+            .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_main_with_telemetry(&listen_url, runtime_paths, telemetry).await
+        })
+        .await
+        .map_err(anyhow::Error::from_boxed)
     }
 }
 
@@ -1745,9 +1746,13 @@ async fn load_exec_server_remote_auth_provider(
         let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
         })?;
-        let auth =
-            CodexAuth::from_agent_identity_jwt(&agent_identity_jwt, Some(&config.chatgpt_base_url))
-                .await?;
+        let auth_route_config = config.auth_route_config();
+        let auth = CodexAuth::from_agent_identity_jwt(
+            &agent_identity_jwt,
+            Some(&config.chatgpt_base_url),
+            auth_route_config.as_ref(),
+        )
+        .await?;
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
     }
 
@@ -2008,7 +2013,10 @@ async fn run_debug_models_command(
             AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
         let models_manager = build_models_manager(&config, auth_manager);
         models_manager
-            .raw_model_catalog(RefreshStrategy::OnlineIfUncached)
+            .raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                config.http_client_factory(),
+            )
             .await
     };
 
@@ -2462,6 +2470,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         strict_config,
         approval_policy,
         web_search,
+        trust_all_projects,
         prompt,
         config_overrides,
         ..
@@ -2474,6 +2483,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     if web_search {
         interactive.web_search = true;
+    }
+    if trust_all_projects {
+        interactive.trust_all_projects = true;
     }
     if strict_config {
         interactive.strict_config = true;
@@ -2980,7 +2992,28 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
-    fn sandbox_parses_permissions_profile() {
+    fn sandbox_parses_permission_profile() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "sandbox",
+            "--permission-profile",
+            ":workspace",
+            "--",
+            "echo",
+        ])
+        .expect("parse");
+
+        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+            panic!("expected sandbox command");
+        };
+
+        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
+        assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_parses_legacy_permissions_profile_alias() {
         let cli = MultitoolCli::try_parse_from([
             "codex",
             "sandbox",
@@ -2997,6 +3030,14 @@ mod tests {
 
         assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
         assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_help_only_shows_singular_permission_profile() {
+        let help = help_from_args(&["codex", "sandbox", "--help"]);
+        assert!(help.contains("--permission-profile"), "{help}");
+        assert!(!help.contains("--permissions-profile"), "{help}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -3296,6 +3337,7 @@ mod tests {
                 "resume",
                 "sid",
                 "--oss",
+                "--trust-all-projects",
                 "--search",
                 "--sandbox",
                 "workspace-write",
@@ -3330,6 +3372,7 @@ mod tests {
             Some(std::path::Path::new("/tmp"))
         );
         assert!(interactive.web_search);
+        assert!(interactive.trust_all_projects);
         assert!(interactive.strict_config);
         let has_a = interactive
             .images
@@ -3572,6 +3615,15 @@ mod tests {
         .expect_err("remote-control should reject root --remote");
 
         assert!(err.to_string().contains("remote-control"));
+    }
+
+    #[test]
+    fn remote_control_pair_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "remote-control", "pair"]).expect("parse");
+        let Some(Subcommand::RemoteControl(remote_control)) = &cli.subcommand else {
+            panic!("expected remote-control subcommand");
+        };
+        assert_eq!(remote_control.subcommand_name(), "remote-control pair");
     }
 
     #[test]

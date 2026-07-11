@@ -131,7 +131,10 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
 
     let models_manager = thread_manager.get_models_manager();
     models_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
         .await;
     let model_info = models_manager
         .get_model_info(model, &config.to_models_manager_config())
@@ -241,6 +244,7 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
+        include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,

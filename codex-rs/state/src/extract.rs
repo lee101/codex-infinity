@@ -1,15 +1,15 @@
 use crate::model::ThreadMetadata;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnContextItem;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::strip_user_message_prefix;
+use codex_protocol::protocol::user_message_preview;
 use serde::Serialize;
 use serde_json::Value;
-
-const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
 
 /// Apply a rollout item to the metadata structure.
 pub fn apply_rollout_item(
@@ -22,8 +22,10 @@ pub fn apply_rollout_item(
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
-        RolloutItem::InterAgentCommunication(_) => {}
+        RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
+        RolloutItem::WorldState(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -37,10 +39,17 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         RolloutItem::EventMsg(
             EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadGoalUpdated(_),
         ) => true,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if matches!(event.item, TurnItem::UserMessage(_)) =>
+        {
+            true
+        }
         RolloutItem::EventMsg(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::Compacted(_) => false,
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::WorldState(_) => false,
     }
 }
 
@@ -52,6 +61,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
+    // Later SessionMeta lines do not redefine the canonical history_mode.
     metadata.thread_source = meta_line.meta.thread_source.clone();
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
     metadata.agent_role = meta_line.meta.agent_role.clone();
@@ -91,16 +101,11 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
             }
         }
         EventMsg::UserMessage(user) => {
-            let preview = user_message_preview(user);
-            if metadata.first_user_message.is_none() {
-                metadata.first_user_message = preview.clone();
-            }
-            set_preview_if_empty(metadata, preview);
-            if metadata.title.is_empty() {
-                let title = strip_user_message_prefix(user.message.as_str());
-                if !title.is_empty() {
-                    metadata.title = title.to_string();
-                }
+            apply_user_message(metadata, user);
+        }
+        EventMsg::ItemCompleted(event) => {
+            if let TurnItem::UserMessage(user) = &event.item {
+                apply_user_message(metadata, &user.as_legacy_user_message_event());
             }
         }
         EventMsg::ThreadGoalUpdated(event) => {
@@ -115,33 +120,24 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
 
 fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
 
+fn apply_user_message(metadata: &mut ThreadMetadata, user: &UserMessageEvent) {
+    let preview = user_message_preview(user);
+    if metadata.first_user_message.is_none() {
+        metadata.first_user_message = preview.clone();
+    }
+    set_preview_if_empty(metadata, preview);
+    if metadata.title.is_empty() {
+        let title = strip_user_message_prefix(user.message.as_str());
+        if !title.is_empty() {
+            metadata.title = title.to_string();
+        }
+    }
+}
+
 fn set_preview_if_empty(metadata: &mut ThreadMetadata, preview: Option<String>) {
     if metadata.preview.is_none() {
         metadata.preview = preview;
     }
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
-fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
-    let message = strip_user_message_prefix(user.message.as_str());
-    if !message.is_empty() {
-        return Some(message.to_string());
-    }
-    if user
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-        || !user.local_images.is_empty()
-    {
-        return Some(IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string());
-    }
-    None
 }
 
 pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
@@ -159,12 +155,15 @@ mod tests {
     use chrono::DateTime;
     use chrono::Utc;
     use codex_protocol::ThreadId;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::items::UserMessageItem;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionMeta;
@@ -173,9 +172,11 @@ mod tests {
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+    use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::user_input::UserInput;
 
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -191,7 +192,7 @@ mod tests {
                 text: "hello from response item".to_string(),
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         });
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
@@ -224,6 +225,29 @@ mod tests {
     }
 
     #[test]
+    fn completed_user_message_items_set_title_and_first_user_message() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::default(),
+            turn_id: "turn-1".to_string(),
+            item: TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                text: format!("{USER_MESSAGE_BEGIN} actual user request"),
+                text_elements: Vec::new(),
+            }])),
+            completed_at_ms: 0,
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("actual user request")
+        );
+        assert_eq!(metadata.preview.as_deref(), Some("actual user request"));
+        assert_eq!(metadata.title, "actual user request");
+    }
+
+    #[test]
     fn event_msg_image_only_user_message_sets_image_placeholder_preview() {
         let mut metadata = metadata_for_test();
         let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
@@ -237,14 +261,8 @@ mod tests {
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
-        assert_eq!(
-            metadata.first_user_message.as_deref(),
-            Some(super::IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER)
-        );
-        assert_eq!(
-            metadata.preview.as_deref(),
-            Some(super::IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER)
-        );
+        assert_eq!(metadata.first_user_message.as_deref(), Some("[Image]"));
+        assert_eq!(metadata.preview.as_deref(), Some("[Image]"));
         assert_eq!(metadata.title, "");
     }
 
@@ -321,6 +339,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
+                    session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: Some(
                         ThreadId::from_string(&Uuid::now_v7().to_string()).expect("thread id"),
@@ -338,8 +357,11 @@ mod tests {
                     model_provider: Some("openai".to_string()),
                     base_instructions: None,
                     dynamic_tools: None,
+                    selected_capability_roots: Vec::new(),
                     memory_mode: None,
+                    history_mode: Default::default(),
                     multi_agent_version: None,
+                    context_window: None,
                 },
                 git: None,
             }),
@@ -359,6 +381,7 @@ mod tests {
                 current_date: None,
                 timezone: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
                 network: None,
@@ -404,6 +427,7 @@ mod tests {
                 current_date: None,
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
+                approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: Some(permission_profile.clone()),
                 network: None,
@@ -445,6 +469,7 @@ mod tests {
                 current_date: None,
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
+                approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
                 network: None,
@@ -483,6 +508,7 @@ mod tests {
                 current_date: None,
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
+                approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
                 network: None,
@@ -507,12 +533,14 @@ mod tests {
     #[test]
     fn session_meta_does_not_set_model_or_reasoning_effort() {
         let mut metadata = metadata_for_test();
+        metadata.history_mode = ThreadHistoryMode::Paginated;
         let thread_id = metadata.id;
 
         apply_rollout_item(
             &mut metadata,
             &RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
+                    session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
                     parent_thread_id: None,
@@ -528,8 +556,11 @@ mod tests {
                     model_provider: Some("openai".to_string()),
                     base_instructions: None,
                     dynamic_tools: None,
+                    selected_capability_roots: Vec::new(),
                     memory_mode: None,
+                    history_mode: ThreadHistoryMode::Legacy,
                     multi_agent_version: None,
+                    context_window: None,
                 },
                 git: None,
             }),
@@ -538,6 +569,7 @@ mod tests {
 
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.reasoning_effort, None);
+        assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
     }
 
     fn metadata_for_test() -> ThreadMetadata {
@@ -550,6 +582,7 @@ mod tests {
             updated_at: created_at,
             recency_at: created_at,
             source: "cli".to_string(),
+            history_mode: Default::default(),
             thread_source: None,
             agent_path: None,
             agent_nickname: None,

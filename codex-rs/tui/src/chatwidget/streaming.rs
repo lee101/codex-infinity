@@ -203,6 +203,11 @@ impl ChatWidget {
         // (between **/**) as the chunk header. Show this header as status.
         self.reasoning_buffer.push_str(&delta);
 
+        if self.safety_buffering_is_waiting() {
+            self.request_redraw();
+            return;
+        }
+
         if self.unified_exec_wait_streak.is_some() {
             // Unified exec waiting should take precedence over reasoning-derived status headers.
             self.request_redraw();
@@ -221,24 +226,26 @@ impl ChatWidget {
 
     pub(super) fn on_agent_reasoning_final(&mut self) {
         // At the end of a reasoning block, record transcript-only content.
-        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
-        if !self.full_reasoning_buffer.is_empty() {
-            let cell = history_cell::new_reasoning_summary_block(
-                self.full_reasoning_buffer.clone(),
-                &self.config.cwd,
-            );
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
+        if !self.reasoning_summary_parts.is_empty() {
+            let reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
+            let cell = history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
             self.add_boxed_history(cell);
         }
         self.reasoning_buffer.clear();
-        self.full_reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
         self.request_redraw();
     }
 
     pub(super) fn on_reasoning_section_break(&mut self) {
         // Start a new reasoning block for header extraction and accumulate transcript.
-        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
-        self.full_reasoning_buffer.push_str("\n\n");
-        self.reasoning_buffer.clear();
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
     }
 
     pub(super) fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
@@ -383,6 +390,7 @@ impl ChatWidget {
     pub(super) fn handle_streaming_delta(&mut self, delta: String) {
         if !delta.is_empty() {
             self.record_visible_turn_activity();
+            self.mark_safety_buffering_agent_message_started();
         }
         if self.stream_controller.is_none() {
             // Before starting an agent stream, flush any active exec cell group.

@@ -1,11 +1,11 @@
-#![cfg(target_os = "windows")]
-
 mod firewall;
+mod read_acl_mutex;
 
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use codex_otel::StatsigMetricsSettings;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
@@ -13,28 +13,29 @@ use codex_windows_sandbox::SetupFailure;
 use codex_windows_sandbox::add_deny_write_ace;
 use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::convert_string_sid_to_sid;
-use codex_windows_sandbox::current_log_file_path;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
 use codex_windows_sandbox::extract_setup_failure;
 use codex_windows_sandbox::hide_newly_created_users;
+use codex_windows_sandbox::install_wfp_filters;
 use codex_windows_sandbox::is_command_cwd_root;
-use codex_windows_sandbox::load_or_create_cap_sids;
 use codex_windows_sandbox::log_note;
+use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
 use codex_windows_sandbox::string_from_sid_bytes;
+use codex_windows_sandbox::sync_persistent_deny_read_acls;
 use codex_windows_sandbox::to_wide;
-use codex_windows_sandbox::workspace_cap_sid_for_cwd;
+use codex_windows_sandbox::workspace_write_cap_sid_for_root;
+use codex_windows_sandbox::workspace_write_root_overlaps_path;
 use codex_windows_sandbox::write_setup_error_report;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
-use std::fs::File;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -64,9 +65,11 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 
 const DENY_ACCESS: i32 = 3;
+const WRITE_ROOT_ALLOW_MASK: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
 
-mod read_acl_mutex;
 mod sandbox_users;
+mod setup_runtime_bin;
 use read_acl_mutex::acquire_read_acl_mutex;
 use read_acl_mutex::read_acl_mutex_exists;
 use sandbox_users::commit_setup_marker;
@@ -86,10 +89,14 @@ struct Payload {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     #[serde(default)]
+    deny_read_paths: Vec<PathBuf>,
+    #[serde(default)]
     deny_write_paths: Vec<PathBuf>,
     proxy_ports: Vec<u16>,
     #[serde(default)]
     allow_local_binding: bool,
+    #[serde(default)]
+    otel: Option<StatsigMetricsSettings>,
     real_user: String,
     #[serde(default)]
     mode: SetupMode,
@@ -117,7 +124,60 @@ fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
     Ok(())
 }
 
-fn spawn_read_acl_helper(payload: &Payload, _log: &mut File) -> Result<()> {
+fn workspace_write_cap_sids_for_path(
+    codex_home: &Path,
+    command_cwd: &Path,
+    write_roots: &[PathBuf],
+    path: &Path,
+) -> Result<Vec<String>> {
+    let mut sid_strs = Vec::new();
+    for root in write_roots {
+        if workspace_write_root_overlaps_path(root, path) {
+            sid_strs.push(workspace_write_cap_sid_for_root(
+                codex_home,
+                command_cwd,
+                root,
+            )?);
+        }
+    }
+    if sid_strs.is_empty() {
+        if write_roots.is_empty() {
+            sid_strs.push(workspace_write_cap_sid_for_root(
+                codex_home,
+                command_cwd,
+                command_cwd,
+            )?);
+        } else {
+            for root in write_roots {
+                sid_strs.push(workspace_write_cap_sid_for_root(
+                    codex_home,
+                    command_cwd,
+                    root,
+                )?);
+            }
+        }
+    }
+    Ok(sid_strs)
+}
+
+fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
+    if !path_mask_allows(
+        root,
+        &[psid],
+        WRITE_ROOT_ALLOW_MASK,
+        /*require_all_bits*/ true,
+    )? {
+        return Ok(true);
+    }
+    path_mask_allows(
+        root,
+        &[psid],
+        FILE_DELETE_CHILD,
+        /*require_all_bits*/ false,
+    )
+}
+
+fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {
     let mut read_payload = payload.clone();
     read_payload.mode = SetupMode::ReadAclsOnly;
     read_payload.refresh_only = true;
@@ -143,7 +203,7 @@ struct ReadAclSubjects<'a> {
 fn apply_read_acls(
     read_roots: &[PathBuf],
     subjects: &ReadAclSubjects<'_>,
-    log: &mut File,
+    log: &mut dyn Write,
     refresh_errors: &mut Vec<String>,
     access_mask: u32,
     access_label: &str,
@@ -220,7 +280,7 @@ fn read_mask_allows_or_log(
     read_mask: u32,
     access_label: &str,
     refresh_errors: &mut Vec<String>,
-    log: &mut File,
+    log: &mut dyn Write,
 ) -> Result<bool> {
     match path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true) {
         Ok(has) => Ok(has),
@@ -255,7 +315,7 @@ fn lock_sandbox_dir(
     sandbox_group_access_mode: i32,
     sandbox_group_mask: u32,
     real_user_mask: u32,
-    _log: &mut File,
+    _log: &mut dyn Write,
 ) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let system_sid = resolve_sid("SYSTEM")?;
@@ -352,8 +412,7 @@ pub fn main() -> Result<()> {
         if let Ok(codex_home) = std::env::var("CODEX_HOME") {
             let sbx_dir = sandbox_dir(Path::new(&codex_home));
             let _ = std::fs::create_dir_all(&sbx_dir);
-            let log_path = current_log_file_path(&sbx_dir);
-            if let Ok(mut f) = File::options().create(true).append(true).open(&log_path) {
+            if let Some(mut f) = log_writer(&sbx_dir) {
                 let _ = writeln!(
                     f,
                     "[{}] top-level error: {}",
@@ -403,17 +462,12 @@ fn real_main() -> Result<()> {
             format!("failed to create sandbox dir {}: {err}", sbx_dir.display()),
         ))
     })?;
-    let log_path = current_log_file_path(&sbx_dir);
-    let mut log = File::options()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperLogFailed,
-                format!("open log {} failed: {err}", log_path.display()),
-            ))
-        })?;
+    let mut log = log_writer(&sbx_dir).ok_or_else(|| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperLogFailed,
+            format!("open log in {} failed", sbx_dir.display()),
+        ))
+    })?;
     let result = run_setup(&payload, &mut log, &sbx_dir);
     if let Err(err) = &result {
         let _ = log_line(&mut log, &format!("setup error: {err:?}"));
@@ -441,7 +495,11 @@ fn real_main() -> Result<()> {
     result
 }
 
-fn run_setup(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<()> {
+fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+    let writes_setup_marker = !payload.refresh_only && payload.mode != SetupMode::ReadAclsOnly;
+    if writes_setup_marker {
+        prepare_setup_marker(&payload.codex_home, &payload.real_user)?;
+    }
     match payload.mode {
         SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
         SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
@@ -459,7 +517,7 @@ fn run_setup(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
+fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
     let _read_acl_guard = match acquire_read_acl_mutex()? {
         Some(guard) => guard,
         None => {
@@ -471,38 +529,42 @@ fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
     let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
     let mut refresh_errors: Vec<String> = Vec::new();
-    let users_sid = resolve_sid("Users")?;
-    let users_psid = sid_bytes_to_psid(&users_sid)?;
-    let auth_sid = resolve_sid("Authenticated Users")?;
-    let auth_psid = sid_bytes_to_psid(&auth_sid)?;
-    let everyone_sid = resolve_sid("Everyone")?;
-    let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
-    let rx_psids = vec![users_psid, auth_psid, everyone_psid];
-    let subjects = ReadAclSubjects {
-        sandbox_group_psid,
-        rx_psids: &rx_psids,
-    };
-    apply_read_acls(
-        &payload.read_roots,
-        &subjects,
-        log,
-        &mut refresh_errors,
-        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        "read",
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-    )?;
+    if !payload.read_roots.is_empty() {
+        let users_sid = resolve_sid("Users")?;
+        let users_psid = sid_bytes_to_psid(&users_sid)?;
+        let auth_sid = resolve_sid("Authenticated Users")?;
+        let auth_psid = sid_bytes_to_psid(&auth_sid)?;
+        let everyone_sid = resolve_sid("Everyone")?;
+        let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
+        let rx_psids = vec![users_psid, auth_psid, everyone_psid];
+        let subjects = ReadAclSubjects {
+            sandbox_group_psid,
+            rx_psids: &rx_psids,
+        };
+        apply_read_acls(
+            &payload.read_roots,
+            &subjects,
+            log,
+            &mut refresh_errors,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            "read",
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )?;
+        unsafe {
+            if !users_psid.is_null() {
+                LocalFree(users_psid as HLOCAL);
+            }
+            if !auth_psid.is_null() {
+                LocalFree(auth_psid as HLOCAL);
+            }
+            if !everyone_psid.is_null() {
+                LocalFree(everyone_psid as HLOCAL);
+            }
+        }
+    }
     unsafe {
         if !sandbox_group_psid.is_null() {
             LocalFree(sandbox_group_psid as HLOCAL);
-        }
-        if !users_psid.is_null() {
-            LocalFree(users_psid as HLOCAL);
-        }
-        if !auth_psid.is_null() {
-            LocalFree(auth_psid as HLOCAL);
-        }
-        if !everyone_psid.is_null() {
-            LocalFree(everyone_psid as HLOCAL);
         }
     }
     if !refresh_errors.is_empty() {
@@ -518,32 +580,180 @@ fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
     Ok(())
 }
 
-fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<()> {
-    let refresh_only = payload.refresh_only;
-    if refresh_only {
-    } else {
-        let provision_result = provision_sandbox_users(
-            &payload.codex_home,
-            &payload.offline_username,
-            &payload.online_username,
-            &payload.proxy_ports,
-            payload.allow_local_binding,
-            log,
-        );
-        if let Err(err) = provision_result {
-            if extract_setup_failure(&err).is_some() {
-                return Err(err);
-            }
-            return Err(anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperUserProvisionFailed,
-                format!("provision sandbox users failed: {err}"),
-            )));
+fn provision_and_hide_sandbox_users(
+    payload: &Payload,
+    log: &mut dyn Write,
+    sbx_dir: &Path,
+) -> Result<()> {
+    let provision_result = provision_sandbox_users(
+        &payload.codex_home,
+        &payload.offline_username,
+        &payload.online_username,
+        log,
+    );
+    if let Err(err) = provision_result {
+        if extract_setup_failure(&err).is_some() {
+            return Err(err);
         }
-        let users = vec![
-            payload.offline_username.clone(),
-            payload.online_username.clone(),
-        ];
-        hide_newly_created_users(&users, sbx_dir);
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUserProvisionFailed,
+            format!("provision sandbox users failed: {err}"),
+        )));
+    }
+    let users = vec![
+        payload.offline_username.clone(),
+        payload.online_username.clone(),
+    ];
+    hide_newly_created_users(&users, sbx_dir);
+    Ok(())
+}
+
+fn configure_offline_sandbox_network(
+    payload: &Payload,
+    offline_sid_str: &str,
+    log: &mut dyn Write,
+) -> Result<()> {
+    let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
+        offline_sid_str,
+        &payload.proxy_ports,
+        payload.allow_local_binding,
+        log,
+    );
+    if let Err(err) = proxy_allowlist_result {
+        if extract_setup_failure(&err).is_some() {
+            return Err(err);
+        }
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+            format!("ensure offline proxy allowlist failed: {err}"),
+        )));
+    }
+    let firewall_result = firewall::ensure_offline_outbound_block(offline_sid_str, log);
+    if let Err(err) = firewall_result {
+        if extract_setup_failure(&err).is_some() {
+            return Err(err);
+        }
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+            format!("ensure offline outbound block failed: {err}"),
+        )));
+    }
+    install_wfp_filters(
+        &payload.codex_home,
+        &payload.offline_username,
+        payload.otel.as_ref(),
+        |message| {
+            let _ = log_line(log, message);
+        },
+    );
+    Ok(())
+}
+
+fn lock_persistent_sandbox_dirs(
+    payload: &Payload,
+    sandbox_group_sid: &[u8],
+    log: &mut dyn Write,
+) -> Result<()> {
+    lock_sandbox_dir(
+        &sandbox_dir(&payload.codex_home),
+        &payload.real_user,
+        sandbox_group_sid,
+        GRANT_ACCESS,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        log,
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSandboxLockFailed,
+            format!(
+                "lock sandbox dir {} failed: {err}",
+                sandbox_dir(&payload.codex_home).display()
+            ),
+        ))
+    })?;
+    lock_sandbox_dir(
+        &sandbox_secrets_dir(&payload.codex_home),
+        &payload.real_user,
+        sandbox_group_sid,
+        DENY_ACCESS,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        log,
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSandboxLockFailed,
+            format!(
+                "lock sandbox secrets dir {} failed: {err}",
+                sandbox_secrets_dir(&payload.codex_home).display()
+            ),
+        ))
+    })?;
+    let legacy_users = sandbox_dir(&payload.codex_home).join("sandbox_users.json");
+    if legacy_users.exists() {
+        let _ = std::fs::remove_file(&legacy_users);
+    }
+    Ok(())
+}
+
+fn lock_sandbox_bin_dir(
+    payload: &Payload,
+    sandbox_group_sid: &[u8],
+    log: &mut dyn Write,
+) -> Result<()> {
+    lock_sandbox_dir(
+        &sandbox_bin_dir(&payload.codex_home),
+        &payload.real_user,
+        sandbox_group_sid,
+        GRANT_ACCESS,
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+        log,
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSandboxLockFailed,
+            format!(
+                "lock sandbox bin dir {} failed: {err}",
+                sandbox_bin_dir(&payload.codex_home).display()
+            ),
+        ))
+    })
+}
+
+fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+    provision_and_hide_sandbox_users(payload, log, sbx_dir)?;
+    let offline_sid = resolve_sid(&payload.offline_username).map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSidResolveFailed,
+            format!(
+                "resolve SID for offline user {} failed: {err}",
+                payload.offline_username
+            ),
+        ))
+    })?;
+    let offline_sid_str = string_from_sid_bytes(&offline_sid).map_err(anyhow::Error::msg)?;
+
+    let sandbox_group_sid = resolve_sandbox_users_group_sid().map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSidResolveFailed,
+            format!("resolve sandbox users group SID failed: {err}"),
+        ))
+    })?;
+
+    configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
+    lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
+    log_note("setup provisioning binary completed", Some(sbx_dir));
+    Ok(())
+}
+
+fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+    let refresh_only = payload.refresh_only;
+    if !refresh_only {
+        provision_and_hide_sandbox_users(payload, log, sbx_dir)?;
     }
     let offline_sid = resolve_sid(&payload.offline_username).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -568,53 +778,31 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             format!("convert sandbox users group SID to PSID failed: {err}"),
         ))
     })?;
+    let sandbox_group_sid_str =
+        string_from_sid_bytes(&sandbox_group_sid).map_err(anyhow::Error::msg)?;
 
-    let caps = load_or_create_cap_sids(&payload.codex_home).map_err(|err| {
-        anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperCapabilitySidFailed,
-            format!("load or create capability SIDs failed: {err}"),
-        ))
-    })?;
-    let cap_psid = unsafe {
-        convert_string_sid_to_sid(&caps.workspace).ok_or_else(|| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperCapabilitySidFailed,
-                format!("convert capability SID {} failed", caps.workspace),
-            ))
-        })?
-    };
-    let workspace_sid_str = workspace_cap_sid_for_cwd(&payload.codex_home, &payload.command_cwd)?;
-    let workspace_psid = unsafe {
-        convert_string_sid_to_sid(&workspace_sid_str)
-            .ok_or_else(|| anyhow::anyhow!("convert workspace capability SID failed"))?
-    };
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
-        let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
-            &offline_sid_str,
-            &payload.proxy_ports,
-            payload.allow_local_binding,
+        configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+    }
+
+    // Deny-read ACEs must be present before the sandboxed command starts. Apply
+    // them synchronously here instead of delegating them to the background
+    // helper used for read grants.
+    let applied_deny_read_paths = unsafe {
+        sync_persistent_deny_read_acls(
+            &payload.codex_home,
+            &sandbox_group_sid_str,
+            &payload.deny_read_paths,
+            sandbox_group_psid,
+        )
+    }
+    .context("apply deny-read ACLs")?;
+    if !applied_deny_read_paths.is_empty() {
+        log_line(
             log,
-        );
-        if let Err(err) = proxy_allowlist_result {
-            if extract_setup_failure(&err).is_some() {
-                return Err(err);
-            }
-            return Err(anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                format!("ensure offline proxy allowlist failed: {err}"),
-            )));
-        }
-        let firewall_result = firewall::ensure_offline_outbound_block(&offline_sid_str, log);
-        if let Err(err) = firewall_result {
-            if extract_setup_failure(&err).is_some() {
-                return Err(err);
-            }
-            return Err(anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                format!("ensure offline outbound block failed: {err}"),
-            )));
-        }
+            &format!("applied {} deny-read ACLs", applied_deny_read_paths.len()),
+        )?;
     }
 
     if payload.read_roots.is_empty() {
@@ -649,12 +837,15 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         }
     }
 
-    let cap_sid_str = caps.workspace;
-    let sandbox_group_sid_str =
-        string_from_sid_bytes(&sandbox_group_sid).map_err(anyhow::Error::msg)?;
-    let write_mask =
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
-    let mut grant_tasks: Vec<PathBuf> = Vec::new();
+    if refresh_only {
+        setup_runtime_bin::ensure_codex_app_runtime_paths_readable(
+            sandbox_group_psid,
+            &mut refresh_errors,
+            log,
+        )?;
+    }
+
+    let mut grant_tasks: Vec<(PathBuf, String)> = Vec::new();
 
     let mut seen_deny_paths: HashSet<PathBuf> = HashSet::new();
     let mut seen_write_roots: HashSet<PathBuf> = HashSet::new();
@@ -676,40 +867,43 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         let cap_label = if is_command_cwd {
             "workspace_cap"
         } else {
-            "cap"
+            "root_cap"
         };
-        let cap_psid_for_root = if is_command_cwd {
-            workspace_psid
-        } else {
-            cap_psid
+        let root_cap_sid_str =
+            workspace_write_cap_sid_for_root(&payload.codex_home, &payload.command_cwd, root)?;
+        let root_cap_psid = unsafe {
+            convert_string_sid_to_sid(&root_cap_sid_str)
+                .ok_or_else(|| anyhow::anyhow!("convert write root capability SID failed"))?
         };
         for (label, psid) in [
             ("sandbox_group", sandbox_group_psid),
-            (cap_label, cap_psid_for_root),
+            (cap_label, root_cap_psid),
         ] {
-            let has =
-                match path_mask_allows(root, &[psid], write_mask, /*require_all_bits*/ true) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        refresh_errors.push(format!(
-                            "write mask check failed on {} for {label}: {}",
+            let needs_refresh = match write_root_needs_refresh(root, psid) {
+                Ok(needs_refresh) => needs_refresh,
+                Err(e) => {
+                    refresh_errors.push(format!(
+                        "write ACE check failed on {} for {label}: {}",
+                        root.display(),
+                        e
+                    ));
+                    log_line(
+                        log,
+                        &format!(
+                            "write ACE check failed on {} for {label}: {}; continuing",
                             root.display(),
                             e
-                        ));
-                        log_line(
-                            log,
-                            &format!(
-                                "write mask check failed on {} for {label}: {}; continuing",
-                                root.display(),
-                                e
-                            ),
-                        )?;
-                        false
-                    }
-                };
-            if !has {
+                        ),
+                    )?;
+                    true
+                }
+            };
+            if needs_refresh {
                 need_grant = true;
             }
+        }
+        unsafe {
+            LocalFree(root_cap_psid as HLOCAL);
         }
         if need_grant {
             log_line(
@@ -719,19 +913,14 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
                     root.display()
                 ),
             )?;
-            grant_tasks.push(root.clone());
+            grant_tasks.push((root.clone(), root_cap_sid_str));
         }
     }
 
     let (tx, rx) = mpsc::channel::<(PathBuf, Result<bool>)>();
     std::thread::scope(|scope| {
-        for root in grant_tasks {
-            let is_command_cwd = is_command_cwd_root(&root, &canonical_command_cwd);
-            let sid_strings = if is_command_cwd {
-                vec![sandbox_group_sid_str.clone(), workspace_sid_str.clone()]
-            } else {
-                vec![sandbox_group_sid_str.clone(), cap_sid_str.clone()]
-            };
+        for (root, root_cap_sid_str) in grant_tasks {
+            let sid_strings = vec![sandbox_group_sid_str.clone(), root_cap_sid_str];
             let tx = tx.clone();
             scope.spawn(move || {
                 // Convert SID strings to psids locally in this thread.
@@ -793,27 +982,36 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
                 .with_context(|| format!("failed to create deny-write path {}", path.display()))?;
         }
 
-        let canonical_path = canonicalize_path(path);
-        let deny_psid = if canonical_path.starts_with(&canonical_command_cwd) {
-            workspace_psid
-        } else {
-            cap_psid
-        };
+        let deny_sid_strs = workspace_write_cap_sids_for_path(
+            &payload.codex_home,
+            &payload.command_cwd,
+            &payload.write_roots,
+            path,
+        )?;
+        for deny_sid_str in deny_sid_strs {
+            let deny_psid = unsafe {
+                convert_string_sid_to_sid(&deny_sid_str)
+                    .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
+            };
 
-        match unsafe { add_deny_write_ace(path, deny_psid) } {
-            Ok(true) => {
-                log_line(
-                    log,
-                    &format!("applied deny ACE to protect {}", path.display()),
-                )?;
+            match unsafe { add_deny_write_ace(path, deny_psid) } {
+                Ok(true) => {
+                    log_line(
+                        log,
+                        &format!("applied deny ACE to protect {}", path.display()),
+                    )?;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
+                    log_line(
+                        log,
+                        &format!("deny ACE failed on {}: {err}", path.display()),
+                    )?;
+                }
             }
-            Ok(false) => {}
-            Err(err) => {
-                refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
-                log_line(
-                    log,
-                    &format!("deny ACE failed on {}: {err}", path.display()),
-                )?;
+            unsafe {
+                LocalFree(deny_psid as HLOCAL);
             }
         }
     }
@@ -838,12 +1036,6 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         if !sandbox_group_psid.is_null() {
             LocalFree(sandbox_group_psid as HLOCAL);
         }
-        if !cap_psid.is_null() {
-            LocalFree(cap_psid as HLOCAL);
-        }
-        if !workspace_psid.is_null() {
-            LocalFree(workspace_psid as HLOCAL);
-        }
     }
     if refresh_only && !refresh_errors.is_empty() {
         log_line(
@@ -854,4 +1046,201 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
     }
     log_note("setup binary completed", Some(sbx_dir));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Payload;
+    use super::SETUP_VERSION;
+    use super::WRITE_ROOT_ALLOW_MASK;
+    use super::convert_string_sid_to_sid;
+    use super::workspace_write_cap_sids_for_path;
+    use super::write_root_needs_refresh;
+    use codex_otel::StatsigMetricsSettings;
+    use codex_windows_sandbox::ensure_allow_mask_aces;
+    use codex_windows_sandbox::ensure_allow_write_aces;
+    use codex_windows_sandbox::load_or_create_cap_sids;
+    use codex_windows_sandbox::workspace_write_cap_sid_for_root;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use std::fs;
+    use windows_sys::Win32::Foundation::HLOCAL;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
+
+    fn payload_json() -> serde_json::Value {
+        json!({
+            "version": SETUP_VERSION,
+            "offline_username": "CodexSandboxOffline",
+            "online_username": "CodexSandboxOnline",
+            "codex_home": "C:\\codex-home",
+            "command_cwd": "C:\\workspace",
+            "read_roots": [],
+            "write_roots": [],
+            "proxy_ports": [],
+            "real_user": "User",
+        })
+    }
+
+    #[test]
+    fn payload_defaults_otel_absent() {
+        let payload: Payload = serde_json::from_value(payload_json()).expect("payload");
+
+        assert_eq!(payload.otel, None);
+    }
+
+    #[test]
+    fn payload_accepts_provision_only_mode() {
+        let mut payload = payload_json();
+        payload["mode"] = json!("provision-only");
+        let payload: Payload = serde_json::from_value(payload).expect("payload");
+
+        assert_eq!(payload.mode, super::SetupMode::ProvisionOnly);
+    }
+
+    #[test]
+    fn payload_accepts_otel_settings() {
+        let mut payload = payload_json();
+        payload["otel"] = json!({
+            "environment": "prod",
+        });
+        let payload: Payload = serde_json::from_value(payload).expect("payload");
+
+        assert_eq!(
+            payload.otel,
+            Some(StatsigMetricsSettings {
+                environment: "prod".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn write_root_refresh_replaces_stale_delete_child_grant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let psid = unsafe { convert_string_sid_to_sid(&sid).expect("convert workspace sid") };
+        let stale_write_mask = WRITE_ROOT_ALLOW_MASK | FILE_DELETE_CHILD;
+        let seeded = unsafe { ensure_allow_mask_aces(&workspace, &[psid], stale_write_mask) }
+            .expect("seed stale write ACE");
+        let needs_refresh_before =
+            write_root_needs_refresh(&workspace, psid).expect("check stale write ACE");
+        let replaced = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
+            .expect("replace stale write ACE");
+        let needs_refresh_after =
+            write_root_needs_refresh(&workspace, psid).expect("check refreshed write ACE");
+        unsafe {
+            LocalFree(psid as HLOCAL);
+        }
+
+        assert_eq!(
+            (seeded, needs_refresh_before, replaced, needs_refresh_after),
+            (true, true, true, false)
+        );
+    }
+
+    #[test]
+    fn deny_path_under_active_root_uses_only_matching_root_sid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        let active_root = temp.path().join("active-root");
+        let stale_root = temp.path().join("stale-root");
+        let deny_path = active_root.join("protected");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&active_root).expect("create active root");
+        fs::create_dir_all(&stale_root).expect("create stale root");
+        fs::create_dir_all(&deny_path).expect("create deny path");
+
+        let stale_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &stale_root)
+            .expect("stale sid");
+        let active_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &active_root)
+            .expect("active sid");
+        let workspace_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
+
+        let deny_sids = workspace_write_cap_sids_for_path(
+            &codex_home,
+            &workspace,
+            &[workspace.clone(), active_root],
+            &deny_path,
+        )
+        .expect("deny sids");
+
+        assert_eq!(deny_sids, vec![active_sid]);
+        assert!(!deny_sids.contains(&workspace_sid));
+        assert!(!deny_sids.contains(&stale_sid));
+        assert!(!deny_sids.contains(&caps.workspace));
+    }
+
+    #[test]
+    fn deny_path_outside_active_roots_falls_back_to_all_active_root_sids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        let active_root = temp.path().join("active-root");
+        let stale_root = temp.path().join("stale-root");
+        let deny_path = temp.path().join("outside-deny");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&active_root).expect("create active root");
+        fs::create_dir_all(&stale_root).expect("create stale root");
+        fs::create_dir_all(&deny_path).expect("create deny path");
+
+        let stale_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &stale_root)
+            .expect("stale sid");
+        let active_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &active_root)
+            .expect("active sid");
+        let workspace_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
+
+        let deny_sids = workspace_write_cap_sids_for_path(
+            &codex_home,
+            &workspace,
+            &[workspace.clone(), active_root],
+            &deny_path,
+        )
+        .expect("deny sids");
+
+        assert_eq!(deny_sids.len(), 2);
+        assert!(deny_sids.contains(&workspace_sid));
+        assert!(deny_sids.contains(&active_sid));
+        assert!(!deny_sids.contains(&stale_sid));
+        assert!(!deny_sids.contains(&caps.workspace));
+    }
+
+    #[test]
+    fn deny_path_includes_nested_active_root_sid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        let protected_dir = workspace.join(".codex");
+        let nested_root = protected_dir.join("nested-root");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&nested_root).expect("create nested root");
+
+        let workspace_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let nested_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &nested_root)
+            .expect("nested sid");
+
+        let deny_sids = workspace_write_cap_sids_for_path(
+            &codex_home,
+            &workspace,
+            &[workspace.clone(), nested_root],
+            &protected_dir,
+        )
+        .expect("deny sids");
+
+        assert_eq!(deny_sids, vec![workspace_sid, nested_sid]);
+    }
 }

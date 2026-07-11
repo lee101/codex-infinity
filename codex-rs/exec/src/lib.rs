@@ -66,6 +66,7 @@ use codex_core::config::ConfigTomlLoadResult;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_bootstrap_auth_keyring_backend_kind;
+use codex_core::config::resolve_bootstrap_auth_route_config;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config::resolve_profile_v2_config_path;
 use codex_core::find_thread_meta_by_name_str;
@@ -207,6 +208,7 @@ struct ExecRunArgs {
     command: Option<ExecCommand>,
     config: Config,
     yolo_mode: YoloMode,
+    resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
     exec_span: tracing::Span,
     images: Vec<PathBuf>,
     json_mode: bool,
@@ -354,6 +356,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let auth_route_config = resolve_bootstrap_auth_route_config(
+        bootstrap_config_toml,
+        bootstrap_config
+            .config_layer_stack
+            .requirements()
+            .feature_requirements
+            .as_ref(),
+    )?;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
@@ -362,6 +372,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .unwrap_or_default(),
         resolve_bootstrap_auth_keyring_backend_kind(&bootstrap_config)?,
         chatgpt_base_url,
+        auth_route_config,
     )
     .await;
     let run_cli_overrides = cli_kv_overrides.clone();
@@ -460,6 +471,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         build_config,
     )
     .await?;
+    let resume_approvals_reviewer_override = cli_kv_overrides
+        .iter()
+        .any(|(key, _)| key == "approvals_reviewer")
+        .then(|| config.approvals_reviewer.into());
 
     #[allow(clippy::print_stderr)]
     match check_execpolicy_for_warnings(&config.config_layer_stack).await {
@@ -475,6 +490,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
+    let auth_route_config = config.auth_route_config();
     if let Err(err) = enforce_login_restrictions(&AuthConfig {
         codex_home: config.codex_home.to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
@@ -482,6 +498,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         forced_login_method: config.forced_login_method,
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
         chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
+        auth_route_config,
     })
     .await
     {
@@ -572,6 +589,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         command,
         config,
         yolo_mode,
+        resume_approvals_reviewer_override,
         exec_span: exec_span.clone(),
         images,
         json_mode,
@@ -669,6 +687,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         command,
         config,
         yolo_mode,
+        resume_approvals_reviewer_override,
         exec_span,
         images,
         json_mode,
@@ -800,7 +819,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 &client,
                 ClientRequest::ThreadResume {
                     request_id: request_ids.next(),
-                    params: thread_resume_params_from_config(&config, thread_id),
+                    params: thread_resume_params_from_config(
+                        &config,
+                        thread_id,
+                        resume_approvals_reviewer_override,
+                    ),
                 },
                 "thread/resume",
             )
@@ -1062,7 +1085,7 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(config),
+        approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox.flatten(),
         permissions,
         config: thread_config_overrides_from_config(config),
@@ -1072,7 +1095,11 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     }
 }
 
-fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {
+fn thread_resume_params_from_config(
+    config: &Config,
+    thread_id: String,
+    approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
+) -> ThreadResumeParams {
     let permissions = permissions_selection_from_config(config);
     let sandbox = permissions.is_none().then(|| {
         sandbox_mode_from_permission_profile(
@@ -1087,7 +1114,7 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
-        approvals_reviewer: approvals_reviewer_override_from_config(config),
+        approvals_reviewer: approvals_reviewer_override,
         sandbox: sandbox.flatten(),
         permissions,
         config: thread_config_overrides_from_config(config),
@@ -1135,12 +1162,6 @@ fn sandbox_mode_from_permission_profile(
             }
         }
     }
-}
-
-fn approvals_reviewer_override_from_config(
-    config: &Config,
-) -> Option<codex_app_server_protocol::ApprovalsReviewer> {
-    Some(config.approvals_reviewer.into())
 }
 
 async fn send_request_with_response<T>(
@@ -1467,6 +1488,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         parent_thread_id: None,
+                        ancestor_thread_id: None,
                         cwd: None,
                         use_state_db_only: false,
                         search_term: None,
@@ -1533,6 +1555,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     parent_thread_id: None,
+                    ancestor_thread_id: None,
                     cwd: None,
                     use_state_db_only: false,
                     search_term: Some(session_id.to_string()),

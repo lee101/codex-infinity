@@ -71,6 +71,7 @@ fn test_model_info(
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
+        include_skills_usage_instructions: false,
         supports_reasoning_summaries: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -93,7 +94,12 @@ fn test_model_info(
 async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let available_models = manager.list_models(RefreshStrategy::Online).await;
+        let available_models = manager
+            .list_models(
+                RefreshStrategy::Online,
+                codex_core::test_support::default_http_client_factory(),
+            )
+            .await;
         if available_models.iter().any(|model| model.model == slug) {
             return;
         }
@@ -213,13 +219,15 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description.contains(
-            "Do not spawn sub-agents unless the user explicitly asks for sub-agents, delegation, or parallel agent work."
+            "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work."
         ),
         "expected explicit authorization rule in spawn_agent description: {description:?}"
     );
     assert!(
-        !description.contains("### When to delegate vs. do the subtask yourself"),
-        "spawn_agent description should not include extra when-to-use delegation guidance: {description:?}"
+        description.contains(
+            "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn."
+        ) && description.contains("### When to delegate vs. do the subtask yourself"),
+        "expected delegation decision guidance in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(

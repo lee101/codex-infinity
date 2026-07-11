@@ -1,6 +1,8 @@
 mod common;
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,11 +13,27 @@ use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
+#[cfg(target_os = "linux")]
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteStatus;
+#[cfg(target_os = "linux")]
+use codex_protocol::models::PermissionProfile;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::FileSystemAccessMode;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::FileSystemPath;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::FileSystemSandboxEntry;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::FileSystemSpecialPath;
+#[cfg(target_os = "linux")]
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -75,12 +93,15 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
         .start(ExecParams {
             process_id: ProcessId::from("proc-1"),
             argv: vec!["true".to_string()],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), "proc-1");
@@ -90,6 +111,132 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
 
     assert_eq!(exit_code, Some(0));
     assert!(closed);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let file = workspace.path().join("allowed.txt");
+    std::fs::write(&file, b"allowed")?;
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Read,
+        },
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::from("proc-restricted-helper"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            env_policy: None,
+            env: HashMap::from([("PATH".to_string(), std::env::var("PATH")?)]),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+        })
+        .await?;
+    let output = collect_process_output_from_events(session.process).await?;
+
+    assert_eq!(
+        output,
+        ("allowed".to_string(), String::new(), Some(0), true)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let file = workspace.path().join("allowed.txt");
+    std::fs::write(&file, b"allowed")?;
+    let hostile_helper = workspace.path().join("codex-linux-sandbox");
+    std::fs::write(&hostile_helper, b"#!/bin/sh\nprintf hostile")?;
+    let mut permissions = std::fs::metadata(&hostile_helper)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hostile_helper, permissions)?;
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    let hostile_path = std::env::join_paths(
+        std::iter::once(workspace.path().to_path_buf()).chain(std::env::split_paths(&path)),
+    )?;
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Read,
+        },
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::from("proc-hostile-helper-path"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            env_policy: None,
+            env: HashMap::from([(
+                "PATH".to_string(),
+                hostile_path.to_string_lossy().into_owned(),
+            )]),
+            tty: true,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+        })
+        .await?;
+    let output = collect_process_output_from_events(session.process).await?;
+
+    assert_eq!(
+        output,
+        ("allowed".to_string(), String::new(), Some(0), true)
+    );
     Ok(())
 }
 
@@ -161,6 +308,7 @@ async fn collect_process_output_from_events(
             ExecProcessEvent::Exited {
                 seq: _,
                 exit_code: code,
+                ..
             } => {
                 exit_code = Some(code);
             }
@@ -187,7 +335,7 @@ async fn collect_process_event_snapshots(
                 stream: chunk.stream,
                 text: String::from_utf8_lossy(&chunk.chunk.into_inner()).into_owned(),
             },
-            ExecProcessEvent::Exited { seq, exit_code } => {
+            ExecProcessEvent::Exited { seq, exit_code, .. } => {
                 ProcessEventSnapshot::Exited { seq, exit_code }
             }
             ExecProcessEvent::Closed { seq } => ProcessEventSnapshot::Closed { seq },
@@ -216,17 +364,20 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
                 "-c".to_string(),
                 "sleep 0.05; printf 'session output\\n'".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
     assert_eq!(output, "session output\n");
@@ -247,17 +398,20 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
                 "-c".to_string(),
                 "printf 'event output\\n'; sleep 0.1; printf 'event err\\n' >&2; sleep 0.1; exit 7".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let actual = collect_process_event_snapshots(process).await?;
     assert_eq!(
         actual,
@@ -294,17 +448,20 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
                 "-c".to_string(),
                 "printf 'late one\\n'; printf 'late two\\n'".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let read_result = collect_process_output_from_reads(Arc::clone(&process), wake_rx).await?;
     assert_eq!(
@@ -342,17 +499,20 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
                 DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG.to_string(),
                 release_path.to_string_lossy().into_owned(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
 
     let exit_response = timeout(
         Duration::from_secs(2),
@@ -415,19 +575,22 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
                 "-c".to_string(),
                 "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: true,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     session.process.write(b"hello\n".to_vec()).await?;
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
 
@@ -452,12 +615,15 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
                 "-c".to_string(),
                 "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: true,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -465,7 +631,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
     tokio::time::sleep(Duration::from_millis(200)).await;
     let write_response = session.process.write(b"hello\n".to_vec()).await?;
     assert_eq!(write_response.status, WriteStatus::Accepted);
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let actual = collect_process_output_from_reads(process, wake_rx).await?;
 
@@ -485,19 +651,22 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
                 "-c".to_string(),
                 "sleep 0.3; if IFS= read -r line; then printf 'read:%s\\n' \"$line\"; else printf 'eof\\n'; fi".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
     let write_response = session.process.write(b"ignored\n".to_vec()).await?;
     assert_eq!(write_response.status, WriteStatus::StdinClosed);
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
 
@@ -519,17 +688,20 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
                 "-c".to_string(),
                 "trap 'printf \"signal:2\\n\"; exit 7' INT; printf 'ready\\n'; while :; do :; done".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let mut wake_rx = process.subscribe_wake();
     let mut ready_output = String::new();
     let mut after_seq = None;
@@ -572,12 +744,15 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
                 "/C".to_string(),
                 "echo ready && ping -n 30 127.0.0.1 >NUL".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
 
@@ -612,18 +787,21 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
                 "-c".to_string(),
                 "printf 'queued output\\n'".to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let StartedExecProcess { process } = session;
+    let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
     assert_eq!(output, "queued output\n");
@@ -661,7 +839,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
                 )
                 .to_string(),
             ],
-            cwd: PathUri::from_path(std::env::current_dir()?)?,
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: HashMap::from([
                 (
@@ -676,6 +854,9 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
             tty: false,
             pipe_stdin: true,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
         })
         .await?;
 
@@ -756,7 +937,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
                 last_seq = chunk.seq;
                 output.extend_from_slice(&chunk.chunk.into_inner());
             }
-            ExecProcessEvent::Exited { seq, exit_code } => {
+            ExecProcessEvent::Exited { seq, exit_code, .. } => {
                 assert_eq!(seq, last_seq + 1);
                 assert_eq!(exit_code, 7);
                 last_seq = seq;

@@ -42,7 +42,7 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         forked_from_id: None,
         fork_parent_title: None,
         thread_name: None,
-        model: "gpt-5.3-codex".to_string(),
+        model: "gpt-5.2".to_string(),
         model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
@@ -59,6 +59,122 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         network_proxy: None,
         rollout_path: None,
     }
+}
+
+fn start_safety_buffering_test_turn(
+    chat: &mut ChatWidget,
+    op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>,
+) -> (ThreadId, &'static str) {
+    let thread_id = ThreadId::new();
+    let turn_id = "turn-safety-buffering";
+    chat.thread_id = Some(thread_id);
+    chat.submit_user_message(UserMessage::from("Explain the request"));
+    let turn = next_submit_op(op_rx);
+    assert_matches!(&turn, Op::UserTurn { .. });
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: thread_id.to_string(),
+            turn: AppServerTurn {
+                id: turn_id.to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    (thread_id, turn_id)
+}
+
+fn safety_buffering_notification(
+    thread_id: ThreadId,
+    turn_id: &str,
+    show_buffering_ui: bool,
+) -> ModelSafetyBufferingUpdatedNotification {
+    ModelSafetyBufferingUpdatedNotification {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        model: "current-model".to_string(),
+        use_cases: Vec::new(),
+        reasons: Vec::new(),
+        show_buffering_ui,
+        faster_model: Some("faster-model".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn safety_buffering_does_not_show_interstitial_ui() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (thread_id, turn_id) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, /*show_buffering_ui*/ true,
+        )),
+        /*replay_kind*/ None,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!popup.contains("Our systems are thinking"));
+    assert!(!popup.contains("Retry with a faster model"));
+    assert!(!popup.contains("Keep waiting"));
+    assert!(!popup.contains("Learn more"));
+    assert!(!popup.contains("Press enter to confirm or esc to go back"));
+    assert!(chat.safety_buffering_is_waiting());
+
+    chat.on_agent_message_delta("Visible response".to_string());
+    assert!(!chat.safety_buffering_is_waiting());
+
+    handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
+    assert!(!chat.safety_buffering_is_waiting());
+}
+
+#[tokio::test]
+async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (thread_id, turn_id) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, /*show_buffering_ui*/ false,
+        )),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            "stale-turn",
+            /*show_buffering_ui*/ true,
+        )),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, /*show_buffering_ui*/ true,
+        )),
+        Some(ReplayKind::ResumeInitialMessages),
+    );
+    assert!(!chat.safety_buffering_is_waiting());
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, /*show_buffering_ui*/ true,
+        )),
+        /*replay_kind*/ None,
+    );
+    assert!(chat.safety_buffering_is_waiting());
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, /*show_buffering_ui*/ false,
+        )),
+        /*replay_kind*/ None,
+    );
+    assert!(!chat.safety_buffering_is_waiting());
 }
 
 #[tokio::test]
@@ -100,7 +216,7 @@ async fn invalid_url_elicitation_is_declined() {
 
 #[tokio::test]
 async fn thread_settings_updated_updates_visible_state_without_transcript() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     set_fast_mode_test_catalog(&mut chat);
     let thread_id = ThreadId::new();
     chat.handle_thread_session(configured_thread_session(thread_id));
@@ -156,7 +272,7 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
 
 #[tokio::test]
 async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     let thread_id = ThreadId::new();
     let mut session = configured_thread_session(thread_id);
     session.model = "gpt-default".to_string();
@@ -963,10 +1079,53 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
-    assert!(rendered.contains("This chat was flagged for possible cybersecurity risk"));
-    assert!(rendered.contains("Trusted Access for Cyber"));
+    assert!(rendered.contains("This content can't be shown"));
+    assert!(rendered.contains("extra caution with cybersecurity requests"));
     assert!(!rendered.contains("server fallback message"));
     assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn app_server_safety_access_errors_render_dedicated_notice() {
+    let legacy_message = "Invalid prompt: we've limited access to this content for safety reasons.";
+    let bio_policy_message = "This content was flagged for possible biological risk.";
+    let cases = [
+        ("legacy plain message", legacy_message.to_string()),
+        (
+            "legacy JSON message",
+            json!({ "error": { "message": legacy_message } }).to_string(),
+        ),
+        ("bio policy plain message", bio_policy_message.to_string()),
+        (
+            "bio policy JSON message",
+            json!({ "error": { "message": bio_policy_message } }).to_string(),
+        ),
+        (
+            "bio policy code",
+            json!({ "error": { "code": "bio_policy", "message": "copy may change" } }).to_string(),
+        ),
+    ];
+    let mut rendered_cases = Vec::new();
+    for (case, message) in cases {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.handle_non_retry_error(message, /*codex_error_info*/ None);
+
+        let cells = drain_insert_history(&mut rx);
+        assert_eq!(cells.len(), 1);
+        let rendered = lines_to_single_string(&cells[0]);
+        assert!(rendered.contains("This content can't be shown"));
+        assert!(rendered.contains("biological research"));
+        rendered_cases.push((case, rendered));
+    }
+
+    let canonical = &rendered_cases[0].1;
+    for (case, rendered) in &rendered_cases[1..] {
+        assert_eq!(rendered, canonical, "unexpected rendering for {case}");
+    }
+    insta::assert_snapshot!(
+        "app_server_bio_policy_error_renders_dedicated_notice",
+        rendered_cases.last().unwrap().1.as_str()
+    );
 }
 
 #[tokio::test]

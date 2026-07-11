@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::network_approval::NetworkApprovalSpec;
+use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
@@ -24,6 +25,7 @@ use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -131,6 +133,8 @@ pub(crate) struct ApprovalCtx<'a> {
     pub network_approval_context: Option<NetworkApprovalContext>,
 }
 
+pub(crate) type ApprovalAction = crate::guardian::GuardianApprovalRequest;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PermissionRequestPayload {
     pub tool_name: HookToolName,
@@ -194,7 +198,7 @@ impl ExecApprovalRequirement {
     }
 }
 
-/// - Never, OnFailure: do not ask
+/// - Never: do not ask
 /// - OnRequest: ask unless filesystem access is unrestricted
 /// - Granular: ask unless filesystem access is unrestricted, but auto-reject
 ///   when granular sandbox approval is disabled.
@@ -204,7 +208,7 @@ pub(crate) fn default_exec_approval_requirement(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
 ) -> ExecApprovalRequirement {
     let needs_approval = match policy {
-        AskForApproval::Never | AskForApproval::OnFailure => false,
+        AskForApproval::Never => false,
         AskForApproval::OnRequest | AskForApproval::Granular(_) => {
             matches!(
                 file_system_sandbox_policy.kind,
@@ -354,7 +358,6 @@ pub(crate) trait Approvable<Req> {
     /// Decide we can request an approval for no-sandbox execution.
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
         match policy {
-            AskForApproval::OnFailure => true,
             AskForApproval::UnlessTrusted => true,
             AskForApproval::Never => false,
             AskForApproval::OnRequest => false,
@@ -367,6 +370,8 @@ pub(crate) trait Approvable<Req> {
         req: &'a Req,
         ctx: ApprovalCtx<'a>,
     ) -> BoxFuture<'a, ReviewDecision>;
+
+    fn approval_action(&self, req: &Req, ctx: &ApprovalCtx<'_>) -> std::io::Result<ApprovalAction>;
 }
 
 pub(crate) trait Sandboxable {
@@ -408,7 +413,11 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 
 pub(crate) struct SandboxAttempt<'a> {
     pub sandbox: SandboxType,
+    /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
+    pub sandbox_requested: bool,
     pub permissions: &'a codex_protocol::models::PermissionProfile,
+    /// Canonical permissions before this host materializes workspace roots.
+    pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
     pub enforce_managed_network: bool,
     pub(crate) manager: &'a SandboxManager,
     pub(crate) sandbox_cwd: &'a PathUri,
@@ -418,9 +427,17 @@ pub(crate) struct SandboxAttempt<'a> {
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub network_denial_cancellation_token: Option<CancellationToken>,
+    pub(crate) network_proxy: Option<&'a NetworkProxy>,
 }
 
 impl<'a> SandboxAttempt<'a> {
+    pub(crate) fn network_proxy<'b>(
+        &'b self,
+        fallback: Option<&'b NetworkProxy>,
+    ) -> Option<&'b NetworkProxy> {
+        fallback.map(|fallback| self.network_proxy.unwrap_or(fallback))
+    }
+
     pub fn env_for(
         &self,
         command: SandboxCommand,
@@ -428,6 +445,7 @@ impl<'a> SandboxAttempt<'a> {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let network = self.network_proxy(network);
         let request = self
             .manager
             .transform(SandboxTransformRequest {
@@ -460,6 +478,12 @@ impl<'a> SandboxAttempt<'a> {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let network = self.network_proxy(network);
+        let managed_network = command.managed_network.clone();
+        let exec_server_permissions = effective_permission_profile(
+            self.exec_server_permissions,
+            command.additional_permissions.as_ref(),
+        );
         let request = self
             .manager
             .transform(SandboxTransformRequest {
@@ -477,11 +501,24 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             })
             .map_err(CodexErr::from)?;
-        Ok(crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+        let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             request,
             options,
             self.workspace_roots.to_vec(),
-        ))
+        );
+        exec_request.exec_server_managed_network = managed_network;
+        if self.sandbox_requested {
+            exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
+                permissions: exec_server_permissions.into(),
+                cwd: Some(exec_request.windows_sandbox_policy_cwd.clone()),
+                workspace_roots: Vec::new(),
+                windows_sandbox_level: self.windows_sandbox_level,
+                windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
+                use_legacy_landlock: self.use_legacy_landlock,
+            });
+            exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
+        }
+        Ok(exec_request)
     }
 }
 

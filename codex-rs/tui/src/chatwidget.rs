@@ -80,14 +80,12 @@ use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::CreditsSnapshot;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -124,6 +122,7 @@ use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_connectors::AppInfo;
 use codex_core_skills::model::SkillMetadata;
 use codex_features::FEATURES;
 use codex_features::Feature;
@@ -388,6 +387,7 @@ use self::rate_limits::RateLimitWarningState;
 use self::rate_limits::app_server_rate_limit_error_kind;
 pub(crate) use self::rate_limits::fallback_limit_label;
 use self::rate_limits::is_app_server_cyber_policy_error;
+mod reset_credits;
 pub(crate) use self::rate_limits::limit_label_for_window;
 mod reasoning_shortcuts;
 mod rendering;
@@ -397,10 +397,12 @@ mod review_popups;
 use self::review::ReviewState;
 #[cfg(test)]
 pub(crate) use self::review_popups::show_review_commit_picker_with_entries;
+mod safety_buffering;
 mod service_tiers;
 mod settings;
 mod settings_popups;
 mod side;
+use self::safety_buffering::SafetyBufferingState;
 mod status_state;
 mod windows_sandbox_prompts;
 use self::status_state::StatusIndicatorState;
@@ -475,6 +477,7 @@ const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentia
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
 const MAX_AGENT_COPY_HISTORY: usize = 32;
+const AUTO_NEXT_REVIEW_INTERVAL: usize = 3;
 const AUTO_NEXT_DONE_SUFFIX_STEPS: &str =
     "\n\nWhen there are no more meaningful next steps, create this file exactly: ";
 const AUTO_NEXT_STEPS_TEMPLATES: &[&str] = &[
@@ -482,11 +485,13 @@ const AUTO_NEXT_STEPS_TEMPLATES: &[&str] = &[
     "Inspect the current state, fix the next concrete issue, and verify the result.",
     "Carry the work forward pragmatically: implement the next useful change, then test it.",
 ];
+const AUTO_NEXT_STEPS_REVIEW_TEMPLATE: &str = "Review: Step back and assess the recent reasoning summaries, tool trace, and original task. Decide whether the agent is on track, what code search or context would help, and then take the best next step.";
 const AUTO_NEXT_IDEA_META_TEMPLATES: &[&str] = &[
     "Review the current project state and pursue the highest-value follow-up improvement.",
     "Find a concrete improvement opportunity in this codebase, implement it, and verify it.",
     "Continue productively from the recent work with one focused, useful improvement.",
 ];
+const AUTO_NEXT_IDEA_REVIEW_TEMPLATE: &str = "Review: Step back and assess the recent reasoning summaries, tool trace, and broader system fit. If the current thread is complete, choose a fresh high-value improvement; otherwise pivot or continue with the best next action.";
 
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
@@ -573,6 +578,7 @@ pub(crate) struct ChatWidget {
     next_token_activity_request_id: u64,
     pending_rate_limit_reset_request_id: Option<u64>,
     pending_rate_limit_reset_hint_request_id: Option<u64>,
+    pending_usage_menu_rate_limit_request_id: Option<u64>,
     pending_rate_limit_reset_hint: Option<PlainHistoryCell>,
     available_rate_limit_reset_credits: Option<i64>,
     next_rate_limit_reset_request_id: u64,
@@ -600,6 +606,7 @@ pub(crate) struct ChatWidget {
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
@@ -634,8 +641,8 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
-    // Accumulates full reasoning content for transcript-only recording
-    full_reasoning_buffer: String,
+    // Preserves reasoning-summary part boundaries for transcript-only recording.
+    reasoning_summary_parts: Vec<String>,
     status_state: StatusState,
     review: ReviewState,
     // Active hook runs render in a dedicated live cell so they can run alongside tools.
@@ -743,6 +750,16 @@ pub(crate) struct ChatWidget {
     status_line_git_summary_pending: bool,
     // True once we've attempted a Git summary lookup for the current CWD.
     status_line_git_summary_lookup_complete: bool,
+    // Cached workspace notification headline for the status line.
+    status_line_workspace_headline: Option<String>,
+    // Request ID for the async workspace headline fetch currently in flight.
+    status_line_workspace_headline_pending_request_id: Option<u64>,
+    // Request ID to assign to the next workspace headline fetch.
+    next_status_line_workspace_headline_request_id: u64,
+    // Last time a workspace headline fetch was requested.
+    status_line_workspace_headline_last_requested_at: Option<Instant>,
+    // Set after the backend reports the workspace-message feature gate is disabled.
+    status_line_workspace_messages_disabled: bool,
     // Current thread-goal status shown in the status line when plan mode is inactive.
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
@@ -1212,6 +1229,7 @@ impl ChatWidget {
         {
             self.refresh_terminal_title();
         }
+        self.refresh_status_line_if_workspace_headline_due();
     }
 
     fn flush_active_cell(&mut self) {

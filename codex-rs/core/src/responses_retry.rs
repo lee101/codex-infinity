@@ -6,10 +6,20 @@ use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
+use chrono::DateTime;
+use chrono::Utc;
+use codex_async_utils::CancelErr;
+use codex_async_utils::OrCancelExt;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::WarningEvent;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// Small cushion after the advertised reset time so retries do not race the window boundary.
+const USAGE_LIMIT_RESET_BUFFER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -78,6 +88,69 @@ pub(crate) async fn handle_retryable_response_stream_error(
     Err(err)
 }
 
+/// Waits until a usage-limit window resets and returns `Ok(())` when the caller should retry the
+/// sampling request. Returns the original error when auto-wait does not apply.
+pub(crate) async fn wait_for_usage_limit_reset_if_applicable(
+    sess: &Session,
+    turn_context: &TurnContext,
+    err: UsageLimitReachedError,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
+    if !is_auto_waitable_usage_limit(&err) {
+        return Err(CodexErr::UsageLimitReached(err));
+    }
+
+    let Some(resets_at) = err.resets_at else {
+        return Err(CodexErr::UsageLimitReached(err));
+    };
+
+    let Some(delay) = delay_until_usage_limit_reset(resets_at) else {
+        return Err(CodexErr::UsageLimitReached(err));
+    };
+
+    let codex_err = CodexErr::UsageLimitReached(err);
+    warn!(
+        turn_id = %turn_context.sub_id,
+        ?delay,
+        "usage limit reached; waiting for reset before retrying"
+    );
+    sess.notify_stream_error(
+        turn_context,
+        "Waiting for usage limit to reset...".to_string(),
+        codex_err,
+    )
+    .await;
+
+    match tokio::time::sleep(delay)
+        .or_cancel(cancellation_token)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(CancelErr::Cancelled) => Err(CodexErr::TurnAborted),
+    }
+}
+
+fn is_auto_waitable_usage_limit(err: &UsageLimitReachedError) -> bool {
+    match err.rate_limit_reached_type {
+        Some(
+            RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+            | RateLimitReachedType::WorkspaceMemberCreditsDepleted
+            | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
+            | RateLimitReachedType::WorkspaceMemberUsageLimitReached,
+        ) => false,
+        Some(RateLimitReachedType::RateLimitReached) | None => err.resets_at.is_some(),
+    }
+}
+
+fn delay_until_usage_limit_reset(resets_at: DateTime<Utc>) -> Option<Duration> {
+    let target = resets_at + chrono::Duration::from_std(USAGE_LIMIT_RESET_BUFFER).ok()?;
+    let now = Utc::now();
+    if target <= now {
+        return Some(Duration::from_secs(0));
+    }
+    (target - now).to_std().ok()
+}
+
 fn log_retry(
     request: ResponsesStreamRequest,
     turn_context: &TurnContext,
@@ -103,3 +176,7 @@ fn log_retry(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responses_retry_tests.rs"]
+mod tests;

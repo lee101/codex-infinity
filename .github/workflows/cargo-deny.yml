@@ -1,15 +1,7 @@
 name: cargo-deny
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-
-# Cargo's libgit2 transport has been flaky when fetching git dependencies with
-# nested submodules. Prefer the system git CLI across every Cargo invocation.
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  workflow_call:
 
 jobs:
   cargo-deny:
@@ -21,6 +13,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - uses: ./.github/actions/setup-ci
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
@@ -29,3 +23,7 @@ jobs:
         with:
           rust-version: stable
           manifest-path: ./codex-rs/Cargo.toml
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

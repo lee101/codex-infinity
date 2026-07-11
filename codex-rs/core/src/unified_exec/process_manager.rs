@@ -10,10 +10,13 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::codex_thread::BackgroundTerminalInfo;
+use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::exec_env::create_env;
+use crate::exec_env::inject_permission_profile_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
@@ -25,6 +28,7 @@ use crate::tools::events::ToolEventStage;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
+use crate::tools::runtimes::is_managed_proxy_env_var;
 use crate::tools::runtimes::unified_exec::UnifiedExecRequest as UnifiedExecToolRequest;
 use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
@@ -107,15 +111,19 @@ fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, S
 fn exec_env_policy_from_shell_policy(
     policy: &ShellEnvironmentPolicy,
 ) -> codex_exec_server::ExecEnvPolicy {
+    let mut exclude = policy
+        .exclude
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
+    let mut r#set = policy.r#set.clone();
+    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
     codex_exec_server::ExecEnvPolicy {
         inherit: policy.inherit.clone(),
         ignore_default_excludes: policy.ignore_default_excludes,
-        exclude: policy
-            .exclude
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
-        r#set: policy.r#set.clone(),
+        exclude,
+        r#set,
         include_only: policy
             .include_only
             .iter()
@@ -130,7 +138,10 @@ fn env_overlay_for_exec_server(
 ) -> HashMap<String, String> {
     request_env
         .iter()
-        .filter(|(key, value)| local_policy_env.get(*key) != Some(*value))
+        .filter(|(key, value)| {
+            key.as_str() == CODEX_PERMISSION_PROFILE_ENV_VAR
+                || local_policy_env.get(*key) != Some(*value)
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
@@ -142,10 +153,16 @@ fn exec_server_env_for_request(
     HashMap<String, String>,
 ) {
     if let Some(exec_server_env_config) = &request.exec_server_env_config {
-        (
-            Some(exec_server_env_config.policy.clone()),
-            env_overlay_for_exec_server(&request.env, &exec_server_env_config.local_policy_env),
-        )
+        let mut env =
+            env_overlay_for_exec_server(&request.env, &exec_server_env_config.local_policy_env);
+        if request.exec_server_managed_network.is_some() {
+            for (key, value) in &request.env {
+                if is_managed_proxy_env_var(key, value) {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (Some(exec_server_env_config.policy.clone()), env)
     } else {
         (None, request.env.clone())
     }
@@ -157,8 +174,14 @@ fn exec_server_params_for_request(
     tty: bool,
 ) -> codex_exec_server::ExecParams {
     let (env_policy, env) = exec_server_env_for_request(request);
+    // Sandbox retries reuse the unified-exec ID but start a distinct executor process.
+    let exec_server_process_id = if request.exec_server_sandbox.is_some() {
+        format!("{process_id}-{}", Uuid::new_v4())
+    } else {
+        process_id.to_string()
+    };
     codex_exec_server::ExecParams {
-        process_id: exec_server_process_id(process_id).into(),
+        process_id: exec_server_process_id.into(),
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env_policy,
@@ -166,6 +189,9 @@ fn exec_server_params_for_request(
         tty,
         pipe_stdin: false,
         arg0: request.arg0.clone(),
+        sandbox: request.exec_server_sandbox.clone(),
+        enforce_managed_network: request.exec_server_enforce_managed_network,
+        managed_network: request.exec_server_managed_network.clone(),
     }
 }
 
@@ -194,10 +220,6 @@ impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
     }
-}
-
-fn exec_server_process_id(process_id: i32) -> String {
-    process_id.to_string()
 }
 
 async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
@@ -471,11 +493,7 @@ impl UnifiedExecProcessManager {
             &output_closed,
             &output_closed_notify,
             &cancellation_token,
-            Some(
-                context
-                    .session
-                    .subscribe_out_of_band_elicitation_pause_state(),
-            ),
+            Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
         )
         .await;
@@ -555,9 +573,8 @@ impl UnifiedExecProcessManager {
                 }
             }
         } else {
-            // Short‑lived command: emit ExecCommandEnd immediately using the
-            // same helper as the background watcher, so all end events share
-            // one implementation.
+            // Short-lived command: emit the completed command item immediately
+            // using the same helper as the background watcher.
             let finish_result = finish_deferred_network_approval_after_process_exit_for_session(
                 Some(&context.session),
                 deferred_network_approval.take(),
@@ -817,7 +834,7 @@ impl UnifiedExecProcessManager {
         let pause_state = entry
             .session
             .upgrade()
-            .map(|session| session.subscribe_out_of_band_elicitation_pause_state());
+            .map(|session| session.subscribe_elicitation_pause_state());
         let session = entry.session.upgrade();
 
         Ok(PreparedProcessHandles {
@@ -1039,7 +1056,7 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started, request.sandbox).await;
+            return UnifiedExecProcess::from_exec_server_started(started).await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1097,6 +1114,8 @@ impl UnifiedExecProcessManager {
             CODEX_THREAD_ID_ENV_VAR.to_string(),
             context.session.thread_id.to_string(),
         );
+        let active_permission_profile = context.turn.config.permissions.active_permission_profile();
+        inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
         let env = apply_unified_exec_env(env);
         let exec_server_env_config = ExecServerEnvConfig {
             policy: exec_env_policy_from_shell_policy(

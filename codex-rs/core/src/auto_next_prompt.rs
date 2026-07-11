@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use codex_login::AuthManager;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_otel::SessionTelemetry;
@@ -17,6 +18,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::RolloutItem;
@@ -39,7 +41,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 const GENERATOR_MODEL: &str = "gpt-5.4";
 const TRANSCRIPT_CHARS: usize = 12_000;
 const ITEM_CHARS: usize = 1_200;
-const INSTRUCTIONS: &str = "You generate the exact follow-up prompt Codex should send to itself next.\n\nReturn JSON matching the schema.\n\nRequirements:\n- Write one strong, concrete prompt in `prompt`.\n- Ground it in the recent session context and visible progress.\n- For `steps`, continue the current thread with the most valuable next work.\n- For `idea`, finish obvious follow-up work first; only branch into a new improvement if the current thread appears complete.\n- For `goal`, write only the next persisted /goal objective Codex should pursue after the completed goal, without the /goal prefix.\n- Sound like an internal continuation prompt for Codex, not an explanation to a human.that will be appended separately.\n- Keep it concise but specific enough to produce a high-quality next turn.";
+const INSTRUCTIONS: &str = "You generate the exact follow-up prompt Codex should send to itself next.\n\nReturn JSON matching the schema.\n\nRequirements:\n- Write one strong, concrete prompt in `prompt`.\n- Ground it in the recent session context and visible progress.\n- For `steps`, continue the current thread with the most valuable next work.\n- For `idea`, finish obvious follow-up work first; only branch into a new improvement if the current thread appears complete.\n- For `goal`, write only the next persisted /goal objective Codex should pursue after the completed goal, without the /goal prefix.\n- When review cadence is enabled, start with `Review:` and ask Codex to reassess the available reasoning summaries, tool trace, whether it is on track, what code search or extra context would help, and whether to pivot or continue.\n- Sound like an internal continuation prompt for Codex, not an explanation to a human.\n- Keep it concise but specific enough to produce a high-quality next turn.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoNextMode {
@@ -60,6 +62,7 @@ pub async fn generate_auto_next_prompt(
     rollout_path: Option<PathBuf>,
     mode: AutoNextMode,
     examples: Vec<String>,
+    review_prompt: bool,
 ) -> Option<String> {
     let recent_context = load_context_snippet(rollout_path).await;
     let examples_joined = examples
@@ -73,9 +76,10 @@ pub async fn generate_auto_next_prompt(
         AutoNextMode::Idea => "idea",
         AutoNextMode::Goal => "goal",
     };
+    let review_label = if review_prompt { "enabled" } else { "disabled" };
     let cwd_display = config.cwd.display().to_string();
     let user_message = format!(
-        "Mode: {mode_label}\nCurrent working directory: {cwd_display}\n\nReference examples:\n{examples_joined}\n\nRecent session context:\n{}\n",
+        "Mode: {mode_label}\nReview cadence: {review_label}\nCurrent working directory: {cwd_display}\n\nReference examples:\n{examples_joined}\n\nRecent session context:\n{}\n",
         if recent_context.is_empty() {
             "(No recent rollout transcript available.)"
         } else {
@@ -92,15 +96,19 @@ pub async fn generate_auto_next_prompt(
     let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
     let client = ModelClient::new(
         Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
         conversation_id,
         provider,
         SessionSource::Cli,
+        "codex-auto-next".to_string(),
         /*model_verbosity*/ None,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
     let session_telemetry = SessionTelemetry::new(
         conversation_id,
@@ -121,7 +129,7 @@ pub async fn generate_auto_next_prompt(
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: user_message }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         }],
         base_instructions: BaseInstructions {
             text: INSTRUCTIONS.to_string(),
@@ -219,6 +227,23 @@ fn format_response_item(item: &ResponseItem) -> Option<String> {
         ResponseItem::Message { role, content, .. } => content_items_to_text(content)
             .filter(|text| !text.trim().is_empty())
             .map(|text| format!("{role}: {}", truncate(&text, ITEM_CHARS))),
+        ResponseItem::Reasoning { summary, .. } => {
+            let text = summary
+                .iter()
+                .map(|item| match item {
+                    ReasoningItemReasoningSummary::SummaryText { text } => text.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "reasoning_summary: {}",
+                    truncate(&text, ITEM_CHARS)
+                ))
+            }
+        }
         ResponseItem::FunctionCall {
             name, arguments, ..
         } => Some(format!(

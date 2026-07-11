@@ -9,6 +9,7 @@ caching).
 use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
+use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::network_policy_decision::network_approval_context_from_payload;
@@ -68,13 +69,18 @@ impl ToolOrchestrator {
     where
         T: ToolRuntime<Rq, Out>,
     {
-        let network_approval = begin_network_approval(
+        let network_approval = match begin_network_approval(
             &tool_ctx.session,
             &tool_ctx.turn.sub_id,
             managed_network_active,
+            attempt.sandbox,
             tool.network_approval_spec(req, tool_ctx),
         )
-        .await;
+        .await
+        {
+            Ok(network_approval) => network_approval,
+            Err(err) => return (Err(err), None),
+        };
 
         let attempt_tool_ctx = ToolCtx {
             session: tool_ctx.session.clone(),
@@ -84,7 +90,9 @@ impl ToolOrchestrator {
         };
         let attempt_with_network_approval = SandboxAttempt {
             sandbox: attempt.sandbox,
+            sandbox_requested: attempt.sandbox_requested,
             permissions: attempt.permissions,
+            exec_server_permissions: attempt.exec_server_permissions,
             enforce_managed_network: attempt.enforce_managed_network,
             manager: attempt.manager,
             sandbox_cwd: attempt.sandbox_cwd,
@@ -96,6 +104,9 @@ impl ToolOrchestrator {
             network_denial_cancellation_token: network_approval
                 .as_ref()
                 .map(ActiveNetworkApproval::cancellation_token),
+            network_proxy: network_approval
+                .as_ref()
+                .map(ActiveNetworkApproval::execution_proxy),
         };
         let run_result = tool
             .run(req, &attempt_with_network_approval, &attempt_tool_ctx)
@@ -225,15 +236,26 @@ impl ToolOrchestrator {
             &file_system_sandbox_policy,
         );
         let managed_network_active = turn_ctx.network.is_some();
-        let initial_sandbox = match sandbox_override {
-            SandboxOverride::BypassSandboxFirstAttempt => SandboxType::None,
-            SandboxOverride::NoOverride => self.sandbox.select_initial(
+        let sandbox_preference = tool.sandbox_preference();
+        let sandbox_requested = match sandbox_override {
+            SandboxOverride::BypassSandboxFirstAttempt => false,
+            SandboxOverride::NoOverride => self.sandbox.should_sandbox(
                 &file_system_sandbox_policy,
                 network_sandbox_policy,
-                tool.sandbox_preference(),
-                turn_ctx.windows_sandbox_level,
+                sandbox_preference,
                 managed_network_active,
             ),
+        };
+        let initial_sandbox = if sandbox_requested {
+            self.sandbox.select_initial(
+                &file_system_sandbox_policy,
+                network_sandbox_policy,
+                sandbox_preference,
+                turn_ctx.windows_sandbox_level,
+                managed_network_active,
+            )
+        } else {
+            SandboxType::None
         };
 
         // Platform-specific flag gating is handled by SandboxManager::select_initial.
@@ -246,7 +268,9 @@ impl ToolOrchestrator {
         let workspace_roots = turn_ctx.config.effective_workspace_roots();
         let initial_attempt = SandboxAttempt {
             sandbox: initial_sandbox,
+            sandbox_requested,
             permissions: &turn_ctx.permission_profile,
+            exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
             enforce_managed_network: managed_network_active,
             manager: &self.sandbox,
             sandbox_cwd: &sandbox_policy_cwd,
@@ -259,6 +283,7 @@ impl ToolOrchestrator {
                 .permissions
                 .windows_sandbox_private_desktop,
             network_denial_cancellation_token: None,
+            network_proxy: None,
         };
 
         let initial_attempt_start = Instant::now();
@@ -401,16 +426,23 @@ impl ToolOrchestrator {
                         .await?;
                 }
 
-                let retry_sandbox = if unsandboxed_allowed {
-                    SandboxType::None
-                } else {
+                let retry_sandbox_requested = !unsandboxed_allowed
+                    && self.sandbox.should_sandbox(
+                        &file_system_sandbox_policy,
+                        network_sandbox_policy,
+                        sandbox_preference,
+                        managed_network_active,
+                    );
+                let retry_sandbox = if retry_sandbox_requested {
                     self.sandbox.select_initial(
                         &file_system_sandbox_policy,
                         network_sandbox_policy,
-                        tool.sandbox_preference(),
+                        sandbox_preference,
                         turn_ctx.windows_sandbox_level,
                         managed_network_active,
                     )
+                } else {
+                    SandboxType::None
                 };
                 let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
                     None
@@ -419,7 +451,9 @@ impl ToolOrchestrator {
                 };
                 let retry_attempt = SandboxAttempt {
                     sandbox: retry_sandbox,
+                    sandbox_requested: retry_sandbox_requested,
                     permissions: &turn_ctx.permission_profile,
+                    exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
                     enforce_managed_network: managed_network_active,
                     manager: &self.sandbox,
                     sandbox_cwd: &sandbox_policy_cwd,
@@ -432,6 +466,7 @@ impl ToolOrchestrator {
                         .permissions
                         .windows_sandbox_private_desktop,
                     network_denial_cancellation_token: None,
+                    network_proxy: None,
                 };
 
                 // Second attempt.
@@ -539,7 +574,26 @@ impl ToolOrchestrator {
         } else {
             ToolDecisionSource::User
         };
-        let decision = tool.start_approval_async(req, approval_ctx).await;
+        let decision = if let Some(review_id) = approval_ctx.guardian_review_id.clone() {
+            match tool.approval_action(req, &approval_ctx) {
+                Ok(action) => {
+                    review_approval_request(
+                        approval_ctx.session,
+                        approval_ctx.turn,
+                        review_id,
+                        action,
+                        approval_ctx.retry_reason.clone(),
+                    )
+                    .await
+                }
+                Err(err) => {
+                    tracing::error!(%err, "failed to build guardian approval action");
+                    ReviewDecision::Abort
+                }
+            }
+        } else {
+            tool.start_approval_async(req, approval_ctx).await
+        };
         let tool_name = flat_tool_name(&tool_ctx.tool_name);
         otel.tool_decision(
             tool_name.as_ref(),

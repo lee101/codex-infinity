@@ -8,9 +8,6 @@ mod ssh_config_dependencies;
 use std::fmt;
 use std::sync::Arc;
 
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_utils_absolute_path::AbsolutePathBuf;
-
 /// Cancellation hook used by Windows sandbox capture backends.
 #[derive(Clone)]
 pub struct WindowsSandboxCancellationToken {
@@ -38,81 +35,103 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
     }
 }
 
-pub fn resolve_windows_deny_read_paths(
-    _policy: &FileSystemSandboxPolicy,
-    _cwd: &AbsolutePathBuf,
-) -> Result<Vec<AbsolutePathBuf>, String> {
-    Ok(Vec::new())
+/// Controls whether a Windows sandbox launch reconciles persistent proxy
+/// firewall settings or preserves the settings established by another launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowsSandboxProxySettingsMode {
+    #[default]
+    Reconcile,
+    Preserve,
 }
-
-macro_rules! windows_modules {
-    ($($name:ident),+ $(,)?) => {
-        $(#[cfg(target_os = "windows")] mod $name;)+
-    };
-}
-
-windows_modules!(
-    acl,
-    allow,
-    audit,
-    cap,
-    desktop,
-    dpapi,
-    env,
-    helper_materialization,
-    hide_users,
-    identity,
-    logging,
-    path_normalization,
-    policy,
-    process,
-    token,
-    winutil,
-    workspace_acl
-);
 
 #[cfg(target_os = "windows")]
-#[path = "conpty/mod.rs"]
+mod acl;
+#[cfg(target_os = "windows")]
+mod allow;
+#[cfg(target_os = "windows")]
+mod audit;
+#[cfg(target_os = "windows")]
+mod cap;
+#[cfg(target_os = "windows")]
+mod deny_read_acl;
+#[cfg(target_os = "windows")]
+mod deny_read_state;
+#[cfg(target_os = "windows")]
+mod desktop;
+#[cfg(target_os = "windows")]
+mod dpapi;
+#[cfg(target_os = "windows")]
+mod env;
+#[cfg(target_os = "windows")]
+mod helper_materialization;
+#[cfg(target_os = "windows")]
+mod hide_users;
+#[cfg(target_os = "windows")]
+mod identity;
+#[cfg(target_os = "windows")]
+mod logging;
+#[cfg(target_os = "windows")]
+mod path_normalization;
+#[cfg(target_os = "windows")]
+mod process;
+#[cfg(target_os = "windows")]
+mod resolved_permissions;
+#[cfg(target_os = "windows")]
+mod token;
+#[cfg(target_os = "windows")]
+mod wfp;
+#[cfg(target_os = "windows")]
+mod wfp_setup;
+#[cfg(target_os = "windows")]
+mod winutil;
+#[cfg(target_os = "windows")]
+mod workspace_acl;
+
+mod deny_read_resolver;
+
+#[cfg(target_os = "windows")]
 mod conpty;
 
 #[cfg(target_os = "windows")]
-#[path = "proc_thread_attr.rs"]
-mod proc_thread_attr;
-
-#[cfg(target_os = "windows")]
-#[path = "elevated/ipc_framed.rs"]
-pub(crate) mod ipc_framed;
-
-#[cfg(target_os = "windows")]
-#[path = "setup_orchestrator.rs"]
-mod setup;
+mod elevated;
 
 #[cfg(target_os = "windows")]
 mod elevated_impl;
 
 #[cfg(target_os = "windows")]
-#[path = "elevated/runner_pipe.rs"]
-mod runner_pipe;
+mod proc_thread_attr;
 
 #[cfg(target_os = "windows")]
-#[path = "elevated/runner_client.rs"]
-mod runner_client;
+mod sandbox_utils;
+
+#[cfg(target_os = "windows")]
+mod setup;
 
 #[cfg(target_os = "windows")]
 mod setup_error;
 
 #[cfg(target_os = "windows")]
-#[path = "sandbox_utils.rs"]
-mod sandbox_utils;
-
-#[cfg(target_os = "windows")]
-#[path = "spawn_prep.rs"]
 mod spawn_prep;
 
 #[cfg(target_os = "windows")]
-#[path = "unified_exec/session.rs"]
-mod session;
+mod stdio_bridge;
 
+#[cfg(target_os = "windows")]
+mod unified_exec;
+#[cfg(target_os = "windows")]
+mod wrapper;
+
+#[cfg(target_os = "windows")]
+pub(crate) use elevated::ipc_framed;
+
+#[cfg(target_os = "windows")]
+pub(crate) use elevated::runner_client;
+
+#[cfg(target_os = "windows")]
+pub(crate) use elevated::runner_pipe;
+
+#[cfg(target_os = "windows")]
+pub use acl::add_deny_read_ace;
 #[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace;
 
@@ -129,13 +148,28 @@ pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
 #[cfg(target_os = "windows")]
-pub use audit::apply_world_writable_scan_and_denies;
+pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(target_os = "windows")]
 pub use cap::load_or_create_cap_sids;
 #[cfg(target_os = "windows")]
 pub use cap::workspace_cap_sid_for_cwd;
 #[cfg(target_os = "windows")]
+pub use cap::workspace_write_cap_sid_for_root;
+#[cfg(target_os = "windows")]
+pub use cap::workspace_write_root_contains_path;
+#[cfg(target_os = "windows")]
+pub use cap::workspace_write_root_overlaps_path;
+#[cfg(target_os = "windows")]
+pub use conpty::ConptyInstance;
+#[cfg(target_os = "windows")]
 pub use conpty::spawn_conpty_process_as_user;
+#[cfg(target_os = "windows")]
+pub use deny_read_acl::apply_deny_read_acls;
+#[cfg(target_os = "windows")]
+pub use deny_read_acl::plan_deny_read_acl_paths;
+pub use deny_read_resolver::resolve_windows_deny_read_paths;
+#[cfg(target_os = "windows")]
+pub use deny_read_state::sync_persistent_deny_read_acls;
 #[cfg(target_os = "windows")]
 pub use desktop::LaunchDesktop;
 #[cfg(target_os = "windows")]
@@ -143,9 +177,9 @@ pub use dpapi::protect as dpapi_protect;
 #[cfg(target_os = "windows")]
 pub use dpapi::unprotect as dpapi_unprotect;
 #[cfg(target_os = "windows")]
-pub use elevated_impl::ElevatedSandboxCaptureRequest;
+pub use elevated_impl::ElevatedSandboxProfileCaptureRequest;
 #[cfg(target_os = "windows")]
-pub use elevated_impl::run_windows_sandbox_capture as run_windows_sandbox_capture_elevated;
+pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile as run_windows_sandbox_capture_for_permission_profile_elevated;
 #[cfg(target_os = "windows")]
 pub use helper_materialization::resolve_current_exe_for_launch;
 #[cfg(target_os = "windows")]
@@ -161,9 +195,13 @@ pub use identity::sandbox_setup_is_complete;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::ErrorPayload;
 #[cfg(target_os = "windows")]
+pub use ipc_framed::ErrorStage;
+#[cfg(target_os = "windows")]
 pub use ipc_framed::ExitPayload;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::FramedMessage;
+#[cfg(target_os = "windows")]
+pub use ipc_framed::IPC_PROTOCOL_VERSION;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::Message;
 #[cfg(target_os = "windows")]
@@ -187,7 +225,13 @@ pub use ipc_framed::write_frame;
 #[cfg(target_os = "windows")]
 pub use logging::current_log_file_path;
 #[cfg(target_os = "windows")]
+pub use logging::current_log_file_path_for_codex_home;
+#[cfg(target_os = "windows")]
+pub use logging::log_file_path_for_utc_date;
+#[cfg(target_os = "windows")]
 pub use logging::log_note;
+#[cfg(target_os = "windows")]
+pub use logging::log_writer;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
 #[cfg(target_os = "windows")]
@@ -203,9 +247,11 @@ pub use process::read_handle_loop;
 #[cfg(target_os = "windows")]
 pub use process::spawn_process_with_pipes;
 #[cfg(target_os = "windows")]
-pub use session::spawn_windows_sandbox_session_elevated;
+pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 #[cfg(target_os = "windows")]
-pub use session::spawn_windows_sandbox_session_legacy;
+pub use resolved_permissions::WindowsSandboxTokenMode;
+#[cfg(target_os = "windows")]
+pub use resolved_permissions::token_mode_for_permission_profile;
 #[cfg(target_os = "windows")]
 pub use setup::SETUP_VERSION;
 #[cfg(target_os = "windows")]
@@ -241,21 +287,42 @@ pub use setup_error::setup_error_path;
 #[cfg(target_os = "windows")]
 pub use setup_error::write_setup_error_report;
 #[cfg(target_os = "windows")]
+pub use stdio_bridge::forward_sandbox_session_stdio;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use token::LocalSid;
+#[cfg(target_os = "windows")]
 pub use token::convert_string_sid_to_sid;
 #[cfg(target_os = "windows")]
 pub use token::create_readonly_token_with_cap_from;
 #[cfg(target_os = "windows")]
+pub use token::create_readonly_token_with_caps_and_user_from;
+#[cfg(target_os = "windows")]
 pub use token::create_readonly_token_with_caps_from;
+#[cfg(target_os = "windows")]
+pub use token::create_workspace_write_token_with_caps_and_user_from;
 #[cfg(target_os = "windows")]
 pub use token::create_workspace_write_token_with_caps_from;
 #[cfg(target_os = "windows")]
 pub use token::get_current_token_for_restriction;
 #[cfg(target_os = "windows")]
+pub use unified_exec::WindowsSandboxSessionRequest;
+#[cfg(target_os = "windows")]
+pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_profile;
+#[cfg(target_os = "windows")]
+pub use unified_exec::spawn_windows_sandbox_session_for_level;
+#[cfg(target_os = "windows")]
+pub use unified_exec::spawn_windows_sandbox_session_legacy;
+#[cfg(target_os = "windows")]
+pub use wfp::install_wfp_filters_for_account;
+#[cfg(target_os = "windows")]
+pub use wfp_setup::install_wfp_filters;
+#[cfg(target_os = "windows")]
 pub use windows_impl::CaptureResult;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_capture;
 #[cfg(target_os = "windows")]
-pub use windows_impl::run_windows_sandbox_capture_with_extra_deny_write_paths;
+pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_legacy_preflight;
 #[cfg(target_os = "windows")]
@@ -282,30 +349,25 @@ pub use stub::run_windows_sandbox_legacy_preflight;
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::acl::add_allow_ace;
-    use super::acl::add_deny_write_ace;
-    use super::acl::allow_null_device;
-    use super::acl::revoke_ace;
-    use super::allow::AllowDenyPaths;
-    use super::allow::compute_allow_paths;
-    use super::cap::load_or_create_cap_sids;
-    use super::cap::workspace_cap_sid_for_cwd;
+    use super::WindowsSandboxCancellationToken;
     use super::logging::log_failure;
     use super::logging::log_success;
-    use super::path_normalization::canonicalize_path;
-    use super::policy::SandboxPolicy;
     use super::process::create_process_as_user;
     use super::sandbox_utils::ensure_codex_home_exists;
+    use super::spawn_prep::LegacyAclSids;
+    use super::spawn_prep::SpawnPrepOptions;
+    use super::spawn_prep::allow_null_device_for_workspace_write;
+    use super::spawn_prep::apply_legacy_session_acl_rules;
+    use super::spawn_prep::legacy_session_capability_roots;
+    use super::spawn_prep::prepare_legacy_session_security;
     use super::spawn_prep::prepare_legacy_spawn_context;
-    use super::token::convert_string_sid_to_sid;
-    use super::token::create_workspace_write_token_with_caps_from;
-    use super::workspace_acl::is_command_cwd_root;
+    use super::spawn_prep::root_capability_sids;
     use anyhow::Result;
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use std::collections::HashMap;
-    use std::ffi::c_void;
     use std::io;
     use std::path::Path;
-    use std::path::PathBuf;
     use std::ptr;
     use std::time::Duration;
     use std::time::Instant;
@@ -412,9 +474,9 @@ mod windows_impl {
         cancellation: Option<WindowsSandboxCancellationToken>,
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
-        run_windows_sandbox_capture_with_extra_deny_write_paths(
-            policy_json_or_preset,
-            sandbox_policy_cwd,
+        run_windows_sandbox_capture_with_filesystem_overrides(
+            permission_profile,
+            workspace_roots,
             codex_home,
             command,
             cwd,
@@ -422,133 +484,86 @@ mod windows_impl {
             timeout_ms,
             cancellation,
             &[],
+            &[],
             use_private_desktop,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn run_windows_sandbox_capture_with_extra_deny_write_paths(
-        policy_json_or_preset: &str,
-        sandbox_policy_cwd: &Path,
+    pub fn run_windows_sandbox_capture_with_filesystem_overrides(
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[AbsolutePathBuf],
         codex_home: &Path,
         command: Vec<String>,
         cwd: &Path,
         mut env_map: HashMap<String, String>,
         timeout_ms: Option<u64>,
-        additional_deny_write_paths: &[PathBuf],
+        cancellation: Option<WindowsSandboxCancellationToken>,
+        additional_deny_read_paths: &[AbsolutePathBuf],
+        additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
+        let additional_deny_read_paths = additional_deny_read_paths
+            .iter()
+            .map(AbsolutePathBuf::to_path_buf)
+            .collect::<Vec<_>>();
+        let additional_deny_write_paths = additional_deny_write_paths
+            .iter()
+            .map(AbsolutePathBuf::to_path_buf)
+            .collect::<Vec<_>>();
         let common = prepare_legacy_spawn_context(
-            policy_json_or_preset,
+            permission_profile,
+            workspace_roots,
             codex_home,
             cwd,
             &mut env_map,
             &command,
-            /*inherit_path*/ false,
-            /*add_git_safe_directory*/ false,
+            SpawnPrepOptions {
+                inherit_path: false,
+                add_git_safe_directory: false,
+            },
         )?;
-        let policy = common.policy;
+        let permissions = common.permissions;
         let current_dir = common.current_dir;
         let logs_base_dir = common.logs_base_dir.as_deref();
-        let is_workspace_write = common.is_workspace_write;
-        if !policy.has_full_disk_read_access() {
+        let uses_write_capabilities = common.uses_write_capabilities;
+        if !permissions.has_full_disk_read_access() {
             anyhow::bail!(
                 "Restricted read-only access requires the elevated Windows sandbox backend"
             );
         }
-        let caps = load_or_create_cap_sids(codex_home)?;
-        let (h_token, psid_generic, psid_workspace): (HANDLE, *mut c_void, Option<*mut c_void>) = unsafe {
-            match &policy {
-                SandboxPolicy::ReadOnly { .. } => {
-                    #[allow(clippy::expect_used)]
-                    let psid =
-                        convert_string_sid_to_sid(&caps.readonly).expect("valid readonly SID");
-                    let (h, _) = super::token::create_readonly_token_with_cap(psid)?;
-                    (h, psid, None)
-                }
-                SandboxPolicy::WorkspaceWrite { .. } => {
-                    #[allow(clippy::expect_used)]
-                    let psid_generic =
-                        convert_string_sid_to_sid(&caps.workspace).expect("valid workspace SID");
-                    let ws_sid = workspace_cap_sid_for_cwd(codex_home, cwd)?;
-                    #[allow(clippy::expect_used)]
-                    let psid_workspace =
-                        convert_string_sid_to_sid(&ws_sid).expect("valid workspace SID");
-                    let base = super::token::get_current_token_for_restriction()?;
-                    let h_res = create_workspace_write_token_with_caps_from(
-                        base,
-                        &[psid_generic, psid_workspace],
-                    );
-                    windows_sys::Win32::Foundation::CloseHandle(base);
-                    let h = h_res?;
-                    (h, psid_generic, Some(psid_workspace))
-                }
-                SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
-                    unreachable!("DangerFullAccess handled above")
-                }
-            }
-        };
-
-        unsafe {
-            if is_workspace_write
-                && let Ok(base) = super::token::get_current_token_for_restriction()
-            {
-                if let Ok(bytes) = super::token::get_logon_sid_bytes(base) {
-                    let mut tmp = bytes;
-                    let psid2 = tmp.as_mut_ptr() as *mut c_void;
-                    allow_null_device(psid2);
-                }
-                windows_sys::Win32::Foundation::CloseHandle(base);
-            }
+        // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
+        // backend cannot make capability-SID deny-read ACLs authoritative.
+        if !additional_deny_read_paths.is_empty() {
+            anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
         }
-
-        let persist_aces = is_workspace_write;
-        let AllowDenyPaths { allow, mut deny } =
-            compute_allow_paths(&policy, sandbox_policy_cwd, &current_dir, &env_map);
-        for path in additional_deny_write_paths {
-            if path.exists() {
-                deny.insert(path.clone());
-            }
-        }
-        let canonical_cwd = canonicalize_path(&current_dir);
-        let mut guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
-        unsafe {
-            for p in &allow {
-                let psid = if is_workspace_write && is_command_cwd_root(p, &canonical_cwd) {
-                    psid_workspace.unwrap_or(psid_generic)
-                } else {
-                    psid_generic
-                };
-                if let Ok(added) = add_allow_ace(p, psid)
-                    && added
-                {
-                    if persist_aces {
-                        if p.is_dir() {
-                            // best-effort seeding omitted intentionally
-                        }
-                    } else {
-                        guards.push((p.clone(), psid));
-                    }
-                }
-            }
-            for p in &deny {
-                if let Ok(added) = add_deny_write_ace(p, psid_generic)
-                    && added
-                    && !persist_aces
-                {
-                    guards.push((p.clone(), psid_generic));
-                }
-            }
-            allow_null_device(psid_generic);
-            if let Some(psid) = psid_workspace {
-                allow_null_device(psid);
-            }
-        }
+        let capability_roots =
+            legacy_session_capability_roots(&permissions, &current_dir, &env_map, codex_home);
+        let security = prepare_legacy_session_security(
+            uses_write_capabilities,
+            codex_home,
+            cwd,
+            capability_roots,
+        )?;
+        allow_null_device_for_workspace_write(uses_write_capabilities);
+        apply_legacy_session_acl_rules(
+            &permissions,
+            codex_home,
+            &current_dir,
+            &env_map,
+            &additional_deny_read_paths,
+            &additional_deny_write_paths,
+            LegacyAclSids {
+                readonly_sid: security.readonly_sid.as_ref(),
+                readonly_sid_str: security.readonly_sid_str.as_deref(),
+                write_root_sids: &security.write_root_sids,
+            },
+        )?;
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
         let spawn_res = unsafe {
             create_process_as_user(
-                h_token,
+                security.h_token,
                 &command,
                 cwd,
                 &env_map,
@@ -567,7 +582,7 @@ mod windows_impl {
                     CloseHandle(out_w);
                     CloseHandle(err_r);
                     CloseHandle(err_w);
-                    CloseHandle(h_token);
+                    CloseHandle(security.h_token);
                 }
                 return Err(err);
             }
@@ -649,7 +664,7 @@ mod windows_impl {
             if pi.hProcess != 0 {
                 CloseHandle(pi.hProcess);
             }
-            CloseHandle(h_token);
+            CloseHandle(security.h_token);
         }
         let _ = t_out.join();
         let _ = t_err.join();
@@ -667,13 +682,6 @@ mod windows_impl {
             log_failure(&command, &format!("exit code {exit_code}"), logs_base_dir);
         }
 
-        if !persist_aces {
-            unsafe {
-                for (p, sid) in guards {
-                    revoke_ace(&p, sid);
-                }
-            }
-        }
         Ok(CaptureResult {
             exit_code,
             stdout,
@@ -700,41 +708,34 @@ mod windows_impl {
         }
 
         ensure_codex_home_exists(codex_home)?;
-        let caps = load_or_create_cap_sids(codex_home)?;
-        #[allow(clippy::expect_used)]
-        let psid_generic =
-            unsafe { convert_string_sid_to_sid(&caps.workspace) }.expect("valid workspace SID");
-        let ws_sid = workspace_cap_sid_for_cwd(codex_home, cwd)?;
-        #[allow(clippy::expect_used)]
-        let psid_workspace =
-            unsafe { convert_string_sid_to_sid(&ws_sid) }.expect("valid workspace SID");
         let current_dir = cwd.to_path_buf();
-        let AllowDenyPaths { allow, deny } =
-            compute_allow_paths(sandbox_policy, sandbox_policy_cwd, &current_dir, env_map);
-        let canonical_cwd = canonicalize_path(&current_dir);
-        unsafe {
-            for p in &allow {
-                let psid = if is_command_cwd_root(p, &canonical_cwd) {
-                    psid_workspace
-                } else {
-                    psid_generic
-                };
-                let _ = add_allow_ace(p, psid);
-            }
-            for p in &deny {
-                let _ = add_deny_write_ace(p, psid_generic);
-            }
-            allow_null_device(psid_generic);
-            allow_null_device(psid_workspace);
-        }
+        let capability_roots =
+            legacy_session_capability_roots(&permissions, &current_dir, env_map, codex_home);
+        let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots)?;
+        apply_legacy_session_acl_rules(
+            &permissions,
+            codex_home,
+            &current_dir,
+            env_map,
+            &[],
+            &[],
+            LegacyAclSids {
+                readonly_sid: None,
+                readonly_sid_str: None,
+                write_root_sids: &write_root_sids,
+            },
+        )?;
 
         Ok(())
     }
 
     #[cfg(test)]
     mod tests {
-        use crate::policy::SandboxPolicy;
-        use crate::spawn_prep::should_apply_network_block;
+        use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+        use codex_protocol::models::PermissionProfile;
+        use codex_protocol::permissions::NetworkSandboxPolicy;
+        use std::collections::HashMap;
+        use std::path::Path;
 
         fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile {
             PermissionProfile::workspace_write_with(
@@ -743,6 +744,15 @@ mod windows_impl {
                 /*exclude_tmpdir_env_var*/ false,
                 /*exclude_slash_tmp*/ false,
             )
+        }
+
+        fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool {
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                permission_profile,
+                &[],
+            )
+            .expect("managed permissions")
+            .should_apply_network_block()
         }
 
         #[test]
