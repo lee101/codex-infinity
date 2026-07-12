@@ -87,7 +87,6 @@ mod override_updates;
 mod pending_input;
 mod permissions_messages;
 mod personality;
-mod personality_migration;
 mod plugins;
 mod prompt_caching;
 mod prompt_debug_tests;
@@ -142,3 +141,4 @@ mod websocket_fallback;
 mod window_headers;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
+mod workspace_roots;
