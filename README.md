@@ -43,6 +43,11 @@ npm install -g @openai/codex
 ```
 
 ```shell
+# Install using bun
+bun install -g @openai/codex
+```
+
+```shell
 # Install using Homebrew
 brew install --cask codex
 ```
