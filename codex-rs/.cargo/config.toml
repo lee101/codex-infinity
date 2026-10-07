@@ -1,5 +1,13 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "link-arg=/STACK:8388608"]
+# `/FORCE:MULTIPLE` is required to link the prebuilt sandbox-enabled rusty_v8
+# static archive: its partition_alloc allocator shim intentionally provides
+# `malloc`/`realloc`, which otherwise collide with the UCRT imports (LNK2005).
+rustflags = [
+    "-C",
+    "link-arg=/STACK:8388608",
+    "-C",
+    "link-arg=/FORCE:MULTIPLE",
+]
 
 # MSVC emits a warning about code that may trip "Cortex-A53 MPCore processor bug #843419" (see
 # https://developer.arm.com/documentation/epm048406/latest) which is sometimes emitted by LLVM.

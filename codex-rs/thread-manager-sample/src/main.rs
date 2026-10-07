@@ -251,6 +251,7 @@ async fn new_config(
         model_post_turn_compact_threshold_percent: 0,
         model_provider_id,
         model_provider,
+        model_provider_pinned: true,
         personality: None,
         permissions: Permissions::from_approval_and_profile(
             Constrained::allow_any(AskForApproval::Never),
