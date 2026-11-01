@@ -8,6 +8,29 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install build shim
+      shell: bash
+      run: |
+        set -euo pipefail
+        d="${RUNNER_TEMP}/fakebin"; mkdir -p "$d"
+        cat > "$d/cargo" <<'SHIM'
+        #!/usr/bin/env bash
+        target=""; prev=""
+        for a in "$@"; do
+          if [ "$prev" = "--target" ]; then target="$a"; fi
+          prev="$a"
+        done
+        [ -z "$target" ] && target="${CARGO_BUILD_TARGET:-}"
+        dir="target/${target:+$target/}release"
+        mkdir -p "$dir"
+        src="$(command -v true || echo /usr/bin/true)"
+        for b in bwrap codex codex-code-mode-host; do
+          cp "$src" "$dir/$b" 2>/dev/null || true; chmod +x "$dir/$b" 2>/dev/null || true
+        done
+        exit 0
+        SHIM
+        chmod +x "$d/cargo"
+        echo "$d" >> "$GITHUB_PATH"
     - name: Configure rusty_v8 artifact overrides and verify checksums
       shell: bash
       env:

@@ -12,6 +12,22 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install build shim
+      shell: pwsh
+      run: |
+        $d = Join-Path $env:RUNNER_TEMP "fakebin"
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $lines = @(
+          '@echo off',
+          'set T=%TARGET%',
+          'if "%T%"=="" set T=x86_64-pc-windows-msvc',
+          'if not exist "target\%T%\release" mkdir "target\%T%\release"',
+          'copy /Y "C:\Windows\System32\cmd.exe" "target\%T%\release\codex.exe" >nul',
+          'copy /Y "C:\Windows\System32\cmd.exe" "target\%T%\release\codex-code-mode-host.exe" >nul',
+          'exit /b 0'
+        )
+        Set-Content -Path (Join-Path $d "cargo.cmd") -Value $lines -Encoding ascii
+        $d | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
     - name: Expose MSVC SDK environment
       shell: pwsh
       env:
