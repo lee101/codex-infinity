@@ -22,14 +22,19 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     // Tool, approval, and collaboration messages still come from that catalog.
     if matches!(
         model.slug.as_str(),
-        "gpt-6.1-sol"
+        "gpt-6.2-sol"
+            | "gpt-6.2-terra"
+            | "gpt-6.1-sol"
             | "gpt-6.1-terra"
             | "gpt-6-sol"
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
             | "gpt-5.6-luna"
     ) && let Ok(catalog) = crate::bundled_models_response()
-        && let Some(bundled) = catalog.models.into_iter().find(|item| item.slug == model.slug)
+        && let Some(bundled) = catalog
+            .models
+            .into_iter()
+            .find(|item| item.slug == model.slug)
         && let Some(messages) = bundled.model_messages
     {
         let active = model.model_messages.get_or_insert_default();
