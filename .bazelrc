@@ -4,20 +4,25 @@ common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
 common --xcode_version_config=//:disable_xcode
 
 common --disk_cache=~/.cache/bazel-disk-cache
+common --experimental_disk_cache_gc_max_age=7d
 common --repo_contents_cache=~/.cache/bazel-repo-contents-cache
+common --repo_contents_cache_gc_max_age=7d
 common --repository_cache=~/.cache/bazel-repo-cache
 common --remote_cache_compression
 startup --experimental_remote_repo_contents_cache
 # rules_python 2.x requires symlink support for Windows Python launchers.
 startup --windows_enable_symlinks
 
+# Start Python launchers with their declared interpreter on lean workers.
+common --@rules_python//python/config_settings:bootstrap_impl=script
+
 common --experimental_platform_in_output_dir
 
 # Match Cargo's MSVC static CRT policy and V8's allocator linkage. Only the
 # MSVC C/C++ toolchain consumes this feature; other toolchains ignore it.
 # Include host dependencies so native build tools use the same runtime.
-build --features=static_link_msvcrt
-build --host_features=static_link_msvcrt
+build --features=-dynamic_link_msvcrt --features=static_link_msvcrt
+build --host_features=-dynamic_link_msvcrt --host_features=static_link_msvcrt
 
 build --workspace_status_command=./scripts/workspace-status.sh
 build:windows --workspace_status_command=./scripts/workspace-status.cmd
@@ -54,47 +59,22 @@ common --test_env=RUST_MIN_STACK=8388608 # 8 MiB
 
 common --test_output=errors
 common --nobuild_runfile_links
-# These settings tune BuildBuddy/RBE behavior but do not contact a remote
-# service unless a `buildbuddy-*` configuration below supplies an endpoint.
+# These settings tune remote cache and execution behavior. They do not
+# configure a remote service.
 common --remote_download_toplevel
 common --remote_timeout=3600
 common --noexperimental_throttle_remote_action_building
 common --experimental_remote_execution_keepalive
 common --grpc_keepalive_time=30s
 
-# Opt-in remote configurations selected by
-# `.github/scripts/run_bazel_with_buildbuddy.py`. Plain Bazel commands do not
-# contact BuildBuddy unless a user selects one of these configurations.
-# Use the generic host for cache, BES, and downloads without remote execution.
-common:buildbuddy-generic --bes_backend=grpcs://remote.buildbuddy.io
-common:buildbuddy-generic --bes_results_url=https://app.buildbuddy.io/invocation/
-common:buildbuddy-generic --remote_cache=grpcs://remote.buildbuddy.io
-common:buildbuddy-generic --experimental_remote_downloader=grpcs://remote.buildbuddy.io
-
-# Add remote execution on the generic host.
-common:buildbuddy-generic-rbe --config=buildbuddy-generic
-common:buildbuddy-generic-rbe --config=remote
-common:buildbuddy-generic-rbe --remote_executor=grpcs://remote.buildbuddy.io
-
-# Use the OpenAI tenant for cache, BES, and downloads without remote execution.
-common:buildbuddy-openai --bes_backend=grpcs://openai.buildbuddy.io
-common:buildbuddy-openai --bes_results_url=https://openai.buildbuddy.io/invocation/
-common:buildbuddy-openai --remote_cache=grpcs://openai.buildbuddy.io
-common:buildbuddy-openai --experimental_remote_downloader=grpcs://openai.buildbuddy.io
-
-# Add remote execution on the OpenAI tenant.
-common:buildbuddy-openai-rbe --config=buildbuddy-openai
-common:buildbuddy-openai-rbe --config=remote
-common:buildbuddy-openai-rbe --remote_executor=grpcs://openai.buildbuddy.io
-
 # This limits both in-flight executions and concurrent downloads. Even with high number
 # of jobs execution will still be limited by CPU cores, so this just pays a bit of
 # memory in exchange for higher download concurrency.
 common --jobs=30
 
-# Shared remote execution policy. The endpoint-bearing `buildbuddy-*-rbe`
-# configurations include this group; CI configs override TestRunner below
-# when tests must remain local on their runner.
+# Shared remote execution policy for callers that provide an approved remote
+# executor. CI configs override TestRunner below when tests must remain local
+# on their runner.
 common:remote --strategy=remote
 # Native Mac voice actions need the local Apple tools; Linux remains remote.
 common:macos --strategy=VoiceNativePrefix=remote,sandboxed,local
@@ -109,6 +89,8 @@ common:remote --jobs=800
 common:ci --remote_download_minimal
 common:ci --keep_going
 common:ci --verbose_failures
+# A failed snapshot assertion should print its diff without leaving a .snap.new after a passing retry.
+test:ci --test_env=INSTA_UPDATE=no
 common:ci --build_metadata=REPO_URL=https://github.com/openai/codex.git
 common:ci --build_metadata=ROLE=CI
 common:ci --build_metadata=VISIBILITY=PUBLIC
@@ -218,12 +200,11 @@ common:ci-v8 --config=ci
 common:ci-v8 --build_metadata=TAG_workflow=v8
 common:ci-v8 --build_metadata=TAG_os=linux
 
-# Native Windows MSVC builds inherit the runner's MSVC SDK environment.
+# Native Windows MSVC builds use the registered LLVM toolchain and its SDK.
+# Voice's separately declared native build tools still need the runner environment.
 # Client environment capture and repository discovery happen before target
 # transitions, so these runner settings cannot live in runtime_package.bzl.
-# Hermetic LLVM targets the GNU ABI on Windows even on an MSVC platform.
-build:ci-windows-msvc --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
-build:ci-windows-msvc --extra_toolchains=@local_config_cc//:cc-toolchain-x64_windows,@local_config_cc//:cc-toolchain-arm64_windows
+build:ci-windows-msvc --repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1
 build:ci-windows-msvc --action_env=PATH
 build:ci-windows-msvc --host_action_env=PATH
 build:ci-windows-msvc --action_env=INCLUDE

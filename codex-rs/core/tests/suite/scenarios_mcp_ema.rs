@@ -316,6 +316,16 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
         ))
         .with_config(move |config| {
             super::configure_scenario_catalog(config);
+            config.model_provider.requires_openai_auth = true;
+            config.model_provider.include_internal_metadata = true;
+            config
+                .features
+                .enable(codex_features::Feature::ConnectorToolResultPassthrough)
+                .expect("enable connector result capture");
+            config
+                .features
+                .enable(codex_features::Feature::ExecutedToolCallMetadata)
+                .expect("enable tool-call metadata");
             if matches!(scenario, EnterpriseLifecycle::RefreshPermissions) {
                 config.permissions.approval_policy = codex_config::Constrained::allow_any(
                     codex_protocol::protocol::AskForApproval::Never,
@@ -361,6 +371,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
         test.codex
             .mcp_server_status_snapshot(
                 "ordinary",
+                /*environment_id*/ None,
                 codex_mcp::McpSnapshotDetail::ToolsAndAuthOnly,
                 /*expected_registration*/ None,
             )
@@ -434,6 +445,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
             .await;
         let mut call = Box::pin(test.codex.call_mcp_tool(
             "enterprise",
+            /*environment_id*/ None,
             "calendar_list_events",
             Some(json!({"query": "permission"})),
             /*meta*/ None,
@@ -479,6 +491,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
             .codex
             .call_mcp_tool(
                 "enterprise",
+                /*environment_id*/ None,
                 "calendar_create_event",
                 /*arguments*/ None,
                 /*meta*/ None,
@@ -563,6 +576,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
             .codex
             .call_mcp_tool(
                 "ordinary",
+                /*environment_id*/ None,
                 "calendar_create_event",
                 Some(json!({"title": "control", "starts_at": "2026-06-18T12:00:00Z"})),
                 /*meta*/ None,
@@ -633,6 +647,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
         thread
             .call_mcp_tool(
                 "enterprise",
+                /*environment_id*/ None,
                 "calendar_list_events",
                 Some(json!({"query":"blocked"})),
                 /*meta*/ None,
@@ -665,6 +680,7 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
             let result = removed
                 .call_mcp_tool(
                     "enterprise",
+                    /*environment_id*/ None,
                     "calendar_list_events",
                     /*arguments*/ None,
                     /*meta*/ None,
@@ -692,6 +708,15 @@ http_headers = {{ Authorization = "Bearer ordinary-access" }}
         .await?;
     let requests = mock.requests();
     assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[1].header("authorization").as_deref(),
+        Some("Bearer account-access"),
+    );
+    let output = requests[1].function_call_output("enterprise-call");
+    assert_eq!(
+        output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+        json!([{"name": "mcp__enterprise__calendar_list_events", "arguments": {}}]),
+    );
     let calls = mcp
         .received_requests()
         .await

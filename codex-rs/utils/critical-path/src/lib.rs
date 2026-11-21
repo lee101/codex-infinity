@@ -5,13 +5,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+mod review_execution;
+pub use review_execution::ReviewExecution;
+pub use review_execution::ReviewExecutionAttempt;
+
 const MAX_PATH_DEPTH: usize = 16_384;
 
 /// Category attributed to an observed segment of dependency work.
 #[derive(Clone, Copy, Debug)]
 pub enum WorkKind {
-    /// Model inference work on the selected dependency path.
-    Inference,
+    /// Model sampling work on the selected dependency path.
+    Sampling,
+    /// Compaction work, including its local bookkeeping.
+    Compaction,
     /// Automatic review work, such as reviewing a tool call before execution.
     AutoReview,
     /// Time awaiting a human answer or approval on the selected dependency path.
@@ -26,7 +32,8 @@ pub enum WorkKind {
     Unknown,
 }
 
-/// An immutable observed dependency path. Forks share their prefix; a join
+/// A persistent observed dependency path. Review observers must be sealed before
+/// publishing completed paths. Forks share their prefix; a join
 /// retains only the dependency that actually released the waiting operation.
 /// Equality compares path identity rather than the contents of each segment.
 #[derive(Clone, Default)]
@@ -57,6 +64,7 @@ impl Eq for CriticalPath {}
 struct Node {
     previous: CriticalPath,
     kind: WorkKind,
+    reviews: Vec<ReviewExecution>,
     start: Instant,
     end: Instant,
     origin: Instant,
@@ -64,20 +72,43 @@ struct Node {
 }
 
 /// Exclusive time attributed to each category within the requested interval.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PathDurations {
-    pub inference: Duration,
+    pub sampling: Duration,
+    pub compaction: Duration,
     pub auto_review: Duration,
+    /// Subcomponent of auto_review excluding the union of observed child execution.
+    /// None means review attribution or dependency history is incomplete.
+    pub auto_review_overhead: Option<Duration>,
     pub user_wait: Duration,
     pub tools: Duration,
     pub overhead: Duration,
     pub unknown: Duration,
 }
 
+impl Default for PathDurations {
+    fn default() -> Self {
+        Self {
+            sampling: Duration::ZERO,
+            compaction: Duration::ZERO,
+            auto_review: Duration::ZERO,
+            auto_review_overhead: Some(Duration::ZERO),
+            user_wait: Duration::ZERO,
+            tools: Duration::ZERO,
+            overhead: Duration::ZERO,
+            unknown: Duration::ZERO,
+        }
+    }
+}
+
 impl PathDurations {
     fn record(&mut self, kind: WorkKind, duration: Duration) {
+        if matches!(kind, WorkKind::Unknown) {
+            self.auto_review_overhead = None;
+        }
         let total = match kind {
-            WorkKind::Inference => &mut self.inference,
+            WorkKind::Sampling => &mut self.sampling,
+            WorkKind::Compaction => &mut self.compaction,
             WorkKind::AutoReview => &mut self.auto_review,
             WorkKind::UserWait => &mut self.user_wait,
             WorkKind::Tools => &mut self.tools,
@@ -106,6 +137,22 @@ impl CriticalPath {
     /// Append work after the existing path ends, clipping overlap and ignoring empty segments.
     /// Exceeding the history limit collapses the retained interval into unknown work.
     pub fn work(self, start: Instant, end: Instant, kind: WorkKind) -> Self {
+        self.append(start, end, kind, Vec::new())
+    }
+
+    /// Adds review time with the exact reviews active during this segment. Their
+    /// child execution union is clipped to the segment and requested window.
+    pub fn auto_review(self, start: Instant, end: Instant, reviews: Vec<ReviewExecution>) -> Self {
+        self.append(start, end, WorkKind::AutoReview, reviews)
+    }
+
+    fn append(
+        self,
+        start: Instant,
+        end: Instant,
+        kind: WorkKind,
+        reviews: Vec<ReviewExecution>,
+    ) -> Self {
         let start = self.end().map_or(start, |previous| previous.max(start));
         if start >= end {
             return self;
@@ -119,6 +166,7 @@ impl CriticalPath {
         Self(Some(Arc::new(Node {
             previous: self,
             kind,
+            reviews,
             start,
             end,
             origin,
@@ -150,6 +198,12 @@ impl CriticalPath {
             }
             if segment_start < segment_end {
                 totals.record(node.kind, segment_end.duration_since(segment_start));
+                if matches!(node.kind, WorkKind::AutoReview) {
+                    totals.auto_review_overhead = totals.auto_review_overhead.and_then(|total| {
+                        review_execution::overhead(&node.reviews, segment_start, segment_end)
+                            .map(|overhead| total.saturating_add(overhead))
+                    });
+                }
             }
             end = end.min(node.start);
             path = &node.previous;

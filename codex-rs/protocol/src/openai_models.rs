@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -40,6 +41,11 @@ mod memento_v2;
 pub use memento_v2::ContextManagementToolMessages;
 pub use memento_v2::HistoryToolMessages;
 pub use memento_v2::NotesToolMessages;
+mod plugins;
+pub use plugins::GenericPluginMessages;
+pub use plugins::PluginMessages;
+pub use plugins::PluginRecommendationMessages;
+pub use plugins::SelectedPluginMessages;
 #[path = "openai_models/guardian.rs"]
 mod guardian;
 pub use guardian::GuardianModelPolicy;
@@ -52,7 +58,9 @@ mod guardian_v2;
 #[path = "openai_models/reasoning_effort.rs"]
 mod reasoning_effort;
 
+pub use access_programs::DaybreakAvailability;
 pub use access_programs::ModelAccessPrograms;
+pub use access_programs::SavedDaybreakChoice;
 pub use guardian_v2::AsyncClassifierMode;
 pub use guardian_v2::GuardianV2ModelConfig;
 pub use guardian_v2::GuardianV2TranscriptModelConfig;
@@ -478,11 +486,6 @@ pub struct ModelInfo {
     /// Input modalities accepted by the backend for this model.
     #[serde(default = "default_input_modalities")]
     pub input_modalities: Vec<InputModality>,
-    /// Internal-only marker set by core when a model slug resolved to fallback metadata.
-    #[serde(default, skip_serializing, skip_deserializing)]
-    #[schemars(skip)]
-    #[ts(skip)]
-    pub used_fallback_model_metadata: bool,
     #[serde(default)]
     pub supports_search_tool: bool,
     /// Whether experimental context management may be activated at session startup.
@@ -517,6 +520,43 @@ pub struct ModelInfo {
     /// Reasoning effort used for multi-agent work when the user selects Ultra.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_reasoning_effort: Option<ReasoningEffort>,
+    /// Whether native multi-agent tools follow the model's tool mode instead of staying direct-only.
+    /// When absent, preserve the runtime's `multi_agent_v2.non_code_mode_only` setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent_tools_in_code_mode: Option<bool>,
+}
+
+/// Where model metadata was obtained during local catalog resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOrigin {
+    Bundled,
+    Provider,
+    ExplicitConfig,
+    /// Generic metadata synthesized when no catalog entry matches the requested model.
+    Synthetic,
+}
+
+/// Model metadata and its locally determined source, retained together through resolution.
+/// Metadata is shared with runtime snapshots and extension stores; mutation uses copy-on-write.
+/// This runtime wrapper is not serialized; managers assign its source from local catalog state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModel {
+    pub model: Arc<ModelInfo>,
+    pub origin: ModelOrigin,
+}
+
+impl std::ops::Deref for CatalogModel {
+    type Target = ModelInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
+}
+
+impl std::ops::DerefMut for CatalogModel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.model)
+    }
 }
 
 impl ModelInfo {
@@ -551,6 +591,12 @@ impl ModelInfo {
 /// retained for model catalog compatibility.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
+    /// Model-owned Apps usage guidance, subject to existing Apps availability and authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps: Option<AppsMessages>,
+    /// Model-owned plugin wording; runtime capability facts and eligibility remain client-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<PluginMessages>,
     /// Developer guidance after a content-filter block. Missing, null, blank, or values over
     /// 512 UTF-8 bytes use the bundled guidance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +620,15 @@ pub struct ModelMessages {
     /// Replacement confirmation-policy documents forwarded in actor MCP request metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmation_policies: Option<ConfirmationPolicies>,
+}
+
+/// Literal model-owned Apps guidance inside the existing developer fragment markers.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct AppsMessages {
+    /// Missing/null uses bundled guidance; empty clears it. Whitespace-only or more than
+    /// 800 UTF-8 bytes falls back to bundled guidance. Other values preserve exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_instructions: Option<String>,
 }
 
 /// Model-owned confirmation-policy Markdown, forwarded unchanged to actor tools.
@@ -604,13 +659,17 @@ pub struct ToolMessages {
     pub incremental_tools: Option<IncrementalToolMessages>,
     /// Prefixes for individual functions in the `functions` namespace, keyed by unqualified name.
     /// Applies to direct declarations, Code Mode, and tool search, including custom tools.
-    /// Values are trimmed; empty values and unavailable functions add nothing. The trimmed
-    /// values for available functions plus separating blank lines must fit in 256 UTF-8 bytes
-    /// in total. This bounds the added text, not the complete definition or its token count.
+    /// Only available functions are annotated. All configured prefixes share the
+    /// `description_prefix_budget_bytes` limit with indirect namespace guidance.
     /// Other namespaces are never affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub functions_namespace_functions_description_prefixes:
         Option<std::collections::BTreeMap<String, String>>,
+    /// Maximum total UTF-8 bytes of trimmed prefix values in this model's catalog entry.
+    /// Defaults to 512. Each configured dictionary entry counts once, including unused
+    /// selectors. Keys, paragraph separators, and rendered copies are excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_prefix_budget_bytes: Option<usize>,
     /// Optional guidance for indirectly presented tools; missing or empty adds no prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indirect_description_prefixes: Option<IndirectDescriptionPrefixes>,
@@ -631,9 +690,14 @@ pub struct ToolMessages {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct IndirectDescriptionPrefixes {
     /// Exact rendered namespaces, including `functions` for plain tools.
-    /// Overlap with an MCP server prefix is allowed only when the trimmed values match.
+    /// Overlapping selectors must have the same trimmed value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<std::collections::BTreeMap<String, String>>,
+    /// Exact rendered namespaces of registered built-in tools, including `functions` for plain tools.
+    /// Adds guidance once to the namespace header, including a header shared with client tools.
+    /// Flat listings have no header and omit this selector. External-only namespaces are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_tool_namespaces: Option<std::collections::BTreeMap<String, String>>,
     /// Configured MCP server names, before callable namespace normalization.
     /// Each prefix applies to all namespaces exposed by that server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -769,12 +833,22 @@ pub struct ModelTokenBudgetConfig {
     pub auto_compact_fallback_buffer_tokens: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ApprovalMessages {
     pub on_request: Option<String>,
     pub on_request_auto_review: Option<String>,
     pub never: Option<String>,
     pub unless_trusted: Option<String>,
+    /// Optional replacement heading for the request_permissions tool instructions.
+    #[serde(
+        default,
+        alias = "request_permissions_tool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_permissions: Option<String>,
+    /// Optional introduction to the harness-owned automatic escalation review policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review_suffix: Option<String>,
     /// Optional catalog templates for harness-owned granular approval facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granular: Option<GranularApprovalMessages>,
@@ -824,6 +898,10 @@ pub struct PermissionMessages {
     /// an empty string suppresses the approved-prefix section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_prefixes: Option<String>,
+    /// Optional plain heading for the separate saved-command-prefix notification.
+    /// The harness formats the prefix list and falls back to its bundled heading for invalid text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_command_prefix_saved: Option<String>,
     /// Single writable-root sentence with exactly one `{{ roots }}` placeholder.
     /// Missing, null, empty, invalid, or oversized templates use the bundled sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1159,7 +1237,6 @@ mod tests {
             effective_context_window_percent: 95,
             experimental_supported_tools: vec![],
             input_modalities: default_input_modalities(),
-            used_fallback_model_metadata: false,
             supports_search_tool: false,
             supports_experimental_context: false,
             use_responses_lite: false,
@@ -1172,6 +1249,7 @@ mod tests {
             tool_mode: None,
             multi_agent_version: None,
             multi_agent_reasoning_effort: None,
+            multi_agent_tools_in_code_mode: None,
         }
     }
     #[test]
@@ -1181,6 +1259,32 @@ mod tests {
                 .expect("model messages should deserialize");
 
         assert_eq!(messages, ModelMessages::default());
+    }
+
+    #[test]
+    fn apps_messages_preserve_nullable_and_literal_wire_values() {
+        for apps in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"usage_instructions": null}),
+            serde_json::json!({"usage_instructions": ""}),
+            serde_json::json!({"usage_instructions": " \r\n\t"}),
+            serde_json::json!({"usage_instructions": "  {{literal}}\r\n"}),
+            serde_json::json!({"usage_instructions": "é".repeat(501)}),
+        ] {
+            let messages: ModelMessages =
+                serde_json::from_value(serde_json::json!({"apps": apps})).unwrap();
+            let serialized = serde_json::to_value(messages).unwrap();
+            let mut expected = serde_json::to_value(ModelMessages::default()).unwrap();
+            if !apps.is_null() {
+                expected["apps"] = if apps["usage_instructions"].is_null() {
+                    serde_json::json!({})
+                } else {
+                    apps
+                };
+            }
+            assert_eq!(serialized, expected);
+        }
     }
 
     #[test]
@@ -1285,7 +1389,9 @@ mod tests {
                 "instructions_template": null,
                 "approvals": {
                     "on_request": "",
-                    "never": ""
+                    "never": "",
+                    "request_permissions": "",
+                    "auto_review_suffix": null
                 }
             }"#,
         )
@@ -1295,12 +1401,39 @@ mod tests {
             messages.approvals,
             Some(ApprovalMessages {
                 on_request: Some(String::new()),
+                request_permissions: Some(String::new()),
                 on_request_auto_review: None,
                 never: Some(String::new()),
                 unless_trusted: None,
                 granular: None,
+                ..Default::default()
             })
         );
+
+        for field in ["request_permissions", "request_permissions_tool"] {
+            for heading in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!("Permission requests"),
+            ] {
+                let approvals: ApprovalMessages =
+                    serde_json::from_value(serde_json::json!({ field: heading }))
+                        .expect("permission heading should deserialize with either field name");
+                let mut expected = serde_json::json!({
+                    "on_request": null,
+                    "on_request_auto_review": null,
+                    "never": null,
+                    "unless_trusted": null,
+                });
+                if !heading.is_null() {
+                    expected["request_permissions"] = heading;
+                }
+                assert_eq!(
+                    serde_json::to_value(approvals).expect("serialize approvals"),
+                    expected
+                );
+            }
+        }
 
         for (granular, expected) in [
             (serde_json::json!(null), None),
@@ -1417,9 +1550,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_path_messages_preserve_sparse_wire_values() {
+    fn permission_messages_preserve_sparse_wire_values() {
         for input in [
             serde_json::json!({}),
+            serde_json::json!({"approved_command_prefix_saved": null}),
+            serde_json::json!({"approved_command_prefix_saved": ""}),
+            serde_json::json!({"approved_command_prefix_saved": "Saved", "approved_prefixes": "Allowed: {{ approved_prefixes }}"}),
             serde_json::json!({"writable_root": null, "writable_roots": null}),
             serde_json::json!({"writable_root": "", "writable_roots": "Roots: {{ roots }}."}),
             serde_json::json!({"omitted_paths": null, "denied_reads": null}),
@@ -1432,6 +1568,8 @@ mod tests {
                 "read_only": null,
             });
             for key in [
+                "approved_command_prefix_saved",
+                "approved_prefixes",
                 "writable_root",
                 "writable_roots",
                 "omitted_paths",
@@ -1647,6 +1785,10 @@ mod tests {
     #[test]
     fn models_response_prefers_template_and_preserves_message_siblings() {
         let messages = ModelMessages {
+            apps: Some(AppsMessages {
+                usage_instructions: Some("Literal Apps {{guidance}}".to_string()),
+            }),
+            plugins: None,
             content_filter_guidance: Some("Offer a permitted alternative.".to_string()),
             persistent_instructions: Some("Persistent catalog instructions".to_string()),
             tools: Some(ToolMessages {
@@ -1674,6 +1816,7 @@ mod tests {
                     prompted_categories: Some("Allowed: {{ categories }}".to_string()),
                     rejected_categories: Some("Denied: {{ categories }}".to_string()),
                 }),
+                ..Default::default()
             }),
             collaboration_modes: Some(CollaborationModeMessages {
                 default: Some("default collaboration".to_string()),
@@ -1807,6 +1950,24 @@ mod tests {
         assert_eq!(model.auto_review_model_override, None);
         assert_eq!(model.tool_mode, None);
         assert_eq!(model.multi_agent_reasoning_effort, None);
+    }
+
+    #[test]
+    fn model_info_preserves_multi_agent_code_mode_presence() {
+        let base = test_model(/*spec*/ None);
+        let base_json = serde_json::to_value(&base).expect("serialize model");
+        assert!(base_json.get("multi_agent_tools_in_code_mode").is_none());
+        assert_eq!(
+            serde_json::from_value::<ModelInfo>(base_json.clone()).unwrap(),
+            base
+        );
+        for value in [None, Some(false), Some(true)] {
+            let mut json = base_json.clone();
+            json["multi_agent_tools_in_code_mode"] = serde_json::to_value(value).unwrap();
+            let mut expected = base.clone();
+            expected.multi_agent_tools_in_code_mode = value;
+            assert_eq!(serde_json::from_value::<ModelInfo>(json).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -2067,13 +2228,17 @@ mod tests {
             (Some(serde_json::Value::Null), None),
             (
                 Some(serde_json::json!({ "cyber": [] })),
-                Some(ModelAccessPrograms { cyber: vec![] }),
+                Some(ModelAccessPrograms {
+                    cyber: vec![],
+                    daybreak_availability: Default::default(),
+                }),
             ),
             (
                 Some(serde_json::json!({
                     "cyber": ["standard", "daybreak_blue", "future_program", "daybreak_red"]
                 })),
                 Some(ModelAccessPrograms {
+                    daybreak_availability: Default::default(),
                     cyber: vec![
                         CyberAccessProgram::Standard,
                         CyberAccessProgram::DaybreakBlue,
@@ -2081,7 +2246,46 @@ mod tests {
                     ],
                 }),
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            [
+                (
+                    serde_json::json!("available"),
+                    DaybreakAvailability::Available,
+                ),
+                (
+                    serde_json::json!("enrollment_required"),
+                    DaybreakAvailability::EnrollmentRequired,
+                ),
+                (
+                    serde_json::json!("unavailable_for_model"),
+                    DaybreakAvailability::UnavailableForModel,
+                ),
+                (serde_json::json!("default"), DaybreakAvailability::Default),
+                (
+                    serde_json::json!("future_status"),
+                    DaybreakAvailability::Default,
+                ),
+            ]
+            .into_iter()
+            .map(|(availability, expected_availability)| {
+                (
+                    Some(serde_json::json!({
+                        "cyber": ["standard", "daybreak_blue", "future_program", "daybreak_red"],
+                        "daybreak_availability": availability,
+                    })),
+                    Some(ModelAccessPrograms {
+                        cyber: vec![
+                            CyberAccessProgram::Standard,
+                            CyberAccessProgram::DaybreakBlue,
+                            CyberAccessProgram::DaybreakRed,
+                        ],
+                        daybreak_availability: expected_availability,
+                    }),
+                )
+            }),
+        ) {
             let mut value = serde_json::to_value(test_model(/*spec*/ None)).unwrap();
             if let Some(metadata) = metadata {
                 value["available_access_programs"] = metadata;

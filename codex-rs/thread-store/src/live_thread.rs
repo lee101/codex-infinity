@@ -1,3 +1,4 @@
+use codex_rollout::ResponseItemEnvelope;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -5,9 +6,11 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::realtime::RealtimeItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
+use codex_rollout::persisted_rollout_item;
 use codex_rollout::persisted_rollout_items;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -138,7 +141,16 @@ impl LiveThread {
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
-        let metadata_sync = ThreadMetadataSync::for_create(&params).await;
+        let inherited_preview = if params.forked_from_id.is_some() {
+            thread_store
+                .read_pending_thread_metadata(thread_id)
+                .await?
+                .and_then(|patch| patch.preview)
+        } else {
+            None
+        };
+        let metadata_sync =
+            ThreadMetadataSync::for_create(&params, inherited_preview.as_deref()).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
             thread_id,
@@ -159,8 +171,10 @@ impl LiveThread {
         inherited_model_context: &[RolloutItem],
         guard: &mut LiveThreadInitGuard,
     ) -> ThreadStoreResult<Self> {
-        let persisted_prefix_item_count =
-            persisted_rollout_items(inherited_model_context, params.history_mode).len();
+        let persisted_prefix_item_count = inherited_model_context
+            .iter()
+            .filter(|item| persisted_rollout_item(item, params.history_mode).is_some())
+            .count();
         params.subagent_history_start_ordinal = Some(
             u64::try_from(persisted_prefix_item_count)
                 .map_err(|_| ThreadStoreError::Internal {
@@ -227,57 +241,40 @@ impl LiveThread {
         fields(item_count = raw_items.len())
     )]
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        let items = self.persist_appended_items(raw_items).await?;
+        let items = self
+            .persist_appended_items(raw_items)
+            .await?
+            .unwrap_or_else(|| persisted_rollout_items(raw_items, self.history_mode));
         if items.is_empty() {
             return Ok(());
         }
-        let update = self
-            .metadata_sync
-            .lock()
-            .await
-            .observe_appended_items(items.as_slice());
-        if let Some(update) = update {
-            self.thread_store
-                .record_thread_metadata(UpdateThreadMetadataParams {
-                    thread_id: self.thread_id,
-                    patch: update.patch.clone(),
-                    include_archived: true,
-                })
-                .await?;
-            self.metadata_sync
-                .lock()
-                .await
-                .mark_pending_update_applied(&update);
-        }
-        Ok(())
+        self.observe_appended_metadata(&items).await
     }
 
+    /// Returns the filtered items if sampling already needed to collect them.
     async fn persist_appended_items(
         &self,
         raw_items: &[RolloutItem],
-    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+    ) -> ThreadStoreResult<Option<Vec<RolloutItem>>> {
         // Empty appends are intentionally ignored rather than represented as zero-sized batches.
         if raw_items.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let (items, measurement) = if self.persistence_telemetry.is_enabled() {
-            let (items, measurement) =
-                measure_and_filter_rollout_items(raw_items, self.history_mode);
-            (items, Some(measurement))
-        } else {
-            (persisted_rollout_items(raw_items, self.history_mode), None)
-        };
+        let measured = self
+            .persistence_telemetry
+            .is_enabled()
+            .then(|| measure_and_filter_rollout_items(raw_items, self.history_mode));
         self.thread_store
             .append_items(AppendThreadItemsParams {
                 thread_id: self.thread_id,
                 items: raw_items.to_vec(),
             })
             .await?;
-        if let Some(measurement) = measurement.as_ref() {
+        Ok(measured.map(|(items, measurement)| {
             self.persistence_telemetry
-                .record_batch(raw_items, measurement);
-        }
-        Ok(items)
+                .record_batch(raw_items, &measurement);
+            items
+        }))
     }
 
     pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
@@ -294,6 +291,73 @@ impl LiveThread {
             .await?;
         let update = self.metadata_sync.lock().await.take_pending_update();
         self.apply_pending_metadata_update(update, context).await
+    }
+
+    pub async fn seal_realtime_items(&self, items: Vec<RealtimeItem>) -> ThreadStoreResult<()> {
+        if self.thread_store.uses_separate_realtime_frame_store() {
+            return self
+                .thread_store
+                .seal_realtime_items(self.thread_id, items)
+                .await;
+        }
+        if items.last().is_some_and(|item| {
+            matches!(
+                item.content,
+                codex_protocol::realtime::RealtimeItemContent::SessionInputSaved {
+                    reason: codex_protocol::realtime::SessionInputReason::SessionEnd,
+                    ..
+                }
+            )
+        }) {
+            self.thread_store
+                .seal_realtime_items(self.thread_id, items.clone())
+                .await?;
+            let records = items
+                .into_iter()
+                .map(RolloutItem::RealtimeItem)
+                .collect::<Vec<_>>();
+            self.observe_appended_metadata(&records).await?;
+            return Ok(());
+        }
+        let records: Vec<_> = items.into_iter().map(RolloutItem::RealtimeItem).collect();
+        self.append_items(&records).await?;
+        self.flush().await
+    }
+
+    pub async fn seal_realtime_input(
+        &self,
+        frames: Vec<RealtimeItem>,
+        input: ResponseItemEnvelope,
+    ) -> ThreadStoreResult<()> {
+        let record = RolloutItem::ResponseItem(input.clone());
+        self.thread_store
+            .seal_realtime_input(self.thread_id, frames, input)
+            .await?;
+        // The store owns the idempotent acceptance barrier. Apply append-derived
+        // metadata afterward so retrying a failed metadata update cannot append again.
+        self.observe_appended_metadata(&[record]).await
+    }
+
+    async fn observe_appended_metadata(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let update = self
+            .metadata_sync
+            .lock()
+            .await
+            .observe_appended_items(items);
+        if let Some(update) = update {
+            self.thread_store
+                .record_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: self.thread_id,
+                    patch: update.patch.clone(),
+                    include_archived: true,
+                })
+                .await?;
+            self.metadata_sync
+                .lock()
+                .await
+                .mark_pending_update_applied(&update);
+        }
+        Ok(())
     }
 
     pub async fn flush(&self) -> ThreadStoreResult<()> {

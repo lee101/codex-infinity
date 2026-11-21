@@ -1,4 +1,4 @@
-//! Verifies that reused Guardian reviewers use Blue for Daybreak without changing parent programs.
+//! Verifies reviewer program selection and parent-only enrollment across reviewer reuse.
 
 use anyhow::Result;
 use codex_core::TurnInputRequest;
@@ -8,6 +8,7 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SandboxPolicy;
@@ -21,11 +22,14 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use test_case::test_case;
 
-#[test_case(CodexAuth::from_api_key("test-api-key"); "api_key")]
-#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(); "chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), false; "api_key")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), false; "chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), true; "api_key_parent_only")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), true; "chatgpt_parent_only")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access_program(
+async fn guardian_reused_reviewer_respects_parent_program_scope(
     auth: CodexAuth,
+    parent_only: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
@@ -34,7 +38,7 @@ async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access
     );
 
     let server = responses::start_mock_server().await;
-    let test = test_codex()
+    let mut test = test_codex()
         .with_auth(auth)
         .with_model_info_override("gpt-6.1-sol", |_| {})
         .with_model_info_override("gpt-5.5", |model| {
@@ -44,9 +48,23 @@ async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access
         .with_config(|config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config.workspace_roots_explicit = false;
+            let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &SandboxPolicy::new_workspace_write_policy(),
+                config.cwd.as_path(),
+            );
             config
-                .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
-                .expect("set sandbox policy");
+                .permissions
+                .can_set_permission_profile(&permission_profile)
+                .expect("set permission profile");
+            config
+                .permissions
+                .set_workspace_roots(vec![config.cwd.clone()]);
+            config
+                .permissions
+                .set_permission_profile(permission_profile)
+                .expect("set permission profile");
+            config.workspace_roots = config.permissions.workspace_roots().to_vec();
             config
                 .features
                 .enable(Feature::ApiKeyCyberAccessPrograms)
@@ -54,8 +72,25 @@ async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access
         })
         .build_with_auto_env(&server)
         .await?;
+    if parent_only {
+        let mut options = test.start_thread_options().await;
+        options
+            .thread_extension_init
+            .insert(codex_core::RequiredCyberAccessPrograms {
+                allowed: vec![
+                    CyberAccessProgram::DaybreakBlue,
+                    CyberAccessProgram::DaybreakRed,
+                    CyberAccessProgram::Standard,
+                ],
+            });
+        test.codex.shutdown_and_wait().await?;
+        test.codex = test.thread_manager.start_thread(options).await?.thread;
+        test.codex
+            .thread_extension_data()
+            .remove::<codex_core::RequiredCyberAccessPrograms>();
+    }
 
-    let cases = [
+    let mut cases = vec![
         (
             Some(CyberAccessProgram::DaybreakBlue),
             Some("daybreak_blue"),
@@ -64,6 +99,9 @@ async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access
         (Some(CyberAccessProgram::Standard), Some("standard")),
         (None, None),
     ];
+    if parent_only {
+        cases.pop();
+    }
     let mut events = Vec::new();
     for (index, _) in cases.iter().enumerate() {
         events.push(responses::sse(vec![
@@ -131,12 +169,16 @@ async fn guardian_reused_reviewer_uses_blue_without_changing_parent_cyber_access
         .iter()
         .map(|(_, name)| name.map(|name| json!({ "cyber": name })))
         .collect::<Vec<_>>();
-    let expected_guardian_programs = [
-        Some(json!({ "cyber": "daybreak_blue" })),
-        Some(json!({ "cyber": "daybreak_blue" })),
-        Some(json!({ "cyber": "standard" })),
-        None,
-    ];
+    let expected_guardian_programs = if parent_only {
+        vec![None; cases.len()]
+    } else {
+        vec![
+            Some(json!({ "cyber": "daybreak_blue" })),
+            Some(json!({ "cyber": "daybreak_blue" })),
+            Some(json!({ "cyber": "standard" })),
+            None,
+        ]
+    };
     assert_eq!(
         guardian_requests
             .iter()

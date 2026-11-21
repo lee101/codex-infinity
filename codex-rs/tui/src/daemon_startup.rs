@@ -7,7 +7,7 @@
 //! configuration; removed features are inert, and unreported features are assumed disabled.
 
 use super::*;
-use codex_app_server_client::TypedRequestError;
+use crate::app_server_session::is_method_not_found;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ExperimentalFeatureStage;
@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 pub(super) const FAILURE_HINT: &str = "To work without the background server, rerun the same command with --no-daemon (including resume or fork and its arguments).";
 pub(super) const WSL_DRVFS_EXCLUSION: &str = "a Windows-mounted WSL CODEX_HOME (DrvFS/9p)";
+pub(super) const GATEWAY_SIGN_IN_EXCLUSION: &str = "custom provider or gateway sign-in";
 
 /// Returns whether `codex_home` is on a Windows-mounted WSL filesystem.
 pub fn uses_wsl_drvfs(codex_home: &std::path::Path) -> bool {
@@ -73,8 +74,6 @@ pub(super) fn exclusion(
         Some("workload identity")
     } else if exec_server_url.is_some() {
         Some("executor selection (CODEX_EXEC_SERVER_URL)")
-    } else if cli.agents_overview {
-        None
     } else if cli.config_profile_v2.is_some() {
         Some("--profile")
     } else {
@@ -197,12 +196,7 @@ pub(super) async fn compatibility_warning(
                     requested.retain(|name, _| !required.contains_key(name));
                 }
             }
-            Err(TypedRequestError::Server { source, .. })
-                if source.code == -32601
-                    || source.code == -32600
-                        && source.message.contains("configRequirements/read")
-                        && (source.message.contains("unknown variant")
-                            || source.message.contains("unknown method")) => {}
+            Err(err) if is_method_not_found(&err) => {}
             Err(_) => return Err("could not check daemon configuration requirements".to_string()),
         }
         if requested.is_empty() {

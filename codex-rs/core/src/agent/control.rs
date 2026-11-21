@@ -15,7 +15,6 @@ use crate::config::RolloutBudgetConfig;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
@@ -25,7 +24,6 @@ use crate::turn_timing::now_unix_timestamp_ms;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
-use codex_protocol::ResponseItemId;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -49,6 +47,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::ReadThreadParams;
+use codex_user_input::ResolvedUserInput;
 use futures::StreamExt;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -62,6 +61,11 @@ pub(crate) use self::runtime::AgentTreeShutdownState;
 pub(crate) use self::runtime::AgentTreeTeardownGuard;
 pub(crate) use self::runtime::LocalAgentRuntime;
 pub(crate) use self::watch::StatusSubscription;
+pub(in crate::agent) use spawn::effective_spawn_config;
+pub(in crate::agent) use spawn::fresh_child_history_and_tools;
+pub(in crate::agent) use spawn::inherited_dynamic_tools;
+pub(in crate::agent) use spawn_guard::PendingSpawn;
+pub(in crate::agent) use spawn_guard::SpawnOwner;
 
 mod api;
 mod budget;
@@ -134,16 +138,19 @@ impl LocalAgentControl {
     pub(crate) async fn send_input(
         &self,
         agent_id: ThreadId,
-        input: Vec<UserInput>,
+        input: Vec<ResolvedUserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+            .start_or_steer_resolved_turn(
+                TurnInputRequest::<ResolvedUserInput>::user_input(input).on_start(start_options),
+            )
             .await
         {
             Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Accepted) => unreachable!("user input returns a turn outcome"),
             Ok(TurnInputSubmission::Steered { .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
                 // `Op::UserInput` path returned a fresh ID for every steer, while the
@@ -208,6 +215,7 @@ impl LocalAgentControl {
             .await;
         let completed_at_ms = now_unix_timestamp_ms();
         let completed = ItemCompletedEvent {
+            content_token_count: None,
             thread_id,
             turn_id: turn_id.clone(),
             item,
@@ -255,32 +263,42 @@ impl LocalAgentControl {
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        mut communication: InterAgentCommunication,
+        communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
-        let observers = state.extensions.message_lifecycle_contributors();
-        let delivery = (!observers.is_empty()).then(|| {
-            let message_id = communication
-                .id
-                .take()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| ResponseItemId::new("amsg"));
-            communication.id = Some(message_id.clone());
-            MessageDelivery::publish(context.sender_thread_id, message_id, observers)
-        });
+        let terminal_result = context.kind == AgentCommunicationKind::Result;
+        let publish = || {
+            MessageDelivery::publish(
+                context.sender_thread_id,
+                context.source_tool_call_id.clone(),
+                state.extensions.message_lifecycle_contributors(),
+                terminal_result.then_some(&self.runtime.unconfirmed_results),
+            )
+        };
         let log_content = crate::agent_communication::send_log_content(&communication);
-        {
-            // Keep unloaded delivery atomic with publication of a reloaded session.
+        let (thread, guard) = {
+            // Choose the loaded submission queue or the eviction mailbox while reload is fenced.
             let threads = state.threads.read().await;
-            if !communication.trigger_turn && !threads.contains_key(&agent_id) {
-                let _membership = self.runtime.admit_start()?;
-                self.runtime.ensure_agent_known(agent_id)?;
-                let submission_id = uuid::Uuid::now_v7().to_string();
+            let thread = threads.get(&agent_id);
+            let guard = thread
+                .filter(|_| terminal_result)
+                .and_then(|thread| Arc::clone(&thread.residency_gate).try_read_owned().ok());
+            if !communication.trigger_turn
+                && (thread.is_none() || (terminal_result && guard.is_none()))
+            {
+                // A reporting child already holds membership until it publishes the result.
+                let _membership = (!terminal_result)
+                    .then(|| self.runtime.admit_start())
+                    .transpose()?;
+                if thread.is_none() {
+                    self.runtime.ensure_agent_known(agent_id)?;
+                }
+                let submission_id = Uuid::now_v7().to_string();
                 self.runtime.mailboxes.enqueue(
                     agent_id,
                     Some(submission_id.clone()),
-                    vec![crate::PendingAgentMessage::new(communication, delivery)],
+                    vec![crate::PendingAgentMessage::new(communication, publish())],
                 )?;
                 drop(threads);
                 crate::agent_communication::emit_agent_communication_send(
@@ -291,8 +309,19 @@ impl LocalAgentControl {
                 );
                 return Ok(submission_id);
             }
-        }
-        // Loaded recipients retain submission ordering with follow-ups and interrupts.
+            (
+                thread.cloned().ok_or(CodexErr::ThreadNotFound(agent_id))?,
+                guard,
+            )
+        };
+        let guard = match guard {
+            Some(guard) => {
+                self.runtime.touch_v2_recipient(&thread);
+                Some(guard)
+            }
+            None => self.runtime.pin_v2_residency(&thread).await?,
+        };
+        let delivery = publish();
         let result = submit_loaded_agent_communication(
             agent_id,
             communication,
@@ -300,7 +329,7 @@ impl LocalAgentControl {
             log_content.as_deref(),
             start_options,
             |op, parent_turn_id, root_turn_id| {
-                state.send_op(agent_id, op, parent_turn_id, root_turn_id, delivery)
+                state.send_pinned_op(&thread, op, parent_turn_id, root_turn_id, guard, delivery)
             },
         )
         .await;
@@ -309,17 +338,14 @@ impl LocalAgentControl {
     }
 
     /// Interrupt the current task for an existing agent thread.
-    pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+    pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId, op: Op) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
         self.handle_thread_request_result(
             agent_id,
             &state,
             state
                 .send_op(
-                    agent_id,
-                    Op::Interrupt,
-                    /*parent_turn_id*/ None,
-                    /*root_turn_id*/ None,
+                    agent_id, op, /*parent_turn_id*/ None, /*root_turn_id*/ None,
                     /*message_delivery*/ None,
                 )
                 .await,
@@ -521,8 +547,10 @@ impl LocalAgentControl {
                     message,
                     /*trigger_turn*/ false,
                 );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
+                let context = AgentCommunicationContext::new(
+                    AgentCommunicationKind::CompletionWatcher,
+                    child_thread_id,
+                );
                 let _ = control
                     .send_inter_agent_communication(
                         parent_thread_id,
@@ -626,35 +654,28 @@ impl LocalAgentControl {
         state: &Arc<ThreadManagerState>,
         session_source: Option<&SessionSource>,
     ) -> Option<TurnEnvironmentSnapshot> {
-        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id, ..
-        })) = session_source
-        else {
-            return None;
-        };
-
-        let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+        let parent_thread_id = session_source?.parent_thread_id()?;
+        let parent_thread = state.get_thread(parent_thread_id).await.ok()?;
         Some(parent_thread.session.inherited_environment_snapshot().await)
     }
 
+    /// Returns true after publication, or false when the source or configuration skips it.
     async fn persist_thread_spawn_edge_for_source(
         &self,
-        child_thread: &crate::CodexThread,
+        ephemeral: bool,
         child_thread_id: ThreadId,
         session_source: Option<&SessionSource>,
-    ) {
+    ) -> CodexResult<bool> {
         let Some(parent_thread_id) = session_source.and_then(SessionSource::parent_thread_id)
         else {
-            return;
+            return Ok(false);
         };
-        if child_thread.config_snapshot().await.ephemeral {
-            return;
+        if ephemeral {
+            return Ok(false);
         }
-        let Ok(state) = self.runtime.upgrade() else {
-            return;
-        };
+        let state = self.runtime.upgrade()?;
         let Some(agent_graph_store) = state.agent_graph_store() else {
-            return;
+            return Ok(false);
         };
         if let Err(err) = agent_graph_store
             .upsert_thread_spawn_edge(
@@ -665,7 +686,11 @@ impl LocalAgentControl {
             .await
         {
             warn!("failed to persist thread-spawn edge: {err}");
+            return Err(CodexErr::Fatal(
+                "failed to persist spawned agent relationship".to_string(),
+            ));
         }
+        Ok(true)
     }
 }
 
@@ -674,14 +699,15 @@ async fn inherited_exec_policy_for_source(
     session_source: Option<&SessionSource>,
     child_config: &Config,
 ) -> Option<Arc<crate::exec_policy::ExecPolicyManager>> {
-    let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id, ..
-    })) = session_source
-    else {
-        return None;
-    };
+    let parent_thread_id = session_source?.parent_thread_id()?;
+    let parent_thread = state.get_thread(parent_thread_id).await.ok()?;
+    inherited_exec_policy_for_parent(&parent_thread, child_config).await
+}
 
-    let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+pub(in crate::agent) async fn inherited_exec_policy_for_parent(
+    parent_thread: &crate::CodexThread,
+    child_config: &Config,
+) -> Option<Arc<crate::exec_policy::ExecPolicyManager>> {
     let parent_config = parent_thread.session.get_config().await;
     if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, child_config) {
         return None;

@@ -41,13 +41,14 @@ pub enum CodeModeOutputTruncation {
     /// transmitting output (10,000 tokens by default). Clients must not truncate
     /// it again or append the script error: status and error metadata remain separate.
     ///
-    /// Between observations, the host retains at most
-    /// [`crate::host::BOUNDED_OUTPUT_MAX_BYTES`] of output payload. It also
-    /// bounds the storage for retained items separately, without charging it
-    /// against the payload or observation token budgets.
-    /// Ordinary text notices report overflow, even for a zero-token budget.
-    /// Media are indivisible and can be omitted if they exceed the collector.
-    /// Without overflow, formatting matches Core's client policy.
+    /// A complete observation keeps up to [`crate::host::BOUNDED_OUTPUT_MAX_BYTES`]
+    /// of text, [`crate::host::BOUNDED_OUTPUT_MAX_IMAGE_BYTES`] of inline image URLs,
+    /// and [`crate::host::BOUNDED_OUTPUT_MAX_AUDIO_BYTES`] of audio URLs, subject
+    /// to a separate item limit. While these limits hold, formatting matches
+    /// Core's client policy. On text overflow the collector keeps a prefix and a
+    /// rolling tail. Each image or audio clip is admitted if it fits its remaining
+    /// byte allowance. Eviction at the item limit can free space for later media.
+    /// Media are indivisible. Bounded loss notices survive even a zero-token budget.
     Server,
 }
 
@@ -56,6 +57,8 @@ pub enum CodeModeOutputTruncation {
 pub struct CodeModeSessionOptions {
     pub cell_execution_limits: CodeModeSessionCellExecutionLimits,
     pub output_truncation: CodeModeOutputTruncation,
+    /// Interval for idle gRPC heartbeats. Zero disables them.
+    pub heartbeat_interval_s: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -223,7 +226,22 @@ pub trait CodeModeSessionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Observes a host without starting a session. Process-owned providers must
+    /// not start or replace a host. Network providers may connect or reconnect
+    /// according to their transport policy. Sampling failures and cancellation
+    /// must not explicitly reset the shared execution connection.
+    fn sample_process_metrics(
+        &self,
+    ) -> CodeModeSessionResultFuture<'_, crate::CodeModeProcessMetricsSample> {
+        Box::pin(async { Ok(crate::CodeModeProcessMetricsSample::Unsupported) })
+    }
+
     fn create_session(&self) -> CodeModeSessionProviderFuture<'_>;
+
+    /// Returns the default options for callers that need to override one setting.
+    fn default_session_options(&self) -> CodeModeSessionOptions {
+        CodeModeSessionOptions::default()
+    }
 
     /// Creates a session whose cells share the supplied execution limits.
     ///

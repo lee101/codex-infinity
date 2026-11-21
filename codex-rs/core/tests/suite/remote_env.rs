@@ -51,6 +51,7 @@ use codex_history::RolloutItem;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkProxyConfig;
+use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::CollaborationMode;
@@ -64,6 +65,8 @@ use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SandboxPermissions;
 use codex_protocol::models::input_text;
+use codex_protocol::openai_models::GuardianModelPolicy;
+use codex_protocol::openai_models::GuardianReviewMode;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -405,6 +408,13 @@ async fn remote_test_env_exposes_target_shell_and_exec_guidance_to_model() -> Re
             .map(str::trim),
         Some(expected_shell),
     );
+    let login_description = exec_command["parameters"]["properties"]["login"]["description"]
+        .as_str()
+        .context("login should have a description")?;
+    assert_eq!(
+        login_description.contains("In PowerShell, false skips profiles."),
+        expected_shell == "<shell>powershell</shell>",
+    );
 
     Ok(())
 }
@@ -716,10 +726,7 @@ async fn environment_permissions_follow_configuration_ownership() -> Result<()> 
             turn_context.permission_profile,
             turn_context.active_permission_profile
         ),
-        (
-            Some(PermissionProfile::read_only()),
-            Some(owner_active_profile)
-        )
+        (PermissionProfile::read_only(), Some(owner_active_profile))
     );
 
     Ok(())
@@ -817,7 +824,7 @@ async fn executor_profile_roots_survive_settings_restore_and_turn_recording() ->
             context.permission_profile,
             context.active_permission_profile,
         ),
-        (Some(expected_profile), Some(active_profile))
+        (expected_profile, Some(active_profile))
     );
     Ok(())
 }
@@ -917,6 +924,15 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
     )
     .await;
     let mut builder = test_codex().with_config(|config| {
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::workspace_write_with(
+                &[],
+                NetworkSandboxPolicy::Restricted,
+                /*exclude_tmpdir_env_var*/ true,
+                /*exclude_slash_tmp*/ true,
+            ))
+            .expect("workspace permissions");
         assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
         assert!(
             config
@@ -982,6 +998,16 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
     );
     assert_eq!(snapshot.cwd(), &next_cwd);
     assert_eq!(snapshot.workspace_roots, vec![next_cwd.clone()]);
+    let policy = snapshot.permission_profile.file_system_sandbox_policy();
+    assert_eq!(
+        [
+            next_cwd.join("ordinary.txt"),
+            next_cwd.join(".git/config"),
+            initial_cwd.join("ordinary.txt"),
+        ]
+        .map(|path| policy.can_write_local_path_with_cwd(path.as_path(), next_cwd.as_path())),
+        [true, false, false],
+    );
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
@@ -1413,7 +1439,9 @@ async fn read_exec_server_json(websocket: &mut WebSocketStream<TcpStream>) -> Va
     }
 }
 
-async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStream<TcpStream> {
+pub(super) async fn accept_initialized_exec_server(
+    listener: TcpListener,
+) -> WebSocketStream<TcpStream> {
     let (stream, _) = listener.accept().await.expect("connection");
     let mut websocket = accept_async(stream).await.expect("websocket handshake");
 
@@ -1452,11 +1480,6 @@ async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
         .expect("environment info response");
 }
 
-async fn serve_environment_info(listener: TcpListener) {
-    let mut websocket = accept_initialized_exec_server(listener).await;
-    send_environment_info(&mut websocket).await;
-}
-
 pub(super) async fn serve_environment_with_agents_md(
     listener: TcpListener,
     contents: &str,
@@ -1474,12 +1497,20 @@ async fn serve_environment_with_instruction_files(
     contents: &str,
     skill: Option<&str>,
     attach: tokio::sync::oneshot::Receiver<()>,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> usize {
     let mut websocket = accept_initialized_exec_server(listener).await;
     attach.await.expect("attach signal");
     send_environment_info(&mut websocket).await;
+    serve_instruction_file_requests(websocket, contents, skill, shutdown).await
+}
 
+async fn serve_instruction_file_requests(
+    mut websocket: WebSocketStream<TcpStream>,
+    contents: &str,
+    skill: Option<&str>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> usize {
     let mut agents_md_reads = 0;
     loop {
         let request = tokio::select! {
@@ -1610,6 +1641,7 @@ impl NoiseRendezvousConnectProvider for OfflineThenReadyNoiseConnectProvider {
             });
         }
         let bundle = NoiseRendezvousConnectBundle {
+            http_headers: Default::default(),
             websocket_url: self.websocket_url.clone(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             executor_registration_id: "ready-first-registration".to_string(),
@@ -1629,7 +1661,7 @@ impl AuthProvider for NoopRegistryAuthProvider {
 }
 
 async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_count: usize) {
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(30), async {
         while response_mock.requests().len() < expected_count {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2343,7 +2375,8 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
     let exec_command_parameters = response_mock
         .requests()
         .iter()
-        .map(|request| {
+        .enumerate()
+        .map(|(index, request)| {
             let body = request.body_json();
             let exec_command = body["tools"]
                 .as_array()
@@ -2351,14 +2384,22 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
                 .iter()
                 .find(|tool| tool["name"] == "exec_command")
                 .context("exec_command should stay available")?;
-            let parameters = &exec_command["parameters"];
-            parameters["properties"]
+            let mut parameters = exec_command["parameters"].clone();
+            let login = parameters["properties"]
                 .get("login")
                 .context("login should be advertised regardless of environment state or policy")?;
+            let description = login["description"].as_str().context("login description")?;
+            let ready = matches!(index, 4 | 5 | 8);
+            assert_eq!(
+                description.contains("In PowerShell, false skips profiles."),
+                ready && matches!(test_target_os(), TestTargetOs::Windows),
+            );
             parameters["properties"].get("shell").context(
                 "shell should be advertised regardless of environment state or shell mode",
             )?;
-            Ok(parameters.clone())
+            // Only shell-specific wording may change when the executor becomes ready.
+            parameters["properties"]["login"]["description"] = Value::Null;
+            Ok(parameters)
         })
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(
@@ -3216,6 +3257,24 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
     let server = start_mock_server().await;
     let completed_response =
         |id: &str, item| sse(vec![ev_response_created(id), item, ev_completed(id)]);
+    if tool == "mcp_elicitation" {
+        // Probe flags are observational, so the async scorer still runs. Keep its
+        // responses separate from the parent and synchronous Guardian review.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt-5.6-luna",
+                "tool_choice": "none",
+            })))
+            .respond_with(core_test_support::responses::sse_response(
+                completed_response(
+                    "resp-guardian-score",
+                    ev_assistant_message("msg-guardian-score", "high"),
+                ),
+            ))
+            .with_priority(/*p*/ 1)
+            .mount(&server)
+            .await;
+    }
     let responses = mount_sse_sequence(
         &server,
         vec![
@@ -3227,11 +3286,22 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
                     &json!({ "environment_id": REMOTE_ENVIRONMENT_ID }).to_string(),
                 ),
             ),
-            completed_response(
-                "resp-guardian-command",
-                if tool == "mcp_elicitation" {
-                    ev_function_call_with_namespace(EXEC_CALL_ID, "mcp__cua_repl", "js", "{}")
-                } else {
+            if tool == "mcp_elicitation" {
+                let mut call =
+                    ev_function_call_with_namespace(EXEC_CALL_ID, "mcp__cua_repl", "js", "{}");
+                call["item"]["id"] = json!("cua-item");
+                sse(vec![
+                    ev_response_created("resp-guardian-command"),
+                    json!({
+                        "type": "response.metadata", "response_id": "resp-guardian-command",
+                        "metadata": {"guardian": {"item_id": "cua-item", "requires_review": false}}
+                    }),
+                    call,
+                    ev_completed("resp-guardian-command"),
+                ])
+            } else {
+                completed_response(
+                    "resp-guardian-command",
                     ev_function_call(
                         EXEC_CALL_ID,
                         "exec_command",
@@ -3242,9 +3312,9 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
                             "justification": "Review the newly ready remote environment.",
                         })
                         .to_string(),
-                    )
-                },
-            ),
+                    ),
+                )
+            },
             completed_response(
                 "resp-guardian-review",
                 ev_assistant_message(
@@ -3267,16 +3337,28 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
             if tool == "mcp_elicitation" {
+                config
+                    .features
+                    .enable(Feature::GuardianV2)
+                    .expect("enable Guardian v2");
                 config.mcp_servers.set(serde_json::from_value(json!({
                     "cua_repl": {
                         "command": if cfg!(windows) { "python" } else { "python3" },
                         "args": ["-u", "-c", super::guardian_mcp_elicitation::ELICITATION_SERVER,
-                            json!([{"codex_sensitive_action": true}]).to_string(), "forward"],
+                            "[{}]", "forward"],
                         "default_tools_approval_mode": "approve",
                     }
                 })).expect("MCP server config")).expect("set MCP fixture");
             }
         });
+    if tool == "mcp_elicitation" {
+        builder = builder.with_model_info_override("gpt-5.5", |model| {
+            model.guardian = Some(GuardianModelPolicy {
+                computer_use: Some(GuardianReviewMode::Adaptive),
+                ..Default::default()
+            });
+        });
+    }
     let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let exec_server = tokio::spawn(serve_environment_with_agents_md(
@@ -3344,10 +3426,18 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
         .await?;
     wait_for_response_request_count(&responses, /*expected_count*/ 1).await;
     attach_tx.send(()).expect("attach remote environment");
+    let mut was_denied = false;
     wait_for_event(&test.codex, |event| {
+        if let EventMsg::GuardianAssessment(assessment) = event
+            && assessment.status == GuardianAssessmentStatus::Denied
+            && assessment.target_item_id.as_deref() == Some(EXEC_CALL_ID)
+        {
+            was_denied = true;
+        }
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    assert!(was_denied, "Guardian should deny the action");
 
     let requests = responses.requests();
     assert!(
@@ -3363,10 +3453,16 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
         })
         .context("expected Guardian review request")?;
     let guardian_context = guardian_request.message_input_texts("user").join("\n");
+    // Both actions start in the remote-primary step, but the MCP server runs locally.
+    let (owner_denied_path, other_denied_path) = if tool == "mcp_elicitation" {
+        (&local_denied_path, &remote_denied_path)
+    } else {
+        (&remote_denied_path, &local_denied_path)
+    };
     for expected in [
         "<environment id=\"remote\" primary=\"true\">".to_string(),
         format!("<cwd>{}</cwd>", remote_cwd.display()),
-        format!("- path `{}`", remote_denied_path.display()),
+        format!("- path `{}`", owner_denied_path.display()),
     ] {
         assert!(
             guardian_context.contains(&expected),
@@ -3374,8 +3470,8 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
         );
     }
     assert!(
-        !guardian_context.contains(&format!("- path `{}`", local_denied_path.display())),
-        "Guardian used the stale local environment's denied-read policy: {guardian_context}"
+        !guardian_context.contains(&format!("- path `{}`", other_denied_path.display())),
+        "Guardian used the other environment's denied-read policy: {guardian_context}"
     );
     let rejection = requests
         .last()
@@ -3559,7 +3655,15 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
     })
     .await;
 
-    serve_environment_info(listener).await;
+    let mut websocket = accept_initialized_exec_server(listener).await;
+    send_environment_info(&mut websocket).await;
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let executor = tokio::spawn(serve_instruction_file_requests(
+        websocket,
+        "",
+        /*skill*/ None,
+        shutdown_rx,
+    ));
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
@@ -3646,6 +3750,8 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
         Some(&json!("zsh"))
     );
 
+    shutdown.send(()).expect("stop executor");
+    executor.await?;
     Ok(())
 }
 

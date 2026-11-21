@@ -21,6 +21,7 @@ use crate::RouteFailureClass;
 use crate::client::TransportClient;
 use crate::client::apply_default_headers;
 use crate::request_draft::RequestDraft;
+use crate::request_draft::prevent_body_redirects;
 use crate::route_aware_redirect::MAX_REDIRECTS;
 use crate::route_aware_redirect::insert_referer;
 use crate::route_aware_redirect::is_redirect;
@@ -104,7 +105,12 @@ impl RouteAwareClientPool {
                     .await?;
                 client.request_logging = self.client_builder.request_logging;
                 if let Some(headers) = draft_headers.take() {
-                    request = RequestDraft { request, headers }.build(&client)?;
+                    request = RequestDraft {
+                        request,
+                        headers,
+                        private_body: draft.private_body,
+                    }
+                    .build(&client)?;
                     request_url = request.url().to_string();
                     apply_default_headers(request.headers_mut(), &self.default_headers);
                 }
@@ -122,6 +128,11 @@ impl RouteAwareClientPool {
                 let version = request.version();
                 let timeout = request.timeout().copied();
                 let replay = request.try_clone();
+                let private_body = draft.private_body && redirects == 0;
+                if private_body {
+                    // Connection recovery uses the original URL and clients with redirects disabled.
+                    prevent_body_redirects(&mut request);
+                }
                 let result = if follows_redirects_manually {
                     client.execute_without_request_logging(request).await
                 } else {
@@ -174,7 +185,7 @@ impl RouteAwareClientPool {
                             headers,
                             version,
                             timeout,
-                            replay,
+                            replay.filter(|_| !private_body),
                             next_url,
                         )
                     })
@@ -211,7 +222,12 @@ impl RouteAwareClientPool {
             if redirects >= MAX_REDIRECTS {
                 return Err(RouteAwareRequestError::TooManyRedirects);
             }
-            remove_sensitive_headers(next_request.headers_mut(), &current_url, &next_request_url);
+            remove_sensitive_headers(
+                next_request.headers_mut(),
+                &current_url,
+                &next_request_url,
+                self.http_client_factory.protects_sensitive_headers(),
+            );
             insert_referer(next_request.headers_mut(), &current_url, &next_request_url);
             request = next_request;
             redirects += 1;
@@ -322,7 +338,8 @@ impl RouteAwareClientPool {
         let client = self.windows_proxy_client(current_route, selected_tls_backend, &pipe)?;
         set_remaining_timeout(&mut request, timeout_deadline)?;
         // Keep the listener alive through a possible TLS retry.
-        match client.execute_without_request_logging(request).await {
+        let result = client.execute_without_request_logging(request).await;
+        match result {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.retry_with_rustls(

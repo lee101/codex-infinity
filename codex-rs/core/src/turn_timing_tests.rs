@@ -1,4 +1,7 @@
 use super::ToolBatchTiming;
+use codex_analytics::IncompleteReason;
+use codex_analytics::IncompleteReason::*;
+use codex_analytics::TurnCriticalPath;
 use codex_analytics::TurnProfile;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
@@ -20,6 +23,12 @@ use super::TurnProfileState;
 use super::TurnTimingState;
 use super::response_item_records_turn_ttft;
 use crate::ResponseEvent;
+
+impl TurnTimingState {
+    pub(crate) fn incomplete_reasons(&self) -> Vec<IncompleteReason> {
+        self.profile_state().incomplete_reasons.clone()
+    }
+}
 
 #[tokio::test]
 async fn turn_timing_state_records_ttft_only_once_per_turn() {
@@ -66,6 +75,7 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
     assert!(
         state
             .record_ttfm_for_turn_item(&TurnItem::AgentMessage(AgentMessageItem {
+                moderation: None,
                 id: "msg-1".to_string(),
                 content: Vec::new(),
                 phase: None,
@@ -79,6 +89,7 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
     assert_eq!(
         state
             .record_ttfm_for_turn_item(&TurnItem::AgentMessage(AgentMessageItem {
+                moderation: None,
                 id: "msg-2".to_string(),
                 content: Vec::new(),
                 phase: None,
@@ -288,7 +299,10 @@ fn turn_profile_counts_compaction_as_an_exclusive_phase() {
                 codex_analytics::TurnCriticalPathDurations {
                     duration_ms: 1100,
                     inference_ms: 800,
+                    sampling_ms: 300,
+                    compaction_ms: 500,
                     auto_review_ms: 0,
+                    auto_review_overhead_ms: Some(0),
                     user_wait_ms: 0,
                     tools_ms: 0,
                     overhead_ms: 300,
@@ -311,7 +325,8 @@ fn turn_profile_counts_compaction_as_an_exclusive_phase() {
         .as_ref()
         .unwrap()
         .durations(started_at, started_at + Duration::from_millis(1_100));
-    assert_eq!(totals.inference, Duration::from_millis(800));
+    assert_eq!(totals.sampling, Duration::from_millis(300));
+    assert_eq!(totals.compaction, Duration::from_millis(500));
     assert_eq!(totals.overhead, Duration::from_millis(300));
     assert_eq!(totals.user_wait, Duration::ZERO);
 }
@@ -332,7 +347,10 @@ async fn turn_profile_and_duration_share_a_completion_instant() {
         codex_analytics::TurnCriticalPath::Complete(codex_analytics::TurnCriticalPathDurations {
             duration_ms: duration_ms.unwrap() as u64,
             inference_ms: 0,
+            sampling_ms: 0,
+            compaction_ms: 0,
             auto_review_ms: 0,
+            auto_review_overhead_ms: Some(0),
             user_wait_ms: 0,
             tools_ms: 0,
             overhead_ms: duration_ms.unwrap() as u64,
@@ -373,8 +391,9 @@ fn capture_preserves_phases_and_freezes_missing_dependencies() {
             .unwrap()
             .durations(started_at, time_after_turn_start(60)),
         PathDurations {
-            inference: Duration::from_millis(10),
+            sampling: Duration::from_millis(10),
             unknown: Duration::from_millis(30),
+            auto_review_overhead: None,
             overhead: Duration::from_millis(20),
             ..PathDurations::default()
         }
@@ -384,7 +403,10 @@ fn capture_preserves_phases_and_freezes_missing_dependencies() {
         codex_analytics::TurnCriticalPath::Complete(codex_analytics::TurnCriticalPathDurations {
             duration_ms: 60,
             inference_ms: 10,
+            sampling_ms: 10,
+            compaction_ms: 0,
             auto_review_ms: 0,
+            auto_review_overhead_ms: None,
             user_wait_ms: 0,
             tools_ms: 0,
             overhead_ms: 20,
@@ -401,17 +423,49 @@ fn capture_preserves_phases_and_freezes_missing_dependencies() {
 async fn invalidation_and_late_guard_drop_cannot_restore_a_frozen_path() {
     let timing = Arc::new(TurnTimingState::default());
     timing.enable_critical_path();
+    timing.invalidate_critical_path(&[CodeModeUnsupported]);
     timing.mark_turn_started(Instant::now()).await;
     let guard = timing.begin_tool_blocking(Some(ToolBatchTiming::default()));
-    timing.invalidate_critical_path();
-    let (_, _, profile) = timing.complete_profile_and_duration_ms().await;
-    assert_eq!(
-        profile.critical_path,
-        codex_analytics::TurnCriticalPath::Incomplete
-    );
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for reason in [UnsupportedOperation, UnattributedUserWait] {
+            let (timing, barrier) = (&timing, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                timing.invalidate_critical_path(&[CodeModeUnsupported, reason]);
+            });
+        }
+    });
+    let result = timing.complete_profile_and_duration_ms().await;
+    let TurnCriticalPath::Incomplete(reasons) = &result.2.critical_path else {
+        panic!("expected incomplete capture");
+    };
+    assert_eq!(reasons.first(), Some(&CodeModeUnsupported));
+    assert_eq!(reasons.len(), 3);
+    assert!(reasons.contains(&UnsupportedOperation) && reasons.contains(&UnattributedUserWait));
+    timing.invalidate_critical_path(&[ForcedTeardown]);
     timing.enable_critical_path();
     drop(guard);
     assert!(timing.snapshot_path(Instant::now()).is_none());
+    assert_eq!(timing.complete_profile_and_duration_ms().await, result);
+}
+
+#[test]
+fn critical_path_fallback_depends_on_whether_the_turn_started() {
+    let now = Instant::now();
+    let mut state = TurnProfileState {
+        capture_enabled: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        state.complete(now).critical_path,
+        TurnCriticalPath::Incomplete(vec![MissingTurnStart])
+    );
+    state.start(now);
+    assert_eq!(
+        state.complete(now).critical_path,
+        TurnCriticalPath::Incomplete(vec![Unclassified])
+    );
 }
 
 #[tokio::test]
@@ -467,7 +521,10 @@ fn critical_path_report_retains_fractional_millisecond_rounding_and_compaction()
         ..Default::default()
     };
     state.start(start);
-    state.begin_compaction(start);
+    state.begin_sampling(start);
+    let compact_at = start + Duration::from_nanos(999_999);
+    state.end_phase(compact_at, TurnProfilePhase::Sampling);
+    state.begin_compaction(compact_at);
     let end = start + Duration::from_nanos(1_999_999);
     state.end_phase(end, TurnProfilePhase::Compaction);
     let profile = state.complete(end);
@@ -476,11 +533,43 @@ fn critical_path_report_retains_fractional_millisecond_rounding_and_compaction()
         codex_analytics::TurnCriticalPath::Complete(codex_analytics::TurnCriticalPathDurations {
             duration_ms: 1,
             inference_ms: 1,
+            sampling_ms: 0,
+            compaction_ms: 1,
             auto_review_ms: 0,
+            auto_review_overhead_ms: Some(0),
             user_wait_ms: 0,
             tools_ms: 0,
             overhead_ms: 0,
             unknown_ms: 0,
         })
     );
+}
+
+#[test_case::test_case(false; "child_capture_disabled")]
+#[test_case::test_case(true; "child_capture_enabled")]
+#[tokio::test]
+async fn review_execution_uses_frozen_profile_window(capture_enabled: bool) {
+    let timing = super::TurnTimingState::default();
+    let execution = codex_direct_tool_timing::ReviewExecution::default();
+    execution.observe();
+    timing.observe_review_execution(execution.clone()).await;
+    if capture_enabled {
+        timing.enable_critical_path();
+    }
+    let start = Instant::now() - Duration::from_millis(25);
+    timing.mark_turn_started(start).await;
+    let first = timing.complete_profile_and_duration_ms().await;
+    let end = timing.state.lock().await.completed_at.unwrap().0;
+    assert_eq!(timing.complete_profile_and_duration_ms().await, first);
+    execution.seal();
+    let review_start = start - Duration::from_millis(100);
+    let review_end = end + Duration::from_millis(200);
+    let path = CriticalPath::default().auto_review(review_start, review_end, vec![execution]);
+    let totals = path.durations(review_start, review_end);
+    assert_eq!(
+        totals.auto_review_overhead,
+        Some(Duration::from_millis(300))
+    );
+    assert_eq!(totals.auto_review, review_end.duration_since(review_start));
+    assert_eq!(first.1, Some(end.duration_since(start).as_millis() as i64));
 }

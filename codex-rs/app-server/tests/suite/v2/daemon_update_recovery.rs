@@ -4,7 +4,7 @@ use super::connection_handling_websocket::DEFAULT_READ_TIMEOUT;
 use super::connection_handling_websocket::create_config_toml;
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::DISABLE_PLUGIN_STARTUP_TASKS_ARG;
+use app_test_support::DEFAULT_APP_SERVER_TEST_ARGS;
 use app_test_support::create_final_assistant_message_sse_response;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -53,6 +53,7 @@ async fn managed_restart_resumes_loaded_threads_and_goal_without_client() -> Res
     let mut client = connect_daemon_client(
         &socket_path,
         InitializeCapabilities {
+            required_human_approval: false,
             experimental_api: true,
             extensions: Some(std::collections::HashMap::from([(
                 "io.modelcontextprotocol/ui".into(),
@@ -132,6 +133,7 @@ async fn managed_restart_resumes_loaded_threads_and_goal_without_client() -> Res
     let mut reconnected = connect_daemon_client(
         &socket_path,
         InitializeCapabilities {
+            required_human_approval: false,
             experimental_api: true,
             extensions: Some(std::collections::HashMap::from([(
                 "io.modelcontextprotocol/ui".into(),
@@ -437,6 +439,176 @@ async fn managed_force_shutdown_exits_with_blocked_rollout_writer() -> Result<()
     assert_still_running(&mut server, "graceful shutdown must wait for the writer").await;
     request_shutdown(&server, &socket_path).await?;
     wait_success(&mut server).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_restart_preserves_child_result_received_during_drain() -> Result<()> {
+    use core_test_support::responses;
+
+    let home = TempDir::new()?;
+    let (release_first, first_gate) = oneshot::channel();
+    let (release_second, second_gate) = oneshot::channel();
+    let (release_guard, guard_gate) = oneshot::channel();
+    let (mock, _completions) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_function_call_with_namespace(
+                    "spawn-child",
+                    "collaboration",
+                    "spawn_agent",
+                    r#"{"task_name":"child","message":"Return the report","fork_turns":"none"}"#,
+                ),
+                responses::ev_completed("spawn-child"),
+            ]),
+        }],
+        vec![stream_chunk(
+            Some(first_gate),
+            "The child report is ready.",
+        )?],
+        vec![stream_chunk(
+            Some(second_gate),
+            "The child report is ready.",
+        )?],
+        vec![stream_chunk(Some(guard_gate), "Guard done")?],
+        vec![stream_chunk(/*gate*/ None, "Result received")?],
+        vec![stream_chunk(/*gate*/ None, "Resumed")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        format!(
+            "{config}\n[features]\nwake_on_agent_messages = true\ncode_mode = false\ncode_mode_only = false\n[features.multi_agent_v2]\nenabled = true\n"
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let parent = start_thread(&mut client, /*id*/ 2, json!({}))
+        .await?
+        .thread
+        .id;
+    start_turn(&mut client, /*id*/ 3, &parent).await?;
+    wait_for_requests(&mock, /*count*/ 3).await?;
+    // Either the parent's continuation or the child can reach the mock first.
+    // Release only the parent, leaving the child's final result gated.
+    let requests = mock.requests().await;
+    let first: serde_json::Value = serde_json::from_slice(&requests[1])?;
+    let first_is_parent = first["input"]
+        .as_array()
+        .context("model input")?
+        .iter()
+        .any(|item| item["type"] == "function_call_output" && item["call_id"] == "spawn-child");
+    let (release_parent, release_child) = if first_is_parent {
+        (release_first, release_second)
+    } else {
+        (release_second, release_first)
+    };
+    release_parent.send(()).expect("parent response is waiting");
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read = request(
+                &mut client,
+                /*id*/ 4,
+                "thread/read",
+                json!({"threadId":parent,"includeTurns":false}),
+            )
+            .await?;
+            if read["thread"]["status"]["type"] == "idle" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    let loaded = request(&mut client, /*id*/ 5, "thread/loaded/list", json!({})).await?;
+    let child = loaded["data"]
+        .as_array()
+        .context("loaded threads")?
+        .iter()
+        .find(|id| **id != json!(parent))
+        .context("child thread")?
+        .clone();
+    let guard = start_thread(&mut client, /*id*/ 6, json!({}))
+        .await?
+        .thread
+        .id;
+    start_turn(&mut client, /*id*/ 7, &guard).await?;
+    wait_for_requests(&mock, /*count*/ 4).await?;
+    request_shutdown(&server, &socket).await?;
+    // Fence drain admission before the child finishes. The unrelated turn keeps
+    // the daemon alive, independently of turn-publication timing.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            if let Err(error) = request(&mut client, /*id*/ 8, "thread/start", json!({})).await {
+                assert!(
+                    error.to_string().contains("Server is draining"),
+                    "{error:#}"
+                );
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    release_child.send(()).expect("child response is waiting");
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read = request(
+                &mut client,
+                /*id*/ 9,
+                "thread/read",
+                json!({"threadId":child,"includeTurns":false}),
+            )
+            .await?;
+            if read["thread"]["status"]["type"] == "idle" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    assert_still_running(&mut server, "guard turn must keep drain open").await;
+    release_guard.send(()).expect("guard response is waiting");
+    wait_success(&mut server).await?;
+
+    let previous_requests = mock.requests().await.len();
+    let mut successor = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    request(
+        &mut client,
+        /*id*/ 2,
+        "thread/resume",
+        json!({"threadId":parent,"excludeTurns":true}),
+    )
+    .await?;
+    start_turn(&mut client, /*id*/ 3, &parent).await?;
+    wait_for_requests(&mock, previous_requests + 1).await?;
+    let requests = mock.requests().await;
+    let resumed: serde_json::Value =
+        serde_json::from_slice(requests.last().context("resumed request")?)?;
+    let results: Vec<_> = resumed["input"]
+        .as_array()
+        .context("resumed input")?
+        .iter()
+        .filter(|item| item["type"] == "agent_message" && item["author"] == "/root/child")
+        .map(|item| item["content"].clone())
+        .collect();
+    successor.kill().await?;
+    assert_eq!(
+        results,
+        vec![json!([{
+            "type": "input_text",
+            "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\nThe child report is ready.",
+        }])],
+        "child result must survive an actual restart"
+    );
     Ok(())
 }
 
@@ -812,7 +984,7 @@ pub(super) fn spawn_server(home: &Path, socket_path: &Path) -> Result<Child> {
     let binary = codex_utils_cargo_bin::cargo_bin("codex-app-server")?;
     Ok(Command::new(binary)
         .args(["--listen", &format!("unix://{}", socket_path.display())])
-        .arg(DISABLE_PLUGIN_STARTUP_TASKS_ARG)
+        .args(DEFAULT_APP_SERVER_TEST_ARGS)
         .env("CODEX_HOME", home)
         // Match TestAppServer's isolation from the host's managed configuration.
         .env(

@@ -11,6 +11,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_feedback::CodexFeedback;
 use codex_http_client::HttpClientFactory;
+use codex_models_manager::manager::ModelCatalogSettings;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::ModelsEndpointResponse;
@@ -28,11 +29,44 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 
+fn test_thread_manager(
+    config: &codex_core::config::Config,
+    models_manager: Option<SharedModelsManager>,
+    auth_manager: Arc<codex_login::AuthManager>,
+) -> Arc<codex_core::ThreadManager> {
+    let factory = match models_manager {
+        Some(models) => codex_core::test_support::fixed_model_catalog(models),
+        None => Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+    };
+    let startup = codex_core::build_startup_models(
+        config,
+        auth_manager,
+        uuid::Uuid::new_v4().to_string(),
+        factory,
+    );
+    Arc::new(codex_core::ThreadManager::new(
+        config,
+        startup,
+        codex_core::CodexAppsToolsCache::default(),
+        codex_protocol::protocol::SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        codex_extension_api::empty_extension_registry(),
+        Arc::new(codex_core::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        codex_core::passthrough_image_store(),
+        codex_core::ThreadStoreBuilder::from_config(config, /*state_db*/ None).build(),
+        /*agent_graph_store*/ None,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ))
+}
+
 #[derive(Debug)]
 struct TestModelsEndpoint {
     fetch_count: AtomicUsize,
     fetched: Notify,
     release_second_fetch: Notify,
+    originator_endpoint: Option<Arc<TestModelsEndpoint>>,
 }
 
 impl TestModelsEndpoint {
@@ -41,6 +75,7 @@ impl TestModelsEndpoint {
             fetch_count: AtomicUsize::new(0),
             fetched: Notify::new(),
             release_second_fetch: Notify::new(),
+            originator_endpoint: None,
         })
     }
 
@@ -56,6 +91,15 @@ impl TestModelsEndpoint {
 }
 
 impl ModelsEndpointClient for TestModelsEndpoint {
+    fn for_originator(
+        &self,
+        _originator: codex_models_manager::ModelCatalogOriginator,
+    ) -> Option<Arc<dyn ModelsEndpointClient>> {
+        self.originator_endpoint
+            .clone()
+            .map(|endpoint| endpoint as Arc<dyn ModelsEndpointClient>)
+    }
+
     fn identity(&self) -> Option<String> {
         Some("test-provider".to_string())
     }
@@ -94,7 +138,10 @@ impl ModelsEndpointClient for TestModelsEndpoint {
 #[tokio::test]
 async fn refreshes_immediately_periodically_and_stops_when_dropped() {
     let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new();
+    let mut endpoint = TestModelsEndpoint::new();
+    let work_endpoint = TestModelsEndpoint::new();
+    work_endpoint.release_second_fetch.notify_one();
+    Arc::get_mut(&mut endpoint).unwrap().originator_endpoint = Some(work_endpoint.clone());
     let requirements_path = codex_home.path().join("requirements.toml");
     std::fs::write(&requirements_path, "model_provider = 'ollama'").unwrap();
     let config_manager = crate::config_manager::ConfigManager::new_for_tests(
@@ -123,6 +170,8 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
         endpoint.clone(),
         /*auth_manager*/ None,
     ));
+    let work_manager = models_manager.for_originator("codex_work_desktop").unwrap();
+    let mut work_updates = work_manager.model_catalog_updates().unwrap();
     let auth_manager = codex_login::AuthManager::shared_from_config(
         config.as_ref(),
         /*enable_codex_api_key_env*/ false,
@@ -132,18 +181,20 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
     let catalog = Arc::new(ModelCatalog::new(
         config_manager,
         Some(config.cwd.to_path_buf()),
-        config,
-        Arc::clone(&models_manager),
-        auth_manager,
+        Arc::clone(&config),
+        test_thread_manager(&config, Some(Arc::clone(&models_manager)), auth_manager),
     ));
     let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
 
     endpoint.wait_for_fetch_count(/*expected*/ 2).await;
     drop(worker);
     endpoint.release_second_fetch.notify_one();
+    work_endpoint.wait_for_fetch_count(/*expected*/ 2).await;
+    work_updates.changed().await.unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+    assert_eq!(work_endpoint.fetch_count.load(Ordering::SeqCst), 2);
 
     // Reloading after login preserves an embedded caller's typed --oss override.
     catalog.invalidate().await;
@@ -213,9 +264,8 @@ async fn background_refresh_blocks_invalid_requirements_then_recovers() -> anyho
     let catalog = Arc::new(ModelCatalog::new(
         config_manager,
         Some(config.cwd.to_path_buf()),
-        config,
-        models_manager,
-        auth_manager,
+        Arc::clone(&config),
+        test_thread_manager(&config, Some(models_manager), auth_manager),
     ));
     let feedback = CodexFeedback::new();
     // This test uses Tokio's current-thread runtime, so spawned refreshes share the subscriber.
@@ -300,9 +350,11 @@ async fn catalog_reload_recovers_after_cloud_failure() -> anyhow::Result<()> {
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
-    let models = codex_core::build_models_manager(&config, Arc::clone(&auth));
     let catalog = Arc::new(ModelCatalog::new(
-        manager, /*startup_cwd*/ None, config, models, auth,
+        manager,
+        /*startup_cwd*/ None,
+        Arc::clone(&config),
+        test_thread_manager(&config, /*models_manager*/ None, auth),
     ));
     failed.store(true, Ordering::SeqCst);
     catalog.invalidate().await;
@@ -351,8 +403,12 @@ async fn catalog_reload_recovers_original_project_after_startup_fallback() -> an
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
-    let models = codex_core::build_models_manager(&config, Arc::clone(&auth));
-    let catalog = ModelCatalog::new(manager, Some(project_path.clone()), config, models, auth);
+    let catalog = ModelCatalog::new(
+        manager,
+        Some(project_path.clone()),
+        Arc::clone(&config),
+        test_thread_manager(&config, /*models_manager*/ None, auth),
+    );
     let mut model = codex_models_manager::bundled_models_response()?
         .models
         .remove(0);

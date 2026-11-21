@@ -100,6 +100,7 @@ fn expected_source(index: usize) -> ExecutorPluginHookSource {
                     .expect("executor hook input"),
                     timeout_sec: None,
                     status_message: None,
+                    on_failure: None,
                 }],
             }],
             ..Default::default()
@@ -247,6 +248,7 @@ fn preserves_allowlisted_executor_plugin_hook_options() {
             .expect("manifest-provided executor hook input"),
         timeout_sec: Some(30),
         status_message: Some("Cleaning up Computer Use".to_string()),
+        on_failure: None,
     };
     expected.hooks.interrupt = expected.hooks.stop.clone();
 
@@ -401,7 +403,7 @@ fn resolves_apps_hook_metadata_from_the_registered_connector() {
             |server, tool| {
                 tool_info
                     .as_ref()
-                    .filter(|info| info.server_name == server && info.tool.name == tool)
+                    .filter(|info| info.server_name() == server && info.tool.name == tool)
             },
         );
         let expected = if admitted {

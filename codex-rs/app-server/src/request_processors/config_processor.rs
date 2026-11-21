@@ -6,6 +6,7 @@ use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::model_catalog::ModelCatalog;
+use crate::otel_config::map_otel_requirements_to_api;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
@@ -28,6 +29,7 @@ use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteErrorCode;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::ConfiguredHookFailurePolicy;
 use codex_app_server_protocol::ConfiguredHookHandler;
 use codex_app_server_protocol::ConfiguredHookMatcherGroup;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
@@ -71,10 +73,14 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "auth_elicitation",
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
     "codex_apps_mcp_2026_07_28",
+    "daybreak_program_propagation",
     "mcp_2026_07_28",
     "mcp_connection_sharing",
+    "mcp_lazy_stdio_startup",
+    "mcp_shared_repl_cwd",
     "memories",
     "mentions_v2",
+    "realtime_frames_local",
     "remote_control",
     "remote_plugin",
     "tool_suggest",
@@ -111,9 +117,18 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigReadParams,
     ) -> Result<ConfigReadResponse, JSONRPCErrorError> {
-        let fallback_cwd = params.cwd.as_ref().map(PathBuf::from);
-        let mut response = self.config_manager.read(params).await.map_err(map_error)?;
-        let config = self.load_latest_config(fallback_cwd).await?;
+        let cwd = params.cwd.as_ref().map(PathBuf::from);
+        let config = match self.load_latest_config(cwd).await {
+            Ok(config) => config,
+            Err(err) => {
+                // Report layer read/decoding errors before full-config validation errors, as before.
+                self.config_manager.read(params).await.map_err(map_error)?;
+                return Err(err);
+            }
+        };
+        let mut response =
+            ConfigManager::config_read_response(&config.config_layer_stack, params.include_layers)
+                .map_err(map_error)?;
         for feature_key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
             let Some(feature) = feature_for_key(feature_key) else {
                 continue;
@@ -208,6 +223,52 @@ impl ConfigRequestProcessor {
             )
             .await;
         Ok(None)
+    }
+
+    pub(crate) async fn model_provider_list(
+        &self,
+        params: codex_app_server_protocol::ModelProviderListParams,
+    ) -> Result<codex_app_server_protocol::ModelProviderListResponse, JSONRPCErrorError> {
+        self.config_manager
+            .model_provider_list(params)
+            .await
+            .map_err(map_error)
+    }
+
+    pub(crate) async fn model_provider_config_write(
+        &self,
+        params: codex_app_server_protocol::ModelProviderConfigWriteParams,
+    ) -> Result<codex_app_server_protocol::ModelProviderConfigWriteResponse, JSONRPCErrorError>
+    {
+        let result = self
+            .config_manager
+            .model_provider_config_write(params)
+            .await
+            .map_err(map_error);
+        let response = self.handle_config_mutation_result(result).await?;
+        self.model_catalog
+            .invalidate_if_current_provider(&response.provider.id)
+            .await;
+        Ok(response)
+    }
+
+    pub(crate) fn model_provider_default_set(
+        &self,
+        params: codex_app_server_protocol::ModelProviderDefaultSetParams,
+    ) -> futures::future::BoxFuture<'_, Result<ClientResponsePayload, JSONRPCErrorError>> {
+        // Keep provider config resolution off the shared request dispatcher stack.
+        Box::pin(async move {
+            let result = self
+                .config_manager
+                .model_provider_default_set(params)
+                .await
+                .map_err(map_error);
+            let response = self.handle_config_mutation_result(result).await?;
+            if response.status == codex_app_server_protocol::WriteStatus::Ok {
+                self.model_catalog.invalidate().await;
+            }
+            Ok(ClientResponsePayload::ModelProviderDefaultSet(response))
+        })
     }
 
     pub(crate) async fn model_provider_capabilities_read(
@@ -329,16 +390,12 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.thread_manager
-            .get_models_manager()
-            .set_api_key_model_discovery_enabled(
-                config.features.enabled(Feature::ApiKeyModelDiscovery),
-            );
-        self.model_catalog
-            .set_api_key_model_discovery_enabled(
-                config.features.enabled(Feature::ApiKeyModelDiscovery),
-            )
-            .await;
+        self.thread_manager.set_api_key_model_discovery_enabled(
+            config.features.enabled(Feature::ApiKeyModelDiscovery),
+        );
+        self.thread_manager.set_realtime_frames_local_enabled(
+            config.features.enabled(Feature::RealtimeFramesLocal),
+        );
         if should_start_background_rollout_migration && config.features.enabled(feature) {
             self.thread_manager.start_background_rollout_migration();
         }
@@ -371,8 +428,16 @@ pub(super) async fn reload_user_config(
     config_manager: &ConfigManager,
     thread_manager: &ThreadManager,
 ) {
-    // Reload owns several config snapshots; do not inline that future into dispatch.
+    // Publish local layers first so Guardian resolves their new policy fallbacks.
     Box::pin(reload_user_config_inner(config_manager, thread_manager)).await;
+    // Guardian still refreshes when unrelated configuration could not load.
+    refresh_guardian_policy(thread_manager).await;
+}
+
+pub(super) async fn refresh_guardian_policy(thread_manager: &ThreadManager) {
+    if let Err(error) = Box::pin(thread_manager.refresh_guardian_policy()).await {
+        tracing::warn!(kind = ?error.kind(), "failed to refresh Guardian policy");
+    }
 }
 
 async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager: &ThreadManager) {
@@ -452,6 +517,12 @@ pub(crate) fn map_requirements_to_api(
         }
         None => ConfigRequirementsToml::default(),
     };
+    let network = requirements
+        .permissions
+        .as_ref()
+        .and_then(|permissions| permissions.network.as_deref())
+        .cloned()
+        .or_else(|| requirements.network.clone());
 
     Some(ConfigRequirements {
         model_provider: requirements.model_provider,
@@ -577,7 +648,7 @@ pub(crate) fn map_requirements_to_api(
         enforce_residency: requirements
             .enforce_residency
             .map(map_residency_requirement_to_api),
-        network: requirements.network.map(map_network_requirements_to_api),
+        network: network.map(map_network_requirements_to_api),
         auto_review: requirements
             .auto_review
             .map(|auto_review| AutoReviewRequirements {
@@ -591,6 +662,9 @@ pub(crate) fn map_requirements_to_api(
                 service_tier: new_thread.service_tier,
             }),
         }),
+        otel: requirements
+            .otel
+            .map(|otel| map_otel_requirements_to_api(*otel)),
         sqlite_home: requirements.sqlite_home.map(Into::into),
         log_dir: requirements.log_dir.map(Into::into),
         model_catalog_json: requirements.model_catalog_json.map(Into::into),
@@ -792,6 +866,7 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
             timeout_sec,
             r#async,
             status_message,
+            on_failure,
             additional_context_limit,
         } => ConfiguredHookHandler::Command {
             command,
@@ -799,6 +874,7 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
             timeout_sec,
             r#async,
             status_message,
+            on_failure: on_failure.map(map_hook_failure_policy_to_api),
             additional_context_limit,
         },
         CoreHookHandlerConfig::McpTool {
@@ -807,15 +883,26 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
             input,
             timeout_sec,
             status_message,
+            on_failure,
         } => ConfiguredHookHandler::McpTool {
             server,
             tool,
             input,
             timeout_sec,
             status_message,
+            on_failure: on_failure.map(map_hook_failure_policy_to_api),
         },
         CoreHookHandlerConfig::Prompt {} => ConfiguredHookHandler::Prompt {},
         CoreHookHandlerConfig::Agent {} => ConfiguredHookHandler::Agent {},
+    }
+}
+
+fn map_hook_failure_policy_to_api(
+    policy: codex_config::HookFailurePolicy,
+) -> ConfiguredHookFailurePolicy {
+    match policy {
+        codex_config::HookFailurePolicy::Continue => ConfiguredHookFailurePolicy::Continue,
+        codex_config::HookFailurePolicy::Block => ConfiguredHookFailurePolicy::Block,
     }
 }
 

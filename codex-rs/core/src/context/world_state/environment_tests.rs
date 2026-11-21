@@ -110,6 +110,8 @@ fn snapshots() -> Result<()> {
                 error: None,
                 shell: None,
                 is_primary: false,
+                filesystem: None,
+                network_access: None,
             },
         )]
         .into_iter()
@@ -219,14 +221,14 @@ fn changing_primary_environment_updates_model_context_and_persisted_state() -> R
 }
 
 #[test]
-fn legacy_single_environment_snapshot_does_not_change() -> Result<()> {
+fn legacy_single_environment_snapshot_preserves_environment_and_refreshes_date() -> Result<()> {
     let environment = EnvironmentsState {
         environments: [("local".to_string(), primary("file:///repo", "bash")?)]
             .into_iter()
             .collect(),
         ..Default::default()
     };
-    let legacy_snapshot = serde_json::from_value::<EnvironmentsSnapshot>(json!({
+    let mut legacy_value = json!({
         "environments": {
             "local": {
                 "cwd": PathUri::parse("file:///repo")?.inferred_native_path_string(),
@@ -234,7 +236,8 @@ fn legacy_single_environment_snapshot_does_not_change() -> Result<()> {
                 "shell": "bash",
             },
         },
-    }))?;
+    });
+    let legacy_snapshot = serde_json::from_value::<EnvironmentsSnapshot>(legacy_value.clone())?;
 
     assert!(
         environment
@@ -254,6 +257,39 @@ fn legacy_single_environment_snapshot_does_not_change() -> Result<()> {
             "status": "available",
             "shell": "bash",
         })
+    );
+
+    let environment = EnvironmentsState {
+        current_date: Some("2026-06-19".to_string()),
+        ..environment
+    };
+    legacy_value["current_date"] = json!("2026-06-19");
+    let legacy_snapshot = serde_json::from_value(legacy_value)?;
+    assert!(
+        environment
+            .render_fragment_diff(PreviousSectionState::Known(&legacy_snapshot))
+            .1
+            .is_none()
+    );
+    let environment = EnvironmentsState {
+        current_date_is_utc: true,
+        ..environment
+    };
+    let (snapshot, update) =
+        environment.render_fragment_diff(PreviousSectionState::Known(&legacy_snapshot));
+    assert_eq!(
+        update
+            .expect("legacy date should be refreshed")
+            .render()
+            .expect_text(),
+        "<environment_context>\n  <current_date_utc>2026-06-19</current_date_utc>\n</environment_context>"
+    );
+    let snapshot = serde_json::from_value(serde_json::to_value(snapshot.unwrap())?)?;
+    assert!(
+        environment
+            .render_fragment_diff(PreviousSectionState::Known(&snapshot))
+            .1
+            .is_none()
     );
 
     Ok(())
@@ -340,6 +376,8 @@ fn available(cwd: &str, shell: &str) -> Result<EnvironmentState> {
         error: None,
         shell: Some(shell.to_string()),
         is_primary: false,
+        filesystem: None,
+        network_access: None,
     })
 }
 
@@ -357,6 +395,8 @@ fn starting(cwd: &str) -> Result<EnvironmentState> {
         error: None,
         shell: None,
         is_primary: false,
+        filesystem: None,
+        network_access: None,
     })
 }
 
@@ -371,6 +411,8 @@ fn failure_context_is_escaped_incremental_and_cleared_on_recovery() -> Result<()
                 error: Some("Repository <empty> & unavailable".to_string()),
                 shell: None,
                 is_primary: false,
+                filesystem: None,
+                network_access: None,
             },
         )]
         .into_iter()
@@ -440,7 +482,7 @@ fn failure_context_limits_total_detail_bytes_at_utf8_boundaries() {
             })
             .collect(),
     };
-    let states = environment_states(&snapshot);
+    let states = environment_states(&snapshot, /*per_environment*/ false);
     let details: Vec<_> = states
         .values()
         .map(|state| state.error.as_deref())

@@ -13,6 +13,7 @@ pub(super) struct LayoutSections {
     pub(super) question_area: Rect,
     pub(super) question_lines: Vec<HyperlinkLine>,
     pub(super) options_area: Rect,
+    pub(super) option_lines: Vec<Vec<HyperlinkLine>>,
     /// Layout already measured the wrapped choices, so the footer can use this flag
     /// without parsing and wrapping their Markdown again.
     pub(super) show_option_tip: bool,
@@ -24,7 +25,8 @@ pub(super) struct LayoutSections {
 impl AsyncQuestions {
     pub(super) fn layout_sections(&self, area: Rect) -> LayoutSections {
         let has_options = self.has_options();
-        let full_options_height = self.options_required_height(area.width);
+        let option_lines = self.option_rows(area.width);
+        let full_options_height = self.answer_height(area.width, &option_lines);
         let mut question_lines = self.wrapped_question_lines(area.width);
         let mut footer_pref = self.footer_lines(area.width, /*option_tip*/ None).len() as u16;
         if has_options
@@ -52,8 +54,9 @@ impl AsyncQuestions {
         let mut spacer_after_input = 0;
         let progress_height;
         let footer_lines;
+        let mut notes_height = 0;
 
-        let notes_height = if has_options {
+        if has_options {
             let min_options_height = remaining.min(1);
             // Reserve hints and spacers while retaining a row for the selected option.
             let reserved = footer_pref + progress_pref + DESIRED_SPACERS_BETWEEN_SECTIONS;
@@ -70,7 +73,6 @@ impl AsyncQuestions {
             spacer_after_question = u16::from(remaining > 0);
             remaining -= spacer_after_question;
             options_height += remaining.min(full_options_height.saturating_sub(options_height));
-            0
         } else {
             // Freeform answers take their preferred input height before hints and progress.
             let preferred_notes = self
@@ -89,8 +91,10 @@ impl AsyncQuestions {
             // Drop padding before input or prompt content in a constrained viewport.
             spacer_before_question = u16::from(remaining >= 2 && self.unanswered_count() > 1);
             spacer_after_question = u16::from(remaining >= 1);
-            min_notes + preferred_notes + remaining - spacer_before_question - spacer_after_question
-        };
+            notes_height = min_notes + preferred_notes + remaining
+                - spacer_before_question
+                - spacer_after_question;
+        }
 
         let mut y = area.y;
         let mut take_rows = |height| {
@@ -110,6 +114,7 @@ impl AsyncQuestions {
             question_area,
             question_lines,
             options_area,
+            option_lines,
             show_option_tip: options_height > 0 && options_height < full_options_height,
             notes_area,
             footer_lines,

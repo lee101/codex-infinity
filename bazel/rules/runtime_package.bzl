@@ -16,7 +16,6 @@ _PROFILE_INPUTS = [
     "//command_line_option:host_action_env",
     "//command_line_option:macos_minimum_os",
     "//command_line_option:host_platform",
-    "//command_line_option:extra_toolchains",
     _RUSTC_FLAGS,
     _EXEC_RUSTC_FLAGS,
 ]
@@ -61,11 +60,13 @@ def _release_profile_impl(settings, attr):
         # Compatibility with the Cargo musl release: aws-lc jitter can hang.
         profile["//command_line_option:copt"] += ["-DDISABLE_CPU_JITTER_ENTROPY"]
     elif attr.platform_os == "windows" and "@platforms//os:windows" in HOST_CONSTRAINTS:
-        # Native MSVC supplies the SDK and host tools for both architectures.
+        # Build tools run natively with the registered LLVM MSVC toolchain.
         profile["//command_line_option:host_platform"] = "//:local_windows_msvc"
-        profile["//command_line_option:extra_toolchains"] += [
-            "@local_config_cc//:cc-toolchain-x64_windows",
-            "@local_config_cc//:cc-toolchain-arm64_windows",
+    if attr.linux_x86_64_musl:
+        # Match the Cargo release linker for x86-64 static PIEs.
+        profile[_RUSTC_FLAGS] += [
+            "-Cllvm-args=--addrsig",
+            "-Clink-arg=-Wl,--icf=safe,-z,pack-relative-relocs",
         ]
     return profile
 
@@ -132,6 +133,7 @@ _runtime_binary_files = rule(
     attrs = {
         "binary": attr.label(mandatory = True, executable = True, cfg = _release_profile),
         "platform_os": attr.string(),
+        "linux_x86_64_musl": attr.bool(),
         "macos_minimum_os": attr.string(),
         "_allowlist_function_transition": attr.label(
             default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
@@ -152,13 +154,17 @@ def runtime_archive(name, srcs, **kwargs):
         **kwargs
     )
 
-def release_binary(binary, name = "release", **kwargs):
+def release_binary(binary, name = "release", macos_x86_64_minimum_os = "10.12", **kwargs):
     """Expose release_files and release.tar.gz; override name for sibling binaries."""
     kwargs.setdefault("tags", ["manual"])
     kwargs.setdefault("visibility", ["//visibility:public"])
     _runtime_binary_files(
         name = name + "_files",
         binary = binary,
+        linux_x86_64_musl = select({
+            "@llvm//platforms/config:linux_x86_64_musl": True,
+            "//conditions:default": False,
+        }),
         platform_os = select({
             "@platforms//os:macos": "macos",
             "@platforms//os:linux": "linux",
@@ -166,7 +172,7 @@ def release_binary(binary, name = "release", **kwargs):
         }),
         macos_minimum_os = select({
             "@platforms//cpu:aarch64": "11.0",
-            "//conditions:default": "10.12",
+            "//conditions:default": macos_x86_64_minimum_os,
         }),
         symbol_group = select({
             "@platforms//os:macos": "dsym_folder",

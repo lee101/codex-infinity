@@ -1,6 +1,8 @@
 //! Exercise backend policy preparation and dependency discovery.
 
 use super::backend;
+#[cfg(target_os = "linux")]
+use super::dependencies::IntegrityCommand;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -13,6 +15,8 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::FileContentsChecker;
 use codex_sandboxing::SandboxExecRequest;
+#[cfg(target_os = "linux")]
+use codex_sandboxing::SandboxIntegrityRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -51,6 +55,7 @@ pub(super) fn sandbox_request(
     policy: &FileSystemSandboxPolicy,
 ) -> SandboxExecRequest {
     SandboxExecRequest {
+        native_program: None,
         sandbox_override: SandboxOverride::NoOverride,
         command: vec![cwd.join("not-executed").to_string_lossy().into_owned()],
         cwd: PathUri::from_abs_path(cwd),
@@ -80,13 +85,7 @@ fn dependency_inventory_uses_launcher_location_and_command_path() -> io::Result<
     fs::create_dir(&cwd)?;
     fs::create_dir(&tools)?;
     fs::create_dir(tools.join("codex-resources"))?;
-    for path in [
-        tools.join("bwrap"),
-        tools.join("rg"),
-        cwd.join("rg"),
-        tools.join("codex"),
-        bundled.clone(),
-    ] {
+    for path in [tools.join("bwrap"), tools.join("codex"), bundled.clone()] {
         fs::write(&path, "fixture")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(/*mode*/ 0o755))?;
     }
@@ -95,18 +94,13 @@ fn dependency_inventory_uses_launcher_location_and_command_path() -> io::Result<
     let policy = FileSystemSandboxPolicy::restricted(vec![deny_glob("*.key")]);
     let mut request = sandbox_request(&cwd, &policy);
     request.command[0] = launcher.to_string_lossy().into_owned();
-    for (path, scanner) in [
-        ("../tools", tools.join("rg")),
-        (":../tools", tools.join("rg")),
-    ] {
+    let mut request = IntegrityCommand::from(SandboxIntegrityRequest::from(&request));
+    for path in ["../tools", ":../tools"] {
         request.env.insert("PATH".to_owned(), path.to_owned());
         let dependencies = backend::critical_dependencies(&request, &policy, &cwd)?
             .into_iter()
             .filter(|(name, _)| {
-                matches!(
-                    *name,
-                    "bundled_bwrap_candidate" | "system_bwrap_candidate" | "glob_scanner"
-                )
+                matches!(*name, "bundled_bwrap_candidate" | "system_bwrap_candidate")
             })
             .map(|(name, path)| path.and_then(fs::canonicalize).map(|path| (name, path)))
             .collect::<io::Result<Vec<_>>>()?;
@@ -118,7 +112,6 @@ fn dependency_inventory_uses_launcher_location_and_command_path() -> io::Result<
                     "system_bwrap_candidate",
                     tools.join("bwrap").into_path_buf()
                 ),
-                ("glob_scanner", scanner.into_path_buf()),
             ]
         );
     }
@@ -149,6 +142,7 @@ fn policy_preparation_uses_command_tmpdir_and_home() -> io::Result<()> {
     request
         .env
         .insert("HOME".to_owned(), home.to_string_lossy().into_owned());
+    let mut request = IntegrityCommand::from(SandboxIntegrityRequest::from(&request));
     for (tmpdir, expected) in [
         ("", None),
         ("scratch", Some(cwd.join("scratch"))),

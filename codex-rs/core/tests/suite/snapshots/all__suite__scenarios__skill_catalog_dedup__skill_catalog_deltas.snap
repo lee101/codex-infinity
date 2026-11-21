@@ -16,15 +16,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -40,14 +40,14 @@ Settings:
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
+
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
 
 02:message/developer[3]:
     [01] <skills_instructions>
@@ -60,7 +60,7 @@ Settings:
         - `r1` = `<SKILLS_ROOT>/.system`
         ### Available skills
         - imagegen: Generate or edit raster images when the task benefits from AI-created bitmap visuals such as...ctly in HTML/CSS/canvas. (file: r1/imagegen/SKILL.md) [hash=dcccaed407aafb03]
-        - openai-docs: Use for Codex models/pricing, scheduled tasks, skills, settings, setup, troubleshooting, ...merely mention Codex. (file: r1/openai-docs/SKILL.md) [hash=1c1693bbc4dfd0f7]
+        - openai-docs: API first-timers, Codex/Work Q&A. If the user already has an OpenAI API integration, skip...upplied text or data. (file: r1/openai-docs/SKILL.md) [hash=8ba7f79795ddc1cb]
         - skill-creator: Create or update a Codex skill with appropriately scoped instructions and any needed supporting resources. (file: r1/skill-creator/SKILL.md)
         - skill-installer: Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo pat...g private repos). (file: r1/skill-installer/SKILL.md) [hash=80e87da510d34d88]
         - browser-testing: Run browser tests for web applications. (file: r0/browser-testing/SKILL.md)
@@ -160,15 +160,15 @@ Settings:
 ## Window 2 (after request 7: input diverged at item 02)
 Settings: same as window 1
 -- request 8 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -184,14 +184,14 @@ Settings: same as window 1
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
+
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
 
 02:message/user:
     Inspect the available skills.
@@ -214,7 +214,7 @@ Settings: same as window 1
         - `r1` = `<SKILLS_ROOT>/.system`
         ### Available skills
         - imagegen: Generate or edit raster images when the task benefits from AI-created bitmap visuals such as...ctly in HTML/CSS/canvas. (file: r1/imagegen/SKILL.md) [hash=dcccaed407aafb03]
-        - openai-docs: Use for Codex models/pricing, scheduled tasks, skills, settings, setup, troubleshooting, ...merely mention Codex. (file: r1/openai-docs/SKILL.md) [hash=1c1693bbc4dfd0f7]
+        - openai-docs: API first-timers, Codex/Work Q&A. If the user already has an OpenAI API integration, skip...upplied text or data. (file: r1/openai-docs/SKILL.md) [hash=8ba7f79795ddc1cb]
         - skill-creator: Create or update a Codex skill with appropriately scoped instructions and any needed supporting resources. (file: r1/skill-creator/SKILL.md)
         - skill-installer: Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo pat...g private repos). (file: r1/skill-installer/SKILL.md) [hash=80e87da510d34d88]
         - code-review: Review code changes for correctness. (file: r0/code-review/SKILL.md)
@@ -295,15 +295,15 @@ Settings: same as window 1
 ## Window 3 (after request 11: input diverged at item 07)
 Settings: same as window 1
 -- request 12 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -319,14 +319,14 @@ Settings: same as window 1
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
+
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
 
 02:message/user:
     Inspect the available skills.
@@ -436,15 +436,15 @@ Settings: same as window 1
 ## Window 4 (after request 18: input diverged at item 10)
 Settings: same as window 1
 -- request 19 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -460,14 +460,14 @@ Settings: same as window 1
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
+
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
 
 02:message/user:
     Inspect the available skills.
@@ -508,7 +508,7 @@ Settings: same as window 1
         - `r1` = `<SKILLS_ROOT>/.system`
         ### Available skills
         - imagegen: Generate or edit raster images (file: r1/imagegen/SKILL.md)
-        - openai-docs: Use for Codex models/pricing, sc (file: r1/openai-docs/SKILL.md)
+        - openai-docs: API first-timers, Codex/Work Q&A (file: r1/openai-docs/SKILL.md)
         - skill-creator: Create or update a Codex skill w (file: r1/skill-creator/SKILL.md)
         - skill-installer: Install Codex skills into $C (file: r1/skill-installer/SKILL.md)
         - documentation: Write project documentation. (file: r0/documentation/SKILL.md)

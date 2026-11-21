@@ -275,6 +275,8 @@ pub struct GuardianAssessmentEvent {
 pub enum ExecApprovalKind {
     #[default]
     Command,
+    /// Requires a fresh human decision; automated and reusable approvals are invalid.
+    HumanCommand,
     WriteStdin,
 }
 
@@ -474,6 +476,10 @@ pub struct ElicitationRequestEvent {
     #[ts(optional)]
     pub turn_id: Option<String>,
     pub server_name: String,
+    /// Registration scope, not necessarily the server's execution environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment_id: Option<String>,
     #[ts(type = "string | number")]
     pub id: RequestId,
     pub request: ElicitationRequest,

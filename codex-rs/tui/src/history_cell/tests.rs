@@ -53,6 +53,7 @@ fn connected_server_version_notice_snapshot() {
     let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
         &settings,
         &target,
+        /*daemon_updates_allowed*/ true,
         /*server_home*/ None,
         "0.153.0",
         Some("0.152.1"),
@@ -78,14 +79,26 @@ fn local_daemon_version_notice_snapshot() {
         show_server_version_notice: true,
         ..Default::default()
     };
-    for (client, server, snapshot) in [
-        ("0.153.0", "0.152.1", "local_daemon_version_notice_snapshot"),
-        ("0.155.0-alpha.12", "0.156.0", "local_daemon_alpha_mismatch"),
-        ("0.0.0", "0.156.0", "local_daemon_source_mismatch"),
+    for (client, server, updates_allowed, snapshot) in [
+        (
+            "0.153.0",
+            "0.152.1",
+            true,
+            "local_daemon_version_notice_snapshot",
+        ),
+        (
+            "0.155.0-alpha.12",
+            "0.156.0",
+            true,
+            "local_daemon_alpha_mismatch",
+        ),
+        ("0.0.0", "0.156.0", true, "local_daemon_source_mismatch"),
+        ("0.153.0", "0.152.1", false, "local_daemon_updates_disabled"),
     ] {
         let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
             &settings,
             &target,
+            updates_allowed,
             /*server_home*/ None,
             client,
             Some(server),
@@ -494,6 +507,7 @@ fn proposed_plan_cell_unwraps_markdown_fenced_table() {
 #[test]
 fn structured_tool_cell_renders_raw_plain_text_without_prefix_or_style() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "search".into(),
         tool: "find_docs".into(),
         arguments: Some(json!({"query": "raw mode"})),
@@ -519,10 +533,32 @@ fn structured_tool_cell_renders_raw_plain_text_without_prefix_or_style() {
 }
 
 #[test]
+fn delegated_message_list_spacing_in_scrollback_and_transcript() {
+    let cell = DelegatedMessageCell::new(
+        "other",
+        "- One\n- This item has enough words to wrap\n- Three".to_string(),
+    );
+    let width = 32;
+    let scrollback = render_lines(&cell.display_lines(width)).join("\n");
+    let transcript = render_lines(&visible_lines(fullscreen_session_lines(
+        &cell,
+        width,
+        /*detailed*/ false,
+        HistoryRenderMode::Rich,
+    )))
+    .join("\n");
+
+    insta::assert_snapshot!(format!(
+        "Scrollback\n{scrollback}\n\nRedrawable transcript\n{transcript}"
+    ));
+}
+
+#[test]
 fn raw_mode_toggle_transcript_snapshot() {
     let mut tool_cell = new_active_mcp_tool_call(
         "call-snapshot".to_string(),
         McpInvocation {
+            environment_id: None,
             server: "workspace".to_string(),
             tool: "inspect".to_string(),
             arguments: Some(json!({"path": "README.md"})),
@@ -586,7 +622,7 @@ fn image_generation_call_renders_saved_path() {
         "call-image-generation".to_string(),
         "completed",
         Some("A tiny blue square".to_string()),
-        Some(saved_path),
+        Some(saved_path.clone()),
     );
 
     assert_eq!(
@@ -597,10 +633,25 @@ fn image_generation_call_renders_saved_path() {
             expected_saved_path,
         ],
     );
+    let lines = cell.transcript_hyperlink_lines(/*width*/ 80);
+    let link = &lines.last().unwrap().hyperlinks[0];
+    assert_eq!(
+        link.reader_destination(/*documents*/ true),
+        Some(crate::terminal_hyperlinks::ReaderLink::Document(
+            crate::markdown_render::FileLink {
+                path: saved_path.to_string_lossy().into_owned(),
+                location: None,
+            },
+        )),
+    );
+    assert_eq!(link.reader_destination(/*documents*/ false), None);
 }
 
 fn session_configured_event(model: &str) -> ThreadSessionState {
     ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
@@ -614,7 +665,7 @@ fn session_configured_event(model: &str) -> ThreadSessionState {
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/tmp/project").abs(),
+        cwd: codex_utils_path_uri::PathUri::parse("file:///tmp/project").unwrap(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
@@ -752,13 +803,8 @@ async fn session_info_uses_availability_nux_tooltip_override() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
 async fn session_info_availability_nux_tooltip_snapshot() {
-    let mut config = test_config().await;
-    config.cwd = test_path_buf("/tmp/project").abs();
+    let config = test_config().await;
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
@@ -827,22 +873,27 @@ async fn session_info_preserves_styled_tooltip_links() {
 }
 
 #[tokio::test]
-async fn session_info_first_event_suppresses_tooltips_and_nux() {
+async fn session_info_first_event_respects_tooltip_preference() {
     let config = test_config().await;
-    let cell = new_session_info(
-        &config,
-        &crate::local_settings::LocalSettings::from(&config),
-        "gpt-5",
-        "gpt-5",
-        &session_configured_event("gpt-5"),
-        /*is_first_event*/ true,
-        Some("Model just became available".to_string()),
-        Some(PlanType::Free),
-    );
+    let mut local_settings = crate::local_settings::LocalSettings::from(&config);
+    for show_tooltips in [true, false] {
+        local_settings.tui.show_tooltips = show_tooltips;
+        let cell = new_session_info(
+            &config,
+            &local_settings,
+            "requested-model",
+            "gpt-5",
+            &session_configured_event("gpt-5"),
+            /*is_first_event*/ true,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+        );
 
-    let rendered = render_transcript(&cell).join("\n");
-    assert!(!rendered.contains("Model just became available"));
-    assert!(rendered.contains("To get started"));
+        let rendered = render_transcript(&cell).join("\n");
+        assert_eq!(rendered.contains("To get started"), show_tooltips);
+        assert!(!rendered.contains("Model just became available"));
+        assert!(!rendered.contains("model changed:"));
+    }
 }
 
 #[tokio::test]
@@ -932,6 +983,8 @@ fn safety_access_block_event_snapshot() {
     let cell = new_safety_access_block_event();
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
+    let body = cell.display_lines(u16::MAX)[1].to_string();
+    assert_eq!(cell.raw_lines()[1].to_string(), body.trim_start());
 }
 
 #[test]
@@ -1133,6 +1186,7 @@ async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_status_only_servers() {
     let statuses = vec![McpServerStatus {
+        environment_id: None,
         server_capabilities: None,
         tool_list_meta: None,
         tools_error: None,
@@ -1169,6 +1223,7 @@ fn mcp_tools_output_from_statuses_renders_status_only_servers() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
+        environment_id: None,
         server_capabilities: None,
         tool_list_meta: None,
         tools_error: None,
@@ -1462,6 +1517,7 @@ fn web_search_history_cell_transcript_snapshot() {
 #[test]
 fn active_mcp_tool_call_snapshot() {
     let invocation = McpInvocation {
+        environment_id: Some("a".to_string()),
         server: "search".into(),
         tool: "find_docs".into(),
         arguments: Some(json!({
@@ -1486,6 +1542,7 @@ fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
     let mut cell = new_active_mcp_tool_call(
         "call-code-mode".into(),
         McpInvocation {
+            environment_id: None,
             server: "node_repl".into(),
             tool: "js".into(),
             arguments: Some(json!({
@@ -1536,6 +1593,7 @@ fn code_mode_tool_call_preserves_failure_details() {
     let mut cell = new_active_mcp_tool_call(
         "call-code-mode-failed".into(),
         McpInvocation {
+            environment_id: None,
             server: "node_repl".into(),
             tool: "js".into(),
             arguments: Some(json!({"title": "Inspect workspace", "code": "throw Error('denied')"})),
@@ -1598,6 +1656,7 @@ fn thread_recap_loading_without_animations_snapshot() {
 #[test]
 fn completed_mcp_tool_call_success_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "search".into(),
         tool: "find_docs".into(),
         arguments: Some(json!({
@@ -1628,6 +1687,7 @@ fn completed_mcp_tool_call_success_snapshot() {
 #[test]
 fn completed_mcp_tool_call_image_after_text_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "image".into(),
         tool: "generate".into(),
         arguments: Some(json!({
@@ -1659,6 +1719,7 @@ fn completed_mcp_tool_call_image_after_text_snapshot() {
 #[test]
 fn completed_mcp_tool_call_accepts_data_url_image_blocks() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "image".into(),
         tool: "generate".into(),
         arguments: Some(json!({
@@ -1688,6 +1749,7 @@ fn completed_mcp_tool_call_accepts_data_url_image_blocks() {
 #[test]
 fn completed_mcp_tool_call_multiple_image_blocks_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "image".into(),
         tool: "generate".into(),
         arguments: Some(json!({
@@ -1716,6 +1778,7 @@ fn completed_mcp_tool_call_multiple_image_blocks_snapshot() {
 #[test]
 fn completed_mcp_tool_call_error_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "search".into(),
         tool: "find_docs".into(),
         arguments: Some(json!({
@@ -1739,6 +1802,7 @@ fn completed_mcp_tool_call_error_snapshot() {
 #[test]
 fn completed_mcp_tool_call_multiple_outputs_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "search".into(),
         tool: "find_docs".into(),
         arguments: Some(json!({
@@ -1779,6 +1843,7 @@ fn completed_mcp_tool_call_multiple_outputs_snapshot() {
 #[test]
 fn completed_mcp_tool_call_wrapped_outputs_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "metrics".into(),
         tool: "get_nearby_metric".into(),
         arguments: Some(json!({
@@ -1811,6 +1876,7 @@ fn completed_mcp_tool_call_wrapped_outputs_snapshot() {
 #[test]
 fn completed_mcp_tool_call_multiple_outputs_inline_snapshot() {
     let invocation = McpInvocation {
+        environment_id: None,
         server: "metrics".into(),
         tool: "summary".into(),
         arguments: Some(json!({

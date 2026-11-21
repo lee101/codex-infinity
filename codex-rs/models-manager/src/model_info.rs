@@ -161,7 +161,6 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     }
     ModelInfo {
-        used_fallback_model_metadata: !is_deepseek,
         ..fallback_model_info(slug)
     }
 }
@@ -174,7 +173,6 @@ pub(crate) fn fallback_model_info(slug: &str) -> ModelInfo {
     let is_deepseek = is_local_wide_context_slug(slug);
     // Callers that serve the slug decide whether it counts as unknown metadata.
     let mut model = ModelInfo {
-        used_fallback_model_metadata: false,
         slug: slug.to_string(),
         display_name: slug.to_string(),
         description: None,
@@ -221,6 +219,7 @@ pub(crate) fn fallback_model_info(slug: &str) -> ModelInfo {
         tool_mode: None,
         multi_agent_version: None,
         multi_agent_reasoning_effort: None,
+        multi_agent_tools_in_code_mode: None,
     };
     if is_deepseek {
         model.description = Some("DeepSeek V4 native API model".into());

@@ -27,8 +27,7 @@ impl App {
         let refresh = matches!(event, TuiEvent::Mouse(mouse)
             if self.chat_widget.rendered_selection.borrow().needs_refresh(*mouse));
         if refresh {
-            let size = tui.prepare_draw_size()?;
-            self.render_owned_transcript(tui, size)?;
+            self.refresh_owned_transcript(tui)?;
         }
         let action = {
             let mut selection = self.chat_widget.rendered_selection.borrow_mut();

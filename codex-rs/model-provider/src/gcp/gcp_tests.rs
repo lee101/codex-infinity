@@ -1,6 +1,7 @@
 use codex_models_manager::ModelsManagerConfig;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::openai_models::ApplyPatchToolType;
+use codex_protocol::openai_models::ModelOrigin;
 use codex_protocol::protocol::MultiAgentVersion;
 use pretty_assertions::assert_eq;
 
@@ -203,8 +204,9 @@ async fn credential_files_scope_token_caches_and_refreshes() {
     first_info.credential_file = Some(first_file.clone());
     let mut second_info = first_info.clone();
     second_info.credential_file = Some(second_file);
-    let first = GcpModelProvider::new(first_info, /*auth_manager*/ None);
-    let second = GcpModelProvider::new(second_info, /*auth_manager*/ None);
+    let primary = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("openai-key"));
+    let first = GcpModelProvider::new(first_info, Some(Arc::clone(&primary)));
+    let second = GcpModelProvider::new(second_info, Some(primary));
 
     assert_eq!(
         (first.auth().await, second.auth().await),
@@ -247,16 +249,23 @@ async fn bundled_vertex_models_filter_catalog_and_normalize_unsupported_tool_met
     let bundled_models = codex_models_manager::bundled_models_response()
         .expect("bundled model catalog should deserialize")
         .models;
-    let mut expected: Vec<_> = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"]
-        .into_iter()
-        .map(|slug| {
-            bundled_models
-                .iter()
-                .find(|model| model.slug == slug)
-                .expect("bundled catalog should contain the supported Vertex model")
-                .clone()
-        })
-        .collect();
+    let mut expected: Vec<_> = [
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-luna",
+    ]
+    .into_iter()
+    .map(|slug| {
+        bundled_models
+            .iter()
+            .find(|model| model.slug == slug)
+            .expect("bundled catalog should contain the supported Vertex model")
+            .clone()
+    })
+    .collect();
     for model in &mut expected {
         model.use_responses_lite = false;
         model.tool_mode = Some(ToolMode::Direct);
@@ -272,10 +281,12 @@ async fn bundled_vertex_models_filter_catalog_and_normalize_unsupported_tool_met
             .map(|model| (model.model, model.show_in_picker))
             .collect::<Vec<_>>(),
         vec![
+            ("gpt-6.2-sol".to_string(), true),
+            ("gpt-6.2-astra".to_string(), true),
+            ("gpt-6.1-terra".to_string(), true),
             ("gpt-6.1-sol".to_string(), true),
             ("gpt-6-astra".to_string(), true),
             ("gpt-6-luna".to_string(), true),
-            ("gpt-6.1-terra".to_string(), true),
         ]
     );
 }
@@ -329,7 +340,7 @@ async fn unknown_vertex_models_use_static_catalog_fallback() {
         .await;
 
     assert_eq!(
-        (model.slug, model.used_fallback_model_metadata),
-        ("vertex-test-model".to_string(), true)
+        (model.slug.as_str(), model.origin),
+        ("vertex-test-model", ModelOrigin::Synthetic)
     );
 }

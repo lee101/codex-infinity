@@ -249,12 +249,14 @@ async fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.turn_item_contributors().len(), 1);
     let thread_store = ExtensionData::new("thread");
     let input = codex_extension_api::ApprovalDecisionInput {
+        serving_assessment: None,
         permissions: Some(&Default::default()),
         approval_id: "approval-1",
         tool_call_id: None,
         action: &serde_json::Value::Null,
         thread_id: codex_protocol::ThreadId::new(),
         thread_store: &thread_store,
+        turn_store: &thread_store,
         category: codex_protocol::openai_models::GuardianScope::Shell,
         approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::AutoReview,

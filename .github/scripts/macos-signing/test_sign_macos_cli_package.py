@@ -26,7 +26,7 @@ with open(os.environ["CALL_LOG"], "a") as log:
 if name == "codesign":
     for arg in args:
         if arg.startswith("--extract-certificates="):
-            Path(arg.split("=", 1)[1] + "0").write_bytes(Path(os.environ["MOCK_CERTIFICATE"]).read_bytes())
+            Path(arg.split("=", 1)[1] + "0").write_bytes(b"wrong certificate" if os.environ.get("MOCK_WRONG_CERTIFICATE") else Path(os.environ["MOCK_CERTIFICATE"]).read_bytes())
     if "--test-requirement" in args and os.environ.get("MOCK_WRONG_SIGNING_IDENTITY"):
         print("code failed to satisfy specified code requirement(s)", file=sys.stderr)
         sys.exit(1)
@@ -34,9 +34,14 @@ if name == "codesign":
         target = Path(args[-1]).name
         if target == "CodexCLI.app":
             source = Path(os.environ["CODEX_REPO_ROOT"]) / "signing-verification/codex-provisioned-entitlements.plist"
-        elif target in ("codex", "codex-code-mode-host"):
+        elif target in ("codex", "codex-code-mode-host", "codex-exec-server"):
             source = Path(os.environ["MOCK_SIGNING_SCRIPTS"]) / (target + ".entitlements.plist")
         else:
+            sys.exit(0)
+        if target == "codex-exec-server" and os.environ.get("MOCK_EXECUTOR_ENTITLEMENTS"):
+            sys.stdout.buffer.write(plistlib.dumps({"unexpected": True}))
+            sys.exit(0)
+        if not plistlib.loads(source.read_bytes()) and os.environ.get("MOCK_OMIT_EMPTY_ENTITLEMENTS"):
             sys.exit(0)
         if os.environ.get("MOCK_WRONG_ENTITLEMENTS"):
             sys.stdout.buffer.write(plistlib.dumps({"unexpected": True}))
@@ -144,16 +149,42 @@ class MacosSigningTests(ProvisioningTestCase):
             check=False,
         )
 
+    def test_sign_only_signs_standard_package_without_notarization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            package, driver, env = self.fixture(root, False, "aarch64-apple-darwin")
+            result = self.run_driver(driver, "sign-only", package, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [
+                json.loads(line)
+                for line in (root / "calls.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [
+                    call[call.index("--target") + 1]
+                    for call in calls
+                    if call[0] == "sign_macos_code.sh"
+                ],
+                [str(package / path) for path in ("bin/codex", *bundle.HELPERS)],
+            )
+            self.assertFalse(any(call[0].startswith("notarize") for call in calls))
+
     def test_standard_and_provisioned_signing_and_verification(self):
-        for provisioned, target in itertools.product(
-            (False, True), ("aarch64-apple-darwin", "x86_64-apple-darwin")
+        for provisioned, target, omit_empty in itertools.product(
+            (False, True),
+            ("aarch64-apple-darwin", "x86_64-apple-darwin"),
+            (False, True),
         ):
             with (
-                self.subTest(provisioned=provisioned, target=target),
+                self.subTest(
+                    provisioned=provisioned, target=target, omit_empty=omit_empty
+                ),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
                 package, driver, env = self.fixture(root, provisioned, target)
+                if omit_empty:
+                    env["MOCK_OMIT_EMPTY_ENTITLEMENTS"] = "1"
                 result = self.run_driver(driver, "sign", package, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 result = self.run_driver(driver, "verify", package, env)
@@ -189,13 +220,13 @@ class MacosSigningTests(ProvisioningTestCase):
                 )
                 self.assertEqual(
                     ["--entitlements" in call for call in signing],
-                    [True, True, False],
+                    [True, True, True, False],
                 )
                 self.assertEqual(
                     [call[0] for call in calls if call[0].startswith("notarize")],
                     ["notarize_with_akv.py"]
                     if provisioned
-                    else ["notarize_macos_binary_with_akv.sh"] * 3,
+                    else ["notarize_macos_binary_with_akv.sh"] * 4,
                 )
                 self.assertEqual(
                     [call[1:] for call in calls if call[0] == "lipo"],
@@ -318,7 +349,13 @@ class MacosSigningTests(ProvisioningTestCase):
 
     def test_verification_rejects_wrong_signing_identity_and_entitlements(self):
         for provisioned, failure in itertools.product(
-            (False, True), ("MOCK_WRONG_SIGNING_IDENTITY", "MOCK_WRONG_ENTITLEMENTS")
+            (False, True),
+            (
+                "MOCK_WRONG_SIGNING_IDENTITY",
+                "MOCK_WRONG_ENTITLEMENTS",
+                "MOCK_WRONG_CERTIFICATE",
+                "MOCK_EXECUTOR_ENTITLEMENTS",
+            ),
         ):
             with (
                 self.subTest(provisioned=provisioned, failure=failure),
@@ -337,6 +374,8 @@ class MacosSigningTests(ProvisioningTestCase):
                         "code failed to satisfy specified code requirement(s)",
                         result.stderr,
                     )
+                elif failure == "MOCK_WRONG_CERTIFICATE":
+                    self.assertIn("Unexpected signing certificate", result.stderr)
                 else:
                     self.assertIn("unexpected", result.stdout)
 

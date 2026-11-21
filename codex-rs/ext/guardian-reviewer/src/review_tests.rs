@@ -34,7 +34,7 @@ struct GatedHost {
 }
 
 impl ReviewHost for GatedHost {
-    type Prepared = ();
+    type Prepared = ReviewDeadline;
     type Evidence = ();
 
     fn permissions(&self) -> Option<codex_guardian_context::PermissionContext> {
@@ -50,24 +50,27 @@ impl ReviewHost for GatedHost {
         &self,
         approval_id: &str,
         reason: GuardianReviewReason,
-        _: ReviewDeadline,
+        deadline: ReviewDeadline,
         _: &CancellationToken,
-    ) -> Result<((), ReviewReport), ReviewDecision> {
+    ) -> Result<(Self::Prepared, ReviewReport), ReviewDecision> {
+        // Make a fresh timeout at verdict time distinguishable from the original deadline.
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         Ok((
-            (),
+            deadline,
             ReviewReport::new(ReviewMetadata {
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
+                turn_trigger: None,
                 review_id: approval_id.into(),
                 target_item_id: Some("call".into()),
                 plugin_id: None,
                 script_path: None,
                 approval_request_source: GuardianApprovalRequestSource::MainTurn,
                 reviewed_action: GuardianReviewedAction::RequestPermissions {},
-                action: GuardianAssessmentAction::RequestPermissions {
+                action: Some(GuardianAssessmentAction::RequestPermissions {
                     reason: None,
                     permissions: Default::default(),
-                },
+                }),
                 review_reason: reason,
                 timeout: Some(crate::REVIEW_TIMEOUT),
                 model_context: ModelInvocationContext {
@@ -79,14 +82,15 @@ impl ReviewHost for GatedHost {
     }
     async fn attempt(
         &self,
-        _: &(),
-        _: ReviewDeadline,
+        preparation_deadline: &Self::Prepared,
+        deadline: ReviewDeadline,
         cancellation: &CancellationToken,
     ) -> (
         GuardianReviewOutcome,
         GuardianReviewAnalyticsResult,
         Option<()>,
     ) {
+        assert_eq!(deadline, *preparation_deadline);
         self.started.notify_one();
         cancellation.cancelled().await;
         self.cleaning.notify_one();
@@ -101,12 +105,12 @@ impl ReviewHost for GatedHost {
             Some(()),
         )
     }
-    async fn cached_approval_is_current(&self, _: &()) -> bool {
+    async fn cached_approval_is_current(&self, _: &Self::Prepared) -> bool {
         self.validations.fetch_add(/*val*/ 1, Ordering::SeqCst);
         self.current
     }
     async fn emit(&self, _: EventMsg) {}
-    async fn record_evidence(&self, _: &(), _: (), _: &GuardianAssessmentEvent) {
+    async fn record_evidence(&self, _: &Self::Prepared, _: (), _: &GuardianAssessmentEvent) {
         self.evidence_recorded.store(true, Ordering::SeqCst);
     }
     async fn interrupt(&self, _: &str, _: EventMsg, _: ErrorEvent) {
@@ -124,7 +128,7 @@ enum ApprovalState {
 #[test_case::test_case(ApprovalState::Current; "current action")]
 #[test_case::test_case(ApprovalState::Invalidated; "invalidated action")]
 #[test_case::test_case(ApprovalState::Cancelled; "cancelled action")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn async_approval_revalidates_without_waiting_for_tracked_cleanup(state: ApprovalState) {
     let host = GatedHost {
         started: Arc::new(Notify::new()),
@@ -160,12 +164,16 @@ async fn async_approval_revalidates_without_waiting_for_tracked_cleanup(state: A
     let analytics = AnalyticsEventsClient::disabled();
     let action = json!({});
     let request = ReviewRequest {
+        sampling_model: "test",
+        turn_id: "turn",
+        serving_assessment: None,
         host: host.clone(),
         approval_id: "approval",
         tool_call_id: Some("call"),
         action: Some(&action),
         thread_id,
         thread_store: &store,
+        turn_store: &store,
         category: GuardianScope::Permissions,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,

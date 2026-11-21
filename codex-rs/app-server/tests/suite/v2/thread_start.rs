@@ -115,7 +115,7 @@ model = "gpt-5.4-mini"
         })
         .await?;
 
-    assert_eq!(response.model, "openai.gpt-6.1-sol");
+    assert_eq!(response.model, "openai.gpt-6.2-sol");
     Ok(())
 }
 
@@ -246,6 +246,8 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
     .await?;
     for model in [
         "openai.gpt-6.1-sol",
+        "openai.gpt-6.2-astra",
+        "openai.gpt-6.2-sol",
         "openai.gpt-6.1-terra",
         "openai.gpt-6-sol",
         "openai.gpt-6-luna",
@@ -275,7 +277,7 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
             supported_with_fallback.model,
             unsupported_without_fallback.model,
         ],
-        vec!["openai.gpt-6.1-sol", "openai.gpt-5.5", "gpt-5.4-mini"]
+        vec!["openai.gpt-6.2-sol", "openai.gpt-5.5", "gpt-5.4-mini"]
     );
     Ok(())
 }
@@ -296,6 +298,10 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
     for model in [
         "global.openai.gpt-6.1-sol",
         "us.openai.gpt-6.1-sol",
+        "global.openai.gpt-6.2-astra",
+        "us.openai.gpt-6.2-astra",
+        "global.openai.gpt-6.2-sol",
+        "us.openai.gpt-6.2-sol",
         "global.openai.gpt-6.1-terra",
         "us.openai.gpt-6.1-terra",
         "global.openai.gpt-6-sol",
@@ -317,7 +323,7 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
         /*allow_provider_model_fallback*/ true,
     )
     .await?;
-    assert_eq!(response.model, "global.openai.gpt-6.1-sol");
+    assert_eq!(response.model, "global.openai.gpt-6.2-sol");
 
     Ok(())
 }
@@ -553,10 +559,26 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
         .build_initialized()
         .await?;
 
+    let invalid_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            runtime_workspace_roots: Some(vec![
+                codex_utils_path_uri::LegacyAppPathString::from_string("relative"),
+            ]),
+            ..Default::default()
+        })
+        .await?;
+    let invalid = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(invalid_id)),
+    )
+    .await??;
+    assert_eq!(invalid.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(invalid.error.message.contains("runtimeWorkspaceRoots"));
+
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
             cwd: Some(cwd.to_string_lossy().to_string()),
-            runtime_workspace_roots: Some(vec![extra_root.abs()]),
+            runtime_workspace_roots: Some(vec![extra_root.abs().into()]),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
         })
@@ -569,8 +591,8 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
 
-    assert_eq!(response_cwd, cwd.abs());
-    assert_eq!(runtime_workspace_roots, vec![extra_root.abs()]);
+    assert_eq!(response_cwd, cwd.abs().into());
+    assert_eq!(runtime_workspace_roots, vec![extra_root.abs().into()]);
     #[cfg(windows)]
     let _ = sandbox;
     #[cfg(not(windows))]
@@ -579,7 +601,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
             panic!("expected workspace-write sandbox");
         };
         assert!(
-            writable_roots.contains(&extra_root.abs().canonicalize()?),
+            writable_roots.contains(&extra_root.abs().canonicalize()?.into()),
             "legacy sandbox projection should include the runtime workspace root"
         );
     }
@@ -590,7 +612,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
     environment.runtime_workspace_roots = Some(vec![environment_root.abs().into()]);
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
-            runtime_workspace_roots: Some(vec![extra_root.abs()]),
+            runtime_workspace_roots: Some(vec![extra_root.abs().into()]),
             environments: Some(vec![environment]),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
@@ -601,7 +623,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
         sandbox,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
-    assert_eq!(runtime_workspace_roots, vec![environment_root.abs()]);
+    assert_eq!(runtime_workspace_roots, vec![environment_root.abs().into()]);
     #[cfg(windows)]
     let _ = sandbox;
     #[cfg(not(windows))]
@@ -610,7 +632,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
             panic!("expected workspace-write sandbox");
         };
         assert!(
-            writable_roots.contains(&environment_root.abs().canonicalize()?),
+            writable_roots.contains(&environment_root.abs().canonicalize()?.into()),
             "legacy sandbox projection should include the environment workspace root"
         );
     }
@@ -650,7 +672,7 @@ async fn thread_start_excludes_profile_workspace_roots_from_runtime_workspace_ro
 
     assert_eq!(
         runtime_workspace_roots,
-        vec![cwd.path().to_path_buf().abs()]
+        vec![cwd.path().to_path_buf().abs().into()]
     );
 
     Ok(())
@@ -1345,6 +1367,7 @@ async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<
         McpServerStatusUpdatedNotification {
             thread_id: Some(start_response.thread.id.clone()),
             name: "optional_broken".to_string(),
+            environment_id: None,
             status: McpServerStartupState::Starting,
             error: None,
             failure_reason: None,
@@ -1657,6 +1680,7 @@ required = true
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                environment_id: None,
                 server_name: None,
                 cursor: None,
                 limit: None,

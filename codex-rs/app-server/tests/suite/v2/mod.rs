@@ -76,11 +76,14 @@ mod frozen_cloud_skills;
 mod fs;
 #[path = "gateway_oauth_tests.rs"]
 mod gateway_oauth;
+#[path = "gcp_setup_tests.rs"]
+mod gcp_setup;
 mod git_attribution;
 mod guardian_v2;
 mod history_notes_extension;
 mod hooks_list;
 mod host_skills;
+mod https_mock;
 mod imagegen_extension;
 mod initialize;
 mod luna_reserve;
@@ -102,8 +105,10 @@ mod model_auto_review;
 mod model_list;
 mod model_list_requirements_tests;
 mod model_provider_capabilities_read;
+mod model_provider_config_tests;
 #[path = "model_provider_enforcement_tests.rs"]
 mod model_provider_enforcement;
+mod model_provider_list_tests;
 mod multi_agent_v2_developer_instructions;
 mod otel;
 mod output_schema;
@@ -167,6 +172,9 @@ mod thread_read_state;
 mod thread_resume;
 mod thread_revert;
 mod thread_sample;
+#[cfg(target_os = "linux")]
+#[path = "thread_search_streaming_tests.rs"]
+mod thread_search_streaming;
 mod thread_sections;
 mod thread_settings_update;
 mod thread_shell_command;

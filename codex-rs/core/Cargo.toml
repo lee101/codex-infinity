@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+codex-thread-context-ids = { workspace = true }
 codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
@@ -70,12 +71,10 @@ codex-sandboxing = { workspace = true }
 codex-skills = { workspace = true }
 codex-skills-extension = { workspace = true }
 codex-state = { workspace = true }
-codex-agent-message-board-extension = { workspace = true }
-codex-message-board = { workspace = true }
-codex-agent-message-board-client = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-thread-store = { workspace = true }
 codex-tools = { workspace = true }
+codex-user-input = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-audio = { workspace = true }
 codex-utils-cache = { workspace = true }
@@ -126,7 +125,6 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
-tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tonic = { workspace = true }
@@ -135,7 +133,6 @@ tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5", "v7"] }
 which = { workspace = true }
-whoami = { workspace = true }
 
 # Build OpenSSL from source for musl builds.
 [target.x86_64-unknown-linux-musl.dependencies]
@@ -146,17 +143,23 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 openssl-sys = { workspace = true, features = ["vendored"] }
 
 [dev-dependencies]
+codex-thread-context-ids-test-support = { workspace = true }
+codex-backend-client = { workspace = true }
+codex-message-board = { workspace = true }
+codex-agent-message-board-host = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 codex-exec-server-test-support = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-home = { workspace = true }
 codex-mcp-extension = { workspace = true }
+codex-message-board-mcp = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol-test-support = { workspace = true }
 codex-test-binary-support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 codex-utils-redacted-string = { workspace = true }
+codex-utils-rustls-provider = { workspace = true }
 codex-web-search-extension = { workspace = true }
 codex-windows-sandbox-test-support = { workspace = true }
 core_test_support = { workspace = true }
@@ -166,6 +169,7 @@ maplit = { workspace = true }
 opentelemetry = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
+rcgen = { workspace = true }
 test-case = "3.3.1"
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
@@ -174,10 +178,13 @@ opentelemetry_sdk = { workspace = true, features = [
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 walkdir = { workspace = true }
+whoami = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
 
@@ -186,4 +193,6 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]
-ignored-paths = ["tests/remote_env_windows/*.rs"]
+ignored-paths = [
+    "tests/remote_env_windows/*.rs",
+]

@@ -10,8 +10,10 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+mod page_segments;
 mod read;
 mod realtime;
+mod realtime_stream;
 mod search;
 mod segment_paging;
 mod turn_lookup;
@@ -19,9 +21,14 @@ mod turn_lookup;
 pub(super) use read::list_items;
 pub(super) use read::list_turns;
 pub(super) use realtime::list_timeline;
+pub(super) use realtime_stream::has_canonical_realtime_session;
+pub(super) use realtime_stream::list_realtime;
+pub(super) use realtime_stream::load_realtime_session;
+pub(super) use realtime_stream::load_realtime_session_head;
 pub(super) use search::search_thread_occurrences;
 pub(super) use turn_lookup::find_source_turn;
 pub(super) use turn_lookup::find_visible_turn;
+pub(super) use turn_lookup::first_user_preview;
 
 /// A valid complete rollout line with its absolute byte span in durable JSONL.
 ///
@@ -113,6 +120,11 @@ pub(super) async fn apply_projection(
     // Write the projected rows and advance the JSONL offset and ordinal in one transaction. If
     // SQLite fails, it stays behind the durable rollout instead of claiming data it did not
     // materialize.
+    let _writer = store
+        .thread_history_writer
+        .acquire()
+        .await
+        .map_err(thread_history_error)?;
     let mut transaction = pool.begin_immediate().await.map_err(thread_history_error)?;
     let thread_id = thread_id.to_string();
     let projection_state = sqlx::query_as::<_, (i64, i64)>(
@@ -252,6 +264,11 @@ pub(super) async fn delete_thread(
     }
 
     let pool = store.thread_history_db().await?;
+    let _writer = store
+        .thread_history_writer
+        .acquire()
+        .await
+        .map_err(thread_history_delete_error)?;
     let mut transaction = pool
         .begin_immediate()
         .await

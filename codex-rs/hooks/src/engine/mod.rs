@@ -33,6 +33,7 @@ use crate::events::user_prompt_submit::UserPromptSubmitRequest;
 use crate::mcp::HookMcpExecutor;
 use crate::output_spill::AdditionalContextLimit;
 use codex_config::ConfigLayerStack;
+use codex_config::HookFailurePolicy;
 use codex_config::HookHandlerConfig;
 use codex_plugin::ExecutorPluginHookSource;
 use codex_plugin::PluginHookSource;
@@ -63,13 +64,14 @@ pub(crate) struct CommandShell {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredHandler {
-    /// Internally admitted cleanup hook, enabled independently of per-hook state.
+    /// Internally admitted bundled hook, enabled independently of per-hook state.
     pub builtin: bool,
     pub plugin_trust: Option<plugin_trust::PluginHookTrust>,
     pub event_name: codex_protocol::protocol::HookEventName,
     pub matcher: Option<HookMatcher>,
     pub timeout_sec: u64,
     pub status_message: Option<String>,
+    pub on_failure: HookFailurePolicy,
     pub additional_context_limit: AdditionalContextLimit,
     pub source_path: HandlerSourcePath,
     pub source: HookSource,
@@ -153,6 +155,7 @@ pub(crate) enum ConfiguredHandlerKind {
         r#async: bool,
     },
     McpTool {
+        expected_app_connector_id: Option<&'static str>,
         server: String,
         tool: String,
         input: serde_json::Map<String, serde_json::Value>,
@@ -161,6 +164,7 @@ pub(crate) enum ConfiguredHandlerKind {
 
 #[derive(Debug)]
 pub(crate) struct HandlerRunResult {
+    pub structured_content: Option<serde_json::Value>,
     pub context_metadata: codex_protocol::models::ContentItemMetadata,
     pub started_at: i64,
     pub completed_at: i64,
@@ -206,6 +210,18 @@ impl ConfiguredHandler {
     /// Only synchronous hooks can apply control effects.
     pub(crate) fn can_apply_control_effects(&self) -> bool {
         self.execution_mode() == HookExecutionMode::Sync
+    }
+
+    pub(crate) fn failure_block_reason(&self) -> Option<String> {
+        (self.on_failure == HookFailurePolicy::Block
+            && self.can_apply_control_effects()
+            && self.event_name != HookEventName::SessionEnd)
+            .then(|| {
+                format!(
+                    "{:?} hook failed. This hook is configured to block continuation on failure.",
+                    self.event_name
+                )
+            })
     }
 
     pub fn run_id(&self) -> String {
@@ -375,9 +391,25 @@ impl ClaudeHooksEngine {
                     input,
                     timeout_sec,
                     status_message,
+                    on_failure,
                 } = handler
                 else {
                     unreachable!("allowlisted executor handler must be an MCP tool");
+                };
+
+                let on_failure = match on_failure.unwrap_or_default() {
+                    HookFailurePolicy::Continue => HookFailurePolicy::Continue,
+                    HookFailurePolicy::Block => {
+                        tracing::warn!(
+                            plugin_id = %source.plugin_id.as_key(),
+                            environment_id = %source.environment_id,
+                            manifest_path = %source.manifest_path,
+                            source_relative_path = %source.source_relative_path,
+                            ?event_name,
+                            "executor-scoped hooks always run asynchronously; ignoring unsupported onFailure:block and running cleanup with onFailure:continue"
+                        );
+                        HookFailurePolicy::Continue
+                    }
                 };
 
                 // Bundled plugins can share a cleanup target; run it once per event
@@ -402,6 +434,7 @@ impl ClaudeHooksEngine {
                     matcher: None,
                     timeout_sec: timeout_sec.unwrap_or(5).max(1),
                     status_message,
+                    on_failure,
                     additional_context_limit: Default::default(),
                     source_path: HandlerSourcePath::ExecutorScoped {
                         plugin_id: source.plugin_id.clone(),
@@ -414,6 +447,7 @@ impl ClaudeHooksEngine {
                     source: HookSource::Plugin,
                     display_order,
                     kind: ConfiguredHandlerKind::McpTool {
+                        expected_app_connector_id: None,
                         server,
                         tool,
                         input,

@@ -26,6 +26,7 @@ pub(crate) const DENIED_READS_TEMPLATE: &str = "## Denied filesystem reads\n{{ d
 /// Resolved approval-policy text; policy and tool selection remain with the consumer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedApprovalMessages<'a> {
+    pub(crate) catalog: Option<&'a ApprovalMessages>,
     pub(crate) never: ResolvedMessage<'a>,
     pub(crate) on_request: ResolvedMessage<'a>,
     pub(crate) on_request_auto_review: ResolvedMessage<'a>,
@@ -35,6 +36,7 @@ pub(crate) struct ResolvedApprovalMessages<'a> {
 impl<'a> ResolvedApprovalMessages<'a> {
     pub(crate) fn new(messages: Option<&'a ApprovalMessages>) -> Self {
         Self {
+            catalog: messages,
             never: ResolvedMessage::new(
                 messages.and_then(|m| m.never.as_deref()),
                 APPROVAL_POLICY_NEVER,
@@ -58,6 +60,7 @@ impl<'a> ResolvedApprovalMessages<'a> {
 /// Permission text retains its source so renderers can distinguish catalog text from templates.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedPermissionMessages<'a> {
+    pub(crate) approved_command_prefix_saved: Option<&'a str>,
     pub(crate) approved_prefixes: ResolvedMessage<'a>,
     pub(crate) danger_full_access: ResolvedMessage<'a>,
     pub(crate) workspace_write: ResolvedMessage<'a>,
@@ -71,6 +74,8 @@ pub(crate) struct ResolvedPermissionMessages<'a> {
 impl<'a> ResolvedPermissionMessages<'a> {
     pub(crate) fn new(messages: Option<&'a PermissionMessages>) -> Self {
         Self {
+            approved_command_prefix_saved: messages
+                .and_then(|m| m.approved_command_prefix_saved.as_deref()),
             approved_prefixes: ResolvedMessage::new(
                 messages.and_then(|m| m.approved_prefixes.as_deref()),
                 include_str!("../../templates/permissions/approved_prefixes.md").trim_end(),

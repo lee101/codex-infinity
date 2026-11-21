@@ -52,6 +52,13 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn reject_user_shell_command(&mut self, message: String) {
+        // No turn event will arrive to clear the pending shell submission.
+        self.input_queue.user_turn_pending_start = false;
+        self.add_error_message(message);
+        self.maybe_send_next_queued_input();
+    }
+
     fn submit_shell_command_with_history(
         &mut self,
         command: &str,
@@ -112,6 +119,27 @@ impl ChatWidget {
         .1
     }
 
+    pub(crate) fn prepare_safety_recourse_rewrite(&mut self, prompt: &str) -> Option<AppCommand> {
+        if !self.is_session_configured()
+            || self.is_user_turn_pending_or_running()
+            || self.pending_image_submission.is_some()
+            || self.input_queue.rate_limit_recovery_pending
+            || self.safety_recourse.is_some()
+        {
+            return None;
+        }
+        let op = self
+            .submit_user_message_with_history_and_shell_escape_policy(
+                prompt.into(),
+                UserMessageHistoryRecord::UserMessageText,
+                ShellEscapePolicy::Disallow,
+                UserMessageSource::SafetyRecourse,
+            )
+            .1?;
+        self.safety_buffering_source = UserMessageSource::Prompt;
+        Some(op)
+    }
+
     pub(super) fn submit_user_message_with_history_and_shell_escape_policy(
         &mut self,
         user_message: UserMessage,
@@ -141,10 +169,15 @@ impl ChatWidget {
             return (false, None);
         }
         self.empty_state_animation.borrow_mut().dismiss();
-        if self.input_queue.rate_limit_recovery_pending || self.pending_image_submission.is_some() {
-            let model_prompt = source == UserMessageSource::Prompt
-                && (shell_escape_policy == ShellEscapePolicy::Disallow
-                    || !user_message.text.starts_with('!'));
+        if self.input_queue.rate_limit_recovery_pending
+            || self.pending_image_submission.is_some()
+            || self.safety_recourse.is_some()
+        {
+            let model_prompt = matches!(
+                source,
+                UserMessageSource::Prompt | UserMessageSource::DirectEnter
+            ) && (shell_escape_policy == ShellEscapePolicy::Disallow
+                || !user_message.text.starts_with('!'));
             // A prepared submission was accepted before any messages queued behind it.
             let queue_index = if prepared_images.is_some() {
                 0
@@ -155,6 +188,7 @@ impl ChatWidget {
                 queue_index,
                 QueuedUserMessage {
                     source,
+                    prepared_images,
                     ..QueuedUserMessage::new(
                         user_message,
                         match shell_escape_policy {
@@ -174,9 +208,11 @@ impl ChatWidget {
             return (true, None);
         }
         if !self.is_session_configured() {
-            let model_prompt = source == UserMessageSource::Prompt
-                && (shell_escape_policy == ShellEscapePolicy::Disallow
-                    || !user_message.text.starts_with('!'));
+            let model_prompt = matches!(
+                source,
+                UserMessageSource::Prompt | UserMessageSource::DirectEnter
+            ) && (shell_escape_policy == ShellEscapePolicy::Disallow
+                || !user_message.text.starts_with('!'));
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
                 .queued_user_messages
@@ -273,6 +309,21 @@ impl ChatWidget {
             }));
         }
 
+        use crate::app_command::CloudSubmissionIntent;
+        let (cloud_submission, source) = match source {
+            UserMessageSource::DirectEnter => (
+                CloudSubmissionIntent::StartOrSteer,
+                UserMessageSource::Prompt,
+            ),
+            UserMessageSource::Prompt => (CloudSubmissionIntent::StartIfIdle, source),
+            UserMessageSource::QuestionAnswer => (
+                CloudSubmissionIntent::QuestionAnswer {
+                    during_turn: !render_in_history,
+                },
+                source,
+            ),
+            UserMessageSource::SafetyRecourse => (CloudSubmissionIntent::UseKnownTurn, source),
+        };
         if !text.is_empty() {
             items.push(UserInput::Text {
                 text: text.clone(),
@@ -438,6 +489,8 @@ impl ChatWidget {
         crate::startup_recovery::bind_submission(&text, &client_user_message_id);
         let pending_steer = (!render_in_history).then(|| PendingSteer {
             client_id: client_user_message_id.clone(),
+            admitted_turn_id: None,
+            optimistically_rendered: false,
             user_message: UserMessage {
                 text: text.clone(),
                 local_images: local_images.clone(),
@@ -452,9 +505,15 @@ impl ChatWidget {
         let service_tier = self.service_tier_update_for_core();
         let active_permission_profile = self.config.permissions.active_permission_profile();
         let op = AppCommand::user_turn(
+            if source == UserMessageSource::SafetyRecourse {
+                "safety_recourse_follow_up"
+            } else {
+                "user"
+            },
+            cloud_submission,
             client_user_message_id.clone(),
             items,
-            self.config.cwd.to_path_buf(),
+            self.session_cwd().to_path_buf(),
             AskForApproval::from(self.config.permissions.approval_policy.value()),
             active_permission_profile,
             effective_mode.model().to_string(),
@@ -489,10 +548,11 @@ impl ChatWidget {
             ));
         }
 
-        if !self.submit_op(op.clone()) {
+        // The app submits recourse turns directly to the verified fork.
+        if source != UserMessageSource::SafetyRecourse && !self.submit_op(op.clone()) {
             return (false, None);
         }
-        if source == UserMessageSource::Prompt {
+        if source != UserMessageSource::QuestionAnswer {
             self.bottom_pane.clear_pending_questions();
         }
         self.dismiss_backend_banner_for_new_turn();
@@ -500,6 +560,7 @@ impl ChatWidget {
         if render_in_history {
             self.input_queue.user_turn_pending_start = true;
             self.input_queue.pending_user_message_client_id = Some(client_user_message_id.clone());
+            self.input_queue.pending_user_message_history_record = Some(history_record.clone());
         }
 
         // Persist the submitted text to cross-session message history. Mentions are encoded into

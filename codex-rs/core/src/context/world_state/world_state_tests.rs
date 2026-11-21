@@ -1,5 +1,6 @@
 use super::*;
 use codex_context_fragments::AnnotatedContent;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::input_text;
@@ -27,7 +28,7 @@ impl WorldStateSection for TestSection {
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> SectionTransition<Self::Snapshot> {
         let current = self.clone();
-        let fragment: Option<Box<dyn ContextualUserFragment>> = match previous {
+        let fragment: Option<super::WorldStateFragment> = match previous {
             PreviousSectionState::Known(previous) if self.value != previous.value => {
                 Some(Box::new(TestFragment(self.value.clone())))
             }
@@ -81,7 +82,9 @@ fn world_state_hash_tracks_typed_content_and_role() {
                 role,
                 ("", ""),
                 ContentItem::InputAudio {
-                    audio_url: audio_url.to_string(),
+                    audio: AudioReference::Inline {
+                        audio_url: audio_url.to_string(),
+                    },
                 },
             ),
             content_kind: ContentItemKind("generic.test".to_string()),
@@ -199,6 +202,7 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
     ));
     let previous = WorldStateSnapshot {
         sections: BTreeMap::from([("extension_test".to_string(), json!({"value": "before"}))]),
+        ..Default::default()
     };
 
     let rendered = world_state
@@ -328,6 +332,7 @@ fn missing_retained_fragment_is_rendered_again() {
 fn extension_snapshot_updates_preserve_skipped_state() {
     let previous = WorldStateSnapshot {
         sections: BTreeMap::from([("extension_test".to_string(), json!({"published": true}))]),
+        ..Default::default()
     };
     let mut removed = WorldState::default();
     removed.add_extension_section(WorldStateSectionContribution::new("extension_test", |_| {
@@ -364,6 +369,7 @@ fn unreadable_section_snapshot_is_treated_as_unknown() {
     });
     let previous = WorldStateSnapshot {
         sections: BTreeMap::from([("test".to_string(), json!({"invalid": true}))]),
+        ..Default::default()
     };
 
     let rendered = current.render_history_fragment_diff(Some(&previous), &[]).1;
@@ -400,12 +406,14 @@ fn snapshot_merge_patch_changes_and_removes_nested_values() {
             ),
             ("removed_section".to_string(), json!({"value": true})),
         ]),
+        ..Default::default()
     };
     let current = WorldStateSnapshot {
         sections: BTreeMap::from([(
             "kept".to_string(),
             json!({"same": true, "changed": "after"}),
         )]),
+        ..Default::default()
     };
 
     assert_eq!(
@@ -517,9 +525,9 @@ fn mixed_output_preserves_order_and_restores_its_snapshot() {
     assert_eq!(
         context
             .into_iter()
-            .map(|update| match update.content {
-                WorldStateUpdateContent::Fragment(fragment) => fragment.into_boxed_response_item(),
-                WorldStateUpdateContent::Item(item) => *item,
+            .map(|update| match update.content.into_fragment() {
+                Ok(fragment) => fragment.into_boxed_response_item(),
+                Err(item) => *item,
             })
             .collect::<Vec<_>>(),
         vec![

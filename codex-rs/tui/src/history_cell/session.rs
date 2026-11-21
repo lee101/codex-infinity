@@ -204,7 +204,7 @@ pub(crate) fn new_session_info(
     let header = SessionHeaderHistoryCell::new(
         model_display_name.to_string(),
         session.reasoning_effort.clone(),
-        config.cwd.to_path_buf(),
+        session.cwd.to_path_buf(),
         CODEX_CLI_VERSION,
     )
     .with_yolo_mode(has_yolo_permissions(
@@ -213,7 +213,7 @@ pub(crate) fn new_session_info(
     ));
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
-    if is_first_event {
+    if is_first_event && local_settings.tui.show_tooltips {
         // Help lines below the header (new copy and list)
         let help_lines: Vec<Line<'static>> = vec![
             "  To get started, describe a task or try one of these commands:"
@@ -248,7 +248,7 @@ pub(crate) fn new_session_info(
         ];
 
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
-    } else {
+    } else if !is_first_event {
         if local_settings.tui.show_tooltips
             && let Some(tooltips) = tooltip_override
                 .or_else(|| tooltips::get_tooltip(auth_plan, &local_settings.tui.keymap))
@@ -290,6 +290,29 @@ pub(crate) fn has_yolo_permissions(
                 }
         )
 }
+/// The fresh terminal header marks the start of visible scrollback after Ctrl+L.
+/// It has no transcript representation because the original session header is still retained.
+#[derive(Debug)]
+pub(crate) struct ClearScreenHeader(pub(crate) SessionHeaderHistoryCell);
+
+impl HistoryCell for ClearScreenHeader {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.0.display_lines(width)
+    }
+
+    fn live_raw_lines(&self) -> Vec<Line<'static>> {
+        self.0.raw_lines()
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+}
+
 /// Session banner with a model label already resolved for presentation by its caller.
 #[derive(Debug)]
 pub(crate) struct SessionHeaderHistoryCell {

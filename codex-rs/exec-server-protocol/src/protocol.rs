@@ -42,6 +42,8 @@ pub const FS_CLOSE_METHOD: &str = "fs/close";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
 pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
 pub const FS_GET_METADATA_METHOD: &str = "fs/getMetadata";
+pub const FS_WATCH_MISSING_METHOD: &str = "fs/watchMissing";
+pub const FS_MISSING_CHANGED_METHOD: &str = "fs/missingChanged";
 pub const FS_CANONICALIZE_METHOD: &str = "fs/canonicalize";
 pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
 pub const FS_WALK_METHOD: &str = "fs/walk";
@@ -156,6 +158,9 @@ pub struct EnvironmentCapabilities {
     /// Whether executor proxies enforce managed review domains before ordinary allows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network_proxy_review_domains: bool,
+    /// Whether the executor can capture TCP for a managed Linux sandbox launch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_proxy_transparent_tcp: bool,
     /// Whether the selected shell can mask executor environment credentials.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     credential_masking: bool,
@@ -165,6 +170,9 @@ pub struct EnvironmentCapabilities {
     /// Whether capability discovery applies the filesystem sandbox sent with each root.
     #[serde(default)]
     pub capability_discovery_sandbox: bool,
+    /// Whether missing metadata paths can be watched on this physical connection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fs_watch_missing: bool,
     /// Whether this executor supports V2 capability discovery.
     #[serde(default)]
     pub capability_discovery_v2: bool,
@@ -318,9 +326,11 @@ impl EnvironmentInfo {
             capabilities: EnvironmentCapabilities {
                 network_proxy_launch: true,
                 network_proxy_review_domains: true,
+                network_proxy_transparent_tcp: cfg!(target_os = "linux"),
                 credential_masking,
                 credential_masking_custom_providers: credential_masking,
                 capability_discovery_sandbox: true,
+                fs_watch_missing: cfg!(target_os = "linux"),
                 capability_discovery_v2: true,
                 environment_config_read: true,
                 http_header_env_vars: true,
@@ -407,6 +417,18 @@ pub struct ExecParams {
     pub network_proxy: Option<RemoteNetworkProxyLaunchConfig>,
 }
 
+impl ExecParams {
+    pub fn requests_transparent_tcp(&self) -> bool {
+        self.network_proxy
+            .as_ref()
+            .is_some_and(|launch| launch.proxy.transparent_tcp)
+            || self
+                .managed_network
+                .as_ref()
+                .is_some_and(|ctx| ctx.transparent_tcp)
+    }
+}
+
 /// Executor ingress for process requests from clients that may omit the sandbox policy cwd.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -489,6 +511,24 @@ pub struct ShellSnapshotRequest {
     pub scope_id: String,
     /// Executor-native shell used to capture and restore the snapshot.
     pub shell: ShellInfo,
+}
+
+/// Optional JSON-RPC error data for a rejected `process/start`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProcessStartErrorData {
+    SpawnNotFound,
+    SpawnPermissionDenied,
+    SpawnFailed,
+    SandboxUnavailable,
+    SandboxPreparation,
+}
+
+impl ProcessStartErrorData {
+    pub fn attach_to(self, mut error: JSONRPCErrorError) -> JSONRPCErrorError {
+        error.data = Some(serde_json::json!(self));
+        error
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +794,27 @@ pub struct FsGetMetadataParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+/// One unsandboxed metadata observation per connection. A newer id supersedes the prior watch.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWatchMissingParams {
+    pub watch_id: u64,
+    pub missing: Vec<PathUri>,
+    pub present: Option<PathUri>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWatchMissingResponse {
+    pub watching: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMissingChangedNotification {
+    pub watch_id: u64,
 }
 
 /// Filesystem RPC wire request with legacy optional sandbox policy cwd.
@@ -1274,6 +1335,7 @@ mod tests {
     fn discovery_v2_support_defaults_off_for_older_executors() -> serde_json::Result<()> {
         let legacy: super::EnvironmentCapabilities = serde_json::from_value(serde_json::json!({}))?;
         assert!(!legacy.capability_discovery_v2);
+        assert!(!legacy.fs_watch_missing);
         let capabilities = super::EnvironmentInfo::local().capabilities;
         assert_eq!(
             serde_json::from_value::<super::EnvironmentCapabilities>(serde_json::to_value(
@@ -1362,6 +1424,7 @@ mod tests {
             sandbox: None,
             enforce_managed_network: true,
             managed_network: Some(ManagedNetworkSandboxContext {
+                transparent_tcp: false,
                 loopback_ports: vec![43123, 48081],
                 allow_local_binding: false,
                 allow_unix_sockets: vec!["/tmp/allowed.sock".to_string()],
@@ -1494,6 +1557,7 @@ mod tests {
                 sandbox: None,
                 enforce_managed_network: true,
                 managed_network: Some(ManagedNetworkSandboxContext {
+                    transparent_tcp: false,
                     loopback_ports: vec![43123],
                     allow_local_binding: true,
                     allow_unix_sockets: Vec::new(),
@@ -1544,9 +1608,11 @@ mod tests {
             EnvironmentCapabilities {
                 network_proxy_launch: true,
                 network_proxy_review_domains: false,
+                network_proxy_transparent_tcp: false,
                 credential_masking: false,
                 credential_masking_custom_providers: false,
                 capability_discovery_sandbox: true,
+                fs_watch_missing: false,
                 capability_discovery_v2: false,
                 environment_config_read: false,
                 http_header_env_vars: false,

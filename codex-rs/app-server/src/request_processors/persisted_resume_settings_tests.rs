@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::PersistedResumeSettings;
 use super::latest_persisted_resume_settings;
 use codex_protocol::ThreadId;
@@ -9,7 +11,6 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TurnContextItem;
@@ -33,11 +34,13 @@ fn settings_item(
             thread_id,
             thread_settings: ThreadSettingsSnapshot {
                 disabled_plugin_ids: Vec::new(),
+                guardian_retention: None,
                 model: "gpt-5".to_string(),
                 model_provider_id: "openai".to_string(),
                 service_tier: None,
                 approval_policy,
                 approvals_reviewer,
+                requested_approvals_reviewer: None,
                 permission_profile: PermissionProfile::read_only(),
                 active_permission_profile,
                 cwd: cwd(),
@@ -67,14 +70,13 @@ fn turn_context_item(
     RolloutItem::TurnContext(TurnContextItem {
         turn_id: Some(turn_id.to_string()),
         root_turn_id: None,
+        direct_only_tool_namespaces: None,
         disabled_plugin_ids: None,
         cwd: cwd(),
         approval_policy,
         approvals_reviewer,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: Some(PermissionProfile::read_only()),
+        permission_profile: PermissionProfile::read_only(),
         active_permission_profile,
-        file_system_sandbox_policy: None,
         model: "gpt-5".to_string(),
         comp_hash: None,
         collaboration_mode: None,
@@ -224,20 +226,35 @@ fn older_reviewer_is_used_when_latest_turn_context_omits_it() {
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             active_permission_profile: None,
-            unnamed_permission_profile: None,
+            unnamed_permission_profile: Some(PermissionProfile::read_only()),
         })
     );
 }
 
 #[test]
-fn an_unattributed_snapshot_does_not_restore_unnamed_permissions() {
-    let history = [settings_item(
+fn an_unattributed_snapshot_restores_only_portable_read_only_permissions() {
+    let mut item = settings_item(
         /*thread_id*/ None,
         AskForApproval::OnRequest,
         ApprovalsReviewer::User,
         /*active_permission_profile*/ None,
-    )];
+    );
+    let thread_id = ThreadId::new();
+    let expected = PersistedResumeSettings {
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: Some(ApprovalsReviewer::User),
+        active_permission_profile: None,
+        unnamed_permission_profile: Some(PermissionProfile::read_only()),
+    };
+    assert_eq!(
+        PersistedResumeSettings::from_history(std::slice::from_ref(&item), thread_id),
+        Some(expected)
+    );
+    let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut item else {
+        unreachable!("fixture must be a settings update");
+    };
+    event.thread_settings.permission_profile = PermissionProfile::Disabled;
     let settings =
-        PersistedResumeSettings::from_history(&history, ThreadId::new()).expect("legacy settings");
+        PersistedResumeSettings::from_history(&[item], thread_id).expect("legacy settings");
     assert_eq!(settings.unnamed_permission_profile, None);
 }

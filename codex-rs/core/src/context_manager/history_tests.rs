@@ -1,16 +1,21 @@
 use super::*;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
+use crate::context::ApprovedCommandPrefixSaved;
+use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions;
 use crate::context::world_state::SectionTransition;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
 use crate::context::world_state::WorldStateUpdateContent;
+use crate::image_preparation::tests::FailingAttachmentStore;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_attachment_store::InlineAttachmentStore;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::ContentItem;
@@ -36,9 +41,9 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol_test_support::ContentItemTestExt;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -55,6 +60,30 @@ use test_case::test_case;
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 const TEST_WAV_SAMPLE_RATE: u32 = 8_000;
+
+#[test]
+fn sampling_checkpoint_excludes_input_appended_during_request() {
+    let mut history = create_history_with_items(vec![user_msg("included in the request")]);
+    let request_sequence = history.input_sequence();
+    history.record_items(
+        [&user_msg("arrived while sampling")],
+        TruncationPolicy::Tokens(10_000),
+    );
+    history.record_annotated_items(
+        &mut [ResponseItemEnvelope {
+            item: assistant_msg("response to the earlier request"),
+            metadata: Some(CodexHarnessMetadata {
+                sampled_through_sequence: Some(request_sequence),
+                ..Default::default()
+            }),
+        }],
+        TruncationPolicy::Tokens(10_000),
+    );
+    assert_eq!(
+        crate::context_manager::sampled_through(history.annotated_items()),
+        request_sequence,
+    );
+}
 
 fn unknown_content_metadata() -> InternalChatMessageMetadataPassthrough {
     InternalChatMessageMetadataPassthrough {
@@ -128,13 +157,17 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
 
 fn root_history() -> ContextManager {
     ContextManager::for_session(
-        &SessionSource::Cli,
+        /*root_capabilities_restricted*/ false,
         &ManagedFeatures::from(codex_features::Features::with_defaults()),
+        /*reuse_parent_compaction*/ true,
+        codex_guardian_context::ContextBudgeting::Fixed,
+        thread_context_ids(),
+        /*retention*/ None,
     )
 }
 
 fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
-    let mut h = ContextManager::new();
+    let mut h = ContextManager::default();
     // Use a generous but fixed token budget; tests only rely on truncation
     // behavior, not on a specific model's token limit.
     h.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
@@ -143,6 +176,21 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
 
 fn raw_items(history: &ContextManager) -> Vec<ResponseItem> {
     history.raw_items().cloned().collect()
+}
+
+fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
+    super::estimate_response_item_model_visible_bytes(item, &FileAudioDurations::default())
+}
+
+impl ContextManager {
+    fn update_world_state(
+        &mut self,
+        world_state: &WorldState,
+    ) -> (Vec<WorldStateUpdate>, Option<WorldStateItem>) {
+        let (snapshot, updates, item) = self.render_step_world_state(world_state);
+        self.set_world_state_baseline(snapshot);
+        (updates, item)
+    }
 }
 
 #[test]
@@ -158,6 +206,7 @@ fn delivered_assistant_context_invalidates_reviews_without_changing_authorizatio
     let before_delivery = history.conversation_history_snapshot();
     let authorization = before_delivery.user_message_revision();
     let event = RetainedContextEvent::DeliveredAssistantMessage {
+        retained_source: None,
         message: codex_history::RetainedUserMessage {
             origin: codex_history::UserInputOrigin::User,
             turn_id: "turn".to_owned(),
@@ -176,7 +225,7 @@ fn delivered_assistant_context_invalidates_reviews_without_changing_authorizatio
     );
     assert!(!history.record_retained_context(&event));
     assert_eq!(revisions(&history), (delivered_revision, authorization));
-    let mut resumed = ContextManager::new();
+    let mut resumed = ContextManager::default();
     resumed.restore_retained_context(Some(history.retained_context()));
     assert_ne!(revisions(&resumed).0, delivered_revision);
 
@@ -532,6 +581,91 @@ fn conversation_history_snapshot_excludes_contextual_user_messages() {
     );
 }
 
+#[test_case(true; "include_on_resume")]
+#[test_case(false; "exclude_on_resume")]
+fn guardian_checkpoint_applies_additional_context_policy_after_resume(include: bool) {
+    let mut features = ManagedFeatures::from(codex_features::Features::with_defaults());
+    features
+        .disable(Feature::GuardianReuseParentCompaction)
+        .unwrap();
+    features
+        .set_enabled(Feature::GuardianIncludeAdditionalContext, !include)
+        .unwrap();
+    let mut history = ContextManager::for_session(
+        /*root_capabilities_restricted*/ false,
+        &features,
+        features.enabled(Feature::GuardianReuseParentCompaction),
+        codex_guardian_context::ContextBudgeting::Fixed,
+        thread_context_ids(),
+        /*retention*/ None,
+    );
+    let additional_context: ResponseItem = crate::context::AdditionalContextToolOutput::new(
+        "browser_info",
+        /*name*/ None,
+        "captured page",
+    )
+    .into();
+    let ordinary_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("browser_info".to_owned()),
+        namespace: Some("agent".to_owned()),
+        output: FunctionCallOutputPayload::from_text("ordinary result".to_owned()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_annotated_items(
+        &mut [
+            ResponseItemEnvelope {
+                item: additional_context.clone(),
+                metadata: Some(CodexHarnessMetadata {
+                    additional_context_tool_output: true,
+                    ..Default::default()
+                }),
+            },
+            ResponseItemEnvelope::new(ordinary_output.clone()),
+        ],
+        TruncationPolicy::Tokens(10_000),
+    );
+    let compacted = vec![ResponseItemEnvelope::new(ordinary_output.clone())];
+    history.replace_compacted(compacted.clone(), /*reviewer_compaction_hash*/ None);
+    let checkpoint: GuardianHistoryCheckpoint = serde_json::from_str(
+        &serde_json::to_string(&history.guardian_history_checkpoint().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    features
+        .set_enabled(Feature::GuardianIncludeAdditionalContext, include)
+        .unwrap();
+    let mut resumed = ContextManager::for_session(
+        /*root_capabilities_restricted*/ false,
+        &features,
+        features.enabled(Feature::GuardianReuseParentCompaction),
+        codex_guardian_context::ContextBudgeting::Fixed,
+        thread_context_ids(),
+        /*retention*/ None,
+    );
+    resumed.replace_annotated(compacted);
+    resumed.restore_review_context(
+        /*retained_context*/ None,
+        Some(&checkpoint),
+        /*reviewer_compaction_hash*/ None,
+    );
+    let snapshot = resumed.conversation_history_snapshot();
+    assert_eq!(
+        snapshot.items().cloned().collect::<Vec<_>>(),
+        vec![ordinary_output.clone()]
+    );
+    let expected = if include {
+        vec![additional_context, ordinary_output]
+    } else {
+        vec![ordinary_output]
+    };
+    assert_eq!(
+        snapshot.review_items().cloned().collect::<Vec<_>>(),
+        expected
+    );
+}
+
 struct TestWorldStateSection;
 
 impl WorldStateSection for TestWorldStateSection {
@@ -572,7 +706,7 @@ fn world_state_baseline_deduplicates_until_history_is_replaced() {
         state.add_section(TestWorldStateSection);
         state
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
 
     let (initial_fragments, initial_item) = history.update_world_state(&world_state());
     assert_eq!(1, initial_fragments.len());
@@ -608,7 +742,7 @@ fn world_state_transitions_persist_changed_state_and_skip_unchanged_state() {
         }));
         state
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     let (_, full) = history.update_world_state(&world_state("before"));
     let full = full.expect("full checkpoint");
     assert!(full.full);
@@ -649,6 +783,7 @@ fn world_state_reconciles_matching_legacy_history_once() {
             .into_iter()
             .map(|update| match update.content {
                 WorldStateUpdateContent::Fragment(fragment) => fragment.body().expect_text(),
+                WorldStateUpdateContent::Environment(_) => panic!("unexpected environment"),
                 WorldStateUpdateContent::Item(item) =>
                     panic!("expected a text fragment, got {item:?}"),
             })
@@ -729,6 +864,7 @@ fn reference_context_item() -> TurnContextItem {
     TurnContextItem {
         turn_id: Some("reference-turn".to_string()),
         root_turn_id: None,
+        direct_only_tool_namespaces: None,
         disabled_plugin_ids: None,
         cwd: AbsolutePathBuf::try_from(
             std::env::current_dir()
@@ -738,10 +874,8 @@ fn reference_context_item() -> TurnContextItem {
         .expect("absolute reference cwd"),
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: None,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: codex_protocol::models::PermissionProfile::read_only(),
         active_permission_profile: None,
-        file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
         comp_hash: None,
         collaboration_mode: None,
@@ -828,7 +962,7 @@ fn filters_non_api_messages() {
 
 #[test]
 fn retains_only_harness_authored_configuration_updates() {
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     let update = ResponseItem::ConfigurationUpdate {
         reasoning: ConfigurationReasoning {
             effort: ReasoningEffort::High,
@@ -837,6 +971,8 @@ fn retains_only_harness_authored_configuration_updates() {
     let trusted = ResponseItemEnvelope {
         item: update.clone(),
         metadata: Some(CodexHarnessMetadata {
+            history_sequence: Some(4),
+            sampled_through_sequence: Some(0),
             harness_authored_configuration: true,
             ..Default::default()
         }),
@@ -879,7 +1015,7 @@ fn retains_only_harness_authored_configuration_updates() {
 
 #[test]
 fn drop_last_n_user_turns_removes_post_input_configuration_update_with_its_turn() {
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     let updates =
         [ReasoningEffort::Low, ReasoningEffort::High].map(|effort| ResponseItemEnvelope {
             item: ResponseItem::ConfigurationUpdate {
@@ -902,6 +1038,7 @@ fn drop_last_n_user_turns_removes_post_input_configuration_update_with_its_turn(
         ResponseItemEnvelope::new(assistant_msg("removed answer")),
     ]);
     history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
+    let surviving = &items[..surviving.len()];
 
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
@@ -920,33 +1057,76 @@ fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
 
 #[test]
 fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
-    let history = create_history_with_items(vec![
+    let mut history = create_history_with_items(vec![
         reasoning_with_encrypted_content(/*len*/ 900),
         user_msg("first"),
         reasoning_with_encrypted_content(/*len*/ 1_000),
         user_msg("second"),
         reasoning_with_encrypted_content(/*len*/ 2_000),
     ]);
+    history.update_token_info(
+        &TokenUsage::default(),
+        /*model_context_window*/ None,
+        /*includes_reasoning*/ false,
+        /*input_item_count*/ 0,
+    );
     // first: (900 * 0.75 - 650) / 4 = 6.25 tokens
     // second: (1000 * 0.75 - 650) / 4 = 25 tokens
     // first + second = 62.5
     assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
 }
 
-#[test]
-fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
-    let history = create_history_with_items(vec![
-        assistant_msg("already counted by API"),
-        user_msg("new user message"),
-        custom_tool_call_output("call-tail", "new tool output"),
+#[test_case(None, 125; "legacy count")]
+#[test_case(Some(false), 125; "exclusive count")]
+#[test_case(Some(true), 100; "inclusive count")]
+fn total_token_usage_respects_saved_reasoning_accounting(
+    includes_reasoning: Option<bool>,
+    expected: i64,
+) {
+    let mut history = ContextManager::default();
+    history.replace(vec![
+        reasoning_with_encrypted_content(/*len*/ 1_000),
+        user_msg("second"),
+        assistant_msg("counted reply"),
     ]);
+    let usage = TokenUsage {
+        total_tokens: 100,
+        ..Default::default()
+    };
+    let mut saved = json!({ "last_token_usage": usage, "total_token_usage": usage });
+    if let Some(included) = includes_reasoning {
+        saved["last_usage_includes_reasoning"] = json!(included);
+    }
+    history.set_token_info(Some(
+        serde_json::from_value(saved).expect("saved token count"),
+    ));
+
+    assert_eq!(history.get_total_token_usage(), expected);
+}
+
+#[test]
+fn items_since_last_usage_include_user_and_tool_output() {
+    let mut history = create_history_with_items(vec![assistant_msg("already counted by API")]);
+    history.update_token_info(
+        &TokenUsage::default(),
+        /*model_context_window*/ None,
+        /*includes_reasoning*/ true,
+        /*input_item_count*/ 0,
+    );
+    history.record_items(
+        [
+            &user_msg("new user message"),
+            &custom_tool_call_output("call-tail", "new tool output"),
+        ],
+        TruncationPolicy::Tokens(10_000),
+    );
     let expected_tokens = estimate_item_token_count(&user_msg("new user message")).saturating_add(
         estimate_item_token_count(&custom_tool_call_output("call-tail", "new tool output")),
     );
 
     assert_eq!(
         history
-            .items_after_last_model_generated_item()
+            .items_since_last_usage()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add),
         expected_tokens
@@ -954,15 +1134,15 @@ fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
 }
 
 #[test]
-fn items_after_last_model_generated_tokens_are_zero_without_model_generated_items() {
+fn items_since_last_usage_include_initial_input() {
     let history = create_history_with_items(vec![user_msg("no model output yet")]);
 
     assert_eq!(
         history
-            .items_after_last_model_generated_item()
+            .items_since_last_usage()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add),
-        0
+        estimate_item_token_count(&user_msg("no model output yet"))
     );
 }
 
@@ -973,13 +1153,18 @@ fn inter_agent_assistant_messages_are_turn_boundaries() {
     assert!(is_user_turn_boundary(&item));
 }
 
-#[test]
-fn for_prompt_preserves_inter_agent_assistant_messages() {
+#[tokio::test]
+async fn for_prompt_preserves_inter_agent_assistant_messages() {
     let item = inter_agent_assistant_msg("continue");
     let history = create_history_with_items(vec![item.clone()]);
 
     assert_eq!(raw_items(&history), std::slice::from_ref(&item));
-    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+    assert_eq!(
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
+        vec![item]
+    );
 }
 
 #[test]
@@ -1011,9 +1196,13 @@ fn cloned_history_shares_items_until_mutated() {
 fn annotated_history_apis_preserve_envelopes() {
     let first_envelope = ResponseItemEnvelope {
         item: assistant_msg("first"),
-        metadata: Some(CodexHarnessMetadata::default()),
+        metadata: Some(CodexHarnessMetadata {
+            history_sequence: Some(7),
+            sampled_through_sequence: Some(4),
+            ..Default::default()
+        }),
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
 
     history.replace_annotated(vec![first_envelope.clone()]);
 
@@ -1054,7 +1243,7 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
             ..Default::default()
         }),
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
 
     history.record_annotated_items(
         std::slice::from_mut(&mut envelope),
@@ -1080,7 +1269,47 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
 }
 
 #[test]
-fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
+fn realtime_input_stages_provenance_without_copying_model_history() {
+    let mut history = create_history_with_items(vec![user_msg("earlier input")]);
+    let original_items = Arc::clone(&history.items);
+    let original_retained = history.retained_context().clone();
+    let mut envelope = ResponseItemEnvelope::new(ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
+        id: Some(ResponseItemId::with_suffix("msg", "realtime")),
+        role: "user".to_owned(),
+        content: vec![ContentItem::InputText {
+            text: "use the smaller logo".to_owned(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("realtime-turn".to_owned()),
+            content_item_kinds: Some(vec![ContentItemKind("user.text".to_owned())]),
+            ..Default::default()
+        }),
+    });
+    history.prepare_item_sampling(&mut envelope);
+    let staged = history.stage_realtime_input(&mut envelope);
+    assert!(Arc::ptr_eq(&history.items, &original_items));
+    assert_eq!(history.retained_context(), &original_retained);
+    assert!(
+        envelope
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.retained_source.is_some())
+    );
+
+    // A failed seal can retry the exact cached envelope, including its source revision.
+    drop(staged);
+    let cached = envelope.clone();
+    let staged = history.stage_realtime_input(&mut envelope);
+    assert_eq!(envelope, cached);
+    history.record_sealed_realtime_input(&envelope, staged, TruncationPolicy::Tokens(10_000));
+    assert_eq!(history.annotated_items().last(), Some(&cached));
+}
+
+#[tokio::test]
+async fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
     let envelope = ResponseItemEnvelope {
         item: ResponseItem::Message {
             status: None,
@@ -1101,12 +1330,18 @@ fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        metadata: Some(CodexHarnessMetadata::default()),
+        metadata: Some(CodexHarnessMetadata {
+            history_sequence: Some(7),
+            sampled_through_sequence: Some(4),
+            ..Default::default()
+        }),
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     history.replace_annotated(vec![envelope.clone()]);
 
-    let normalized = history.for_prompt_annotated(&[InputModality::Text]);
+    let normalized = history
+        .for_prompt_annotated(&[InputModality::Text], &InlineAttachmentStore)
+        .await;
 
     assert_eq!(normalized.len(), 1);
     assert_eq!(normalized[0].metadata, envelope.metadata);
@@ -1140,8 +1375,9 @@ fn legacy_inter_agent_assistant_messages_are_not_turn_boundaries() {
     assert!(!is_user_turn_boundary(&item));
 }
 
-#[test]
-fn total_token_usage_includes_all_items_after_last_model_generated_item() {
+#[test_case(false; "exclusive count")]
+#[test_case(true; "inclusive count")]
+fn total_token_usage_includes_all_items_since_last_usage(includes_reasoning: bool) {
     let mut history = create_history_with_items(vec![assistant_msg("already counted by API")]);
     history.update_token_info(
         &TokenUsage {
@@ -1149,6 +1385,8 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
             ..Default::default()
         },
         /*model_context_window*/ None,
+        includes_reasoning,
+        /*input_item_count*/ 0,
     );
     let added_user = user_msg("new user message");
     let added_tool_output = custom_tool_call_output("tool-tail", "new tool output");
@@ -1158,14 +1396,157 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
     );
 
     assert_eq!(
-        history.get_total_token_usage(/*server_reasoning_included*/ true),
+        history.get_total_token_usage(),
         100 + estimate_item_token_count(&added_user)
             + estimate_item_token_count(&added_tool_output)
     );
+
+    // An empty successful response still covers the input sent with that request.
+    let input_item_count = history.raw_items().len();
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
+        includes_reasoning,
+        input_item_count,
+    );
+    assert_eq!(history.get_total_token_usage(), 100);
+
+    // A failed response can report spending without covering its retained output.
+    let partial = reasoning_with_encrypted_content(/*len*/ 2_000);
+    history.record_items([&partial], TruncationPolicy::Tokens(10_000));
+    let mut spending = history.token_info().expect("saved usage");
+    spending.total_token_usage.total_tokens += 15;
+    history.set_token_info(Some(spending));
+    history.record_items([&added_user], TruncationPolicy::Tokens(10_000));
+    let expected =
+        100 + estimate_item_token_count(&partial) + estimate_item_token_count(&added_user);
+    assert_eq!(history.get_total_token_usage(), expected);
+
+    // Local output after the final model item is not covered by server usage.
+    history.record_items(
+        [&assistant_msg("next response"), &added_tool_output],
+        TruncationPolicy::Tokens(10_000),
+    );
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
+        includes_reasoning,
+        input_item_count,
+    );
+    let prior_reasoning = if includes_reasoning {
+        0
+    } else {
+        estimate_item_token_count(&partial)
+    };
+    assert_eq!(
+        history.get_total_token_usage(),
+        100 + prior_reasoning + estimate_item_token_count(&added_tool_output),
+    );
 }
 
-#[test]
-fn for_prompt_strips_media_when_model_does_not_support_it() {
+/// Unavailable images become harness-attributed placeholders without changing saved history or
+/// neighboring inline content and its annotations.
+#[tokio::test]
+async fn for_prompt_replaces_unavailable_message_images() {
+    let original: ResponseItem = from_value(json!({
+        "type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "file_id": "expired"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": ["user.text", "user.image", "user.image"]
+        }
+    }))
+    .unwrap();
+    let history = create_history_with_items(vec![original.clone()]);
+    let projected = history
+        .clone()
+        .for_prompt_annotated(
+            &[
+                InputModality::Text,
+                InputModality::Image,
+                InputModality::Audio,
+            ],
+            &FailingAttachmentStore,
+        )
+        .await;
+    let expected: ResponseItem = from_value(json!({
+        "type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_text", "text": "[image unavailable]"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": ["user.text", "images.unavailable", "user.image"],
+            "content_item_metadata": [{}, {"harness_injected": true}, {}]
+        }
+    }))
+    .unwrap();
+    let mut expected_envelope = history.annotated_items()[0].clone();
+    expected_envelope.item = expected;
+    assert_eq!(projected, vec![expected_envelope]);
+    assert_eq!(raw_items(&history), vec![original]);
+}
+
+/// Both tool output formats retain inline images and text when a neighboring file expires.
+#[tokio::test]
+async fn for_prompt_replaces_unavailable_tool_images() {
+    for (call, output) in [
+        (
+            json!({"type": "function_call", "call_id": "call-1", "name": "view_image", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call-1"}),
+        ),
+        (
+            json!({"type": "custom_tool_call", "call_id": "call-1", "name": "js_repl", "input": "view_image"}),
+            json!({"type": "custom_tool_call_output", "call_id": "call-1"}),
+        ),
+    ] {
+        let call: ResponseItem = from_value(call).unwrap();
+        let mut original = output.clone();
+        original["output"] = json!([
+            {"type": "input_text", "text": "result"},
+            {"type": "input_image", "file_id": "expired"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ]);
+        let original: ResponseItem = from_value(original).unwrap();
+        let history = create_history_with_items(vec![call.clone(), original.clone()]);
+        let mut expected = output;
+        expected["output"] = json!([
+            {"type": "input_text", "text": "result"},
+            {"type": "input_text", "text": "[image unavailable]"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ]);
+        let expected: ResponseItem = from_value(expected).unwrap();
+
+        assert_eq!(
+            history
+                .clone()
+                .for_prompt(
+                    &[
+                        InputModality::Text,
+                        InputModality::Image,
+                        InputModality::Audio
+                    ],
+                    &FailingAttachmentStore,
+                )
+                .await,
+            vec![call.clone(), expected]
+        );
+        assert_eq!(raw_items(&history), vec![call, original]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn for_prompt_strips_media_when_model_does_not_support_it() {
     let items = vec![
         ResponseItem::Message {
             status: None,
@@ -1183,7 +1564,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 ContentItem::InputAudio {
-                    audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+                    audio: AudioReference::Inline {
+                        audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+                    },
                 },
                 ContentItem::InputText {
                     text: "caption".to_string(),
@@ -1228,9 +1611,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
-                FunctionCallOutputContentItem::InputAudio {
-                    audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
-                },
+                FunctionCallOutputContentItem::inline_audio(
+                    "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+                ),
             ]),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1258,9 +1641,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
-                FunctionCallOutputContentItem::InputAudio {
-                    audio_url: "data:audio/ogg;base64,YXVkaW8=".to_string(),
-                },
+                FunctionCallOutputContentItem::inline_audio(
+                    "data:audio/ogg;base64,YXVkaW8=".to_string(),
+                ),
             ]),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1268,7 +1651,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     let fully_supported_items = items.clone();
     let history = create_history_with_items(items);
     let text_only_modalities = vec![InputModality::Text];
-    let stripped = history.for_prompt(&text_only_modalities);
+    let stripped = history
+        .for_prompt(&text_only_modalities, &InlineAttachmentStore)
+        .await;
 
     let expected = vec![
         ResponseItem::Message {
@@ -1372,11 +1757,16 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     ];
     assert_eq!(stripped, expected);
     assert_eq!(
-        create_history_with_items(fully_supported_items.clone()).for_prompt(&[
-            InputModality::Text,
-            InputModality::Image,
-            InputModality::Audio,
-        ]),
+        create_history_with_items(fully_supported_items.clone())
+            .for_prompt(
+                &[
+                    InputModality::Text,
+                    InputModality::Image,
+                    InputModality::Audio,
+                ],
+                &InlineAttachmentStore
+            )
+            .await,
         fully_supported_items
     );
 
@@ -1401,7 +1791,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }]);
-    let preserved = with_images.for_prompt(&modalities);
+    let preserved = with_images
+        .for_prompt(&modalities, &InlineAttachmentStore)
+        .await;
     assert_eq!(preserved.len(), 1);
     if let ResponseItem::Message { content, .. } = &preserved[0] {
         assert_eq!(content.len(), 2);
@@ -1416,20 +1808,27 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputAudio {
-            audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+            audio: AudioReference::Inline {
+                audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+            },
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     };
     let with_audio = create_history_with_items(vec![audio_message.clone()]);
     assert_eq!(
-        with_audio.for_prompt(&[InputModality::Text, InputModality::Audio]),
+        with_audio
+            .for_prompt(
+                &[InputModality::Text, InputModality::Audio],
+                &InlineAttachmentStore
+            )
+            .await,
         vec![audio_message]
     );
 }
 
-#[test]
-fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
+#[tokio::test]
+async fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     let history = create_history_with_items(vec![
         ResponseItem::ImageGenerationCall {
             encrypted_content: None,
@@ -1453,7 +1852,9 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     ]);
 
     assert_eq!(
-        history.for_prompt(&default_input_modalities()),
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
         vec![
             ResponseItem::ImageGenerationCall {
                 encrypted_content: None,
@@ -1478,8 +1879,8 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     );
 }
 
-#[test]
-fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
+#[tokio::test]
+async fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     let history = create_history_with_items(vec![
         ResponseItem::Message {
             status: None,
@@ -1503,7 +1904,9 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     ]);
 
     assert_eq!(
-        history.for_prompt(&[InputModality::Text]),
+        history
+            .for_prompt(&[InputModality::Text], &InlineAttachmentStore)
+            .await,
         vec![
             ResponseItem::Message {
                 encrypted_content: None,
@@ -1657,8 +2060,8 @@ fn remove_first_item_handles_local_shell_pair() {
     assert_eq!(raw_items(&h), vec![]);
 }
 
-#[test]
-fn drop_last_n_user_turns_preserves_prefix() {
+#[tokio::test]
+async fn drop_last_n_user_turns_preserves_prefix() {
     let items = vec![
         assistant_msg("session prefix item"),
         user_msg("u1"),
@@ -1671,7 +2074,9 @@ fn drop_last_n_user_turns_preserves_prefix() {
     let mut history = create_history_with_items(items);
     history.drop_last_n_user_turns(/*num_turns*/ 1);
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_msg("u1"),
@@ -1688,7 +2093,10 @@ fn drop_last_n_user_turns_preserves_prefix() {
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 99);
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![assistant_msg("session prefix item")]
     );
     // With no remaining instruction boundary, rollback must not revoke facts from a
@@ -1761,6 +2169,130 @@ fn drop_last_n_user_turns_preserves_prefix() {
 }
 
 #[test]
+fn session_end_input_does_not_consume_a_rollback_turn() {
+    let first = user_input_text_msg("first turn");
+    // Even if its content happens to look like normal pre-turn context, a saved
+    // hangup belongs to the preceding turn and must survive rollback of the next.
+    let tail =
+        user_input_text_msg("<environment_context>speech saved at hangup</environment_context>");
+    let next = user_input_text_msg("next turn");
+    let mut saved_tail = ResponseItemEnvelope::new(tail.clone());
+    saved_tail.metadata = Some(CodexHarnessMetadata {
+        realtime_session_end_input: true,
+        ..Default::default()
+    });
+
+    for (mut items, expected) in [
+        (
+            vec![ResponseItemEnvelope::new(first.clone()), saved_tail.clone()],
+            Vec::new(),
+        ),
+        (
+            vec![
+                ResponseItemEnvelope::new(first.clone()),
+                saved_tail,
+                ResponseItemEnvelope::new(next),
+            ],
+            vec![first, tail],
+        ),
+    ] {
+        let mut live = ContextManager::default();
+        live.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
+        let mut checkpoint = ContextManager::default();
+        checkpoint.replace_annotated(live.annotated_items().to_vec());
+
+        for mut history in [live, checkpoint] {
+            history.drop_last_n_user_turns(/*num_turns*/ 1);
+            assert_eq!(raw_items(&history), expected);
+        }
+    }
+}
+
+#[test]
+fn oversized_direct_delivery_retains_its_incomplete_marker_across_replay() {
+    let call_id = "question";
+    let mut call: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "function_call", "call_id": call_id,
+        "namespace": "mcp__codex_apps", "name": "user_messaging_send_message",
+        "arguments": "{}",
+    }))
+    .unwrap();
+    call.set_id(Some(ResponseItemId::with_suffix("call", "question")));
+    call.set_turn_id_if_missing("turn");
+    const RECORD_BYTES: usize = 512;
+    let original = "x".repeat(RECORD_BYTES);
+    let expected = codex_history::RetainedUserMessage {
+        turn_id: "turn".to_owned(),
+        message_id: call.id().map(|id| id.as_str().to_owned()),
+        text: String::new(),
+        complete: false,
+        origin: codex_history::UserInputOrigin::User,
+        phase: None,
+    };
+    let retention = Some(MessageRetention {
+        thread_id: codex_protocol::ThreadId::new(),
+        policy: serde_json::from_value(serde_json::json!({"assistant_record_bytes": RECORD_BYTES}))
+            .unwrap(),
+    });
+    let new_history = || ContextManager::new(thread_context_ids(), retention);
+    let mut live = new_history();
+    let mut items = [
+        ResponseItemEnvelope {
+            item: call,
+            metadata: Some(CodexHarnessMetadata {
+                user_input_order: Some(0),
+                ..Default::default()
+            }),
+        },
+        ResponseItemEnvelope {
+            item: serde_json::from_value(serde_json::json!({
+                "type": "function_call_output", "call_id": call_id, "output": "Sent.",
+            }))
+            .unwrap(),
+            metadata: Some(CodexHarnessMetadata {
+                delivered_assistant_message: Some(original),
+                ..Default::default()
+            }),
+        },
+    ];
+    const TEST_HISTORY_TOKENS: usize = 10_000;
+    live.record_annotated_items(&mut items, TruncationPolicy::Tokens(TEST_HISTORY_TOKENS));
+    let saved = serde_json::to_vec(&items.map(codex_history::RolloutItem::ResponseItem)).unwrap();
+    let mut replayed = new_history();
+    let replay_items = serde_json::from_slice::<Vec<codex_history::RolloutItem>>(&saved)
+        .unwrap()
+        .into_iter()
+        .map(|item| match item {
+            codex_history::RolloutItem::ResponseItem(envelope) => envelope,
+            _ => panic!("expected a saved response item"),
+        })
+        .collect();
+    replayed.replace_annotated(replay_items);
+    replayed.restore_retained_context(/*checkpoint*/ None);
+    for history in [live, replayed] {
+        let metadata = history.annotated_items()[1].metadata.as_ref().unwrap();
+        assert_eq!(
+            (
+                metadata.delivered_assistant_message.as_deref(),
+                metadata.delivered_assistant_message_incomplete
+            ),
+            (None, true)
+        );
+        assert!(history.retained_context().has_omitted_assistant_messages());
+        let mut entries = history.retained_context().ordered_entries();
+        let Some((order, codex_history::RetainedContextEntry::AssistantMessage(message))) =
+            entries.next()
+        else {
+            panic!("missing confirmed delivery");
+        };
+        assert_eq!(
+            (order, message),
+            (codex_history::RetainedContextOrder::Local(0), &expected)
+        );
+    }
+}
+
+#[test]
 fn rollback_removes_assistant_sources_recorded_ahead_of_queued_input() {
     let mut history = root_history();
     let original = user_msg("Staging only.");
@@ -1792,8 +2324,8 @@ fn rollback_removes_assistant_sources_recorded_ahead_of_queued_input() {
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
+#[tokio::test]
+async fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     let items = vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
         user_input_text_msg(
@@ -1833,7 +2365,9 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     ];
 
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         expected_prefix_and_first_turn
     );
 
@@ -1869,7 +2403,12 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
         assistant_msg("turn 2 assistant"),
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 2);
-    assert_eq!(history.for_prompt(&modalities), expected_prefix_only);
+    assert_eq!(
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
+        expected_prefix_only
+    );
 
     let mut history = create_history_with_items(vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
@@ -1889,11 +2428,16 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
         assistant_msg("turn 2 assistant"),
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 3);
-    assert_eq!(history.for_prompt(&modalities), expected_prefix_only);
+    assert_eq!(
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
+        expected_prefix_only
+    );
 }
 
-#[test]
-fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
+#[tokio::test]
+async fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
     let items = vec![
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
@@ -1904,6 +2448,9 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
         developer_msg(&format!(
             "{APPS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_APPS_INSTRUCTIONS"
         )),
+        developer_msg(
+            "<catalog_apps_instructions>Retired Apps guidance</catalog_apps_instructions>",
+        ),
         developer_msg(&format!(
             "{PLUGINS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_PLUGIN_INSTRUCTIONS"
         )),
@@ -1927,7 +2474,10 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
@@ -2014,15 +2564,38 @@ fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragment
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
+#[test_case::test_case(APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX, None; "legacy")]
+#[test_case::test_case("Saved for this session", Some(crate::context::SAVED_PREFIX_KIND); "catalog")]
+#[test_case::test_case("Saved for this session", None; "catalog_without_metadata")]
+#[tokio::test]
+async fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn(
+    heading: &str,
+    kind: Option<&str>,
+) {
+    // Without metadata, use the rendered text to exercise the legacy reader's
+    // prefix-based classification of notifications written by this client.
+    let text = match kind {
+        Some(_) => format!("{heading}\n- [\"touch\"]"),
+        None => ApprovedCommandPrefixSaved::new("- [\"touch\"]".to_string(), Some(heading))
+            .render()
+            .expect_text(),
+    };
+    let mut notification = developer_msg(&text);
+    if let Some(kind) = kind
+        && let ResponseItem::Message {
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &mut notification
+    {
+        internal_chat_message_metadata_passthrough
+            .get_or_insert_with(Default::default)
+            .content_item_kinds = Some(vec![ContentItemKind(kind.to_owned())]);
+    }
     let items = vec![
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
-        developer_msg(&format!(
-            "{APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX}\n- [\"touch\"]"
-        )),
+        notification,
         user_input_text_msg("turn 2 user"),
         assistant_msg("turn 2 assistant"),
     ];
@@ -2032,7 +2605,9 @@ fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
@@ -2041,8 +2616,8 @@ fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_bundles() {
+#[tokio::test]
+async fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_bundles() {
     let items = vec![
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
@@ -2063,7 +2638,10 @@ fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_b
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             user_input_text_msg("turn 1 user"),
             assistant_msg("turn 1 assistant"),
@@ -2098,8 +2676,8 @@ fn remove_first_item_handles_custom_tool_pair() {
     assert_eq!(raw_items(&h), vec![]);
 }
 
-#[test]
-fn normalization_retains_local_shell_outputs() {
+#[tokio::test]
+async fn normalization_retains_local_shell_outputs() {
     let items = vec![
         ResponseItem::LocalShellCall {
             encrypted_content: None,
@@ -2127,13 +2705,15 @@ fn normalization_retains_local_shell_outputs() {
 
     let modalities = default_input_modalities();
     let history = create_history_with_items(items.clone());
-    let normalized = history.for_prompt(&modalities);
+    let normalized = history
+        .for_prompt(&modalities, &InlineAttachmentStore)
+        .await;
     assert_eq!(normalized, items);
 }
 
 #[test]
 fn record_items_truncates_function_call_output_content() {
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     // Any reasonably small token budget works; the test only cares that
     // truncation happens and the marker is present.
     let policy = TruncationPolicy::Tokens(1_000);
@@ -2177,7 +2757,7 @@ fn record_items_truncates_function_call_output_content() {
 
 #[test]
 fn record_items_truncates_custom_tool_call_output_content() {
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     let policy = TruncationPolicy::Tokens(1_000);
     let line = "custom output that is very long\n";
     let long_output = line.repeat(2_500);
@@ -2211,7 +2791,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
 
 #[test]
 fn record_items_respects_custom_token_limit() {
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     let policy = TruncationPolicy::Tokens(10);
     let long_output = "tokenized content repeated many times ".repeat(200);
     let item = ResponseItem::FunctionCallOutput {
@@ -2630,8 +3210,8 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
     );
 }
 
-#[test]
-fn normalize_preserves_named_function_call_output_without_call_id() {
+#[tokio::test]
+async fn normalize_preserves_named_function_call_output_without_call_id() {
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: None,
@@ -2642,11 +3222,16 @@ fn normalize_preserves_named_function_call_output_without_call_id() {
     };
     let history = create_history_with_items(vec![item.clone()]);
 
-    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+    assert_eq!(
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
+        vec![item]
+    );
 }
 
-#[test]
-fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history() {
+#[tokio::test]
+async fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history() {
     let items = vec![
         ResponseItem::FunctionCall {
             status: None,
@@ -2672,8 +3257,12 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
         },
     ];
 
-    let first = create_history_with_items(items.clone()).for_prompt(&default_input_modalities());
-    let second = create_history_with_items(items).for_prompt(&default_input_modalities());
+    let first = create_history_with_items(items.clone())
+        .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+        .await;
+    let second = create_history_with_items(items)
+        .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+        .await;
 
     assert_eq!(
         first, second,
@@ -3069,7 +3658,9 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
         encrypted_content: None,
         id: None,
         role: "user".to_string(),
-        content: vec![ContentItem::InputAudio { audio_url }],
+        content: vec![ContentItem::InputAudio {
+            audio: AudioReference::Inline { audio_url },
+        }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
@@ -3083,6 +3674,35 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
 }
 
 #[test]
+fn uploaded_audio_estimate_accounts_for_each_recording_instead_of_its_id() {
+    let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputAudio {
+                audio: AudioReference::File {
+                    file_id: "file_a".into(),
+                },
+            },
+            ContentItem::InputAudio {
+                audio: AudioReference::File {
+                    file_id: "file_a_longer_reference".into(),
+                },
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert_eq!(
+        estimate_response_item_model_visible_bytes(&item),
+        approx_bytes_for_tokens(/*tokens*/ 24_000) as i64,
+    );
+}
+
+#[test]
 fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
     let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 800);
     let item = ResponseItem::FunctionCallOutput {
@@ -3091,7 +3711,7 @@ fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
         name: None,
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputAudio { audio_url },
+            FunctionCallOutputContentItem::inline_audio(audio_url),
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
@@ -3112,7 +3732,7 @@ fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
         call_id: "call-custom-audio".to_string(),
         name: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputAudio { audio_url },
+            FunctionCallOutputContentItem::inline_audio(audio_url),
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
@@ -3136,7 +3756,9 @@ fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
         encrypted_content: None,
         id: None,
         role: "user".to_string(),
-        content: vec![ContentItem::InputAudio { audio_url }],
+        content: vec![ContentItem::InputAudio {
+            audio: AudioReference::Inline { audio_url },
+        }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
@@ -3156,13 +3778,13 @@ fn record_items_omits_audio_that_exceeds_the_output_budget() {
         namespace: None,
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::ContentItems(vec![
-                FunctionCallOutputContentItem::InputAudio { audio_url },
+                FunctionCallOutputContentItem::inline_audio(audio_url),
             ]),
             success: Some(true),
         },
         internal_chat_message_metadata_passthrough: None,
     };
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
 
     history.record_items([&item], TruncationPolicy::Tokens(50));
 

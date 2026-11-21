@@ -14,7 +14,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
@@ -96,6 +95,14 @@ async fn stops_at_newest_usable_compaction_and_keeps_companions() {
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
     let world_state = RolloutItem::WorldState(WorldStateItem::full(Default::default()));
     let turn_context = turn_context(home.path(), "companion");
+    let checkpoint: RolloutItem = serde_json::from_value(serde_json::json!({
+        "type": "compacted", "payload": {
+            "message": "latest compaction", "replacement_history": [], "window_number": 2,
+            "window_id": {"salt": "window", "ordinal": 2, "value": 6},
+            "resume_metadata": {"next_item_ordinal": 24}
+        }
+    }))
+    .expect("seeded checkpoint");
     let path = write_paginated_rollout(
         home.path(),
         "2025-01-03T13-00-00",
@@ -104,7 +111,7 @@ async fn stops_at_newest_usable_compaction_and_keeps_companions() {
             user_message("older history"),
             compacted("older compaction", Some(Vec::new())),
             user_message("superseded suffix"),
-            compacted("latest compaction", Some(Vec::new())),
+            checkpoint.clone(),
             world_state.clone(),
             turn_context.clone(),
         ],
@@ -126,7 +133,7 @@ async fn stops_at_newest_usable_compaction_and_keeps_companions() {
         serde_json::to_value(context.items).expect("serialize context"),
         serde_json::to_value(vec![
             RolloutItem::SessionMeta(Box::new(session_meta)),
-            compacted("latest compaction", Some(Vec::new())),
+            checkpoint,
             world_state,
             turn_context,
         ])
@@ -273,6 +280,10 @@ async fn fork_version_stops_before_older_segments_once_resolved() {
             unreachable!();
         };
         compacted.resume_metadata = Some(codex_rollout::CompactionResumeMetadata {
+            next_item_ordinal: None,
+            rejected_audio_file_ids: Default::default(),
+            dynamic_tools: None,
+            observation_clock_floor_ms: None,
             multi_agent_version: Some(MultiAgentVersion::V2),
             last_started_turn_id: None,
             turn_attribution: None,
@@ -719,6 +730,7 @@ fn contextual_user_message() -> RolloutItem {
 
 fn completed_user_message(turn_id: &str, message: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        content_token_count: None,
         thread_id: codex_protocol::ThreadId::from_string("00000000-0000-0000-0000-000000000000")
             .expect("fixture thread id"),
         turn_id: turn_id.to_string(),
@@ -739,14 +751,13 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
     RolloutItem::TurnContext(TurnContextItem {
         turn_id: Some(turn_id.to_string()),
         root_turn_id: None,
+        direct_only_tool_namespaces: None,
         disabled_plugin_ids: None,
         cwd: serde_json::from_value(serde_json::json!(root)).expect("absolute cwd"),
         approval_policy: AskForApproval::Never,
         approvals_reviewer: None,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: codex_protocol::models::PermissionProfile::read_only(),
         active_permission_profile: None,
-        file_system_sandbox_policy: None,
         model: "test-model".to_string(),
         comp_hash: None,
         collaboration_mode: None,

@@ -1,5 +1,6 @@
 use super::step_settings::ResolvedStepSettings;
 use super::*;
+use codex_protocol::openai_models::ModelOrigin;
 
 /// Spawn a review thread using the given prompt.
 pub(super) async fn spawn_review_thread(
@@ -57,7 +58,7 @@ pub(super) async fn spawn_review_thread(
     per_turn_config.compact_prompt = parent_turn_context.config.compact_prompt.clone();
     if let Some(current_effort) = reasoning_effort.as_ref()
         && review_model_info.slug != parent_turn_context.model_info().slug
-        && !review_model_info.used_fallback_model_metadata
+        && review_model_info.origin != ModelOrigin::Synthetic
         && !review_model_info
             .supported_reasoning_levels
             .iter()
@@ -154,11 +155,7 @@ pub(super) async fn spawn_review_thread(
     // Seed the child task with the review prompt as the initial user message.
     let input = vec![TurnInput::UserInput {
         metadata: Default::default(),
-        content: vec![UserInput::Text {
-            text: review_prompt,
-            // Review prompt is synthesized; no UI element ranges to preserve.
-            text_elements: Vec::new(),
-        }],
+        content: vec![ResolvedUserInput::text(review_prompt)],
         client_id: None,
     }];
     let tc = Arc::new(review_turn_context);

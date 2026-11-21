@@ -93,7 +93,7 @@ impl Session {
         let _guard = thread_settings::acquire_persistence_lock(self).await;
         let mut item = ContextualUserFragment::into(update);
         Self::stamp_response_item_for_history(&mut item, &context.sub_id);
-        Self::assign_missing_response_item_id(&mut item);
+        self.assign_missing_response_item_id(&mut item);
         let mut item = ResponseItemEnvelope {
             item,
             metadata: Some(CodexHarnessMetadata {
@@ -156,7 +156,6 @@ impl Session {
     }
 
     pub(crate) async fn record_retained_context(&self, mut event: RetainedContextEvent) {
-        event.bound();
         // Share the checkpoint persistence lock so a fact cannot land on the wrong side
         // of the checkpoint/suffix boundary. Ephemeral threads use the same live state.
         let _guard = thread_settings::acquire_persistence_lock(self).await;
@@ -165,7 +164,7 @@ impl Session {
             .lock()
             .await
             .history
-            .record_retained_context(&event)
+            .record_retained_context_for_persistence(&mut event)
         {
             self.persist_rollout_items(&[RolloutItem::RetainedContext(event)])
                 .await;
@@ -197,7 +196,7 @@ impl Session {
     /// Starts recording confirmed delivery synchronously while the tool's admission is held.
     pub(crate) fn record_delivered_assistant_message(
         self: &Arc<Self>,
-        message: RetainedUserMessage,
+        mut message: RetainedUserMessage,
     ) -> (JoinHandle<()>, watch::Receiver<()>) {
         let session = Arc::clone(self);
         let persistence_session = Arc::clone(self);
@@ -209,12 +208,26 @@ impl Session {
                 .await
                 .unwrap_or_else(|_| unreachable!("communication boundary remains open"));
             let mut state = session.state.lock().await;
+            if !state
+                .history
+                .retained_context()
+                .retains_original_assistant_messages()
+            {
+                let (text, truncated) = crate::guardian::guardian_truncate_text(
+                    &message.text,
+                    crate::guardian::GUARDIAN_MAX_ROOT_MESSAGE_TOKENS,
+                );
+                message.text = text;
+                message.complete &= !truncated;
+            }
             let mut event = RetainedContextEvent::DeliveredAssistantMessage {
                 message,
+                retained_source: None,
                 acceptance_order: state.history.reserve_input_order(),
             };
-            event.bound();
-            state.history.record_retained_context(&event);
+            state
+                .history
+                .record_retained_context_for_persistence(&mut event);
             let mut pending = session
                 .code_mode_message_tasks
                 .pending_persistence

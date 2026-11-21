@@ -1,15 +1,16 @@
-//! Bounded image previews for the owned fullscreen transcript.
+//! Bounded local image previews for the transcript and composer.
 //!
 //! Only decoded local image pixels reach the terminal encoders. Previews are never source text;
 //! their reserved rows belong to layout. The terminal retains visible placements and any local
 //! transport files until those placements change.
+
+pub(crate) mod composer;
 
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossterm::cursor::MoveTo;
 use crossterm::cursor::RestorePosition;
 use crossterm::cursor::SavePosition;
 use crossterm::queue;
@@ -19,6 +20,7 @@ use image::RgbaImage;
 use ratatui::layout::Rect;
 
 use crate::pets::ImageProtocol;
+use crate::pets::KittyPlacement;
 
 // Separate from the two image ids reserved for pets (0xC0DE and 0xC0DF).
 pub(crate) const FIRST_IMAGE_ID: u32 = 0xC100;
@@ -28,6 +30,20 @@ pub(crate) struct ImagePlacement {
     pub(crate) area: Rect,
     pub(crate) first_row: usize,
     pub(crate) file: Option<tempfile::NamedTempFile>,
+    pub(crate) terminal_id: Option<u32>,
+}
+
+impl ImagePlacement {
+    /// Register the same pixels for another frame. The terminal owns the transport file.
+    pub(crate) fn registration(&self) -> Self {
+        Self {
+            image: Arc::clone(&self.image),
+            area: self.area,
+            first_row: self.first_row,
+            file: None,
+            terminal_id: None,
+        }
+    }
 }
 
 impl PartialEq for ImagePlacement {
@@ -59,22 +75,32 @@ pub(crate) fn terminal_cell_size() -> Option<(u32, u32)> {
         })
 }
 
+/// Generated output is larger than an image shown as a tool detail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewKind {
+    Inspected,
+    Generated,
+}
+
 impl TranscriptImage {
-    pub(crate) fn load(path: &Path, width: u16, protocol: ImageProtocol) -> Option<Self> {
-        let columns = width.saturating_sub(2).min(48);
-        let metadata = path.metadata().ok()?;
-        // Bound encoded input as well as the raster: metadata alone can dwarf a tiny image.
-        if columns == 0 || !metadata.is_file() || metadata.len() > 32 * 1024 * 1024 {
+    fn load_pixels(path: &Path, max_width: u32, max_height: u32) -> Option<RgbaImage> {
+        if max_width == 0 || max_height == 0 {
             return None;
         }
-        // Sixel paints physical pixels rather than sizing to a Kitty cell rectangle. Guessing
-        // the cell size could paint beyond the reserved rows and cover the composer.
-        let (cell_width, cell_height) = match protocol {
-            ImageProtocol::Sixel => terminal_cell_size()?,
-            // Kitty scales to cell coordinates itself. Use a stable, typical cell aspect ratio.
-            ImageProtocol::Kitty | ImageProtocol::KittyLocalFile => (8, 16),
-        };
-        let mut reader = image::ImageReader::open(path)
+        let image = Self::decode(path)?;
+        Some(
+            image
+                .thumbnail(max_width.min(image.width()), max_height.min(image.height()))
+                .to_rgba8(),
+        )
+    }
+
+    fn decode(path: &Path) -> Option<DynamicImage> {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > 32 * 1024 * 1024 {
+            return None;
+        }
+        let reader = image::ImageReader::open(path)
             .ok()?
             .with_guessed_format()
             .ok()?;
@@ -82,21 +108,52 @@ impl TranscriptImage {
         // screenshots usable, but never allocate hundreds of MB for an optional thumbnail.
         let mut limits = image::Limits::default();
         limits.max_alloc = Some(32 * 1024 * 1024);
-        reader.limits(limits);
-        let image = reader.decode().ok()?;
-        // The sprite encoder scans each active color per Sixel band. Bound both its CPU
-        // work and worst-case output even with large terminal cells or high-entropy images.
-        let (max_width, max_height) = match protocol {
-            ImageProtocol::Sixel => (160, 80),
-            ImageProtocol::Kitty | ImageProtocol::KittyLocalFile => (384, 160),
+        crate::image_decode::decode_oriented(reader, limits).ok()
+    }
+
+    pub(crate) fn load(
+        path: &Path,
+        width: u16,
+        protocol: ImageProtocol,
+        kind: PreviewKind,
+    ) -> Option<Self> {
+        let columns = width.saturating_sub(2);
+        if columns == 0 {
+            return None;
+        }
+        // Sixel paints physical pixels. Guessing could paint outside the reserved rows.
+        let (cell_width, cell_height) = match protocol {
+            ImageProtocol::Sixel => terminal_cell_size()?,
+            ImageProtocol::Kitty | ImageProtocol::KittyLocalFile => match kind {
+                PreviewKind::Inspected => (8, 16),
+                PreviewKind::Generated => terminal_cell_size().unwrap_or((8, 16)),
+            },
         };
+        let image = Self::decode(path)?;
+        // Keep the current Sixel encoding and tmux placeholder budgets.
+        let (columns, max_width, max_height) = match (protocol, kind) {
+            (ImageProtocol::Sixel, _) => (columns.min(48), 160, 80.min(6 * cell_height)),
+            (_, PreviewKind::Inspected) => (columns.min(48), 384, 6 * cell_height),
+            (_, PreviewKind::Generated) => {
+                let ratio = f64::from(image.width()) / f64::from(image.height());
+                let max_width = if ratio >= 2.0 {
+                    768
+                } else if ratio >= 1.01 {
+                    480
+                } else {
+                    400
+                };
+                let max_height = if crate::tui::tmux_fullscreen_image_base().is_some() {
+                    6 * cell_height
+                } else {
+                    400
+                };
+                (columns, max_width, max_height)
+            }
+        };
+        let max_width = (u32::from(columns) * cell_width).min(max_width);
         let pixels = image
-            .thumbnail(
-                (u32::from(columns) * cell_width)
-                    .min(image.width())
-                    .min(max_width),
-                (6 * cell_height).min(image.height()).min(max_height),
-            )
+            .thumbnail(max_width.min(image.width()), max_height.min(image.height()))
             .to_rgba8();
         Some(Self {
             protocol,
@@ -114,7 +171,7 @@ impl TranscriptImage {
         writer: &mut impl Write,
         area: Rect,
         first_row: usize,
-        id: u32,
+        placement: KittyPlacement,
     ) -> Result<Option<tempfile::NamedTempFile>> {
         let (top, bottom) = match self.protocol {
             ImageProtocol::Sixel => (
@@ -149,7 +206,7 @@ impl TranscriptImage {
                     } else {
                         crate::pets::kitty_transmit_png_with_id
                     };
-                    let command = transmit(png.path(), self.columns, area.height, Some(id))?;
+                    let command = transmit(png.path(), self.columns, area.height, placement)?;
                     file = (self.protocol == ImageProtocol::KittyLocalFile).then_some(png);
                     command.into_bytes()
                 }
@@ -161,8 +218,8 @@ impl TranscriptImage {
         let Ok(payload) = payload else {
             return Ok(None);
         };
-        queue!(writer, SavePosition, MoveTo(area.x, area.y))?;
-        writer.write_all(&payload)?;
+        queue!(writer, SavePosition)?;
+        placement.draw(writer, area, &payload)?;
         queue!(writer, RestorePosition)?;
         Ok(file)
     }

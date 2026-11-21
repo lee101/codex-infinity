@@ -163,6 +163,7 @@ pub(crate) fn apply_network_proxy_feature_config(
         enabled: feature_config.enabled,
         proxy_url: feature_config.proxy_url.clone(),
         enable_socks5: feature_config.enable_socks5,
+        transparent_tcp: feature_config.transparent_tcp,
         socks_url: feature_config.socks_url.clone(),
         enable_socks5_udp: feature_config.enable_socks5_udp,
         allow_upstream_proxy: feature_config.allow_upstream_proxy,
@@ -255,6 +256,7 @@ fn permission_profile_toml_from_file_system_policy(
         insert_filesystem_permission_toml(&mut filesystem.entries, entry);
     }
     PermissionProfileToml {
+        credentials: None,
         description: None,
         extends: None,
         workspace_roots: None,

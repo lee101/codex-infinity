@@ -294,10 +294,10 @@ async fn custom_permission_selection_scenario() -> Result<()> {
         before
     );
     let settings = next_thread_settings_updated(&mut server, thread_id).await;
-    let expected = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
-        &settings.thread_settings.sandbox_policy.to_core(),
-        settings.thread_settings.cwd.as_path(),
-    );
+    let expected = settings
+        .thread_settings
+        .sandbox_policy
+        .permission_profile_for_cwd(&settings.thread_settings.cwd.clone().try_into()?)?;
     assert!(matches!(
         settings.thread_settings.sandbox_policy,
         codex_app_server_protocol::SandboxPolicy::WorkspaceWrite { .. }
@@ -420,10 +420,12 @@ async fn custom_permission_selection_scenario() -> Result<()> {
         server.fork_side_thread(
             &app.local_settings,
             app.config.clone(),
+            /*workspace_roots*/ None,
             thread_id,
             app.agents_overview
                 .requested_permission_profiles
                 .get(&thread_id),
+            crate::app_server_session::SideChatStorage::Temporary,
         ),
     )
     .await?;

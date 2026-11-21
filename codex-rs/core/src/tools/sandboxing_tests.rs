@@ -301,7 +301,7 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
         sandbox_override: SandboxOverride::NoOverride,
-        sandbox: SandboxType::WindowsRestrictedToken,
+        local_selection: SandboxSelection::Explicit(SandboxType::WindowsRestrictedToken),
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
@@ -340,6 +340,7 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
         .expect("prepare elevated Windows sandbox request");
     let overrides = request
         .windows_sandbox_filesystem_overrides
+        .as_ref()
         .expect("elevated Windows sandbox should preserve deny-read overrides");
     assert_eq!(overrides.additional_deny_read_paths, vec![denied_path]);
     assert_eq!(request.windows_sandbox_workspace_roots, vec![cwd]);
@@ -363,19 +364,20 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
 
 #[tokio::test]
 async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
-    let cwd: AbsolutePathBuf = std::env::current_dir()
-        .expect("current dir")
-        .try_into()
-        .expect("absolute cwd");
-    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let cwd_uri = PathUri::parse(if cfg!(windows) {
+        "file:///workspace"
+    } else {
+        "file:///C:/workspace"
+    })
+    .expect("foreign workspace");
     let exec_server_permissions = codex_protocol::models::PermissionProfile::workspace_write();
     let permissions = exec_server_permissions
         .clone()
-        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
+        .materialize_project_roots_with_path_uris(std::slice::from_ref(&cwd_uri));
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
         sandbox_override: SandboxOverride::NoOverride,
-        sandbox: SandboxType::None,
+        local_selection: SandboxSelection::Explicit(SandboxType::None),
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &exec_server_permissions,
@@ -395,34 +397,40 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         allow_local_binding: false,
         ..Default::default()
     };
-    let command = || SandboxCommand {
-        program: "/bin/bash".into(),
-        args: vec!["-lc".to_string(), "pwd".to_string()],
-        cwd: cwd_uri.clone(),
-        env: HashMap::new(),
-        managed_network: Some(managed_network.clone()),
-        additional_permissions: None,
+    let argv = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printf 'café au lait'".to_string(),
+        String::new(),
+    ];
+    let prepare = async |attempt: &SandboxAttempt<'_>, route, proxy_launch| {
+        attempt
+            .env_for_exec_server(
+                argv.clone(),
+                cwd_uri.clone(),
+                HashMap::new(),
+                route,
+                proxy_launch,
+                /*additional_permissions*/ None,
+                crate::sandboxing::ExecOptions {
+                    expiration: crate::exec::ExecExpiration::DefaultTimeout,
+                    capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
+                },
+            )
+            .await
     };
-    let options = || crate::sandboxing::ExecOptions {
-        expiration: crate::exec::ExecExpiration::DefaultTimeout,
-        capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
-    };
-    let request = attempt
-        .env_for_exec_server(command(), options())
-        .await
-        .expect("prepare remote exec request");
+    let request = prepare(
+        &attempt,
+        Some(managed_network.clone()),
+        /*proxy_launch*/ None,
+    )
+    .await
+    .expect("prepare remote exec request");
     assert!(!attempt.is_escalated());
 
-    assert_eq!(
-        request.command,
-        vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
-            "pwd".to_string()
-        ]
-    );
-    assert_eq!(request.arg0, None);
-    assert_eq!(request.sandbox, SandboxType::None);
+    assert_eq!(request.argv(), argv);
+    assert_eq!(request.arg0(), &None);
+    assert_eq!(request.sandbox(), SandboxType::None);
     assert_eq!(
         request.exec_server_sandbox,
         Some(codex_exec_server::FileSystemSandboxContext {
@@ -433,9 +441,9 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
             user_home_dir: None,
             temporary_directories: None,
             windows_sandbox_selection: if cfg!(windows) {
-                codex_file_system::WindowsSandboxSelection::RestrictedToken
-            } else {
                 codex_file_system::WindowsSandboxSelection::Disabled
+            } else {
+                codex_file_system::WindowsSandboxSelection::RestrictedToken
             },
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
@@ -448,10 +456,13 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     );
 
     attempt.sandbox_override = SandboxOverride::EscalatedSandboxWithRestrictions;
-    let escalated_request = attempt
-        .env_for_exec_server(command(), options())
-        .await
-        .expect("prepare approved escalation with retained sandbox restrictions");
+    let escalated_request = prepare(
+        &attempt,
+        Some(managed_network.clone()),
+        /*proxy_launch*/ None,
+    )
+    .await
+    .expect("prepare approved escalation with retained sandbox restrictions");
     let mut expected_context = request.exec_server_sandbox.expect("sandbox context");
     expected_context.sandbox_override = SandboxOverride::EscalatedSandboxWithRestrictions;
     assert_eq!(
@@ -459,11 +470,31 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         Some(expected_context)
     );
 
+    let disabled_proxy = codex_network_proxy::RemoteNetworkProxyConfig::from_effective_config(
+        &codex_network_proxy::NetworkProxyConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    )
+    .expect("valid disabled proxy");
+    let request = prepare(
+        &attempt,
+        /*route*/ None,
+        Some(RemoteNetworkProxyLaunchConfig::new(disabled_proxy)),
+    )
+    .await
+    .expect("prepare remote command with a controller-only proxy");
+    assert!(!request.exec_server_enforce_managed_network);
+    assert!(request.exec_server_network_proxy.is_none());
+
     attempt.sandbox_requested = false;
-    let request = attempt
-        .env_for_exec_server(command(), options())
-        .await
-        .expect("prepare unsandboxed remote exec request");
+    let request = prepare(
+        &attempt,
+        Some(managed_network.clone()),
+        /*proxy_launch*/ None,
+    )
+    .await
+    .expect("prepare unsandboxed remote exec request");
     assert!(attempt.is_escalated());
 
     assert_eq!(request.exec_server_sandbox, None);

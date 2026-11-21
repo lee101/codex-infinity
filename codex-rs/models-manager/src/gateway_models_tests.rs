@@ -17,7 +17,6 @@ fn gateway_models_are_picker_visible_and_resolve_to_provider_model_ids() {
                     model.context_window,
                     model.max_context_window,
                     model.visibility,
-                    model.used_fallback_model_metadata,
                     model_info::wire_model(&model.slug),
                 )
             })
@@ -31,7 +30,6 @@ fn gateway_models_are_picker_visible_and_resolve_to_provider_model_ids() {
                 Some(1_050_000),
                 Some(1_050_000),
                 ModelVisibility::List,
-                false,
                 "xiaomi/mimo-v2.6-pro",
             ),
             (
@@ -42,7 +40,6 @@ fn gateway_models_are_picker_visible_and_resolve_to_provider_model_ids() {
                 Some(1_000_000),
                 Some(1_000_000),
                 ModelVisibility::List,
-                false,
                 "stealth/space-bunny-alpha",
             ),
             (
@@ -53,7 +50,6 @@ fn gateway_models_are_picker_visible_and_resolve_to_provider_model_ids() {
                 Some(1_000_000),
                 Some(1_000_000),
                 ModelVisibility::List,
-                false,
                 "openpaths-free",
             ),
         ]

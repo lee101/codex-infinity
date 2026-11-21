@@ -1,6 +1,7 @@
 //! Transcript selection chord routing kept outside the central application input path.
 
 use super::super::*;
+use crate::pager_overlay::TranscriptOverlay;
 
 impl App {
     pub(crate) fn transcript_select_exit_key(event: &TuiEvent) -> Option<KeyBinding> {
@@ -15,21 +16,24 @@ impl App {
     }
 
     pub(super) fn select_mode_owns_chord(&self, tui: &tui::Tui, key_event: KeyEvent) -> bool {
-        let select_mode = matches!(
-            &self.overlay,
-            Some(Overlay::Transcript(overlay)) if overlay.is_select_mode()
-        ) || (tui.is_owned_screen()
-            && self.overlay.is_none()
-            && self.transcript_view.is_select_mode());
+        let transcript = self.overlay.as_ref().and_then(Overlay::input_transcript);
+        let select_mode = transcript.is_some_and(TranscriptOverlay::is_select_mode)
+            || (tui.is_owned_screen()
+                && self.overlay.is_none()
+                && (self.focused_document().map_or_else(
+                    || self.transcript_view.is_select_mode(),
+                    super::super::sidebar_document::Document::is_select_mode,
+                )));
         if !select_mode {
             return false;
         }
-        let contexts = self.active_keymap_contexts();
-        let search_editing = matches!(
-            &self.overlay,
-            Some(Overlay::Transcript(overlay)) if overlay.is_search_editing()
-        ) || (self.overlay.is_none()
-            && self.transcript_view.is_search_editing());
+        let contexts = self.key_chord_contexts(tui);
+        let search_editing = transcript.is_some_and(TranscriptOverlay::is_search_editing)
+            || (self.overlay.is_none()
+                && self.focused_document().map_or_else(
+                    || self.transcript_view.is_search_editing(),
+                    super::super::sidebar_document::Document::is_search_editing,
+                ));
         let (code, modifiers) =
             crate::key_hint::normalize_key_parts(key_event.code, key_event.modifiers);
         let fixed_search_control = search_editing
@@ -101,6 +105,7 @@ impl App {
                                     | "half_page_down"
                                     | "jump_top"
                                     | "jump_bottom"
+                                    | "mark_markdown"
                             )
                     ) || (self.overlay.is_some()
                         && action.context == crate::keymap::KeymapContext::Pager
@@ -113,15 +118,19 @@ impl App {
                     && crate::keymap::dispatch_event(binding.action) == Some(dispatch)
             })
         };
-        if fixed_search_control || fixed_select_control || pager_motion {
-            false
-        } else if self.key_chord_matcher.is_pending() {
+        let fixed_control = fixed_search_control || fixed_select_control || pager_motion;
+        if self.key_chord_matcher.is_pending() {
             match self
                 .key_chord_matcher
                 .clone()
                 .advance(key_event, &self.keymap.chords, contexts)
             {
-                crate::keymap::KeyChordMatch::Completed(dispatch) => completed_action(dispatch),
+                crate::keymap::KeyChordMatch::Completed(dispatch) => {
+                    // The Markdown chord's completion may be the standalone text mark.
+                    completed_action(dispatch)
+                        && (!fixed_control || self.keymap.pager.mark_markdown.is_pressed(dispatch))
+                }
+                _ if fixed_control => false,
                 crate::keymap::KeyChordMatch::Pending(prefix) => {
                     let (code, modifiers) = prefix.parts();
                     self.keymap.chords.bindings.iter().any(|binding| {
@@ -136,6 +145,8 @@ impl App {
                 crate::keymap::KeyChordMatch::PassThrough
                 | crate::keymap::KeyChordMatch::Cancelled => false,
             }
+        } else if fixed_control {
+            false
         } else {
             self.keymap.chords.bindings.iter().any(|binding| {
                 active_action(binding.action)

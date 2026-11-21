@@ -173,9 +173,14 @@ pub(super) async fn prepare(
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
         let resolved = async {
-            let target = lookup_session_target_with_app_server(&mut lookup, &source, id_or_name)
-                .await?
-                .ok_or_else(|| color_eyre::eyre::eyre!("Session not found: {id_or_name}"))?;
+            let target = lookup_session_target_with_app_server(
+                crate::resume_picker::SessionPickerAction::Fork,
+                &mut lookup,
+                &source,
+                id_or_name,
+            )
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("Session not found: {id_or_name}"))?;
             lookup
                 .thread_read(target.thread_id, /*include_turns*/ false)
                 .await
@@ -186,7 +191,7 @@ pub(super) async fn prepare(
         shutdown?;
         cli.fork_session_id = Some(thread.id);
         if cli.cwd.is_none() {
-            let cwd = latest_thread_cwd(thread.path, thread.cwd.into_path_buf()).await;
+            let cwd = latest_thread_cwd(thread.path, PathBuf::from(thread.cwd.into_string())).await;
             let cwd = AbsolutePathBuf::from_absolute_path(cwd)?;
             let bootstrap = load_bootstrap_config_or_exit(
                 &source.codex_home,

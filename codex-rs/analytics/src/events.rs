@@ -23,6 +23,7 @@ use crate::facts::PluginState;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
 use crate::facts::TrackEventsContext;
+use crate::facts::TurnAnalyticsMetadata;
 use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
@@ -108,6 +109,8 @@ pub(crate) enum TrackEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct CodexArtifactOperationEventParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) item_id: String,
@@ -136,9 +139,11 @@ pub(crate) fn codex_artifact_operation_event_request(
     tracking: TrackEventsContext,
     operation: ArtifactOperation,
 ) -> CodexArtifactOperationEventRequest {
+    let turn = tracking.turn_metadata.as_deref();
     CodexArtifactOperationEventRequest {
         event_type: "codex_artifact_operation",
         event_params: CodexArtifactOperationEventParams {
+            turn_trigger: turn.and_then(TurnAnalyticsMetadata::turn_trigger),
             thread_id: tracking.thread_id,
             turn_id: tracking.turn_id,
             item_id: operation.item_id,
@@ -160,6 +165,46 @@ pub(crate) fn codex_artifact_operation_event_request(
 }
 
 impl TrackEventRequest {
+    pub(crate) fn event_type(&self) -> &'static str {
+        match self {
+            Self::SkillInvocation(event) => event.event_type,
+            Self::ThreadInitialized(event) => event.event_type,
+            Self::ThreadArchive(event) => event.event_type,
+            Self::GuardianReview(event) => event.event_type,
+            Self::GuardianV2(event) => event.event_type,
+            Self::AppMentioned(event) => event.event_type,
+            Self::AppUsed(event) => event.event_type,
+            Self::HookRun(event) => event.event_type,
+            Self::Compaction(event) => event.event_type,
+            Self::Goal(event) => event.event_type,
+            Self::ThreadHintStatus(event) => event.event_type,
+            Self::TurnEvent(event) => event.event_type,
+            Self::TurnSteer(event) => event.event_type,
+            Self::ArtifactOperation(event) => event.event_type,
+            Self::CommandExecution(event) => event.event_type,
+            Self::PluginMeasurement(event) => event.event_type,
+            Self::FileChange(event) => event.event_type,
+            Self::CuaToolCallStarted(event) => event.event_type,
+            Self::McpToolCall(event) => event.event_type,
+            Self::DynamicToolCall(event) => event.event_type,
+            Self::ControlToolCall(event) => event.event_type,
+            Self::CollabAgentToolCall(event) => event.event_type,
+            Self::WebSearch(event) => event.event_type,
+            Self::ImageGeneration(event) => event.event_type,
+            Self::AcceptedLineFingerprints(event) => event.event_type,
+            Self::ReviewEvent(event) => event.event_type,
+            Self::PluginUsed(event) => event.event_type,
+            Self::PluginInstallRequested(event) => event.event_type,
+            Self::PluginInstalled(event)
+            | Self::PluginUninstalled(event)
+            | Self::PluginEnabled(event)
+            | Self::PluginDisabled(event) => event.event_type,
+            Self::PluginInstallFailed(event) => event.event_type,
+            Self::ExternalAgentConfigImportCompleted(event) => event.event_type,
+            Self::ExternalAgentConfigImportFailure(event) => event.event_type,
+        }
+    }
+
     pub(crate) fn should_send_in_isolated_request(&self) -> bool {
         matches!(self, Self::AcceptedLineFingerprints(_))
     }
@@ -209,6 +254,8 @@ pub(crate) struct SkillInvocationEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct SkillInvocationEventParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) product_client_id: Option<String>,
     pub(crate) skill_scope: Option<String>,
     pub(crate) plugin_id: Option<String>,
@@ -369,6 +416,7 @@ impl From<&AdditionalPermissionProfile> for GuardianAdditionalPermissions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardianReviewedAction {
+    NativeToolCall {},
     Shell {
         sandbox_permissions: SandboxPermissions,
         additional_permissions: Option<GuardianAdditionalPermissions>,
@@ -681,6 +729,8 @@ pub(crate) enum ToolEventType {
 
 #[derive(Serialize)]
 pub(crate) struct CodexToolItemEventBase {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
@@ -718,6 +768,8 @@ pub(crate) struct CodexToolItemEventBase {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCuaToolCallStartedEventParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
@@ -999,6 +1051,8 @@ pub(crate) struct CodexImageGenerationEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct CodexAppMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) connector_id: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) turn_id: Option<String>,
@@ -1030,6 +1084,8 @@ pub(crate) struct CodexAppUsedEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct CodexHookRunMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) product_client_id: Option<String>,
@@ -1158,6 +1214,9 @@ pub(crate) struct CodexTurnEventParams {
     /// The server-selected window responsible for a usage limit, when known.
     pub(crate) usage_limit_window_minutes: Option<u16>,
     pub(crate) steer_count: Option<usize>,
+    /// True when any accepted input used dictation. False requires known attribution for every input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) used_dictation: Option<bool>,
     pub(crate) total_tool_call_count: Option<usize>,
     pub(crate) shell_command_count: Option<usize>,
     pub(crate) file_change_count: Option<usize>,
@@ -1229,6 +1288,8 @@ pub(crate) struct CodexPluginMetadata {
 
 #[derive(Serialize)]
 pub(crate) struct CodexPluginUsedMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_trigger: Option<String>,
     #[serde(flatten)]
     pub(crate) plugin: CodexPluginMetadata,
     pub(crate) mcp_server_names: Option<Vec<String>>,
@@ -1339,7 +1400,9 @@ pub(crate) fn codex_app_metadata(
     tracking: &TrackEventsContext,
     app: AppInvocation,
 ) -> CodexAppMetadata {
+    let turn = tracking.turn_metadata.as_deref();
     CodexAppMetadata {
+        turn_trigger: turn.and_then(TurnAnalyticsMetadata::turn_trigger),
         connector_id: app.connector_id,
         thread_id: Some(tracking.thread_id.clone()),
         turn_id: Some(tracking.turn_id.clone()),
@@ -1486,7 +1549,9 @@ pub(crate) fn codex_plugin_used_metadata(
         .capability_summary
         .as_ref()
         .map(|summary| summary.mcp_server_names.clone());
+    let turn = tracking.turn_metadata.as_deref();
     CodexPluginUsedMetadata {
+        turn_trigger: turn.and_then(TurnAnalyticsMetadata::turn_trigger),
         plugin: codex_plugin_metadata_with_product_client_id(
             plugin,
             tracking.product_client_id.clone(),
@@ -1502,7 +1567,9 @@ pub(crate) fn codex_hook_run_metadata(
     tracking: &TrackEventsContext,
     hook: HookRunFact,
 ) -> CodexHookRunMetadata {
+    let turn = tracking.turn_metadata.as_deref();
     CodexHookRunMetadata {
+        turn_trigger: turn.and_then(TurnAnalyticsMetadata::turn_trigger),
         thread_id: Some(tracking.thread_id.clone()),
         turn_id: Some(tracking.turn_id.clone()),
         product_client_id: Some(tracking.product_client_id.clone()),

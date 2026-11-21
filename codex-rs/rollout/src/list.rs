@@ -1,6 +1,7 @@
 #![allow(warnings, clippy::all)]
 
 use codex_utils_path as path_utils;
+use memchr::memmem::Finder;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -10,6 +11,8 @@ use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use time::OffsetDateTime;
 use time::PrimitiveDateTime;
 use time::format_description::FormatItem;
@@ -88,6 +91,8 @@ pub struct ThreadItem {
     pub source: Option<SessionSource>,
     /// Persisted thread history contract selected when this thread was created.
     pub history_mode: ThreadHistoryMode,
+    /// Parent of a persisted attached thread.
+    pub attached_to_thread_id: Option<ThreadId>,
     /// Immediate control/spawn parent thread id from session metadata.
     pub parent_thread_id: Option<ThreadId>,
     /// Random unique nickname from session metadata for AgentControl-spawned sub-agents.
@@ -122,7 +127,8 @@ pub type ConversationsPage = ThreadsPage;
 struct HeadTailSummary {
     originator: Option<String>,
     saw_session_meta: bool,
-    attached_to_parent: bool,
+    has_fork_history: bool,
+    attached_to_thread_id: Option<ThreadId>,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
     preview: Option<String>,
@@ -146,6 +152,10 @@ const MAX_SCAN_FILES: usize = 10000;
 const HEAD_RECORD_LIMIT: usize = 10;
 const USER_EVENT_SCAN_LIMIT: usize = 200;
 
+// A Unicode escape can spell part of the event tag. Either marker requires a full decode.
+static EVENT_MSG_MARKERS: LazyLock<[Finder<'static>; 2]> =
+    LazyLock::new(|| [Finder::new(br#""event_msg""#), Finder::new(br"\u")]);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadSortKey {
     CreatedAt,
@@ -165,12 +175,14 @@ pub enum ThreadListLayout {
     Flat,
 }
 
+#[derive(Clone, Copy)]
 pub struct ThreadListConfig<'a> {
     pub allowed_sources: &'a [SessionSource],
     pub model_providers: Option<&'a [String]>,
     pub cwd_filters: Option<&'a [PathBuf]>,
     pub default_provider: &'a str,
     pub layout: ThreadListLayout,
+    pub include_attached_threads: bool,
 }
 
 /// Pagination cursor identifying the last item in a page.
@@ -181,10 +193,6 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub(crate) fn new(ts: OffsetDateTime) -> Self {
-        Self { ts, id: None }
-    }
-
     pub(crate) fn with_thread_id(ts: OffsetDateTime, id: ThreadId) -> Self {
         Self { ts, id: Some(id) }
     }
@@ -198,12 +206,11 @@ impl Cursor {
     }
 }
 
-/// Keeps track of where a paginated listing left off. As the file scan goes newest -> oldest,
-/// it ignores everything until it passes the last seen timestamp from the previous page, then
-/// starts returning results after that. This makes paging stable even if new files show up during
-/// pagination.
+/// Resume the descending file scan after the previous row. A legacy cursor
+/// without a thread ID skips every file at its timestamp.
 struct AnchorState {
     ts: OffsetDateTime,
+    id: Option<Uuid>,
     passed: bool,
 }
 
@@ -212,20 +219,24 @@ impl AnchorState {
         match anchor {
             Some(cursor) => Self {
                 ts: cursor.ts,
+                id: cursor
+                    .id
+                    .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
                 passed: false,
             },
             None => Self {
                 ts: OffsetDateTime::UNIX_EPOCH,
+                id: None,
                 passed: true,
             },
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool {
+    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
         if self.passed {
             return false;
         }
-        if ts < self.ts {
+        if ts < self.ts || (ts == self.ts && self.id.is_some_and(|anchor| id < anchor)) {
             self.passed = true;
             false
         } else {
@@ -256,12 +267,10 @@ struct FilesByCreatedAtVisitor<'a> {
     page_size: usize,
     anchor_state: AnchorState,
     more_matches_available: bool,
-    allowed_sources: &'a [SessionSource],
-    provider_matcher: Option<&'a ProviderMatcher<'a>>,
-    cwd_filters: Option<&'a [PathBuf]>,
+    filters: Arc<SummaryFilters>,
 }
 
-impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
+impl RolloutFileVisitor for FilesByCreatedAtVisitor<'_> {
     async fn visit(
         &mut self,
         ts: OffsetDateTime,
@@ -286,12 +295,9 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
             .and_then(format_rfc3339);
         if let Some(item) = build_thread_item(
             path,
-            self.allowed_sources,
-            self.provider_matcher,
-            self.cwd_filters,
+            Arc::clone(&self.filters),
             updated_at,
             PreviewFilter::RequirePreview,
-            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -364,6 +370,7 @@ pub async fn get_threads(
             cwd_filters,
             default_provider,
             layout: ThreadListLayout::NestedByDate,
+            include_attached_threads: false,
         },
     )
     .await
@@ -387,34 +394,22 @@ pub async fn get_threads_in_root(
 
     let anchor = cursor.cloned();
 
-    let provider_matcher = config
-        .model_providers
-        .and_then(|filters| ProviderMatcher::new(filters, config.default_provider));
+    let filters = Arc::new(SummaryFilters {
+        allowed_sources: config.allowed_sources.to_vec(),
+        provider_matcher: config
+            .model_providers
+            .and_then(|providers| ProviderMatcher::new(providers, config.default_provider)),
+        cwd_filters: config.cwd_filters.map(<[PathBuf]>::to_vec),
+        include_attached_threads: config.include_attached_threads,
+    });
 
     let result = match config.layout {
         ThreadListLayout::NestedByDate => {
-            traverse_directories_for_paths(
-                root.clone(),
-                page_size,
-                anchor,
-                sort_key,
-                config.allowed_sources,
-                provider_matcher.as_ref(),
-                config.cwd_filters,
-            )
-            .await?
+            traverse_directories_for_paths(root.clone(), page_size, anchor, sort_key, filters)
+                .await?
         }
         ThreadListLayout::Flat => {
-            traverse_flat_paths(
-                root.clone(),
-                page_size,
-                anchor,
-                sort_key,
-                config.allowed_sources,
-                provider_matcher.as_ref(),
-                config.cwd_filters,
-            )
-            .await?
+            traverse_flat_paths(root.clone(), page_size, anchor, sort_key, filters).await?
         }
     };
     Ok(result)
@@ -429,32 +424,14 @@ async fn traverse_directories_for_paths(
     page_size: usize,
     anchor: Option<Cursor>,
     sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
-            traverse_directories_for_paths_created(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-            )
-            .await
+            traverse_directories_for_paths_created(root, page_size, anchor, filters).await
         }
         ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
-            traverse_directories_for_paths_updated(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-            )
-            .await
+            traverse_directories_for_paths_updated(root, page_size, anchor, filters).await
         }
     }
 }
@@ -464,32 +441,14 @@ async fn traverse_flat_paths(
     page_size: usize,
     anchor: Option<Cursor>,
     sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
-            traverse_flat_paths_created(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-            )
-            .await
+            traverse_flat_paths_created(root, page_size, anchor, filters).await
         }
         ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
-            traverse_flat_paths_updated(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-            )
-            .await
+            traverse_flat_paths_updated(root, page_size, anchor, filters).await
         }
     }
 }
@@ -504,9 +463,7 @@ async fn traverse_directories_for_paths_created(
     root: PathBuf,
     page_size: usize,
     anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -516,9 +473,7 @@ async fn traverse_directories_for_paths_created(
         page_size,
         anchor_state: AnchorState::new(anchor),
         more_matches_available,
-        allowed_sources,
-        provider_matcher,
-        cwd_filters,
+        filters,
     };
     walk_rollout_files(&root, &mut scanned_files, &mut visitor).await?;
     more_matches_available = visitor.more_matches_available;
@@ -529,7 +484,9 @@ async fn traverse_directories_for_paths_created(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::CreatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::CreatedAt))
     } else {
         None
     };
@@ -553,9 +510,7 @@ async fn traverse_directories_for_paths_updated(
     root: PathBuf,
     page_size: usize,
     anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -578,15 +533,12 @@ async fn traverse_directories_for_paths_updated(
             break;
         }
 
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
+        let updated_at_fallback = format_rfc3339(ts);
         if let Some(item) = build_thread_item(
             candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
+            Arc::clone(&filters),
             updated_at_fallback,
             PreviewFilter::RequirePreview,
-            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -600,7 +552,9 @@ async fn traverse_directories_for_paths_updated(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::UpdatedAt))
     } else {
         None
     };
@@ -616,9 +570,7 @@ async fn traverse_flat_paths_created(
     root: PathBuf,
     page_size: usize,
     anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -640,12 +592,9 @@ async fn traverse_flat_paths_created(
             .and_then(format_rfc3339);
         if let Some(item) = build_thread_item(
             path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
+            Arc::clone(&filters),
             updated_at,
             PreviewFilter::IncludeEmpty,
-            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -659,7 +608,9 @@ async fn traverse_flat_paths_created(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::CreatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::CreatedAt))
     } else {
         None
     };
@@ -675,9 +626,7 @@ async fn traverse_flat_paths_updated(
     root: PathBuf,
     page_size: usize,
     anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -700,15 +649,12 @@ async fn traverse_flat_paths_updated(
             break;
         }
 
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
+        let updated_at_fallback = format_rfc3339(ts);
         if let Some(item) = build_thread_item(
             candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
+            Arc::clone(&filters),
             updated_at_fallback,
             PreviewFilter::IncludeEmpty,
-            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -722,7 +668,9 @@ async fn traverse_flat_paths_updated(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::UpdatedAt))
     } else {
         None
     };
@@ -754,27 +702,38 @@ pub fn parse_cursor(token: &str) -> Option<Cursor> {
     Some(Cursor { ts, id })
 }
 
-fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cursor> {
-    let last = items.last()?;
-    let file_name = last.path.file_name()?.to_string_lossy();
-    let (created_ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
-    let ts = match sort_key {
-        ThreadSortKey::CreatedAt => created_ts,
-        ThreadSortKey::UpdatedAt => {
-            let updated_at = last.updated_at.as_deref()?;
-            OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
-        }
-        ThreadSortKey::RecencyAt => {
-            let recency_at = last.recency_at.as_deref().or(last.updated_at.as_deref())?;
-            OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
-        }
-    };
-    match sort_key {
-        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
-            ts,
-            ThreadId::from_string(&id.to_string()).ok()?,
-        )),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
+impl ThreadItem {
+    pub(crate) fn filesystem_sort_key(
+        &self,
+        sort_key: ThreadSortKey,
+    ) -> Option<(OffsetDateTime, Uuid)> {
+        let (created_at, id) =
+            parse_timestamp_uuid_from_filename(self.path.file_name()?.to_str()?)?;
+        let timestamp = match sort_key {
+            ThreadSortKey::CreatedAt => created_at,
+            ThreadSortKey::UpdatedAt => {
+                let updated_at = self.updated_at.as_deref().or(self.created_at.as_deref())?;
+                OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
+            }
+            ThreadSortKey::RecencyAt => {
+                let recency_at = self
+                    .recency_at
+                    .as_deref()
+                    .or(self.updated_at.as_deref())
+                    .or(self.created_at.as_deref())?;
+                OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
+            }
+        };
+        Some((timestamp, id))
+    }
+
+    /// Cursor for this row in a filesystem listing, where creation order uses the rollout filename.
+    pub fn filesystem_cursor(&self, sort_key: ThreadSortKey) -> Option<Cursor> {
+        let (timestamp, id) = self.filesystem_sort_key(sort_key)?;
+        Some(Cursor::with_thread_id(
+            timestamp,
+            ThreadId::from_u128(id.as_u128()),
+        ))
     }
 }
 
@@ -785,45 +744,19 @@ enum PreviewFilter {
 
 async fn build_thread_item(
     path: PathBuf,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
+    filters: Arc<SummaryFilters>,
     updated_at: Option<String>,
     preview_filter: PreviewFilter,
-    include_attached_threads: bool,
 ) -> Option<ThreadItem> {
-    // Read head and detect preview-bearing events; goal previews can appear before
-    // the first normal user message.
-    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
-        .await
-        .unwrap_or_default();
-    if summary.attached_to_parent && !include_attached_threads {
-        return None;
-    }
-    if !allowed_sources.is_empty()
-        && !summary
-            .source
-            .as_ref()
-            .is_some_and(|source| allowed_sources.contains(source))
-    {
-        return None;
-    }
-    if let Some(matcher) = provider_matcher
-        && !matcher.matches(summary.model_provider.as_deref())
-    {
-        return None;
-    }
-    if let Some(cwd_filters) = cwd_filters
-        && !summary.cwd.as_ref().is_some_and(|cwd| {
-            cwd_filters
-                .iter()
-                .any(|filter| path_utils::paths_match_after_normalization(cwd, filter))
-        })
-    {
-        return None;
-    }
+    let summary =
+        compression::read_rollout_lines(&path, move |lines| read_head_summary(lines, &filters))
+            .await
+            .ok()??;
     if summary.saw_session_meta
-        && (matches!(preview_filter, PreviewFilter::IncludeEmpty) || summary.preview.is_some())
+        && (matches!(preview_filter, PreviewFilter::IncludeEmpty)
+            || summary.preview.is_some()
+            || summary.has_fork_history
+            || summary.attached_to_thread_id.is_some())
     {
         let HeadTailSummary {
             originator,
@@ -852,6 +785,7 @@ async fn build_thread_item(
             originator,
             path,
             thread_id,
+            attached_to_thread_id: summary.attached_to_thread_id,
             first_user_message,
             preview,
             section: None,
@@ -886,12 +820,14 @@ async fn build_thread_item(
 pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> {
     build_thread_item(
         path,
-        &[],
-        /*provider_matcher*/ None,
-        /*cwd_filters*/ None,
+        Arc::new(SummaryFilters {
+            allowed_sources: Vec::new(),
+            provider_matcher: None,
+            cwd_filters: None,
+            include_attached_threads: true,
+        }),
         /*updated_at*/ None,
         PreviewFilter::RequirePreview,
-        /*include_attached_threads*/ true,
     )
     .await
 }
@@ -948,20 +884,20 @@ async fn walk_rollout_files(
     Ok(())
 }
 
-struct ProviderMatcher<'a> {
-    filters: &'a [String],
+struct ProviderMatcher {
+    filters: Vec<String>,
     matches_default_provider: bool,
 }
 
-impl<'a> ProviderMatcher<'a> {
-    fn new(filters: &'a [String], default_provider: &'a str) -> Option<Self> {
+impl ProviderMatcher {
+    fn new(filters: &[String], default_provider: &str) -> Option<Self> {
         if filters.is_empty() {
             return None;
         }
 
         let matches_default_provider = filters.iter().any(|provider| provider == default_provider);
         Some(Self {
-            filters,
+            filters: filters.to_vec(),
             matches_default_provider,
         })
     }
@@ -974,23 +910,66 @@ impl<'a> ProviderMatcher<'a> {
     }
 }
 
-async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
-    let mut lines = compression::open_rollout_line_reader(path).await?;
+struct SummaryFilters {
+    allowed_sources: Vec<SessionSource>,
+    provider_matcher: Option<ProviderMatcher>,
+    cwd_filters: Option<Vec<PathBuf>>,
+    include_attached_threads: bool,
+}
+
+impl SummaryFilters {
+    /// Filters only the rollout's first session metadata; copied fork metadata cannot override it.
+    fn matches(&self, summary: &HeadTailSummary) -> bool {
+        (self.include_attached_threads || summary.attached_to_thread_id.is_none())
+            && (self.allowed_sources.is_empty()
+                || summary
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| self.allowed_sources.contains(source)))
+            && self
+                .provider_matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.matches(summary.model_provider.as_deref()))
+            && self.cwd_filters.as_deref().is_none_or(|filters| {
+                summary.cwd.as_ref().is_some_and(|cwd| {
+                    filters
+                        .iter()
+                        .any(|filter| path_utils::paths_match_after_normalization(cwd, filter))
+                })
+            })
+    }
+}
+
+fn read_head_summary(
+    lines: &mut dyn Iterator<Item = io::Result<String>>,
+    filters: &SummaryFilters,
+) -> io::Result<Option<HeadTailSummary>> {
     let mut summary = HeadTailSummary::default();
     let mut lines_scanned = 0usize;
+    let event_msg_markers = LazyLock::force(&EVENT_MSG_MARKERS);
 
-    while lines_scanned < head_limit
+    while lines_scanned < HEAD_RECORD_LIMIT
         || (summary.saw_session_meta
             && (summary.preview.is_none() || summary.first_user_message.is_none())
-            && lines_scanned < head_limit + USER_EVENT_SCAN_LIMIT)
+            && lines_scanned < HEAD_RECORD_LIMIT + USER_EVENT_SCAN_LIMIT)
     {
-        let line_opt = lines.next_line().await?;
-        let Some(line) = line_opt else { break };
+        let Some(line) = lines.next().transpose()? else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         lines_scanned += 1;
+
+        // After the first session header, only events can change the summary.
+        if summary.saw_session_meta
+            && !event_msg_markers
+                .iter()
+                .any(|marker| marker.find(trimmed.as_bytes()).is_some())
+        {
+            continue;
+        }
 
         let parsed = crate::parse_rollout_line(trimmed);
         let rollout_line = match parsed {
@@ -1014,7 +993,17 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.originator = (!session_meta_line.meta.originator.is_empty())
                         .then(|| session_meta_line.meta.originator.clone());
                     summary.source = Some(session_meta_line.meta.source.clone());
-                    summary.attached_to_parent = session_meta_line.meta.attached_thread;
+                    summary.attached_to_thread_id = session_meta_line
+                        .meta
+                        .forked_from_id
+                        .filter(|_| session_meta_line.meta.attached_thread);
+                    // A reference-backed fork can have a stored preview before its first local message.
+                    summary.has_fork_history = session_meta_line.meta.forked_from_id.is_some()
+                        && session_meta_line
+                            .meta
+                            .history_base
+                            .is_some_and(|base| base.end_ordinal_exclusive > 0)
+                        && !session_meta_line.meta.source.is_non_root_agent();
                     summary.history_mode = session_meta_line.meta.history_mode;
                     summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
                     summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
@@ -1037,6 +1026,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.cli_version = Some(session_meta_line.meta.cli_version);
                     summary.created_at = Some(session_meta_line.meta.timestamp.clone());
                     summary.saw_session_meta = true;
+                    if !filters.matches(&summary) {
+                        return Ok(None);
+                    }
 
                     if codex_state::is_guardian_review_source(&session_meta_line.meta.source) {
                         // The synthetic prompt is not needed for the thread summary.
@@ -1059,6 +1051,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
             RolloutItem::RetainedContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::SecurityRiskScore(_) => {
                 // Not included in `head`; skip.
             }
@@ -1097,7 +1090,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
         }
     }
 
-    Ok(summary)
+    Ok(Some(summary))
 }
 
 /// Read up to `HEAD_RECORD_LIMIT` records from the start of the rollout file at `path`.
@@ -1138,6 +1131,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::RetainedContext(_)
+                | RolloutItem::DynamicToolsUpdated { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {}
             }
@@ -1232,6 +1226,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }
@@ -1431,6 +1426,7 @@ async fn find_thread_path_by_id_from_filenames(
     let mut newest = None;
     visit_rollout_filenames::<()>(
         root,
+        /*excluded_path*/ None,
         |file_name| file_name.thread_id() == target,
         |file_name, path| {
             let rollout_id = Uuid::parse_str(&file_name.rollout_id().to_string()).ok();
@@ -1455,6 +1451,7 @@ async fn find_thread_path_by_id_from_filenames(
 
 async fn visit_rollout_filenames<T>(
     root: &Path,
+    excluded_path: Option<&Path>,
     matches: impl Fn(&RolloutFileName) -> bool,
     mut visitor: impl FnMut(RolloutFileName, PathBuf) -> ControlFlow<T>,
 ) -> io::Result<Option<T>> {
@@ -1490,7 +1487,16 @@ async fn visit_rollout_filenames<T>(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            if let ControlFlow::Break(found) = visitor(file_name, rollout_file.into_path()) {
+            let path = rollout_file.into_path();
+            if let Some(excluded) = excluded_path
+                && (path == excluded
+                    || !tokio::fs::canonicalize(&path)
+                        .await
+                        .is_ok_and(|path| path != excluded))
+            {
+                continue;
+            }
+            if let ControlFlow::Break(found) = visitor(file_name, path) {
                 return Ok(Some(found));
             }
         }
@@ -1501,9 +1507,11 @@ async fn visit_rollout_filenames<T>(
 async fn find_rollout_path_by_rollout_id_from_filenames(
     root: &Path,
     rollout_id: RolloutId,
+    excluded_canonical_path: Option<&Path>,
 ) -> io::Result<Option<PathBuf>> {
     visit_rollout_filenames(
         root,
+        excluded_canonical_path,
         |file_name| file_name.rollout_id() == rollout_id,
         |_file_name, path| ControlFlow::Break(path),
     )
@@ -1545,10 +1553,23 @@ pub async fn find_rollout_path_by_rollout_id(
     codex_home: &Path,
     rollout_id: RolloutId,
 ) -> io::Result<Option<PathBuf>> {
+    find_rollout_path_by_rollout_id_excluding(
+        codex_home, rollout_id, /*excluded_canonical_path*/ None,
+    )
+    .await
+}
+
+/// Find an immutable rollout, skipping the canonical path of a rejected copy when supplied.
+pub async fn find_rollout_path_by_rollout_id_excluding(
+    codex_home: &Path,
+    rollout_id: RolloutId,
+    excluded_canonical_path: Option<&Path>,
+) -> io::Result<Option<PathBuf>> {
     for subdir in [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR] {
         let path = find_rollout_path_by_rollout_id_from_filenames(
             codex_home.join(subdir).as_path(),
             rollout_id,
+            excluded_canonical_path,
         )
         .await?;
         if path.is_some() {
@@ -1556,6 +1577,42 @@ pub async fn find_rollout_path_by_rollout_id(
         }
     }
     Ok(None)
+}
+
+/// Locate a page's rollout IDs with one filename traversal per storage root.
+///
+/// Keeps the first match, searching active storage before archives. On a read error, stops
+/// scanning and retains earlier matches, just as individual lookups would have found them.
+pub async fn find_rollout_paths_by_rollout_ids(
+    codex_home: &Path,
+    rollout_ids: &[RolloutId],
+) -> HashMap<RolloutId, PathBuf> {
+    let ids: std::collections::HashSet<_> = rollout_ids.iter().copied().collect();
+    let mut paths = HashMap::new();
+    for subdir in [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR] {
+        if paths.len() == ids.len() {
+            break;
+        }
+        if visit_rollout_filenames(
+            &codex_home.join(subdir),
+            /*excluded_path*/ None,
+            |file_name| ids.contains(&file_name.rollout_id()),
+            |file_name, path| {
+                paths.entry(file_name.rollout_id()).or_insert(path);
+                if paths.len() == ids.len() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+    }
+    paths
 }
 
 /// Prefetch a bounded set of active rollout paths for a history page.
@@ -1604,6 +1661,7 @@ pub async fn prefetch_sibling_rollout_paths(
     let mut paths = HashMap::new();
     visit_rollout_filenames(
         &active_root,
+        /*excluded_path*/ None,
         |file_name| ids.contains(&file_name.rollout_id()),
         |file_name, path| {
             paths.entry(file_name.rollout_id()).or_insert(path);

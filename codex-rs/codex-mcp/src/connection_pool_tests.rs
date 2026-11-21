@@ -1,6 +1,8 @@
 //! Tests for shared MCP connection ownership and protocol negotiation.
 
 use super::*;
+use crate::McpServerKey;
+use crate::McpServerPermissions;
 use crate::binding_clients::McpBindingClients;
 use crate::connection_manager::tests::create_ready_async_managed_client;
 use crate::connection_manager::tests::create_test_tool;
@@ -34,8 +36,12 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub(crate) struct TestServer {
@@ -170,7 +176,7 @@ pub(crate) fn startup(
     starts: Arc<AtomicUsize>,
     first_started: Arc<Notify>,
     release_first: Arc<Notify>,
-    server: TestServer,
+    server: impl InProcessTransportFactory + Clone + 'static,
 ) -> impl Fn(CancellationToken, Option<CancellationToken>) -> ManagedClientFuture {
     move |cancellation, _sharing_declined| {
         let sharing = sharing.clone();
@@ -236,6 +242,201 @@ pub(crate) fn startup(
     }
 }
 
+struct LeaseFrame {
+    message: serde_json::Value,
+    replies: mpsc::UnboundedSender<serde_json::Value>,
+}
+
+impl LeaseFrame {
+    fn reply(&self, result: serde_json::Value) {
+        self.replies
+            .send(json!({"jsonrpc": "2.0", "id": self.message["id"], "result": result}))
+            .unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct LeaseTransport(mpsc::UnboundedSender<LeaseFrame>);
+
+impl InProcessTransportFactory for LeaseTransport {
+    fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
+        let (client, server) = tokio::io::duplex(4096);
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut lines = BufReader::new(reader).lines();
+        let frames = self.0.clone();
+        let (replies, mut responses) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(response) = responses.recv() => {
+                        writer.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+                    }
+                    line = lines.next_line() => {
+                        let Some(line) = line.unwrap() else { break };
+                        let frame = LeaseFrame {
+                            message: serde_json::from_str(&line).unwrap(),
+                            replies: replies.clone(),
+                        };
+                        match frame.message["method"].as_str().unwrap() {
+                            "initialize" => frame.reply(json!({
+                                "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "test", "version": "1"}
+                            })),
+                            "notifications/initialized" => {}
+                            "tools/list" => frame.reply(json!({"tools": []})),
+                            _ => frames.send(frame).unwrap(),
+                        }
+                    }
+                }
+            }
+        });
+        futures::future::ready(Ok(client)).boxed()
+    }
+}
+
+struct LeasePeer {
+    pool: McpConnectionPool,
+    key: ConnectionKey,
+    transport: LeaseTransport,
+    frames: mpsc::UnboundedReceiver<LeaseFrame>,
+}
+
+impl LeasePeer {
+    fn new() -> Self {
+        let (tx, frames) = mpsc::unbounded_channel();
+        Self {
+            pool: McpConnectionPool::default(),
+            key: key(&context(), &config()),
+            transport: LeaseTransport(tx),
+            frames,
+        }
+    }
+
+    fn attach(&self) -> tokio::task::JoinHandle<Result<ManagedClient, StartupOutcomeError>> {
+        let pool = self.pool.clone();
+        let key = self.key.clone();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            let ready = Arc::<Notify>::default();
+            ready.notify_one();
+            let launch = startup(
+                ConnectionSharing::Negotiated,
+                Arc::default(),
+                Arc::default(),
+                ready,
+                transport,
+            );
+            pool.connect(
+                Arc::default(),
+                key,
+                Arc::new(Mutex::new(Some(
+                    json!({"extensions": {LEASE_CAPABILITY: {}}}),
+                ))),
+                /*tool_catalog_cache_context*/ None,
+                CancellationToken::new(),
+                launch,
+            )
+            .await
+        })
+    }
+
+    async fn next(&mut self, method: &str) -> LeaseFrame {
+        let frame = tokio::time::timeout(Duration::from_secs(2), self.frames.recv())
+            .await
+            .expect("expected a frame from the client")
+            .unwrap();
+        assert_eq!(frame.message["method"], method);
+        frame
+    }
+
+    async fn chat(&mut self) -> (ManagedClient, serde_json::Value) {
+        let attach = self.attach();
+        let open = self.next("codex/connection/open").await;
+        open.reply(json!({}));
+        (
+            attach.await.unwrap().unwrap(),
+            open.message["params"]["leaseId"].clone(),
+        )
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_lease_cancels_pending_call_before_release() {
+    let mut peer = LeasePeer::new();
+    let (first, first_id) = peer.chat().await;
+    let (other, other_id) = peer.chat().await;
+    let call = first.call_tool(
+        "wait".into(),
+        /*arguments*/ None,
+        |_| Ok(None),
+        /*timeout*/ None,
+    );
+    tokio::pin!(call);
+    let request = tokio::select! {
+        result = &mut call => panic!("call completed without a reply: {result:?}"),
+        frame = peer.next("tools/call") => frame,
+    };
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("expected shared lease")
+    };
+    lease.release();
+    // Leave the caller unpolled: the release must drive the cancellation write itself.
+    let cancel = peer.next("notifications/cancelled").await;
+    assert_eq!(cancel.message["params"]["requestId"], request.message["id"]);
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(release.message["params"]["leaseId"], first_id);
+    release.reply(json!({}));
+    assert!(call.await.is_err());
+
+    let (result, ()) = tokio::join!(
+        other.call_tool(
+            "test".into(),
+            /*arguments*/ None,
+            |_| Ok(None),
+            /*timeout*/ None,
+        ),
+        async {
+            let request = peer.next("tools/call").await;
+            assert_eq!(request.message["params"]["_meta"][LEASE_META_KEY], other_id);
+            request.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_lease_outside_runtime_releases_it() {
+    let mut peer = LeasePeer::new();
+    let (_other, _) = peer.chat().await;
+    let (chat, id) = peer.chat().await;
+    std::thread::spawn(move || drop(chat)).join().unwrap();
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(release.message["params"]["leaseId"], id);
+    release.reply(json!({}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_open_is_released_after_the_server_acknowledges_it() {
+    let mut peer = LeasePeer::new();
+    let (_other, _) = peer.chat().await;
+    let attach = peer.attach();
+    let open = peer.next("codex/connection/open").await;
+    tokio::time::advance(LEASE_REQUEST_TIMEOUT).await;
+    assert!(attach.await.unwrap().is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), peer.frames.recv())
+            .await
+            .is_err()
+    );
+    open.reply(json!({}));
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(
+        release.message["params"]["leaseId"],
+        open.message["params"]["leaseId"]
+    );
+    release.reply(json!({}));
+}
+
 #[tokio::test]
 async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bindings() {
     let pool = McpConnectionPool::default();
@@ -291,9 +492,10 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
         .await
         .unwrap();
     let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());
-    config
-        .server_permission_profiles
-        .insert("test_server".to_string(), config.permission_profile.clone());
+    config.server_permissions.insert(
+        McpServerKey::unscoped("test_server"),
+        McpServerPermissions::Thread,
+    );
     let prepared = crate::binding::PreparedMcpCall::new(
         Arc::new(crate::connection_manager::McpConnectionSet::empty(
             /*prefix_mcp_tool_names*/ true,
@@ -304,6 +506,7 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
         create_test_tool("test_server", "test"),
         crate::server::McpServerMetadata {
             environment_id: "local".to_string(),
+            server_key: McpServerKey::unscoped("test_server"),
             pollutes_memory: false,
             origin: None,
             supports_parallel_tool_calls: true,
@@ -314,15 +517,19 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
         /*selected_plugin_server*/ false,
     )
     .unwrap();
-    let bindings = McpBindingClients::new(HashMap::from([(
-        "test_server".to_string(),
-        Arc::new(client.clone()),
-    )]));
+    let bindings = McpBindingClients::new(
+        HashMap::from([(
+            McpServerKey::unscoped("test_server"),
+            Arc::new(client.clone()),
+        )]),
+        Vec::new(),
+    );
     server.block_listing.store(true, Ordering::Release);
     let waiting = async {
+        let server = McpServerKey::unscoped("test_server");
         tokio::join!(
-            bindings.list_resources("test_server", /*params*/ None),
-            bindings.list_resource_templates("test_server", /*params*/ None),
+            bindings.list_resources(&server, /*params*/ None),
+            bindings.list_resource_templates(&server, /*params*/ None),
         )
     };
     tokio::pin!(waiting);
@@ -567,6 +774,7 @@ async fn new_chat_relists_tools_without_invalidating_or_waiting_for_existing_cal
             Duration::from_secs(1),
             second.tool_catalog.refresh(
                 || async { Ok((vec![create_test_tool("test_server", "refreshed")], None, ())) },
+                || Some(()),
                 |_, _, ()| {},
             ),
         )

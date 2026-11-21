@@ -38,7 +38,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+codex-core = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+codex-plugin-host = { workspace = true }
 codex-code-mode = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
+codex-utils-process = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

@@ -1,9 +1,19 @@
+mod display;
+
+pub use display::AgentMessageDisplay;
+pub use display::AgentMessageDisplayVersion;
+pub use display::AnswerAnnotation;
+pub use display::AnswerReplacement;
+pub use display::BlockReason;
+pub use display::HelplineSubject;
+pub use display::TrustedContacts;
+
 use crate::AgentPath;
-use crate::ResponseItemId;
 use crate::ThreadId;
 use crate::dynamic_tools::DynamicToolCallOutputContentItem;
 use crate::mcp::CallToolResult;
 use crate::memory_citation::MemoryCitation;
+use crate::models::AudioReference;
 use crate::models::ContentItem;
 use crate::models::ContentItemMetadata;
 use crate::models::FunctionCallOutputBody;
@@ -24,6 +34,7 @@ use crate::protocol::PatchApplyStatus;
 use crate::protocol::ReviewOutputEvent;
 use crate::protocol::ReviewTarget;
 use crate::protocol::SubAgentActivityKind;
+use crate::protocol::UserMessageAudioKind;
 use crate::user_input::ByteRange;
 use crate::user_input::TextElement;
 use crate::user_input::UserInput;
@@ -149,6 +160,15 @@ pub struct AsyncUserInputQuestion {
     pub options: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, TS, JsonSchema)]
+#[serde(from = "display::StoredModeration")]
+pub struct AgentMessageModeration {
+    pub moderated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display: Option<AgentMessageDisplay>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 /// Assistant-authored message payload used in turn-item streams.
 ///
@@ -156,6 +176,9 @@ pub struct AsyncUserInputQuestion {
 /// should use it when present, but retain legacy completion semantics when it
 /// is `None`.
 pub struct AgentMessageItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub moderation: Option<AgentMessageModeration>,
     pub id: String,
     pub content: Vec<AgentMessageContent>,
     /// Optional phase metadata carried through from `ResponseItem::Message`.
@@ -457,6 +480,10 @@ pub enum McpAppDisplayMode {
 pub struct McpToolCallItem {
     pub id: String,
     pub server: String,
+    /// Registration scope, not necessarily the server's execution environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment_id: Option<String>,
     pub tool: String,
     pub arguments: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -635,7 +662,52 @@ impl UserMessageItem {
         self.content
             .iter()
             .filter_map(|c| match c {
-                UserInput::Audio { audio_url } => Some(audio_url.clone()),
+                UserInput::Audio {
+                    audio: AudioReference::Inline { audio_url },
+                } => Some(audio_url.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns file-backed audio references when the message includes an upload.
+    /// Inline payloads remain exclusively in the legacy `audio` field.
+    pub fn audio_references(&self) -> Option<Vec<AudioReference>> {
+        let audio = self
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                UserInput::Audio {
+                    audio: audio @ AudioReference::File { .. },
+                } => Some(audio.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (!audio.is_empty()).then_some(audio)
+    }
+
+    /// Returns the original inline/file ordering when uploaded audio is present.
+    pub fn audio_order(&self) -> Vec<UserMessageAudioKind> {
+        if !self.content.iter().any(|content| {
+            matches!(
+                content,
+                UserInput::Audio {
+                    audio: AudioReference::File { .. }
+                }
+            )
+        }) {
+            return Vec::new();
+        }
+
+        self.content
+            .iter()
+            .filter_map(|content| match content {
+                UserInput::Audio {
+                    audio: AudioReference::Inline { .. },
+                } => Some(UserMessageAudioKind::Inline),
+                UserInput::Audio {
+                    audio: AudioReference::File { .. },
+                } => Some(UserMessageAudioKind::File),
                 _ => None,
             })
             .collect()
@@ -697,7 +769,7 @@ pub fn build_hook_prompt_message(fragments: &[HookPromptFragment]) -> Option<Res
     Some(ResponseItem::Message {
         status: None,
         encrypted_content: None,
-        id: Some(ResponseItemId::new("msg")),
+        id: None,
         role: "user".to_string(),
         content,
         phase: None,
@@ -812,7 +884,14 @@ mod tests {
                 text_elements: Vec::new(),
             },
             UserInput::Audio {
-                audio_url: "https://example.com/remote.mp3".to_string(),
+                audio: AudioReference::Inline {
+                    audio_url: "https://example.com/remote.mp3".to_string(),
+                },
+            },
+            UserInput::Audio {
+                audio: AudioReference::File {
+                    file_id: "file_audio".to_string(),
+                },
             },
             UserInput::LocalAudio {
                 path: std::path::PathBuf::from("local.wav"),
@@ -825,6 +904,16 @@ mod tests {
                 vec!["https://example.com/remote.mp3".to_string()],
                 vec![std::path::PathBuf::from("local.wav")],
             )
+        );
+        assert_eq!(
+            item.audio_references(),
+            Some(vec![AudioReference::File {
+                file_id: "file_audio".to_string(),
+            }])
+        );
+        assert_eq!(
+            item.audio_order(),
+            vec![UserMessageAudioKind::Inline, UserMessageAudioKind::File]
         );
     }
 
@@ -858,10 +947,9 @@ mod tests {
         ];
         let message = build_hook_prompt_message(&original).expect("hook prompt");
 
-        let ResponseItem::Message { id, content, .. } = message else {
+        let ResponseItem::Message { content, .. } = message else {
             panic!("expected hook prompt message");
         };
-        assert!(id.is_some_and(|id| id.starts_with("msg_")));
 
         let parsed = parse_hook_prompt_message(/*id*/ None, &content).expect("parsed hook prompt");
         assert_eq!(parsed.fragments, original);

@@ -95,10 +95,12 @@ def test_schema_refresh_only_updates_python_for_repository_schemas(monkeypatch, 
     runpy.run_path(str(script), run_name="__main__")
 
     assert [args[0] for args, _kwargs in calls] == (
-        ["cargo", "uv"] if mode == "repository" else ["cargo"]
+        ["cargo", sys.executable] if mode == "repository" else ["cargo"]
     )
     assert all(kwargs["check"] for _args, kwargs in calls)
     if mode == "repository":
+        runner = ROOT.parents[1] / "codex-rs/scripts/run_locked_python_tool.py"
+        assert calls[1][0][1] == str(runner)
         assert calls[1][0][-3:] == [
             "generate-types",
             "--schema-dir",
@@ -119,3 +121,60 @@ def test_schema_generation_failure_does_not_update_python(monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         runpy.run_path(str(script), run_name="__main__")
     assert calls == ["cargo"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "modelProviderNotConfigured", "modelProvider": "old-provider"},
+        {
+            "type": "modelProviderMismatch",
+            "modelProvider": "old-provider",
+            "currentModelProvider": "current-provider",
+        },
+        {
+            "type": "modelProviderPolicyConflict",
+            "modelProvider": "old-provider",
+            "requiredModelProvider": "required-provider",
+        },
+    ],
+)
+def test_model_provider_errors_round_trip_wire_names(payload):
+    from openai_codex.generated.v2_all import ModelProviderError
+
+    error = ModelProviderError.model_validate(payload)
+    assert error.model_dump(by_alias=True) == payload
+
+
+def test_answer_display_is_read_in_thread_history_and_notifications():
+    from openai_codex.generated.v2_all import ItemCompletedNotification, ThreadItemsListResponse
+
+    display = {
+        "version": 1,
+        "mode": "show",
+        "trustedContacts": "check",
+        "annotation": {"kind": "wellbeingHelpline", "subject": "answer"},
+    }
+    item = {
+        "id": "a",
+        "type": "agentMessage",
+        "text": "answer",
+        "moderation": {"moderated": True, "display": {**display, "additionalV1Field": True}},
+    }
+    history = ThreadItemsListResponse.model_validate({"data": [{"turnId": "u", "item": item}]})
+    event = ItemCompletedNotification.model_validate(
+        {"threadId": "t", "turnId": "u", "completedAtMs": 1, "item": item}
+    )
+    for envelope in (history.data[0].item, event.item):
+        assert (
+            envelope.root.moderation.display.model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+            == display
+        )
+    item["moderation"] = {"moderated": False, "display": {"version": 2, "mode": "new"}}
+    moderated = ItemCompletedNotification.model_validate(
+        {"threadId": "t", "turnId": "u", "completedAtMs": 1, "item": item}
+    ).item.root.moderation
+    assert moderated.moderated is True
+    assert moderated.display is None

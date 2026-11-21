@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use codex_prompts::render_review_exit_interrupted;
 use codex_prompts::render_review_exit_success;
-use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
@@ -27,8 +26,8 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
-use codex_protocol::user_input::UserInput;
 use codex_thread_store::PersistContext;
+use codex_user_input::ResolvedUserInput;
 
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -99,7 +98,7 @@ impl SessionTask for ReviewTask {
 async fn start_review_conversation(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
-    input: Vec<UserInput>,
+    input: Vec<ResolvedUserInput>,
     cancellation_token: CancellationToken,
 ) -> Option<async_channel::Receiver<Event>> {
     let config = ctx.config.clone();
@@ -242,7 +241,7 @@ pub(crate) async fn exit_review_mode(
             &[ResponseItem::Message {
                 status: None,
                 encrypted_content: None,
-                id: Some(ResponseItemId::new("msg")),
+                id: Some(session.context_ids.next_item("msg")),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
                 phase: None,
@@ -264,7 +263,7 @@ pub(crate) async fn exit_review_mode(
             ResponseItem::Message {
                 status: None,
                 encrypted_content: None,
-                id: Some(ResponseItemId::new("msg")),
+                id: Some(session.context_ids.next_item("msg")),
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
                     annotations: None,

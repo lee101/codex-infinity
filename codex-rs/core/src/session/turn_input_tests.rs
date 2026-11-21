@@ -19,17 +19,20 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
-use codex_protocol::user_input::UserInput;
+use codex_user_input::ResolvedUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::test_codex::local_selections;
 use pretty_assertions::assert_eq;
 use test_case::test_case;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 struct NeverEndingTask {
@@ -93,7 +96,7 @@ async fn submit_start_only(
 
 async fn submit_steer_only(
     session: &Arc<Session>,
-    input: Vec<UserInput>,
+    input: Vec<ResolvedUserInput>,
     expected_turn_id: &str,
 ) -> TurnInputSubmission {
     handle(
@@ -148,10 +151,9 @@ async fn steering_does_not_wait_for_realtime_history() {
             std::time::Duration::from_secs(5),
             handle(
                 &session,
-                TurnInputRequest::user_input(vec![UserInput::Text {
-                    text: "steer without waiting for persistence".to_string(),
-                    text_elements: Vec::new(),
-                }]),
+                TurnInputRequest::user_input(vec![ResolvedUserInput::text(
+                    "steer without waiting for persistence".to_string(),
+                )]),
                 mode,
                 "steer-submission".to_string(),
             ),
@@ -177,27 +179,24 @@ async fn accepted_input_applies_thread_settings() {
     let config = session.get_config().await;
     handle(
         &session,
-        TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".to_string(),
-            text_elements: Vec::new(),
-        }])
-        .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(config.cwd.clone()).into_requests()),
-            approval_policy: Some(config.permissions.approval_policy.value()),
-            approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
-            sandbox_policy: Some(config.legacy_sandbox_policy()),
-            summary: config.model_reasoning_summary,
-            personality: config.personality,
-            collaboration_mode: Some(CollaborationMode {
-                mode: ModeKind::Default,
-                settings: Settings {
-                    model: turn_context.model_info().slug.clone(),
-                    reasoning_effort: config.model_reasoning_effort.clone(),
-                    developer_instructions: None,
-                },
+        TurnInputRequest::user_input(vec![ResolvedUserInput::text("hello".to_string())])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(config.cwd.clone()).into_requests()),
+                approval_policy: Some(config.permissions.approval_policy.value()),
+                approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
+                permission_profile: Some(config.permissions.effective_permission_profile()),
+                summary: config.model_reasoning_summary,
+                personality: config.personality,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: turn_context.model_info().slug.clone(),
+                        reasoning_effort: config.model_reasoning_effort.clone(),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
             }),
-            ..Default::default()
-        }),
         TurnInputMode::StartOrSteer,
         "sub-1".to_string(),
     )
@@ -239,7 +238,7 @@ async fn start_only_rejects_active_turn_without_injecting() {
         submission
     );
     assert_eq!(
-        Vec::<TurnInput>::new(),
+        Vec::<InputQueueEntry>::new(),
         session
             .input_queue
             .get_pending_input(&session.active_turn)
@@ -248,6 +247,29 @@ async fn start_only_rejects_active_turn_without_injecting() {
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn saved_message_wake_checks_the_last_started_turn_during_admission() {
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    for (last_started, reason) in [
+        ("original", NotSubmittedReason::NotIdle),
+        ("successor", NotSubmittedReason::Superseded),
+    ] {
+        session.state.lock().await.last_started_turn_id = Some(last_started.into());
+        let result = handle(
+            &session,
+            TurnInputRequest::user_input(vec![]),
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id: "original".into(),
+            },
+            "wake".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, TurnInputSubmission::NotSubmitted { reason });
+    }
 }
 
 #[tokio::test]
@@ -303,7 +325,7 @@ async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
             .get_pending_input(&session.active_turn)
             .await
             .0,
-        Vec::<TurnInput>::new()
+        Vec::<InputQueueEntry>::new()
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
@@ -377,7 +399,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
     assert_eq!(session.thread_settings_snapshot().await, desired_settings);
     assert!(session.active_turn.lock().await.is_none());
     assert_eq!(
-        Vec::<TurnInput>::new(),
+        Vec::<InputQueueEntry>::new(),
         session
             .input_queue
             .get_pending_input(&session.active_turn)
@@ -616,7 +638,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
         .acquire()
         .await
         .expect("acquire MCP refresh gate");
-    session.mcp_refresh.claim();
+    session.mcp_refresh.take_pending();
     assert!(!session.mcp_refresh.is_pending());
 
     for (submission_id, prepared) in [
@@ -651,7 +673,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
             .get_pending_input(&session.active_turn)
             .await
             .0,
-        Vec::<TurnInput>::new()
+        Vec::<InputQueueEntry>::new()
     );
 
     // The rejected candidate is valid and would have real runtime effects if
@@ -734,6 +756,7 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
             misalignment: None,
             message: expected_message,
             codex_error_info: Some(CodexErrorInfo::BadRequest),
+            rejected_audio_file_ids: Vec::new(),
         }]
     );
     assert_eq!(session.thread_settings_snapshot().await, desired_settings);
@@ -744,7 +767,7 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
             .get_pending_input(&session.active_turn)
             .await
             .0,
-        Vec::<TurnInput>::new()
+        Vec::<InputQueueEntry>::new()
     );
 }
 
@@ -763,10 +786,7 @@ async fn start_only_accepts_user_input_in_plan_mode() {
     let submission = submit_start_only(
         &session,
         SubmittedTurnInput::UserInput {
-            content: vec![UserInput::Text {
-                text: "queued user input".to_string(),
-                text_elements: Vec::new(),
-            }],
+            content: vec![ResolvedUserInput::text("queued user input".to_string())],
             client_id: Some("queued-user-message".to_string()),
         },
     )
@@ -904,10 +924,7 @@ async fn steer_only_requires_active_turn() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let submission = submit_steer_only(
         &session,
-        vec![UserInput::Text {
-            text: "steer".to_string(),
-            text_elements: Vec::new(),
-        }],
+        vec![ResolvedUserInput::text("steer".to_string())],
         "missing-turn-id",
     )
     .await;
@@ -931,10 +948,7 @@ async fn steer_only_enforces_expected_turn_id() {
             Arc::clone(&turn_context),
             vec![TurnInput::UserInput {
                 metadata: Default::default(),
-                content: vec![UserInput::Text {
-                    text: "hello".to_string(),
-                    text_elements: Vec::new(),
-                }],
+                content: vec![ResolvedUserInput::text("hello".to_string())],
                 client_id: None,
             }],
             NeverEndingTask {
@@ -946,10 +960,7 @@ async fn steer_only_enforces_expected_turn_id() {
 
     let submission = submit_steer_only(
         &session,
-        vec![UserInput::Text {
-            text: "steer".to_string(),
-            text_elements: Vec::new(),
-        }],
+        vec![ResolvedUserInput::text("steer".to_string())],
         "different-turn-id",
     )
     .await;
@@ -970,14 +981,15 @@ async fn steer_only_enforces_expected_turn_id() {
     }))
     .expect("valid standalone output");
 
+    let request = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)).on_start(
+        TurnStartOptions {
+            turn_trigger: Some("automation_cron_scheduled".to_string()),
+            ..Default::default()
+        },
+    );
     let submission = handle(
         &session,
-        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)).on_start(
-            TurnStartOptions {
-                turn_trigger: Some("automation_cron_scheduled".to_string()),
-                ..Default::default()
-            },
-        ),
+        request,
         TurnInputMode::StartOrSteer,
         "test-submission".to_string(),
     )
@@ -1034,10 +1046,7 @@ async fn rejects_non_regular_turns() {
                 Arc::clone(&turn_context),
                 vec![TurnInput::UserInput {
                     metadata: Default::default(),
-                    content: vec![UserInput::Text {
-                        text: "hello".to_string(),
-                        text_elements: Vec::new(),
-                    }],
+                    content: vec![ResolvedUserInput::text("hello".to_string())],
                     client_id: None,
                 }],
                 NeverEndingTask {
@@ -1047,10 +1056,7 @@ async fn rejects_non_regular_turns() {
             )
             .await;
 
-        let steer_input = vec![UserInput::Text {
-            text: "steer".to_string(),
-            text_elements: Vec::new(),
-        }];
+        let steer_input = vec![ResolvedUserInput::text("steer".to_string())];
         let steer_submission = submit_steer_only(&session, steer_input.clone(), "turn").await;
         assert_eq!(
             TurnInputSubmission::NotSubmitted {
@@ -1103,10 +1109,9 @@ async fn steer_preserves_request_origin(
             },
         )
         .await;
-    let content = vec![UserInput::Text {
-        text: "Create the worktree now.".to_owned(),
-        text_elements: Vec::new(),
-    }];
+    let content = vec![ResolvedUserInput::text(
+        "Create the worktree now.".to_owned(),
+    )];
     handle(
         &session,
         TurnInputRequest::user_input(content.clone()).on_start(TurnStartOptions {
@@ -1124,7 +1129,10 @@ async fn steer_preserves_request_origin(
         .input_queue
         .get_pending_input(&session.active_turn)
         .await
-        .0;
+        .0
+        .into_iter()
+        .map(|entry| entry.input)
+        .collect::<Vec<_>>();
     assert_eq!(
         pending,
         vec![TurnInput::UserInput {
@@ -1133,8 +1141,133 @@ async fn steer_preserves_request_origin(
             metadata: crate::session::UserInputMetadata {
                 acceptance_order: Some(0),
                 origin,
+                ..Default::default()
             },
         }]
     );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[test]
+fn dictation_metadata_is_captured_per_input_and_removed_from_responses() {
+    use std::collections::HashMap;
+
+    let mut request = TurnInputRequest::user_input(Vec::new())
+        .with_responses_metadata(Some(HashMap::from([
+            ("source".to_owned(), "codex".to_owned()),
+            ("codex_app_used_dictation".to_owned(), "true".to_owned()),
+        ])))
+        .with_responses_metadata_patch(Some(HashMap::from([(
+            "codex_app_used_dictation".to_owned(),
+            "false".to_owned(),
+        )])));
+    assert_eq!(
+        user_input_metadata(&mut request, /*realtime_handoff_id*/ None).used_dictation,
+        Some(false)
+    );
+    assert_eq!(
+        request.responsesapi_client_metadata.replacement,
+        Some(HashMap::from([("source".to_owned(), "codex".to_owned())]))
+    );
+    assert_eq!(
+        request.responsesapi_client_metadata.patch,
+        Some(HashMap::new())
+    );
+}
+
+#[tokio::test]
+async fn scored_prompt_keeps_its_submission_item_id() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    // A legacy steer can present the same UI client ID as an admitted steer.
+    for id in [Some(first), None, Some(second)] {
+        let mut request = TurnInputRequest::new(SubmittedTurnInput::UserInput {
+            content: vec![ResolvedUserInput::text("identical input".into())],
+            client_id: Some("same-client-id".into()),
+        });
+        request.user_item_uuid = id;
+        handle(
+            &session,
+            request,
+            TurnInputMode::Steer {
+                expected_turn_id: turn.sub_id.clone(),
+            },
+            Uuid::now_v7().to_string(),
+        )
+        .await
+        .unwrap();
+    }
+    let (pending, _) = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await;
+    for input in pending {
+        let TurnInput::UserInput {
+            content,
+            client_id,
+            metadata,
+        } = input.input
+        else {
+            panic!("expected admitted user input");
+        };
+        session
+            .record_user_prompt_and_emit_turn_item(
+                &turn,
+                turn.model_info(),
+                &content,
+                client_id,
+                metadata,
+                codex_thread_store::PersistContext::Standard,
+            )
+            .await
+            .expect("record user input");
+    }
+    let history = session.clone_history().await;
+    let ids: Vec<_> = history
+        .raw_items()
+        .filter_map(|item| {
+            if let ResponseItem::Message { role, id, .. } = item
+                && role == "user"
+            {
+                id.as_ref().map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids[0], format!("msg_input_{first}"));
+    assert!(!ids[1].starts_with("msg_input_"));
+    assert_eq!(ids[2], format!("msg_input_{second}"));
+    let ui_ids = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event.msg {
+            codex_protocol::protocol::EventMsg::ItemCompleted(event) => {
+                let item = codex_app_server_protocol::ThreadItemPayload::from(event.item);
+                if let codex_app_server_protocol::ThreadItemPayload::UserMessage {
+                    id,
+                    client_id,
+                    ..
+                } = item
+                {
+                    assert_eq!(client_id.as_deref(), Some("same-client-id"));
+                    return Some(id);
+                }
+                None
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

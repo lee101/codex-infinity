@@ -12,6 +12,8 @@ pub enum MessageBoardTool {
     SearchPosts,
     ReadThread,
     ReadPost,
+    /// Lists the caller's own subscriptions on a live board.
+    SubscribedChannels,
     Subscribe,
     Unsubscribe,
     /// Posts, subscribes the author unless opted out, and notifies recipients.
@@ -21,6 +23,15 @@ pub enum MessageBoardTool {
 }
 
 impl MessageBoardTool {
+    /// Shared catalog and post queries that cannot change board state.
+    pub(super) const READ_ONLY: [Self; 5] = [
+        Self::GetChannels,
+        Self::ListThreads,
+        Self::SearchPosts,
+        Self::ReadThread,
+        Self::ReadPost,
+    ];
+
     /// Existing agent discussion tools, in their original registration order.
     pub const DISCUSSION: [Self; 9] = [
         Self::CreateChannel,
@@ -34,7 +45,16 @@ impl MessageBoardTool {
         Self::Post,
     ];
 
-    pub(super) fn name(self) -> &'static str {
+    /// Bundled schema for discovery before a caller has been bound to a board.
+    pub fn spec(self) -> codex_tools::ToolSpec {
+        super::spec::tool(
+            self, /*namespace*/ None, /*namespace_description*/ "",
+            /*description_override*/ None,
+        )
+    }
+
+    /// Stable model-facing function name.
+    pub fn name(self) -> &'static str {
         match self {
             Self::CreateChannel => "create_channel",
             Self::UpsertChannel => "upsert_channel",
@@ -43,6 +63,7 @@ impl MessageBoardTool {
             Self::SearchPosts => "search_posts",
             Self::ReadThread => "read_thread",
             Self::ReadPost => "read_post",
+            Self::SubscribedChannels => "subscribed_channels",
             Self::Subscribe => "subscribe",
             Self::Unsubscribe => "unsubscribe",
             Self::Post => "post",

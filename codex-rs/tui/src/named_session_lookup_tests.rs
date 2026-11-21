@@ -54,7 +54,7 @@ async fn lookup_name(
     name: &str,
     collections: &[SessionCollection],
     mode: ThreadParamsMode,
-    model_provider: Option<&str>,
+    model_provider: Option<Vec<String>>,
 ) -> color_eyre::Result<Option<codex_app_server_protocol::Thread>> {
     let mut app_server = AppServerSession::new(
         crate::backend_id::BackendId::new(),
@@ -95,14 +95,14 @@ fn thread_metadata(
     let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-01T10:00:00Z")
         .expect("timestamp should parse")
         .with_timezone(&chrono::Utc);
-    let mut builder = ThreadMetadataBuilder::new(
+    let builder = ThreadMetadataBuilder::new(
         thread_id,
         rollout_path,
         created_at,
         serde_json::from_value(serde_json::json!("cli"))
             .expect("cli session source should deserialize"),
-    );
-    builder.cwd = config.codex_home.join("project").to_path_buf();
+    )
+    .with_cwd(config.codex_home.join("project").to_path_buf());
     let mut metadata = builder.build(config.model_provider_id.as_str());
     metadata.title = title.to_string();
     metadata.first_user_message = Some("preview text".to_string());
@@ -230,7 +230,7 @@ async fn resolves_name_and_preview_from_server_list() -> color_eyre::Result<()> 
         "saved-session",
         &[SessionCollection::Active],
         ThreadParamsMode::Embedded,
-        Some(&config.model_provider_id),
+        Some(vec![config.model_provider_id.clone()]),
     )
     .await?;
     let preview = lookup_name(
@@ -238,7 +238,7 @@ async fn resolves_name_and_preview_from_server_list() -> color_eyre::Result<()> 
         "preview text",
         &[SessionCollection::Active],
         ThreadParamsMode::Embedded,
-        Some(&config.model_provider_id),
+        Some(vec![config.model_provider_id.clone()]),
     )
     .await?;
     let switched_provider = lookup_name(
@@ -246,7 +246,7 @@ async fn resolves_name_and_preview_from_server_list() -> color_eyre::Result<()> 
         "saved-session",
         &[SessionCollection::Active],
         ThreadParamsMode::Embedded,
-        Some(&other_config.model_provider_id),
+        Some(vec![other_config.model_provider_id.clone()]),
     )
     .await?;
     let remote = lookup_name(
@@ -317,7 +317,7 @@ async fn rejects_duplicate_labels_across_server_pages() -> color_eyre::Result<()
         "same-label",
         &[SessionCollection::Active],
         &[resume_source_kinds(/*include_non_interactive*/ false)],
-        Some(&config.model_provider_id),
+        Some(vec![config.model_provider_id.clone()]),
     )
     .await
     .expect_err("duplicate labels should require an ID");
@@ -327,7 +327,7 @@ async fn rejects_duplicate_labels_across_server_pages() -> color_eyre::Result<()
         "other-1",
         &[SessionCollection::Active],
         &[resume_source_kinds(/*include_non_interactive*/ false)],
-        Some(&config.model_provider_id),
+        Some(vec![config.model_provider_id.clone()]),
     )
     .await?;
     app_server.shutdown().await?;
@@ -408,7 +408,7 @@ async fn skips_stale_listed_thread_before_valid_label() -> color_eyre::Result<()
         "same-label",
         &[SessionCollection::Active],
         ThreadParamsMode::Embedded,
-        Some(&config.model_provider_id),
+        Some(vec![config.model_provider_id.clone()]),
     )
     .await?;
     assert_eq!(found.map(|thread| thread.id), Some(valid_id.to_string()));
@@ -528,6 +528,7 @@ async fn verifies_name_uniqueness_across_server_pages() -> color_eyre::Result<()
             }
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: true,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: url,
                 auth_token: None,
@@ -551,7 +552,7 @@ async fn verifies_name_uniqueness_across_server_pages() -> color_eyre::Result<()
             "saved-session",
             &[SessionCollection::Active],
             &[resume_source_kinds(/*include_non_interactive*/ false)],
-            /*model_provider*/ None,
+            /*model_providers*/ None,
         )
         .await;
         if unverified_pagination {

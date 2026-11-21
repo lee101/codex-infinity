@@ -45,6 +45,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_rollout::RolloutItem;
 use codex_rollout::read_session_meta_line;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -384,7 +385,10 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
             .await?;
         assert_eq!(
             (cwd.as_path(), runtime_workspace_roots),
-            (saved_cwd.as_path(), saved_roots.clone())
+            (
+                saved_cwd.as_path(),
+                LegacyAppPathString::from_abs_paths(&saved_roots)
+            )
         );
         mcp.start_turn_and_wait_for_completion(TurnStartParams {
             thread_id: child.id.clone(),
@@ -505,6 +509,7 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
                 cursor: items_backwards_cursor.map(ThreadItemsListCursor::Opaque),
                 limit: None,
                 sort_direction: None,
+                defer_output: None,
             },
         })
         .await?;
@@ -756,6 +761,7 @@ async fn initialize_experimental(mcp: &mut TestAppServer) -> Result<()> {
                 version: "0.1.0".to_string(),
             },
             Some(InitializeCapabilities {
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,

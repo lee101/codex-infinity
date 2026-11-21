@@ -2,7 +2,71 @@ use super::*;
 use crate::CodexHarnessMetadata;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn large_elastic_sender_snapshots_survive_checkpoint_and_rollback() {
+    const ELASTIC_SNAPSHOT_BYTES: usize = 35_000;
+    let text = "s".repeat(ELASTIC_SNAPSHOT_BYTES);
+    let snapshot = |index| SenderUserMessages {
+        receiver_turn_id: format!("turn-{index}"),
+        receiver_message_id: format!("delivery-{index}"),
+        text: text.clone(),
+    };
+    let mut history = RetainedContext::default();
+    for index in 0..MAX_FAMILY_RECORDS {
+        assert!(history.record_sender_user_messages(&CodexHarnessMetadata {
+            sender_user_messages: Some(Box::new(snapshot(index))),
+            ..Default::default()
+        }));
+    }
+
+    let checkpoint = serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+    let mut restored = RetainedContext::default();
+    restored.restore(Some(&checkpoint), &[]);
+    let removed = (1..MAX_FAMILY_RECORDS)
+        .map(|index| format!("turn-{index}"))
+        .collect::<Vec<_>>();
+    restored.rollback(
+        &removed.iter().map(String::as_str).collect::<Vec<_>>(),
+        /*first_removed_message_id*/ None,
+        RetainedInputSource::Local(None),
+    );
+    assert_eq!(
+        restored.sender_user_messages(),
+        Some(&snapshot(/*index*/ 0))
+    );
+}
+
+#[test]
+fn accepted_audio_checkpoint_discards_oversized_and_rolled_back_evidence() {
+    let mut retained = RetainedContext::default();
+    let proof = |id: String| RetainedContextEvent::AcceptedFileAudio {
+        evidence: Arc::new(AcceptedFileAudio {
+            turn_id: "accepted".into(),
+            model: "model".into(),
+            provider: "provider".into(),
+            file_ids: BTreeSet::from([id]),
+        }),
+    };
+    assert!(retained.record(&proof("file_a".into()), &thread_context_ids()));
+    assert!(!retained.record(&proof("x".repeat(MAX_RECORD_BYTES)), &thread_context_ids()));
+    let bytes = serde_json::to_vec(&retained).expect("encode checkpoint");
+    let mut restored: RetainedContext = serde_json::from_slice(&bytes).expect("decode checkpoint");
+    let get_ids = |state: &RetainedContext| {
+        state
+            .accepted_file_audio("model", "provider")
+            .map(|proof| proof.file_ids.clone())
+    };
+    assert_eq!(get_ids(&restored), Some(BTreeSet::from(["file_a".into()])));
+    restored.rollback(
+        &["accepted"],
+        /*first_removed_message_id*/ None,
+        RetainedInputSource::Local(None),
+    );
+    assert_eq!(get_ids(&restored), None);
+}
 
 fn publish_answer() -> RetainedContextEvent {
     RetainedContextEvent::VerifiedAnswer {
@@ -20,6 +84,7 @@ fn publish_answer() -> RetainedContextEvent {
 
 fn delivered_message(id: &str, text: &str, acceptance_order: u64) -> RetainedContextEvent {
     RetainedContextEvent::DeliveredAssistantMessage {
+        retained_source: None,
         message: RetainedUserMessage {
             origin: crate::UserInputOrigin::User,
             turn_id: "turn-1".to_owned(),
@@ -36,7 +101,7 @@ fn delivered_message(id: &str, text: &str, acceptance_order: u64) -> RetainedCon
 fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() {
     let mut context = RetainedContext::default();
     let first = publish_answer();
-    assert!(context.record(&first));
+    assert!(context.record(&first, &thread_context_ids()));
     let before_restriction = context.clone();
     context.record_user_message(
         RetainedUserMessage {
@@ -48,6 +113,7 @@ fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() 
             complete: false,
         },
         RetainedInputSource::Local(None),
+        &thread_context_ids(),
     );
     let mut expected = context.clone();
     expected.user_messages[0].value.text = "Do not publish after all.".to_owned();
@@ -58,7 +124,7 @@ fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() 
     assert_eq!(context, expected);
     context.recover_user_message_excerpts(|_| panic!("existing text must not be replaced"));
     let snapshot = context.clone();
-    assert!(!context.record(&first));
+    assert!(!context.record(&first, &thread_context_ids()));
     assert_eq!(context, snapshot);
     let checkpoint =
         serde_json::from_str(&serde_json::to_string(&context).expect("retained answer fixture"))
@@ -92,24 +158,90 @@ fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() 
 }
 
 #[test]
+fn assistant_record_limit_applies_on_capture_and_restore() {
+    const LARGE_RECORD_BYTES: usize = 24_000;
+    let context_ids = thread_context_ids();
+    let thread_id = ThreadId::new();
+    let recorder = |assistant_record_bytes| {
+        RetainedContext::new(Some(MessageRetention {
+            thread_id,
+            policy: GuardianRetentionPolicy {
+                assistant_record_bytes,
+                user_record_bytes: None,
+            },
+        }))
+    };
+    let mut elastic = recorder(Some(LARGE_RECORD_BYTES));
+    let text = "x".repeat(MAX_RECORD_BYTES);
+    for index in 0..=MAX_FAMILY_BYTES / text.len() {
+        let order = elastic.reserve_order();
+        elastic.record_assistant_message(
+            RetainedUserMessage {
+                turn_id: "turn-1".to_owned(),
+                message_id: Some(index.to_string()),
+                text: text.clone(),
+                complete: true,
+                origin: crate::UserInputOrigin::User,
+                phase: None,
+            },
+            RetainedInputSource::Local(Some(order)),
+            &context_ids,
+        );
+    }
+    assert_eq!(elastic.assistant_messages[0].value.text, text);
+    assert!(elastic.has_omitted_assistant_messages());
+
+    let order = elastic.reserve_order();
+    let mut delivery = delivered_message("long-send", &text, order);
+    assert!(elastic.record_and_capture(&mut delivery, &context_ids));
+    let RetainedContextEvent::DeliveredAssistantMessage { message, .. } = delivery else {
+        unreachable!("recording preserves the event variant");
+    };
+    assert_eq!((message.text, message.complete), (text, true));
+
+    let checkpoint = serde_json::from_value(serde_json::json!({
+        "type": "compacted", "payload": {"message": "", "retained_context": &elastic}
+    }))
+    .unwrap();
+    let saved = MessageRetention::saved(&[checkpoint], thread_id);
+    assert_eq!(saved, elastic.message_retention);
+    let mut restored = recorder(/*assistant_record_bytes*/ None);
+    restored.restore(Some(&elastic), &[]);
+    assert_eq!(
+        restored.assistant_messages,
+        elastic.fixed_message_view().assistant_messages
+    );
+    let omitted = &restored.assistant_messages[0].value;
+    assert_eq!((omitted.complete, omitted.text.capacity()), (false, 0));
+    let mut restored = recorder(Some(1));
+    let order = restored.reserve_order();
+    let delivery = delivered_message("confirmed", "Deploy?", order);
+    assert!(restored.record(&delivery, &context_ids));
+    assert!(!restored.record(&delivery, &context_ids));
+}
+
+#[test]
 fn retained_families_enforce_storage_limits_without_changing_snapshots() {
     let mut context = RetainedContext::default();
     let first = publish_answer();
-    context.record(&first);
+    context.record(&first, &thread_context_ids());
     let snapshot = context.clone();
 
     for index in 2..=10 {
-        context.record(&RetainedContextEvent::VerifiedAnswer {
-            answer: VerifiedAnswer {
-                turn_id: "turn-2".to_owned(),
-                call_id: format!("ask-{index}"),
-                questions: vec![VerifiedQuestionAnswer {
-                    question: "Continue?".to_owned(),
-                    answer: "Yes".to_owned(),
-                }],
+        context.record(
+            &RetainedContextEvent::VerifiedAnswer {
+                answer: VerifiedAnswer {
+                    turn_id: "turn-2".to_owned(),
+                    call_id: format!("ask-{index}"),
+                    questions: vec![VerifiedQuestionAnswer {
+                        question: "Continue?".to_owned(),
+                        answer: "Yes".to_owned(),
+                    }],
+                },
+                acceptance_order: None,
             },
-            acceptance_order: None,
-        });
+            &thread_context_ids(),
+        );
     }
     assert!(!context.verified_answers_complete());
     assert_eq!(context.verified_answers().count(), MAX_FAMILY_RECORDS);
@@ -127,7 +259,7 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
         panic!("verified answer fixture");
     };
     answer.questions[0].answer = "a".repeat(MAX_RECORD_BYTES);
-    restored.record(&oversized);
+    restored.record(&oversized, &thread_context_ids());
     assert!(!restored.verified_answers_complete());
     assert!(
         restored
@@ -157,6 +289,7 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
                 complete: true,
             },
             RetainedInputSource::Local(None),
+            &thread_context_ids(),
         );
     }
     assert!(!restored.user_messages_complete());
@@ -178,6 +311,7 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
             complete: true,
         },
         RetainedInputSource::Local(Some(0)),
+        &thread_context_ids(),
     );
     assert_eq!(
         restored, recent,
@@ -193,6 +327,7 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
             complete: true,
         },
         RetainedInputSource::Local(None),
+        &thread_context_ids(),
     );
     let Some((_, RetainedContextEntry::UserMessage(message))) =
         restored.ordered_entries().next_back()
@@ -212,18 +347,19 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
                 ..restrictions.back().unwrap().value.clone()
             },
             RetainedInputSource::Local(Some(order)),
+            &thread_context_ids(),
         );
     }
     assert!(!restored.has_omitted_assistant_messages());
     let evicted = delivered_message("evicted", "Already replaced?", /*acceptance_order*/ 0);
-    assert!(restored.record(&evicted));
+    assert!(restored.record(&evicted, &thread_context_ids()));
     // The old-order delivery is immediately evicted, so the bounded buffer
     // cannot prove a subsequent recording with this ID is a duplicate.
-    assert!(restored.record(&evicted));
+    assert!(restored.record(&evicted, &thread_context_ids()));
     let order = restored.reserve_order();
     let oversized = delivered_message("oversized", &"x".repeat(MAX_RECORD_BYTES), order);
-    assert!(restored.record(&oversized));
-    assert!(!restored.record(&oversized));
+    assert!(restored.record(&oversized, &thread_context_ids()));
+    assert!(!restored.record(&oversized, &thread_context_ids()));
     assert_eq!(restored.user_messages, restrictions);
     assert_eq!(restored.verified_answers, authorization);
     assert_eq!(restored.assistant_messages.len(), MAX_FAMILY_RECORDS);
@@ -242,8 +378,8 @@ fn retained_families_enforce_storage_limits_without_changing_snapshots() {
     // Once the omission marker is set, another confirmed delivery still needs
     // its own rollout record even when the bounded window stays incomplete.
     let later = delivered_message("later", "A later question?", order + 1);
-    assert!(restored.record(&later));
-    assert!(!restored.record(&later));
+    assert!(restored.record(&later, &thread_context_ids()));
+    assert!(!restored.record(&later, &thread_context_ids()));
 }
 
 #[test]
@@ -260,6 +396,7 @@ fn recovered_excerpts_obey_record_and_family_limits() {
                 complete: false,
             },
             RetainedInputSource::Local(None),
+            &thread_context_ids(),
         );
     }
     let unchanged = context.clone();
@@ -352,7 +489,7 @@ fn accepted_order_survives_delayed_recording_and_checkpoint_replay() {
         answer,
         acceptance_order: Some(answer_order),
     };
-    context.record(&event);
+    context.record(&event, &thread_context_ids());
     let instruction = RetainedUserMessage {
         phase: None,
         origin: crate::UserInputOrigin::User,
@@ -364,16 +501,21 @@ fn accepted_order_survives_delayed_recording_and_checkpoint_replay() {
     // Assistant delivery after accepted steering must not move the steering past it.
     let assistant_order = context.reserve_order();
     let delivered = delivered_message("assistant", "Publish publicly?", assistant_order);
-    assert!(context.record(&delivered));
+    assert!(context.record(&delivered, &thread_context_ids()));
     let checkpoint = serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
     context.record_user_message(
         instruction.clone(),
         RetainedInputSource::Local(Some(steer_order)),
+        &thread_context_ids(),
     );
     let mut resumed = RetainedContext::default();
     resumed.restore(Some(&checkpoint), &[]);
-    assert!(!resumed.record(&delivered));
-    resumed.record_user_message(instruction, RetainedInputSource::Local(Some(steer_order)));
+    assert!(!resumed.record(&delivered, &thread_context_ids()));
+    resumed.record_user_message(
+        instruction,
+        RetainedInputSource::Local(Some(steer_order)),
+        &thread_context_ids(),
+    );
     // This suffix has no captured version metadata, so replay creates a fresh revision.
     // Its original contents and acceptance order still reconstruct identically.
     let mut expected = context.clone();
@@ -442,7 +584,7 @@ fn accepted_order_survives_delayed_recording_and_checkpoint_replay() {
 #[test]
 fn adopted_instructions_preserve_local_order_and_rollback_scope() {
     let mut context = RetainedContext::default();
-    context.record(&publish_answer());
+    context.record(&publish_answer(), &thread_context_ids());
     for index in 0..2 {
         let message = RetainedUserMessage {
             phase: None,
@@ -452,9 +594,21 @@ fn adopted_instructions_preserve_local_order_and_rollback_scope() {
             text: format!("Parent instruction {index}"),
             complete: true,
         };
-        context.record_user_message(message.clone(), RetainedInputSource::Inherited);
-        context.record_user_message(message.clone(), RetainedInputSource::Inherited);
-        context.record_assistant_message(message, RetainedInputSource::Inherited);
+        context.record_user_message(
+            message.clone(),
+            RetainedInputSource::Inherited,
+            &thread_context_ids(),
+        );
+        context.record_user_message(
+            message.clone(),
+            RetainedInputSource::Inherited,
+            &thread_context_ids(),
+        );
+        context.record_assistant_message(
+            message,
+            RetainedInputSource::Inherited,
+            &thread_context_ids(),
+        );
     }
     assert_eq!(context.reserve_order(), 1);
     assert!(!context.verified_answers_complete());

@@ -2,8 +2,10 @@ use super::*;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
 use codex_config::LoaderOverrides;
+use codex_config::types::BuiltinStatusLine;
 use codex_config::types::RightClickPaste;
 use codex_config::types::SessionPickerViewMode;
+use codex_config::types::StatusLineSelection;
 use codex_terminal_detection::Multiplexer;
 use pretty_assertions::assert_eq;
 
@@ -119,9 +121,10 @@ async fn system_motion_suppresses_animations_without_changing_saved_preferences(
 
 #[tokio::test]
 async fn local_load_preserves_defaults_and_resolved_overrides() -> anyhow::Result<()> {
-    for config_text in [
-        "",
-        r#"
+    for (config_text, expected_server) in [
+        ("", None),
+        (
+            r#"
 [tui]
 animations = false
 show_tooltips = false
@@ -135,6 +138,9 @@ right_click_paste = "off"
 vim_mode_default = true
 terminal_resize_reflow_max_rows = 0
 session_picker_view = "comfortable"
+status_line_provider = { server = "remote.work", tool = "usage" }
+[tui.default_hosts.project_a]
+user_a = "remote.work"
 [tui.effects]
 shimmer = false
 [tui.rendering]
@@ -148,11 +154,26 @@ max_bytes = 4096
 [notice]
 fast_default_opt_out = true
 "#,
+            Some("remote.work"),
+        ),
     ] {
         let home = tempfile::tempdir()?;
         std::fs::write(home.path().join("config.toml"), config_text)?;
+        let project = tempfile::tempdir()?;
+        let project_cwd = AbsolutePathBuf::from_absolute_path(project.path())?;
+        std::fs::create_dir(project.path().join(".codex"))?;
+        std::fs::write(
+            project.path().join(".codex/config.toml"),
+            "[tui]\ntheme = 'project-theme'\nstatus_line_provider = { server = 'project', tool = 'usage' }\n[tui.default_hosts.project_a]\nuser_a = 'project-override'\nuser_b = 'project-only'\n",
+        )?;
+        crate::legacy_core::config::set_project_trust_level(
+            home.path(),
+            project.path(),
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )?;
         let cli_overrides = vec![
             ("tui.disable_paste_burst".into(), true.into()),
+            ("tui.status_line_provider".into(), "default".into()),
             ("tui.right_click_paste".into(), "on".into()),
             ("tui.mouse_scroll_speed".into(), 1.5.into()),
             // The removed flag must not override the TUI preference.
@@ -163,11 +184,9 @@ fast_default_opt_out = true
         ];
         let config = ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(project.path().to_path_buf()))
             .strict_config(true)
-            .loader_overrides(LoaderOverrides {
-                ignore_project_config: true,
-                ..LoaderOverrides::without_managed_config_for_tests()
-            })
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .cli_overrides(cli_overrides.clone())
             .build()
             .await?;
@@ -176,13 +195,10 @@ fast_default_opt_out = true
         assert!(config.tui_fullscreen_transcript);
         let bootstrap = crate::legacy_core::config::load_config_toml_with_layer_stack(
             home.path(),
-            /*cwd*/ None,
+            Some(&project_cwd),
             cli_overrides,
             codex_config::ConfigLoadOptions {
-                loader_overrides: LoaderOverrides {
-                    ignore_project_config: true,
-                    ..LoaderOverrides::without_managed_config_for_tests()
-                },
+                loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
                 strict_config: true,
                 ..Default::default()
             },
@@ -193,6 +209,177 @@ fast_default_opt_out = true
             LocalSettings::from(&config),
         );
         assert_eq!(config.features.legacy_feature_usages().count(), 1);
+        assert_eq!(config.tui_theme.as_deref(), Some("project-theme"));
+        assert_eq!(
+            config.tui_status_line_provider.as_deref(),
+            Some(&StatusLineSelection::Builtin(BuiltinStatusLine::Default)),
+        );
+        assert!(
+            LocalSettings::from(&config)
+                .tui
+                .default_hosts
+                .get("project_a")
+                .and_then(|users| users.get("user_b"))
+                .is_none()
+        );
+        assert_eq!(
+            LocalSettings::from(&config)
+                .tui
+                .default_hosts
+                .get("project_a")
+                .and_then(|users| users.get("user_a"))
+                .map(String::as_str),
+            expected_server,
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_status_line_provider_uses_project_and_user_validation_rules()
+-> anyhow::Result<()> {
+    use codex_config::ConfigLayerSource;
+
+    let home = tempfile::tempdir()?;
+    let project = tempfile::tempdir()?;
+    let project_config = project.path().join(".codex");
+    std::fs::create_dir(&project_config)?;
+    let malformed = "[tui]\nstatus_line_provider = 42\n";
+    std::fs::write(
+        project_config.join("instructions.md"),
+        "project instructions",
+    )?;
+    let project_file = project_config.join("config.toml");
+    std::fs::write(
+        &project_file,
+        format!("model_instructions_file = 'instructions.md'\n{malformed}"),
+    )?;
+    let system_config = home.path().join("system.toml");
+    std::fs::write(
+        &system_config,
+        "[tui]\nstatus_line_provider = { server = 'system', tool = 'usage' }\n",
+    )?;
+    let user_config = home.path().join("config.toml");
+    std::fs::write(&user_config, "[tui]\nstatus_line_provider = 'default'\n")?;
+    crate::legacy_core::config::set_project_trust_level(
+        home.path(),
+        project.path(),
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )?;
+    let build = |strict| {
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(project.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides {
+                system_config_path: Some(system_config.clone()),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .strict_config(strict)
+            .build()
+    };
+    let config = build(/*strict*/ false).await?;
+    let layers = &config.config_layer_stack;
+    let project_layer = layers
+        .layers_low_to_high()
+        .find(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+        .expect("trusted project layer");
+    assert_eq!(
+        project_layer.version,
+        codex_config::version_for_toml(&project_layer.config)
+    );
+    assert_eq!(
+        project_layer.config["tui"]["status_line_provider"].as_integer(),
+        Some(42)
+    );
+    assert_eq!(
+        project_layer.config["model_instructions_file"].as_str(),
+        project_config.join("instructions.md").to_str()
+    );
+    assert_eq!(
+        layers.effective_config()["tui"]["status_line_provider"].as_str(),
+        Some("default")
+    );
+    assert_eq!(
+        layers.origins_with_path_filter(
+            |path| path.starts_with(&["tui".into(), "status_line_provider".into()])
+        ),
+        std::collections::HashMap::from([(
+            "tui.status_line_provider".into(),
+            layers
+                .get_active_user_layer()
+                .expect("user layer")
+                .metadata()
+        )])
+    );
+
+    let assert_error_at = |error: std::io::Error, path: &std::path::Path, line| {
+        let diagnostic = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<codex_config::ConfigLoadError>())
+            .expect("config diagnostic")
+            .config_error();
+        assert_eq!(
+            (diagnostic.path.as_path(), diagnostic.range.start.line),
+            (path, line)
+        );
+    };
+    let error = build(/*strict*/ true)
+        .await
+        .expect_err("malformed project preference");
+    assert_error_at(error, &project_file, 3);
+
+    std::fs::write(
+        &user_config,
+        "[tui]\nstatus_line_provider = { plugin = 'old', server = 'local', tool = 'usage' }\n",
+    )?;
+    let config = build(/*strict*/ false).await?;
+    assert_eq!(
+        config.tui_status_line_provider.as_deref(),
+        Some(&StatusLineSelection::Builtin(BuiltinStatusLine::Default))
+    );
+    assert!(
+        config
+            .startup_warnings
+            .iter()
+            .any(|warning| warning.contains("tui.status_line_provider"))
+    );
+    assert_error_at(
+        build(/*strict*/ true)
+            .await
+            .expect_err("malformed user preference"),
+        &user_config,
+        2,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_line_provider_requires_a_complete_identity_in_the_selected_profile()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let profile = AbsolutePathBuf::from_absolute_path(home.path().join("work.config.toml"))?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[tui]\nstatus_line_provider = { server = 'personal', tool = 'usage' }\n",
+    )?;
+    for partial in ["server = 'work'", "tool = 'quota'"] {
+        std::fs::write(
+            &profile,
+            format!("[tui]\nstatus_line_provider = {{ {partial} }}\n"),
+        )?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                user_config_path: Some(profile.clone()),
+                user_config_profile: Some("work".parse()?),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        assert_eq!(
+            config.tui_status_line_provider.as_deref(),
+            Some(&StatusLineSelection::Builtin(BuiltinStatusLine::Default))
+        );
     }
     Ok(())
 }
@@ -280,6 +467,7 @@ async fn copy_on_select_respects_terminal_defaults_and_config_overrides() -> any
             ),
         ] {
             let terminal = TerminalInfo {
+                backend: None,
                 name,
                 multiplexer,
                 term_program: None,

@@ -28,6 +28,72 @@ fn domain_permissions(
 }
 
 #[tokio::test]
+async fn saved_grant_cannot_open_loopback_under_fixed_allowlist() -> anyhow::Result<()> {
+    let profile = PermissionProfile::workspace_write();
+    let spec = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            proxy_url: "http://127.0.0.1:0".into(),
+            enable_socks5: false,
+            allow_upstream_proxy: false,
+            ..Default::default()
+        },
+        Some(NetworkConstraints {
+            enabled: Some(true),
+            managed_allowed_domains_only: Some(true),
+            allow_local_binding: Some(false),
+            domains: Some(domain_permissions([(
+                "127.0.0.1:*",
+                NetworkDomainPermissionToml::Allow,
+            )])),
+            ..Default::default()
+        }),
+        &profile,
+    )?;
+    let mut saved = Policy::empty();
+    saved.add_network_rule(
+        "127.0.0.1",
+        codex_execpolicy::NetworkRuleProtocol::Http,
+        Allow,
+        /*justification*/ None,
+    )?;
+    let spec = spec.with_exec_policy_network_rules(&saved)?;
+    assert_eq!(
+        spec.config.allowed_domains(),
+        Some(vec!["127.0.0.1:*".to_owned()])
+    );
+
+    core_test_support::skip_if_no_network!(Ok(()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let proxy = spec
+        .start_proxy(
+            &profile,
+            ManagedProxyRouting::DedicatedListeners,
+            DefaultFalse,
+            /*policy_decider*/ None,
+            /*blocked_request_observer*/ None,
+            /*enable_network_approval_flow*/ false,
+            NetworkProxyAuditMetadata::default(),
+        )
+        .await?;
+    let request = codex_http_client::HttpClientBuilder::new()
+        .build_direct()?
+        .get(format!("http://{}/", proxy.proxy().http_addr()))
+        .header(http::header::HOST, listener.local_addr()?.to_string())
+        .timeout(std::time::Duration::from_secs(5))
+        .send();
+    tokio::select! {
+        biased;
+        connection = listener.accept() => anyhow::bail!("loopback destination reached: {:?}", connection?.1),
+        response = request => {
+            let response = response?;
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+            assert_eq!(response.json::<serde_json::Value>().await?["reason"], "not_allowed_local");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn attachment_socket_grants_respect_configured_restrictions_at_remote_launch()
 -> anyhow::Result<()> {
     let profile = PermissionProfile::workspace_write();
@@ -778,6 +844,7 @@ async fn environment_local_binding_preserves_explicit_denials_and_inherits_omitt
         allowed_domains = ["example.com"]
         "#,
     )?;
+    let empty = Policy::empty();
     for (name, configured, required, expected_bindings) in [
         (
             "absent",
@@ -883,21 +950,60 @@ async fn environment_local_binding_preserves_explicit_denials_and_inherits_omitt
                 "{name}: {local_binding_policy:?}, owner={owner_binding:?}"
             );
             let carrier = controller.as_ref().unwrap_or(&composed);
+            // Exercise both directions of a mixed-executor route when the controller
+            // leaves binding unspecified. An explicit denial cannot start an MXC proxy.
+            let (primary_os, primary_binding) = if local_binding_policy == DefaultFalse
+                && carrier.config.allow_local_binding.is_none()
+            {
+                (Platform::Windows, RequireTrue)
+            } else {
+                (Platform::Linux, DefaultFalse)
+            };
             let proxy = NetworkProxy::builder()
                 .state(Arc::new(carrier.build_state_with_audit_metadata(
                     Default::default(),
-                    Platform::Linux,
-                    DefaultFalse,
+                    primary_os,
+                    primary_binding,
                 )?))
                 .managed_by_codex(/*managed_by_codex*/ false)
                 .build()
                 .await?;
-            for policy in [owner, composed.environment_policy()] {
+            for policy in [Some(owner), Some(composed.environment_policy()), None] {
+                if policy.is_none() && (controller.is_none() || owner_binding.is_some()) {
+                    continue;
+                }
+                if let Some(controller) = &controller {
+                    let mcp = NetworkProxySpec::mcp_network_policy(
+                        Some(controller),
+                        &profile,
+                        McpNetworkRoute {
+                            primary_allows_proxy: true,
+                            local_binding: local_binding_policy,
+                            owner: policy.as_ref(),
+                        },
+                        &profile,
+                        AskForApproval::OnRequest,
+                        &empty,
+                    )?;
+                    assert_eq!(
+                        mcp.enabled,
+                        expected || local_binding_policy == DefaultFalse
+                    );
+                    if policy.is_some() || name == "managed_omitted" {
+                        assert_eq!(
+                            mcp.allowed_domains.iter().any(|host| host == "example.com"),
+                            expected
+                        );
+                    }
+                    if !expected {
+                        assert!(mcp.hard_deny_allowlist_misses);
+                    }
+                }
                 let scoped = proxy.for_execution(
                     "remote",
                     "binding-test",
                     "binding-token".to_string(),
-                    Some(policy),
+                    policy,
                     Some(Arc::new(|_request| async { NetworkDecision::Allow })),
                 )?;
                 let launch = scoped

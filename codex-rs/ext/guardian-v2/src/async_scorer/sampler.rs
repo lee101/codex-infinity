@@ -10,6 +10,7 @@ pub(super) use telemetry::SampledScore;
 
 use super::request::PreparedRequest;
 use super::score::PendingScore;
+use codex_login::AuthOwner;
 use connection_pool::ConnectionPool;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use codex_api::Reasoning;
 use codex_api::ReasoningContext;
 use codex_api::ResponsesApiRequest;
 use codex_context_fragments::RenderedFragment;
+use codex_core::SharedModelsManager;
 use codex_core::cyber_access_program::ApiKeyCyberAccessPrograms;
 use codex_extension_api::ExtensionMetrics;
 use codex_history::ResponseItemEnvelope;
@@ -25,17 +27,17 @@ use codex_http_client::HttpClientFactory;
 use codex_login::AgentIdentityAuthPolicy;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::WorkspaceRoutingContext;
-use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::turn_input::CyberAccessProgram;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+pub(super) const INPUT_TOKEN_MARGIN: usize = 256;
 pub(crate) const MODEL: &str = "gpt-5.6-luna";
 pub(crate) const CLASSIFICATION_TOKEN_USAGE_METRIC: &str =
     "codex.guardian_v2.classification.token_usage";
@@ -49,6 +51,8 @@ pub struct LunaSamplerConfig {
     pub provider: SharedModelProvider,
     /// Provider and feature policy shared with ordinary model requests.
     pub api_key_cyber_access_programs: ApiKeyCyberAccessPrograms,
+    /// False when the parent host confines its explicit program to that thread.
+    pub inherit_parent_cyber_access_program: bool,
     /// Routing scope and retained configuration layers for the owning thread.
     pub workspace_routing: WorkspaceRoutingContext,
     /// Effective proxy, custom-CA, and cookie configuration.
@@ -65,6 +69,8 @@ pub struct LunaSamplerConfig {
     pub originator: Option<String>,
     /// Optional inference service tier.
     pub service_tier: Option<String>,
+    /// Host-selected catalog, initialized when scoring needs Luna metadata.
+    pub(super) guardian_catalog: Option<SharedModelsManager>,
     /// Luna model's host-resolved encrypted-compaction compatibility hash.
     pub luna_compaction_hash: Option<String>,
     /// Complete input allowance resolved for the classifier model.
@@ -75,6 +81,8 @@ pub struct LunaSamplerConfig {
 
 /// One tool-less Luna classification request.
 pub struct LunaSamplingRequest {
+    /// Generator selected by the owning session for response items.
+    pub context_ids: codex_thread_context_ids::ThreadContextIds,
     /// Cyber selection captured from the owning turn; Daybreak reviews use Blue.
     pub cyber_access_program: Option<CyberAccessProgram>,
     /// ID of the response handling the classified tool.
@@ -94,6 +102,8 @@ pub struct LunaSamplingRequest {
     pub root_turn_id: Option<String>,
     /// Sampling expiry remains active until its response finishes draining.
     pub(super) pending_score: Option<PendingScore>,
+    /// Responses turn ID for this classifier execution.
+    pub(super) turn_id: Uuid,
 }
 
 /// Admitted retained input and Luna settings consumed together at execution.
@@ -135,6 +145,7 @@ pub enum LunaSamplerError {
 pub struct LunaSampler {
     config: Arc<LunaSamplerConfig>,
     connections: Arc<ConnectionPool>,
+    catalog_initialization_lock: Arc<Mutex<()>>,
 }
 
 impl LunaSampler {
@@ -152,68 +163,81 @@ impl LunaSampler {
         Self {
             connections: ConnectionPool::new(Arc::clone(&config)),
             config,
+            catalog_initialization_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(super) async fn ensure_catalog_initialized(&self) {
+        if let Some(catalog) = &self.config.guardian_catalog {
+            catalog
+                .ensure_initialized(self.config.http_client_factory.clone())
+                .await;
+        }
+    }
+
+    /// Retry catalog discovery without delaying tool dispatch or overlapping retries.
+    pub(super) fn retry_catalog_initialization_in_background(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let catalog = self.config.guardian_catalog.as_ref()?;
+        if !catalog.needs_initialization() {
+            return None;
+        }
+        let guard = Arc::clone(&self.catalog_initialization_lock)
+            .try_lock_owned()
+            .ok()?;
+        let sampler = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            let _guard = guard;
+            sampler.ensure_catalog_initialized().await;
+        }))
+    }
+
+    pub(super) fn max_input_tokens(&self) -> usize {
+        self.config.max_input_tokens
     }
 
     pub(super) async fn prewarm(&self) {
         self.connections.prewarm().await;
     }
 
-    fn auth_owner_generation(&self) -> Option<u64> {
-        self.config
-            .provider
-            .auth_manager()
-            .filter(|_| self.config.provider.info().auth.is_none())
-            .map(|manager| {
-                manager
-                    .auth_change_state_receiver()
-                    .borrow()
-                    .owner_generation
-            })
+    fn auth_owner(&self) -> Option<AuthOwner> {
+        let provider = &self.config.provider;
+        if provider.info().auth.is_none() {
+            codex_model_provider::request_auth_owner(provider.as_ref())
+        } else {
+            None
+        }
     }
 
-    // Normalize new evidence while preserving the retained prefix and its item IDs.
-    pub(super) fn prepare_input(
+    /// Builds fresh classifier setup with stable IDs before evidence selection.
+    pub(super) fn prepare_setup(request: &LunaSamplingRequest) -> Vec<ResponseItemEnvelope> {
+        let mut input = vec![
+            ResponseItemEnvelope::new(ResponseItem::AdditionalTools {
+                id: None,
+                role: "developer".to_owned(),
+                tools: Arc::from([]),
+            }),
+            ResponseItemEnvelope::new(ResponseItem::from(request.instructions.clone())),
+        ];
+        input.extend(
+            request
+                .parent_compaction
+                .clone()
+                .map(ResponseItemEnvelope::new),
+        );
+        Self::assign_item_ids(request, &mut input);
+        input
+    }
+
+    /// Assigns IDs and counts prepared setup and evidence, excluding committed history.
+    pub(super) fn finish_input(
         request: &LunaSamplingRequest,
-        history: Option<Vec<ResponseItemEnvelope>>,
-        mut evidence: Vec<ResponseItemEnvelope>,
+        mut input: Vec<ResponseItemEnvelope>,
+        evidence: Vec<ResponseItemEnvelope>,
     ) -> (Vec<ResponseItemEnvelope>, usize) {
-        let mut input = history.unwrap_or_else(|| {
-            let mut input = vec![
-                ResponseItemEnvelope::new(ResponseItem::AdditionalTools {
-                    id: None,
-                    role: "developer".to_owned(),
-                    tools: Arc::from([]),
-                }),
-                ResponseItemEnvelope::new(ResponseItem::from(request.instructions.clone())),
-            ];
-            input.extend(
-                request
-                    .parent_compaction
-                    .clone()
-                    .map(ResponseItemEnvelope::new),
-            );
-            input
-        });
-        // Normalize only new evidence; never rewrite the committed prefix.
-        for item in &mut evidence {
-            if let ResponseItem::Message { content, .. } = &mut item.item {
-                for content in content {
-                    if let ContentItem::InputImage { detail, .. } = content {
-                        *detail = None;
-                    }
-                }
-            }
-        }
         input.extend(evidence);
-        // Assign IDs once so retries reuse the same input item identities.
-        for item in &mut input {
-            if item.id().is_none()
-                && let Some(prefix) = item.id_prefix()
-            {
-                item.set_id(Some(ResponseItemId::new(prefix)));
-            }
-        }
+        Self::assign_item_ids(request, &mut input);
         let tokens = input
             .iter()
             .map(|item| codex_guardian_context::estimate_input_tokens(&item.item))
@@ -221,13 +245,25 @@ impl LunaSampler {
         (input, tokens)
     }
 
+    fn assign_item_ids(request: &LunaSamplingRequest, input: &mut [ResponseItemEnvelope]) {
+        // Assign IDs once so retries reuse the same input item identities.
+        for item in input {
+            if item.id().is_none()
+                && let Some(prefix) = item.id_prefix()
+            {
+                item.set_id(Some(request.context_ids.next_item(prefix)));
+            }
+        }
+    }
+
     fn execution(
         &self,
         request: &LunaSamplingRequest,
         input: Vec<ResponseItem>,
-        auth_owner_generation: Option<u64>,
+        auth_owner: Option<AuthOwner>,
     ) -> execution::SamplingExecution {
         let api_request = ResponsesApiRequest {
+            request_country: Default::default(),
             model: MODEL.to_owned(),
             input,
             tools: None,
@@ -244,28 +280,26 @@ impl LunaSampler {
             include: Vec::new(),
             service_tier: None,
             prompt_cache_key: Some(format!("guardian-v2:{}", self.config.thread_id)),
+            prompt_cache_options: None,
             text: None,
             client_metadata: None,
             access_programs: None,
         };
         execution::SamplingExecution {
-            auth_owner_generation,
+            auth_owner,
             cyber_access_program: codex_guardian_reviewer::guardian_cyber_access_program(
-                request.cyber_access_program,
+                request
+                    .cyber_access_program
+                    .filter(|_| self.config.inherit_parent_cyber_access_program),
             ),
             config: Arc::clone(&self.config),
             connections: Arc::clone(&self.connections),
             request: api_request,
-            // Retries keep the classification's inference turn identity.
-            turn_id: Uuid::now_v7().to_string(),
+            turn_id: request.turn_id.to_string(),
             parent_response_id: request.parent_response_id.clone(),
             parent_turn_id: request.parent_turn_id.clone(),
             root_turn_id: request.root_turn_id.clone(),
         }
-    }
-
-    pub(super) fn max_input_tokens(&self) -> usize {
-        self.config.max_input_tokens
     }
 
     /// Publishes the early score and returns only validated, completed history.
@@ -278,15 +312,14 @@ impl LunaSampler {
             input: review_request,
             sampling,
         } = sample;
-        let auth_owner_generation = self.auth_owner_generation();
+        let auth_owner = self.auth_owner();
         let mut completion = execution::RetainedCompletion {
             ready: Some(ready),
             output: Some(Vec::new()),
             early_score: None,
-            remaining_tokens: self
-                .config
+            remaining_tokens: review_request
                 .max_input_tokens
-                .saturating_sub(/*rhs*/ 256)
+                .saturating_sub(INPUT_TOKEN_MARGIN)
                 .saturating_sub(review_request.input_tokens),
         };
         // Transport sees model items; delivery proof follows the unchanged input prefix.
@@ -295,7 +328,7 @@ impl LunaSampler {
             .into_iter()
             .map(|envelope| (envelope.item, envelope.metadata))
             .unzip();
-        let mut execution = self.execution(&sampling, input, auth_owner_generation);
+        let mut execution = self.execution(&sampling, input, auth_owner);
         execution.request.include = vec!["reasoning.encrypted_content".to_owned()];
         let mut telemetry = telemetry::SamplingTelemetry::new(
             self.config.metrics.clone(),

@@ -10,7 +10,7 @@ use crate::models::PermissionProfile;
 use crate::models::PermissionProfileSnapshot;
 use crate::protocol::AskForApproval;
 use crate::sandbox::SandboxType;
-use codex_execpolicy::RequirementsExecPolicy;
+use codex_execpolicy_rules::RequirementsExecPolicy;
 use codex_network_proxy::EnvironmentNetworkPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -204,7 +204,7 @@ pub struct EnvironmentConfig {
     pub windows_sandbox_level: WindowsSandboxLevel,
     /// Concrete Windows sandbox backend selected for this environment attachment.
     pub windows_sandbox_type: SandboxType,
-    /// Whether Linux sandbox processes use the legacy Landlock backend.
+    /// Whether this environment requests legacy Landlock mode.
     pub use_legacy_landlock: bool,
     /// Additional managed command restrictions for this environment attachment.
     pub exec_policy: Option<RequirementsExecPolicy>,

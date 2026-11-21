@@ -137,6 +137,76 @@ async fn configured_ctrl_space_submit_wins_over_transcript_selection() -> Result
 }
 
 #[tokio::test]
+async fn markdown_chord_and_remapped_find_work_in_transcript_selection() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 80, /*height*/ 16);
+    tui.terminal.resize(size)?;
+
+    for (config, prefix) in [
+        (
+            serde_json::json!({"pager": {"find": "c"}}),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        ),
+        (
+            serde_json::json!({"global": {"leader": "f6"}, "pager": {"find": "c"}}),
+            KeyCode::F(6).into(),
+        ),
+    ] {
+        let config = serde_json::from_value(config)?;
+        app.keymap = RuntimeKeymap::from_config(&config).expect("valid Markdown shortcuts");
+        app.local_settings.tui.keymap = config.clone();
+        app.chat_widget.apply_keymap_update(config, &app.keymap);
+        app.transcript_view = Default::default();
+        app.transcript_cells = vec![Arc::new(crate::history_cell::AgentMarkdownCell::new(
+            "| Left | Right |\n|---|---|\n| alpha | Beta |".into(),
+            std::path::Path::new("/"),
+        ))];
+        app.render_owned_transcript(&mut tui, size)?;
+        assert!(app.transcript_view.begin_select_mode(&app.transcript_cells));
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyCode::Char('c').into()),
+        )
+        .await?;
+        assert!(app.transcript_view.is_search_editing());
+        for event in [
+            TuiEvent::Paste("Beta".into()),
+            TuiEvent::Draw,
+            TuiEvent::Key(KeyCode::Enter.into()),
+            TuiEvent::Key(prefix),
+            TuiEvent::Key(KeyCode::Char('v').into()),
+        ] {
+            app.handle_tui_event(&mut tui, &mut server, event).await?;
+        }
+        assert_eq!(
+            app.transcript_view
+                .selected_text(&app.transcript_cells)
+                .as_deref(),
+            Some("Beta")
+        );
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyCode::Char('v').into()),
+        )
+        .await?;
+        assert_eq!(
+            app.transcript_view
+                .selected_text(&app.transcript_cells)
+                .as_deref(),
+            Some("B")
+        );
+    }
+    server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn default_page_up_still_scrolls_the_transcript() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
@@ -252,18 +322,24 @@ async fn plan_menu_allows_transcript_wheel_scrolling_and_keeps_keyboard_ownershi
         let bottom = app.render_owned_transcript(&mut tui, size)?;
         let latest = screen(&tui);
         let menu = render_bottom_popup(&app.chat_widget, /*width*/ 80);
-        for kind in [
-            MouseEventKind::ScrollUp,
-            MouseEventKind::ScrollDown,
-            MouseEventKind::ScrollUp,
+        let mut screens = Vec::new();
+        for (kind, ticks) in [
+            (MouseEventKind::ScrollUp, 2),
+            (MouseEventKind::ScrollDown, 2),
+            (MouseEventKind::ScrollUp, 1),
         ] {
-            app.handle_tui_event(
-                &mut tui,
-                &mut server,
-                pointer_event(kind, /*column*/ 1, /*row*/ 1),
-            )
-            .await?;
+            let painted = screen(&tui);
+            for _ in 0..ticks {
+                app.handle_tui_event(
+                    &mut tui,
+                    &mut server,
+                    pointer_event(kind, /*column*/ 1, /*row*/ 1),
+                )
+                .await?;
+                assert_eq!(screen(&tui), painted);
+            }
             app.render_owned_transcript(&mut tui, size)?;
+            screens.push(screen(&tui));
             assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 80), menu);
             if kind == MouseEventKind::ScrollDown {
                 assert_eq!(screen(&tui), latest);
@@ -274,6 +350,7 @@ async fn plan_menu_allows_transcript_wheel_scrolling_and_keeps_keyboard_ownershi
             }
         }
         let scrolled = screen(&tui);
+        assert_ne!(screens[0], scrolled);
         if close == KeyCode::Esc {
             insta::assert_snapshot!("plan_prompt_scrolled", scrolled);
         }
@@ -643,6 +720,40 @@ async fn enter_preserves_search_backtrack_and_modal_ownership_while_scrolled() -
     app.chat_widget.open_feature_enable_prompt(Feature::Collab);
     assert!(!app.handle_owned_transcript_event(&mut tui, &mut server, &enter)?);
     assert!(!app.transcript_view.is_following());
+
+    let outer = tui.terminal.size()?;
+    let area = Rect::new(
+        /*x*/ 48, /*y*/ 2, /*width*/ 26, /*height*/ 14,
+    );
+    let frames = tui.frame_requester();
+    let mut painted = Default::default();
+    tui.draw(outer.height, |frame| {
+        for cell in &mut frame.buffer.content {
+            cell.set_char('.');
+        }
+        let prepared = app.prepare_conversation(frame.area(), Some(area), &frames);
+        painted = app.paint_conversation(frame, &prepared);
+        app.paint_centered_dialog(frame);
+        assert!(frame.cursor_position.is_none());
+    })?;
+    app.finish_conversation(&mut tui, painted)?;
+    let dialog = screen(&tui);
+    let title = dialog
+        .lines()
+        .find(|line| line.contains("Enable subagents?"))
+        .expect("confirmation title");
+    assert!(title.find("Enable subagents?").unwrap() < usize::from(area.x));
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
+        .await?;
+    assert!(!app.chat_widget.has_active_modal());
+    assert!(!app.transcript_view.is_following());
+
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Draw)
+        .await?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    for pos in buffer.area.positions().filter(|pos| !area.contains(*pos)) {
+        assert_eq!(buffer[pos].symbol(), ".");
+    }
 
     tui.set_owned_screen(/*owned*/ false)?;
     server.shutdown().await?;

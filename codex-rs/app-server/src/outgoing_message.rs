@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -16,6 +17,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
+use codex_app_server_protocol::ServerRequestResolvedNotification;
 use codex_app_server_protocol::ServerResponse;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -23,9 +25,14 @@ use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use futures::FutureExt;
+use futures::future::Shared;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::warn;
@@ -66,6 +73,7 @@ pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
     cancellation_scope: RequestCancellationScope,
+    is_process_request: bool,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
     _diagnostics_guard: Arc<GaugeGuard>,
@@ -76,6 +84,8 @@ enum RequestCancellationScope {
     Unavailable,
     UserVerification,
     ThreadSample,
+    ThreadSearch,
+    ThreadSearchStream,
 }
 
 impl RequestContext {
@@ -88,12 +98,18 @@ impl RequestContext {
         Self {
             request_id,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            is_process_request: matches!(
+                method,
+                "process/spawn" | "process/writeStdin" | "process/resizePty" | "process/kill"
+            ),
             cancellation_scope: match method {
                 "userVerification/status"
                 | "userVerification/enroll"
                 | "userVerification/delete"
                 | "userVerification/verify" => RequestCancellationScope::UserVerification,
                 "thread/sample" => RequestCancellationScope::ThreadSample,
+                "thread/search" => RequestCancellationScope::ThreadSearch,
+                "thread/search/stream" => RequestCancellationScope::ThreadSearchStream,
                 _ => RequestCancellationScope::Unavailable,
             },
             span,
@@ -127,18 +143,68 @@ pub(crate) enum OutgoingEnvelope {
     },
 }
 
+pub(crate) enum NotificationTarget {
+    Broadcast,
+    Connection(ConnectionId),
+}
+
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
     verification_auth: OnceLock<Arc<codex_login::AuthManager>>,
     verification_connections: Mutex<HashSet<ConnectionId>>,
+    human_approval_connections: Mutex<HashSet<ConnectionId>>,
+    replay_connections: Mutex<HashMap<ConnectionId, Arc<ReplayConnection>>>,
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
+    process_reply_sender: mpsc::Sender<OutgoingEnvelope>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
     request_contexts: Mutex<HashMap<ConnectionRequestId, RequestContext>>,
     analytics_events_client: AnalyticsEventsClient,
+}
+
+struct ReplayConnection {
+    // Keep the last receipt on the connection, rather than the replay task: a
+    // replacement listener must not bypass a write its predecessor queued.
+    pending: StdMutex<Option<Shared<oneshot::Receiver<()>>>>,
+    turn: Semaphore,
+    disconnect: CancellationToken,
+}
+
+impl ReplayConnection {
+    async fn acquire_turn(&self) -> Option<SemaphorePermit<'_>> {
+        tokio::select! {
+            biased;
+            _ = self.disconnect.cancelled() => None,
+            permit = self.turn.acquire() => permit.ok(),
+        }
+    }
+
+    async fn wait_pending(&self) -> bool {
+        let receipt = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(receipt) = receipt else {
+            return !self.disconnect.is_cancelled();
+        };
+        tokio::select! {
+            biased;
+            _ = self.disconnect.cancelled() => {}
+            _ = receipt => {}
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // A dropped physical-write receipt can mean either encoding rejection
+        // or a message retained for reconnect. In either case it has left the
+        // bounded connection queue; only logical disconnect ends the replay.
+        !self.disconnect.is_cancelled()
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +215,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 }
 
 struct PendingCallbackEntry {
+    human_approval_recipients: HashSet<ConnectionId>,
     verification_owner: Option<ConnectionId>,
     verification_auth_revision: Option<u64>,
     verification_identity: Option<user_verification_auth::Identity>,
@@ -220,6 +287,17 @@ impl ThreadScopedOutgoingMessageSender {
         self.outgoing.send_server_notification(notification).await;
     }
 
+    pub(crate) async fn resolve_server_request(&self, request_id: RequestId) {
+        self.outgoing.cancel_request(&request_id).await;
+        self.send_server_notification(ServerNotification::ServerRequestResolved(
+            ServerRequestResolvedNotification {
+                thread_id: self.thread_id.to_string(),
+                request_id,
+            },
+        ))
+        .await;
+    }
+
     pub(crate) async fn abort_pending_server_requests(&self) {
         self.outgoing
             .cancel_requests_for_thread(
@@ -253,12 +331,23 @@ impl OutgoingMessageSender {
         Self {
             verification_auth: OnceLock::new(),
             verification_connections: Mutex::new(HashSet::new()),
+            human_approval_connections: Mutex::new(HashSet::new()),
+            replay_connections: Mutex::new(HashMap::new()),
             next_server_request_id: AtomicI64::new(0),
+            process_reply_sender: sender.clone(),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
         }
+    }
+
+    pub(crate) fn with_process_reply_sender(
+        mut self,
+        sender: mpsc::Sender<OutgoingEnvelope>,
+    ) -> Self {
+        self.process_reply_sender = sender;
+        self
     }
 
     pub(crate) async fn register_request_context(&self, request_context: RequestContext) {
@@ -289,11 +378,72 @@ impl OutgoingMessageSender {
         }
     }
 
+    /// Capture the exact target at ordered ingress; cancellation must not resolve a reused ID later.
+    pub(crate) async fn search_cancellation_target(
+        &self,
+        request_id: &ConnectionRequestId,
+        streaming: bool,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        let scope = if streaming {
+            RequestCancellationScope::ThreadSearchStream
+        } else {
+            RequestCancellationScope::ThreadSearch
+        };
+        self.request_contexts
+            .lock()
+            .await
+            .get(request_id)
+            .filter(|context| context.cancellation_scope == scope)
+            .map(|context| context.cancellation.clone())
+    }
+
+    pub(crate) async fn enable_human_approval_connection(&self, connection_id: ConnectionId) {
+        self.human_approval_connections
+            .lock()
+            .await
+            .insert(connection_id);
+    }
+
+    pub(crate) async fn connection_initialized(&self, connection_id: ConnectionId) {
+        self.replay_connections.lock().await.insert(
+            connection_id,
+            Arc::new(ReplayConnection {
+                pending: StdMutex::new(None),
+                turn: Semaphore::new(1),
+                disconnect: CancellationToken::new(),
+            }),
+        );
+    }
+
+    pub(crate) async fn stop_connection_replays(&self, connection_id: ConnectionId) {
+        let replay = self.replay_connections.lock().await.remove(&connection_id);
+        if let Some(replay) = replay {
+            replay.disconnect.cancel();
+        }
+    }
+
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.stop_connection_replays(connection_id).await;
+        self.human_approval_connections
+            .lock()
+            .await
+            .remove(&connection_id);
         self.disconnect_user_verification_connection(connection_id)
             .await;
         let mut request_contexts = self.request_contexts.lock().await;
-        request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        request_contexts.retain(|request_id, context| {
+            if request_id.connection_id != connection_id {
+                return true;
+            }
+            if matches!(
+                context.cancellation_scope,
+                RequestCancellationScope::ThreadSearch
+                    | RequestCancellationScope::ThreadSearchStream
+            ) {
+                context.cancellation.cancel();
+            }
+            false
+        });
     }
 
     pub(crate) async fn request_trace_context(
@@ -372,6 +522,22 @@ impl OutgoingMessageSender {
                     || verification_identity != self.verification_identity())
         };
         let (tx_approve, rx_approve) = oneshot::channel();
+        let human_connections;
+        let connection_ids = if requires_human_approval(&request) {
+            let eligible = self.human_approval_connections.lock().await;
+            human_connections = connection_ids
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .filter(|id| eligible.contains(id))
+                .collect::<Vec<_>>();
+            if human_connections.is_empty() {
+                return (outgoing_message_id, rx_approve);
+            }
+            Some(human_connections.as_slice())
+        } else {
+            connection_ids
+        };
         // One app owns this ceremony. Reconnect and other subscribers cannot answer it.
         let verification_owner = if user_verification {
             let eligible = self.verification_connections.lock().await;
@@ -394,6 +560,11 @@ impl OutgoingMessageSender {
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
+                    human_approval_recipients: if requires_human_approval(&request) {
+                        connection_ids.unwrap_or_default().iter().copied().collect()
+                    } else {
+                        HashSet::new()
+                    },
                     verification_owner,
                     verification_auth_revision,
                     verification_identity: verification_identity.clone(),
@@ -460,23 +631,74 @@ impl OutgoingMessageSender {
         (outgoing_message_id, rx_approve)
     }
 
-    pub(crate) async fn replay_requests_to_connection_for_thread(
+    pub(crate) async fn replay_requests_to_connection(
         &self,
         connection_id: ConnectionId,
-        thread_id: ThreadId,
+        requests: Vec<ServerRequest>,
     ) {
-        let requests = self.pending_requests_for_thread(thread_id).await;
+        let Some(replay) = self
+            .replay_connections
+            .lock()
+            .await
+            .get(&connection_id)
+            .cloned()
+        else {
+            return;
+        };
         for request in requests {
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
+            let Some(_turn) = replay.acquire_turn().await else {
+                return;
+            };
+            if !replay.wait_pending().await {
+                return;
+            }
+            let permit = tokio::select! {
+                biased;
+                _ = replay.disconnect.cancelled() => return,
+                permit = self.sender.reserve() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
+            let approval = requires_human_approval(&request);
+            if approval {
+                let eligible = tokio::select! {
+                    biased;
+                    _ = replay.disconnect.cancelled() => return,
+                    eligible = self.human_approval_connections.lock() => eligible,
+                };
+                if !eligible.contains(&connection_id) {
+                    continue;
+                }
+            }
+            {
+                let mut callbacks = tokio::select! {
+                    biased;
+                    _ = replay.disconnect.cancelled() => return,
+                    callbacks = self.request_id_to_callback.lock() => callbacks,
+                };
+                let Some(entry) = callbacks.get_mut(request.id()) else {
+                    continue;
+                };
+                if replay.disconnect.is_cancelled() {
+                    return;
+                }
+                if approval {
+                    entry.human_approval_recipients.insert(connection_id);
+                }
+                let (tx, receipt) = oneshot::channel();
+                permit.send(OutgoingEnvelope::ToConnection {
                     connection_id,
                     message: OutgoingMessage::Request(request),
-                    write_complete_tx: None,
-                })
-                .await
-            {
-                warn!("failed to resend request to client: {err:?}");
+                    write_complete_tx: Some(tx),
+                });
+                *replay
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.shared());
+            }
+            if !replay.wait_pending().await {
+                return;
             }
         }
     }
@@ -580,8 +802,18 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         id: &RequestId,
     ) -> Option<(RequestId, PendingCallbackEntry)> {
+        let human_approval = self
+            .human_approval_connections
+            .lock()
+            .await
+            .contains(&connection_id);
         let mut callbacks = self.request_id_to_callback.lock().await;
         let entry = callbacks.get(id)?;
+        if requires_human_approval(&entry.request)
+            && (!human_approval || !entry.human_approval_recipients.contains(&connection_id))
+        {
+            return None;
+        }
         if let Some(owner) = entry.verification_owner {
             if owner != connection_id {
                 return None;
@@ -769,12 +1001,35 @@ impl OutgoingMessageSender {
             .await;
     }
 
-    pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) {
-        if let Err(error) = self.sender.try_send(OutgoingEnvelope::Broadcast {
-            message: timestamped_server_notification(notification),
-        }) {
-            warn!("failed to queue server notification to clients: {error}");
+    /// Queue an optional notification without delaying the request or other connections.
+    pub(crate) fn try_send_server_notification(
+        &self,
+        target: NotificationTarget,
+        notification: ServerNotification,
+    ) -> bool {
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if matches!(target, NotificationTarget::Broadcast) {
+                    warn!("failed to queue server notification to clients: {error}");
+                }
+                return false;
+            }
+        };
+        // Leave room for the authoritative response when progress fills the queue.
+        if matches!(target, NotificationTarget::Connection(_)) && self.sender.capacity() == 0 {
+            return false;
         }
+        let message = timestamped_server_notification(notification);
+        permit.send(match target {
+            NotificationTarget::Broadcast => OutgoingEnvelope::Broadcast { message },
+            NotificationTarget::Connection(connection_id) => OutgoingEnvelope::ToConnection {
+                connection_id,
+                message,
+                write_complete_tx: None,
+            },
+        });
+        true
     }
 
     pub(crate) async fn send_server_notification_to_connections(
@@ -889,10 +1144,23 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
     ) {
-        let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
+        // Process requests serialize by handle. A blocked resize reply would also block the next kill.
+        let sender = if request_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_process_request)
+        {
+            &self.process_reply_sender
+        } else {
+            &self.sender
+        };
+        // The spawn reply must reach the embedder before the collectors can publish output.
+        let (written_tx, written_rx) = (!sender.same_channel(&self.sender))
+            .then(oneshot::channel)
+            .unzip();
+        let send_fut = sender.send(OutgoingEnvelope::ToConnection {
             connection_id,
             message,
-            write_complete_tx: None,
+            write_complete_tx: written_tx,
         });
         let send_result = if let Some(request_context) = request_context {
             send_fut.instrument(request_context.span()).await
@@ -902,6 +1170,8 @@ impl OutgoingMessageSender {
 
         if let Err(err) = send_result {
             warn!("failed to send {message_kind} to client: {err:?}");
+        } else if let Some(written_rx) = written_rx {
+            let _ = written_rx.await;
         }
     }
 }
@@ -920,6 +1190,11 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
         notification,
         emitted_at_ms: Some(now_unix_timestamp_ms().try_into().unwrap_or_default()),
     })
+}
+
+fn requires_human_approval(request: &ServerRequest) -> bool {
+    matches!(request, ServerRequest::CommandExecutionRequestApproval { params, .. }
+        if params.kind == codex_app_server_protocol::CommandExecutionApprovalKind::HumanCommand)
 }
 
 #[cfg(test)]
@@ -1078,6 +1353,7 @@ mod tests {
     #[test]
     fn verify_account_updated_notification_serialization() {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
+            reason: None,
             auth_mode: Some(AuthMode::Chatgpt),
             plan_type: Some(PlanType::SelfServeBusinessProLite),
         });
@@ -1087,7 +1363,8 @@ mod tests {
                 "method": "account/updated",
                 "params": {
                     "authMode": "chatgpt",
-                    "planType": "self_serve_business_prolite"
+                    "planType": "self_serve_business_prolite",
+                    "reason": null
                 },
             }),
             serde_json::to_value(notification)
@@ -1299,6 +1576,72 @@ mod tests {
             }
             other => panic!("expected targeted response envelope, got: {other:?}"),
         }
+    }
+
+    /// Search cancellation is scoped to the owning connection, including on disconnect.
+    #[tokio::test]
+    async fn thread_search_cancellation_is_connection_scoped() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let request = |connection_id| ConnectionRequestId {
+            connection_id: ConnectionId(connection_id),
+            request_id: RequestId::String("bf76b226-4c49-4394-a28c-3ff976abb756".to_string()),
+        };
+        let first = RequestContext::new(
+            request(1),
+            "thread/search",
+            Span::none(),
+            /*parent_trace*/ None,
+        );
+        let second = RequestContext::new(
+            request(2),
+            "thread/search/stream",
+            Span::none(),
+            /*parent_trace*/ None,
+        );
+        outgoing.register_request_context(first.clone()).await;
+        outgoing.register_request_context(second.clone()).await;
+
+        assert!(
+            outgoing
+                .search_cancellation_target(&request(2), /*streaming*/ false)
+                .await
+                .is_none()
+        );
+        assert!(
+            outgoing
+                .search_cancellation_target(&request(1), /*streaming*/ true)
+                .await
+                .is_none()
+        );
+        assert!(!first.cancellation.is_cancelled());
+        assert!(!second.cancellation.is_cancelled());
+
+        outgoing
+            .search_cancellation_target(&request(2), /*streaming*/ true)
+            .await
+            .expect("stream target")
+            .cancel();
+        assert!(second.cancellation.is_cancelled());
+        assert!(!first.cancellation.is_cancelled());
+
+        let captured = outgoing
+            .search_cancellation_target(&request(1), /*streaming*/ false)
+            .await
+            .expect("original target");
+        let replacement = RequestContext::new(
+            request(1),
+            "thread/search",
+            Span::none(),
+            /*parent_trace*/ None,
+        );
+        outgoing.register_request_context(replacement.clone()).await;
+        captured.cancel();
+        assert!(first.cancellation.is_cancelled());
+        assert!(!replacement.cancellation.is_cancelled());
+        outgoing.connection_closed(ConnectionId(1)).await;
+        assert!(replacement.cancellation.is_cancelled());
     }
 
     #[tokio::test]

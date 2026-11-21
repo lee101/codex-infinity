@@ -1,5 +1,6 @@
 mod audio;
 mod callbacks;
+mod event_channel;
 mod globals;
 mod module_loader;
 mod timers;
@@ -12,17 +13,18 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
-use codex_code_mode_protocol::CodeModeToolKind;
-use codex_code_mode_protocol::EnabledToolMetadata;
-use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::normalize_code_mode_identifier;
-use codex_protocol::ToolName;
-use serde_json::Value as JsonValue;
-use tokio::sync::mpsc;
-
 use crate::TaskFailureHandler;
+use crate::ToolPreload;
+use crate::session_runtime::CreateCellRequest;
+use crate::session_runtime::OutputItem;
+use crate::session_runtime::ToolCatalog;
 use crate::v8_init::ensure_v8_initialized;
+use codex_code_mode_protocol::CodeModeToolKind;
+use codex_protocol::ToolName;
+pub(crate) use event_channel::RuntimeEventReceiver;
+pub(crate) use event_channel::RuntimeEventSender;
+pub(crate) use event_channel::runtime_event_channel;
+use serde_json::Value as JsonValue;
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
@@ -51,7 +53,7 @@ pub(crate) enum RuntimeControlCommand {
 pub(crate) enum RuntimeEvent {
     Started,
     Pending,
-    ContentItem(FunctionCallOutputContentItem),
+    ContentItem(OutputItem),
     YieldRequested,
     ToolCall {
         id: String,
@@ -72,8 +74,8 @@ pub(crate) enum RuntimeEvent {
 
 pub(crate) fn spawn_runtime(
     stored_values: HashMap<String, Arc<JsonValue>>,
-    request: ExecuteRequest,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    request: CreateCellRequest,
+    event_tx: impl Into<RuntimeEventSender>,
     pending_mode: PendingRuntimeMode,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> Result<
@@ -84,25 +86,17 @@ pub(crate) fn spawn_runtime(
     ),
     String,
 > {
+    let event_tx = event_tx.into();
     ensure_v8_initialized()?;
 
     let (command_tx, command_rx) = std_mpsc::channel();
     let (control_tx, control_rx) = std_mpsc::channel();
     let runtime_command_tx = command_tx.clone();
     let (isolate_handle_tx, isolate_handle_rx) = std_mpsc::sync_channel(1);
-    let enabled_tools = request
-        .enabled_tools
-        .into_iter()
-        .map(|definition| EnabledToolMetadata {
-            global_name: normalize_code_mode_identifier(&definition.name),
-            tool_name: definition.tool_name,
-            description: definition.description,
-            kind: definition.kind,
-        })
-        .collect::<Vec<_>>();
     let config = RuntimeConfig {
         tool_call_id: request.tool_call_id,
-        enabled_tools,
+        enabled_tools: request.enabled_tools,
+        tool_preloads: request.tool_preloads,
         source: request.source,
         stored_values,
     };
@@ -128,16 +122,17 @@ pub(crate) fn spawn_runtime(
 }
 
 fn spawn_supervised_runtime_thread(
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: impl Into<RuntimeEventSender>,
     task_failure_handler: Option<TaskFailureHandler>,
     runtime: impl FnOnce() + Send + 'static,
 ) {
+    let event_tx = event_tx.into();
     thread::spawn(move || {
         if catch_unwind(AssertUnwindSafe(runtime)).is_err() {
             if let Some(task_failure_handler) = task_failure_handler {
                 task_failure_handler("code-mode V8 runtime thread panicked".to_string());
             }
-            let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
+            let _ = event_tx.blocking_send(RuntimeEvent::ThreadPanicked);
         }
     });
 }
@@ -145,24 +140,19 @@ fn spawn_supervised_runtime_thread(
 #[derive(Clone)]
 struct RuntimeConfig {
     tool_call_id: String,
-    enabled_tools: Vec<EnabledToolMetadata>,
+    enabled_tools: ToolCatalog,
+    tool_preloads: &'static [ToolPreload],
     source: String,
     stored_values: HashMap<String, Arc<JsonValue>>,
 }
 
-// Callback indices refer to this cell's original catalog for its entire lifetime.
-struct ToolCallbackMetadata {
-    tool_name: ToolName,
-    kind: CodeModeToolKind,
-}
-
 pub(super) struct RuntimeState {
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: RuntimeEventSender,
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, Arc<JsonValue>>,
     stored_value_writes: HashMap<String, Arc<JsonValue>>,
-    enabled_tools: Vec<ToolCallbackMetadata>,
+    enabled_tools: ToolCatalog,
     next_tool_call_id: u64,
     next_timeout_id: u64,
     tool_call_id: String,
@@ -177,7 +167,7 @@ pub(super) enum CompletionState {
 
 fn run_runtime(
     config: RuntimeConfig,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: RuntimeEventSender,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
     control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
     pending_mode: PendingRuntimeMode,
@@ -195,25 +185,13 @@ fn run_runtime(
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    if let Err(error_text) = globals::install_globals(scope, &config.enabled_tools) {
-        send_result(&event_tx, HashMap::new(), Some(error_text));
-        return;
-    }
-
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
         stored_value_writes: HashMap::new(),
-        enabled_tools: config
-            .enabled_tools
-            .into_iter()
-            .map(|tool| ToolCallbackMetadata {
-                tool_name: tool.tool_name,
-                kind: tool.kind,
-            })
-            .collect(),
+        enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         next_timeout_id: 1,
         tool_call_id: config.tool_call_id,
@@ -221,7 +199,12 @@ fn run_runtime(
         exit_requested: false,
     });
 
-    let _ = event_tx.send(RuntimeEvent::Started);
+    if let Err(error_text) = globals::install_globals(scope, config.tool_preloads) {
+        send_result(&event_tx, HashMap::new(), Some(error_text));
+        return;
+    }
+
+    let _ = event_tx.blocking_send(RuntimeEvent::Started);
 
     let pending_promise = match module_loader::evaluate_main_module(scope, &config.source) {
         Ok(pending_promise) => pending_promise,
@@ -289,7 +272,7 @@ fn run_runtime(
 }
 
 fn next_runtime_command(
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &RuntimeEventSender,
     command_rx: &std_mpsc::Receiver<RuntimeCommand>,
     control_rx: &std_mpsc::Receiver<RuntimeControlCommand>,
     pending_mode: PendingRuntimeMode,
@@ -301,7 +284,7 @@ fn next_runtime_command(
             Err(std_mpsc::TryRecvError::Empty) => {}
         }
 
-        let _ = event_tx.send(RuntimeEvent::Pending);
+        let _ = event_tx.blocking_send(RuntimeEvent::Pending);
         match pending_mode {
             #[cfg(test)]
             PendingRuntimeMode::Continue => return command_rx.recv().ok(),
@@ -316,7 +299,7 @@ fn next_runtime_command(
 
 fn send_scope_result(
     scope: &mut v8::PinScope<'_, '_>,
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &RuntimeEventSender,
     error_text: Option<String>,
 ) {
     // Error rendering can itself run JS getters, including exit(). Capture
@@ -330,11 +313,11 @@ fn send_scope_result(
 }
 
 fn send_result(
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &RuntimeEventSender,
     stored_value_writes: HashMap<String, Arc<JsonValue>>,
     error_text: Option<String>,
 ) {
-    let _ = event_tx.send(RuntimeEvent::Result {
+    let _ = event_tx.blocking_send(RuntimeEvent::Result {
         stored_value_writes,
         error_text,
     });
@@ -348,22 +331,22 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
 
-    use super::ExecuteRequest;
+    use super::CreateCellRequest;
     use super::PendingRuntimeMode;
     use super::RuntimeCommand;
     use super::RuntimeControlCommand;
     use super::RuntimeEvent;
     use super::spawn_runtime;
     use super::spawn_supervised_runtime_thread;
-    use crate::FunctionCallOutputContentItem;
+    use crate::session_runtime::OutputItem;
 
-    fn execute_request(source: &str) -> ExecuteRequest {
-        ExecuteRequest {
+    fn execute_request(source: &str) -> CreateCellRequest {
+        CreateCellRequest {
             tool_call_id: "call_1".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Default::default(),
+            tool_preloads: &[],
             source: source.to_string(),
-            yield_time_ms: Some(1),
-            max_output_tokens: None,
+            output_truncation: codex_code_mode_protocol::CodeModeOutputTruncation::Client,
         }
     }
 
@@ -530,9 +513,7 @@ await new Promise(() => {});
             .await
             .unwrap()
             .unwrap();
-        let RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) =
-            content_event
-        else {
+        let RuntimeEvent::ContentItem(OutputItem::InputText { text }) = content_event else {
             panic!("expected resumed runtime output");
         };
         assert_eq!(text, "after");
@@ -602,7 +583,7 @@ setTimeout(() => text("late"), 3_600_000);
         }
         assert_eq!(
             output,
-            vec![FunctionCallOutputContentItem::InputText {
+            vec![OutputItem::InputText {
                 text: "done".to_string()
             }]
         );

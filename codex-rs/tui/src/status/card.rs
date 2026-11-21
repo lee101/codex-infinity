@@ -11,6 +11,8 @@ use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
+use codex_model_provider::provider_uses_first_party_auth_path;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -117,8 +119,9 @@ impl StatusHistoryHandle {
     pub(crate) fn set_thread_usage(
         &self,
         estimate: Option<codex_app_server_protocol::ThreadUsage>,
+        plan: Option<PlanType>,
     ) {
-        self.card.thread_usage.set_estimate(estimate);
+        self.card.thread_usage.set_estimate(estimate, plan);
     }
 }
 
@@ -140,7 +143,6 @@ struct StatusHistoryCell {
     token_usage: StatusTokenUsageData,
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
     thread_usage: StatusThreadUsage,
-    plan_type: Option<PlanType>,
 }
 
 #[cfg(test)]
@@ -351,7 +353,27 @@ impl StatusHistoryCell {
             workspace_root_suffix.as_deref(),
         );
         let show_chatgpt_usage_link = requires_openai_auth;
-        let account = compose_account_display(account_display);
+        let mut account = compose_account_display(account_display);
+        let workspace_matches_provider = if remote_connection.is_some() {
+            // A connected server owns the provider definitions; only the built-in ID is certain.
+            model_provider
+                .as_deref()
+                .is_none_or(|provider| provider == OPENAI_PROVIDER_ID)
+        } else {
+            config
+                .model_providers
+                .get(
+                    model_provider
+                        .as_deref()
+                        .unwrap_or(&config.model_provider_id),
+                )
+                .is_some_and(provider_uses_first_party_auth_path)
+        };
+        if !workspace_matches_provider
+            && let Some(StatusAccountDisplay::ChatGpt { workspace, .. }) = &mut account
+        {
+            *workspace = None;
+        }
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -400,7 +422,6 @@ impl StatusHistoryCell {
             agents_summary,
             rate_limit_state,
             thread_usage,
-            plan_type: _plan_type,
         }
     }
 
@@ -740,7 +761,7 @@ impl StatusHistoryCell {
         let mut lines = Vec::new();
 
         let account_value = self.account.as_ref().map(|account| match account {
-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
+            StatusAccountDisplay::ChatGpt { email, plan, .. } => match (email, plan) {
                 (Some(email), Some(plan)) => format!("{email} ({plan})"),
                 (Some(email), None) => email.clone(),
                 (None, Some(plan)) => plan.clone(),
@@ -750,6 +771,11 @@ impl StatusHistoryCell {
                 "API key configured (run codex login to use ChatGPT)".to_string()
             }
         });
+
+        let workspace = match &self.account {
+            Some(StatusAccountDisplay::ChatGpt { workspace, .. }) => workspace.as_deref(),
+            _ => None,
+        };
 
         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
             .into_iter()
@@ -774,6 +800,9 @@ impl StatusHistoryCell {
         }
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
+        }
+        if workspace.is_some() {
+            push_label(&mut labels, &mut seen, "ChatGPT workspace");
         }
         if thread_name.is_some() {
             push_label(&mut labels, &mut seen, "Thread name");
@@ -801,12 +830,11 @@ impl StatusHistoryCell {
             let value = if remote_connection.is_local_daemon {
                 Line::from("Local background server")
             } else {
-                Line::from(vec![
-                    Span::from(remote_connection.address.clone()),
-                    Span::from(" (").dim(),
-                    Span::from(remote_connection.version.clone()).dim(),
-                    Span::from(")").dim(),
-                ])
+                let mut spans = vec![remote_connection.address.clone().into()];
+                if let Some(version) = &remote_connection.version {
+                    spans.push(format!(" ({version})").dim());
+                }
+                Line::from(spans)
             };
             let wrapped_remote = word_wrap_lines([value], RtOptions::new(value_width.max(1)));
             let mut wrapped_remote = wrapped_remote.into_iter();
@@ -837,6 +865,9 @@ impl StatusHistoryCell {
         if let Some(account_value) = account_value {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
         }
+        if let Some(workspace) = workspace {
+            lines.push(formatter.line("ChatGPT workspace", vec![Span::from(workspace.to_owned())]));
+        }
 
         if let Some(thread_name) = thread_name {
             lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
@@ -864,9 +895,7 @@ impl StatusHistoryCell {
         }
 
         lines.extend(self.rate_limit_lines(&rate_limit_state, available_width, &formatter));
-        let thread_usage_lines = self
-            .thread_usage
-            .lines(&formatter, value_width, self.plan_type);
+        let thread_usage_lines = self.thread_usage.lines(&formatter, value_width);
         if !thread_usage_lines.is_empty() {
             lines.push(Line::from(Vec::<Span<'static>>::new()));
             lines.extend(thread_usage_lines);

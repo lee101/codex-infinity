@@ -6,6 +6,7 @@ print_failed_bazel_test_logs=0
 print_failed_bazel_action_summary=0
 remote_download_toplevel=0
 windows_msvc_host_platform=0
+windows_cross_compile=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +26,10 @@ while [[ $# -gt 0 ]]; do
       windows_msvc_host_platform=1
       shift
       ;;
+    --windows-cross-compile)
+      windows_cross_compile=1
+      shift
+      ;;
     --)
       shift
       break
@@ -37,7 +42,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: $0 [--print-failed-test-logs] [--print-failed-action-summary] [--remote-download-toplevel] [--windows-msvc-host-platform] -- <bazel args> -- <targets>" >&2
+  echo "Usage: $0 [--print-failed-test-logs] [--print-failed-action-summary] [--remote-download-toplevel] [--windows-msvc-host-platform] [--windows-cross-compile] -- <bazel args> -- <targets>" >&2
   exit 1
 fi
 
@@ -48,11 +53,11 @@ fi
 
 run_bazel() {
   if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-    MSYS2_ARG_CONV_EXCL='*' "$(dirname "${BASH_SOURCE[0]}")/run_bazel_with_buildbuddy.py" "$@"
+    MSYS2_ARG_CONV_EXCL='*' "$(dirname "${BASH_SOURCE[0]}")/run_bazel.py" "$@"
     return
   fi
 
-  "$(dirname "${BASH_SOURCE[0]}")/run_bazel_with_buildbuddy.py" "$@"
+  "$(dirname "${BASH_SOURCE[0]}")/run_bazel.py" "$@"
 }
 
 run_bazel_with_startup_args() {
@@ -64,28 +69,11 @@ run_bazel_with_startup_args() {
   run_bazel "$@"
 }
 
-ci_config=ci-linux
-case "${RUNNER_OS:-}" in
-  macOS)
-    ci_config=ci-macos
-    ;;
-  Windows)
-    ci_config=ci-windows
-    ;;
-esac
-
 print_bazel_test_log_tails() {
   local console_log="$1"
   local testlogs_dir
 
   local -a bazel_info_args=(info)
-  if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-    # `bazel info` needs the same CI config as the failed test invocation so
-    # platform-specific output roots match. On Windows, omitting `ci-windows`
-    # would point at `local_windows-fastbuild` even when the test ran with the
-    # MSVC host platform under `local_windows_msvc-fastbuild`.
-    bazel_info_args+=("--config=${ci_config}")
-  fi
 
   # Only pass flags that affect Bazel's output-root selection or repository
   # lookup. Test/build-only flags such as execution logs or remote download
@@ -107,8 +95,8 @@ print_bazel_test_log_tails() {
   while IFS= read -r target; do
     failed_targets+=("$target")
   done < <(
-    grep -E '^FAIL: //' "$console_log" \
-      | sed -E 's#^FAIL: (//[^ ]+).*#\1#' \
+    grep -E '^(FAIL: //|ERROR: .* Testing //)' "$console_log" \
+      | sed -E 's#^FAIL: (//[^ ]+).*#\1#; s#^ERROR: .* Testing (//[^ ]+) failed:.*#\1#' \
       | sort -u
   )
 
@@ -246,6 +234,11 @@ if [[ ${#bazel_args[@]} -eq 0 || ${#bazel_targets[@]} -eq 0 ]]; then
   exit 1
 fi
 
+if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 ]]; then
+  # Run Windows actions with the native MSVC host platform.
+  windows_msvc_host_platform=1
+fi
+
 post_config_bazel_args=()
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_msvc_host_platform -eq 1 ]]; then
   has_host_platform_override=0
@@ -271,6 +264,12 @@ if [[ $remote_download_toplevel -eq 1 ]]; then
   post_config_bazel_args+=(--remote_download_toplevel)
 fi
 
+
+if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 ]]; then
+  # Bound concurrent native Windows actions to fit the runner.
+  post_config_bazel_args+=(--jobs=8)
+fi
+
 if [[ -n "${BAZEL_REPO_CONTENTS_CACHE:-}" ]]; then
   # Windows self-hosted runners can run multiple Bazel jobs concurrently. Give
   # each job its own repo contents cache so they do not fight over the shared
@@ -289,6 +288,7 @@ if [[ -n "${CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR:-}" ]]; then
 fi
 
 if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+
   windows_action_env_vars=(
     INCLUDE
     LIB
@@ -310,6 +310,29 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
     fi
   done
 
+  if [[ -n "${VOICE_WINDOWS_BAZEL_REPOSITORY:-}" ]]; then
+    # Reuse the verified native audio inputs for local CI's voice targets.
+    # These fixed values must be visible during Starlark analysis as well
+    # as action execution; inherited --action_env values are insufficient.
+    : "${VOICE_WINDOWS_SYSTEM_ROOT:?Windows SystemRoot is required}"
+    : "${VOICE_WINDOWS_HOST_ARCH:?Windows host architecture is required}"
+    # GNU-host lint jobs still need the LLVM linker for their build tools.
+    if [[ $windows_msvc_host_platform -eq 1 ]]; then
+      post_config_bazel_args+=("--config=ci-windows-msvc")
+    fi
+    post_config_bazel_args+=(
+      "--workspace_status_command=./scripts/workspace-status.cmd"
+      "--extra_toolchains=//third_party/voice:windows_pkg_config_toolchain,//third_party/voice:windows_cmake_toolchain"
+      "--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1"
+      "--inject_repository=voice_windows_tools=${VOICE_WINDOWS_BAZEL_REPOSITORY}"
+      "--//third_party/voice:windows_installed_tools=@voice_windows_tools//:tools"
+      "--action_env=SystemRoot=${VOICE_WINDOWS_SYSTEM_ROOT}"
+      "--host_action_env=SystemRoot=${VOICE_WINDOWS_SYSTEM_ROOT}"
+      "--action_env=PROCESSOR_ARCHITECTURE=${VOICE_WINDOWS_HOST_ARCH}"
+      "--host_action_env=PROCESSOR_ARCHITECTURE=${VOICE_WINDOWS_HOST_ARCH}"
+    )
+  fi
+
   if [[ -z "${CODEX_BAZEL_WINDOWS_PATH:-}" ]]; then
     echo "CODEX_BAZEL_WINDOWS_PATH must be set for Windows Bazel CI." >&2
     exit 1
@@ -318,8 +341,8 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
   post_config_bazel_args+=(
     "--action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
     "--host_action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
-    "--test_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
   )
+  post_config_bazel_args+=("--test_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}")
 fi
 
 bazel_console_log="$(mktemp)"
@@ -328,11 +351,8 @@ trap 'rm -f "$bazel_console_log"' EXIT
 bazel_run_args=(
   "${bazel_args[@]}"
 )
-if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-  echo "BuildBuddy API key is available; using remote Bazel configuration."
-  bazel_run_args+=("--config=${ci_config}")
-else
-  echo "BuildBuddy API key is not available; using local Bazel configuration."
+if [[ "${bazel_args[0]}" == "test" ]]; then
+  bazel_run_args+=("--test_env=INSTA_UPDATE=no")
 fi
 if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
@@ -341,7 +361,7 @@ set +e
 # Work around Bazel 9 remote repo contents cache / overlay materialization
 # failures seen in CI (for example "is not a symlink" or permission errors
 # while materializing external repos such as rules_perl). This only disables
-# the startup-level repo contents cache; keyed runs still use BuildBuddy.
+# the startup-level repo contents cache.
 run_bazel_with_startup_args \
   --noexperimental_remote_repo_contents_cache \
   "${bazel_run_args[@]}" \

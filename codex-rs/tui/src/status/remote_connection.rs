@@ -1,3 +1,5 @@
+//! Formats connection metadata and notices, preserving unavailable server versions as absent.
+
 use crate::AppServerTarget;
 use crate::RemoteAppServerEndpoint;
 use crate::update_versions::ServerVersionNoticeKind;
@@ -8,7 +10,7 @@ use url::Url;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteConnectionStatus {
     pub(crate) address: String,
-    pub(crate) version: String,
+    pub(crate) version: Option<String>,
     pub(crate) is_local_daemon: bool,
     pub(crate) is_managed_daemon: bool,
 }
@@ -23,25 +25,23 @@ pub(crate) fn remote_connection_status_value(
     app_server_target: &AppServerTarget,
     server_version: Option<&str>,
 ) -> Option<RemoteConnectionStatus> {
-    let endpoint = match app_server_target {
+    let address = match app_server_target {
         AppServerTarget::Embedded => return None,
+        AppServerTarget::Cloud => "Cloud".to_string(),
         AppServerTarget::LocalDaemon { endpoint, .. } | AppServerTarget::Remote { endpoint } => {
-            endpoint
+            match endpoint {
+                RemoteAppServerEndpoint::WebSocket { websocket_url, .. } => {
+                    sanitized_websocket_url(websocket_url)
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| "<invalid websocket URL>".to_string())
+                }
+                RemoteAppServerEndpoint::UnixSocket { socket_path } => {
+                    format!("unix://{}", socket_path.display())
+                }
+            }
         }
     };
-    let address = match endpoint {
-        RemoteAppServerEndpoint::WebSocket { websocket_url, .. } => {
-            sanitized_websocket_url(websocket_url)
-                .map(|url| url.to_string())
-                .unwrap_or_else(|| "<invalid websocket URL>".to_string())
-        }
-        RemoteAppServerEndpoint::UnixSocket { socket_path } => {
-            format!("unix://{}", socket_path.display())
-        }
-    };
-    let version = server_version
-        .map(|version| format!("v{version}"))
-        .unwrap_or_else(|| "unknown".to_string());
+    let version = server_version.map(|version| format!("v{version}"));
     Some(RemoteConnectionStatus {
         address,
         version,
@@ -89,7 +89,7 @@ pub(crate) fn server_version_notice_key(
     server_version_notice(client, Some(server))?;
     let mut hasher = Sha256::new();
     let endpoint = match target {
-        AppServerTarget::Embedded => None,
+        AppServerTarget::Embedded | AppServerTarget::Cloud => None,
         AppServerTarget::LocalDaemon { endpoint, .. } | AppServerTarget::Remote { endpoint } => {
             Some(endpoint)
         }
@@ -147,6 +147,7 @@ pub(crate) fn server_version_notice_key(
 pub(crate) fn pending_server_version_notice(
     settings: &codex_config::types::Tui,
     target: &AppServerTarget,
+    daemon_updates_allowed: bool,
     server_home: Option<&str>,
     client: &str,
     server: Option<&str>,
@@ -155,7 +156,8 @@ pub(crate) fn pending_server_version_notice(
     let message = server_version_notice_for_tui(settings, client, server)?;
     let notice = ServerVersionNotice {
         message,
-        offer_update: matches!(target, AppServerTarget::LocalDaemon { .. }),
+        offer_update: daemon_updates_allowed
+            && matches!(target, AppServerTarget::LocalDaemon { .. }),
     };
     let key = server_version_notice_key(target, server_home, client, server)?;
     (last_shown != Some(key.as_str())).then_some((notice, key))
@@ -193,7 +195,7 @@ mod tests {
             remote_connection_status_value(&websocket_target, Some("1.2.3")),
             Some(RemoteConnectionStatus {
                 address: "ws://127.0.0.1:4500/".to_string(),
-                version: "v1.2.3".to_string(),
+                version: Some("v1.2.3".to_string()),
                 is_local_daemon: false,
                 is_managed_daemon: false,
             })
@@ -210,7 +212,7 @@ mod tests {
             remote_connection_status_value(&daemon_target, /*server_version*/ None),
             Some(RemoteConnectionStatus {
                 address: format!("unix://{}", socket_path.display()),
-                version: "unknown".to_string(),
+                version: None,
                 is_local_daemon: true,
                 is_managed_daemon: false,
             })
@@ -224,7 +226,7 @@ mod tests {
             remote_connection_status_value(&remote_socket_target, Some("1.2.3")),
             Some(RemoteConnectionStatus {
                 address: format!("unix://{}", socket_path.display()),
-                version: "v1.2.3".to_string(),
+                version: Some("v1.2.3".to_string()),
                 is_local_daemon: false,
                 is_managed_daemon: false,
             })
@@ -278,6 +280,7 @@ mod tests {
             pending_server_version_notice(
                 &settings,
                 target,
+                /*daemon_updates_allowed*/ true,
                 /*server_home*/ None,
                 "0.153.0-alpha.10.1",
                 Some("0.153.0-alpha.9.2"),

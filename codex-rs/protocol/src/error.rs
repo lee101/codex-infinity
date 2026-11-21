@@ -75,17 +75,35 @@ pub enum SandboxErr {
     LandlockRestrict,
 }
 
+/// Which customer-configured spend limit prevented inference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendLimitScope {
+    ApiKey,
+    Project,
+    Organization,
+}
+
 pub struct CodexErr {
     details: CodexErrorDetails,
     retry_after: Option<RetryAfter>,
     agent_context: Option<AgentErrorContext>,
 }
 
+enum RetryPolicy {
+    Never,
+    ServerDirected,
+    Backoff,
+    FallBackToHttp,
+}
+
 /// A terminal response that stopped before the model finished, with any reported usage.
 /// Content-filter retries and explicit interruptions have separate handling.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(derive_more::Debug, Error, PartialEq, Eq)]
 #[error("Incomplete response returned, reason: {reason}")]
 pub struct ResponseIncompleteError {
+    /// Provider output items explicitly marked incomplete, retained for failed inference traces.
+    #[debug(skip)]
+    pub partial_output: Vec<serde_json::Value>,
     pub reason: String,
     pub response_id: Option<String>,
     pub token_usage: Option<TokenUsage>,
@@ -102,7 +120,7 @@ pub enum CodexErrorDetails {
     #[error("turn aborted. Something went wrong? Hit `/feedback` to report the issue.")]
     TurnAborted,
 
-    #[error("shared rollout token budget exhausted")]
+    #[error("budget reached")]
     SessionBudgetExceeded,
 
     /// Returned by ResponsesClient when the SSE stream disconnects or errors out **after** the HTTP
@@ -111,6 +129,9 @@ pub enum CodexErrorDetails {
     /// The Session loop treats this as a transient error and will automatically retry the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String),
+    /// The peer's WebSocket message size limit requires sending this request over HTTP.
+    #[error("websocket request exceeds the peer's message size limit")]
+    WebsocketMessageTooLarge,
     /// A response stopped by the content filter. Sampling retries need developer guidance.
     #[error(
         "stream disconnected before completion: Incomplete response returned, reason: content_filter"
@@ -145,6 +166,12 @@ pub enum CodexErrorDetails {
     /// surface a polite FunctionCallOutput back to the model instead of crashing the CLI.
     #[error("interrupted (Ctrl-C). Something went wrong? Hit `/feedback` to report the issue.")]
     Interrupted,
+    /// The account cannot use Codex in the selected workspace.
+    #[error("{0}")]
+    WorkspaceAccessDenied(UnexpectedResponseError),
+    /// The provider denied the access program required for this request.
+    #[error("{0}")]
+    AccessProgramNotEnabled(ProviderRejection),
     /// Unexpected HTTP status code.
     #[error("{0}")]
     UnexpectedStatus(UnexpectedResponseError),
@@ -152,12 +179,27 @@ pub enum CodexErrorDetails {
     #[error("{0}")]
     InvalidRequest(String),
     #[error("{message}")]
+    InvalidAudioInput {
+        message: String,
+        /// True when the provider rejected an individual clip, independent of request size.
+        per_recording: bool,
+    },
+    #[error("{message}")]
     ModelNotFound {
         message: String,
         status: Option<StatusCode>,
     },
     #[error("{message}")]
     InvalidPrompt { message: String },
+    /// The workspace's inference hook explicitly denied this request.
+    #[error("{message}")]
+    InferenceHookDenied { message: String },
+    /// The provider rejected the input under its content policy.
+    #[error("{message}")]
+    ContentPolicyViolation {
+        message: String,
+        status: Option<StatusCode>,
+    },
     /// Multiple registered tools share the same effective name.
     #[error("duplicate tool: {0}")]
     ToolCollision(String),
@@ -168,6 +210,9 @@ pub enum CodexErrorDetails {
     UsageLimitReached(UsageLimitReachedError),
     #[error("Selected model is at capacity. Please try a different model.")]
     ServerOverloaded,
+    /// Policy-restricted capacity follows the same retry advice as ordinary overloads.
+    #[error("Policy-restricted capacity is unavailable. Please try again later.")]
+    PolicyCapacityUnavailable,
     #[error("Flex capacity unavailable.")]
     FlexUnavailable,
     #[error("{message}")]
@@ -185,6 +230,12 @@ pub enum CodexErrorDetails {
     ConnectionFailed(ConnectionFailedError),
     #[error("Quota exceeded. Check your plan and billing details.")]
     QuotaExceeded,
+    #[error("Your API {} has reached its spend limit.", match .0 {
+        SpendLimitScope::ApiKey => "key",
+        SpendLimitScope::Project => "project",
+        SpendLimitScope::Organization => "organization",
+    })]
+    APISpendLimitExceeded(SpendLimitScope),
     #[error(
         "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus."
     )]
@@ -200,8 +251,11 @@ pub enum CodexErrorDetails {
     /// Sandbox error
     #[error("sandbox error: {0}")]
     Sandbox(#[from] SandboxErr),
+    // Keep the published analytics category stable across the Rust variant rename.
+    #[strum_discriminants(serde(rename = "landlock_sandbox_executable_not_provided"))]
+    #[strum_discriminants(strum(serialize = "landlock_sandbox_executable_not_provided"))]
     #[error("codex-linux-sandbox was required but not provided")]
-    LandlockSandboxExecutableNotProvided,
+    LinuxSandboxExecutableNotProvided,
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
     #[error("{0}")]
@@ -211,6 +265,9 @@ pub enum CodexErrorDetails {
     GatewayLoginRequired(String),
     #[error("Fatal error: {0}")]
     Fatal(String),
+    /// The provider attempt ended. Retrying inference cannot settle its bill.
+    #[error("{0}")]
+    UsageAccountingFailed(String),
     // -----------------------------------------------------------------
     // Automatic conversions for common external error types
     // -----------------------------------------------------------------
@@ -367,7 +424,7 @@ impl CodexErr {
         UsageNotIncluded,
         InternalServerError,
         InternalAgentDied,
-        LandlockSandboxExecutableNotProvided,
+        LinuxSandboxExecutableNotProvided,
     );
 
     codex_err_tuple_constructors!(
@@ -383,6 +440,7 @@ impl CodexErr {
         UnsupportedOperation(message: String),
         RefreshTokenFailed(error: RefreshTokenFailedError),
         Fatal(message: String),
+        UsageAccountingFailed(message: String),
         Io(error: io::Error),
         Json(error: serde_json::Error),
         #[cfg(target_os = "linux")]
@@ -411,30 +469,60 @@ impl CodexErr {
         &self.details
     }
 
+    /// Whether retrying this request requires switching from WebSocket to HTTP.
+    pub fn requires_http_fallback(&self) -> bool {
+        matches!(self.retry_policy(), RetryPolicy::FallBackToHttp)
+    }
+
     /// Returns the delay before the given retry attempt, or `None` for a terminal error.
     ///
     /// The first retry is attempt one. Retryable errors use server advice when available and
     /// otherwise use exponential backoff with jitter. Callers enforce their own retry budgets.
     pub fn retry_delay(&self, retry_count: u64) -> Option<Duration> {
+        match self.retry_policy() {
+            RetryPolicy::Never => None,
+            RetryPolicy::ServerDirected => self.server_retry_delay(),
+            RetryPolicy::Backoff | RetryPolicy::FallBackToHttp => Some(
+                self.server_retry_delay()
+                    .unwrap_or_else(|| backoff(retry_count)),
+            ),
+        }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
         match self.details() {
+            CodexErrorDetails::UnexpectedStatus(error)
+                if is_runtime_auth_denial(
+                    error.status,
+                    &error.body,
+                    error.identity_error_code.as_deref(),
+                ) =>
+            {
+                RetryPolicy::Never
+            }
             CodexErrorDetails::TurnAborted
             | CodexErrorDetails::SessionBudgetExceeded
             | CodexErrorDetails::Interrupted
             | CodexErrorDetails::EnvVar(_)
             | CodexErrorDetails::Fatal(_)
+            | CodexErrorDetails::UsageAccountingFailed(_)
             | CodexErrorDetails::UsageNotIncluded
             | CodexErrorDetails::QuotaExceeded
+            | CodexErrorDetails::APISpendLimitExceeded(_)
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
+            | CodexErrorDetails::InvalidAudioInput { .. }
             | CodexErrorDetails::ResponseIncomplete(_)
             | CodexErrorDetails::ModelNotFound { .. }
             | CodexErrorDetails::InvalidPrompt { .. }
+            | CodexErrorDetails::InferenceHookDenied { .. }
+            | CodexErrorDetails::ContentPolicyViolation { .. }
             | CodexErrorDetails::ToolCollision(_)
             | CodexErrorDetails::RefreshTokenFailed(_)
             | CodexErrorDetails::GatewayLoginRequired(_)
             | CodexErrorDetails::UnsupportedOperation(_)
             | CodexErrorDetails::Sandbox(_)
-            | CodexErrorDetails::LandlockSandboxExecutableNotProvided
+            | CodexErrorDetails::LinuxSandboxExecutableNotProvided
             | CodexErrorDetails::ContextWindowExceeded
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. }
@@ -444,14 +532,16 @@ impl CodexErr {
             | CodexErrorDetails::FlexUnavailable
             | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::BioPolicy { .. }
-            | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
+            | CodexErrorDetails::WorkspaceAccessDenied(_)
+            | CodexErrorDetails::AccessProgramNotEnabled(_)
+            | CodexErrorDetails::MisalignmentPolicyViolation { .. } => RetryPolicy::Never,
             // Capacity pressure is retryable on its own, so without server advice callers
             // still get a local backoff instead of treating the turn as terminal.
-            CodexErrorDetails::ServerOverloaded => Some(
-                self.server_retry_delay()
-                    .unwrap_or_else(|| backoff(retry_count)),
-            ),
-            CodexErrorDetails::RetryLimit(_) => self.server_retry_delay(),
+            CodexErrorDetails::ServerOverloaded => RetryPolicy::Backoff,
+            CodexErrorDetails::PolicyCapacityUnavailable | CodexErrorDetails::RetryLimit(_) => {
+                RetryPolicy::ServerDirected
+            }
+            CodexErrorDetails::WebsocketMessageTooLarge => RetryPolicy::FallBackToHttp,
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::ContentFilter
             | CodexErrorDetails::RateLimitExceeded(_)
@@ -464,12 +554,11 @@ impl CodexErr {
             | CodexErrorDetails::InternalAgentDied
             | CodexErrorDetails::Io(_)
             | CodexErrorDetails::Json(_)
-            | CodexErrorDetails::TokioJoin(_) => Some(
-                self.server_retry_delay()
-                    .unwrap_or_else(|| backoff(retry_count)),
-            ),
+            | CodexErrorDetails::TokioJoin(_) => RetryPolicy::Backoff,
             #[cfg(target_os = "linux")]
-            CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => None,
+            CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => {
+                RetryPolicy::Never
+            }
         }
     }
 
@@ -502,27 +591,42 @@ impl CodexErr {
         match &self.details {
             CodexErrorDetails::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
             CodexErrorDetails::SessionBudgetExceeded => CodexErrorInfo::SessionBudgetExceeded,
+            CodexErrorDetails::APISpendLimitExceeded(SpendLimitScope::ApiKey) => {
+                CodexErrorInfo::ApiKeySpendLimitExceeded
+            }
+            CodexErrorDetails::APISpendLimitExceeded(SpendLimitScope::Project) => {
+                CodexErrorInfo::ProjectSpendLimitExceeded
+            }
+            CodexErrorDetails::APISpendLimitExceeded(SpendLimitScope::Organization) => {
+                CodexErrorInfo::OrganizationSpendLimitExceeded
+            }
             CodexErrorDetails::RateLimitExceeded(_) => CodexErrorInfo::RateLimitExceeded,
             CodexErrorDetails::UsageLimitReached(_)
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
             CodexErrorDetails::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
+            CodexErrorDetails::PolicyCapacityUnavailable => {
+                CodexErrorInfo::PolicyCapacityUnavailable
+            }
             CodexErrorDetails::FlexUnavailable => CodexErrorInfo::FlexUnavailable,
+            CodexErrorDetails::InferenceHookDenied { .. } => CodexErrorInfo::InferenceHookDenied,
             CodexErrorDetails::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErrorDetails::BioPolicy { .. } => CodexErrorInfo::BioPolicy,
             CodexErrorDetails::ModelNotFound { .. } => CodexErrorInfo::ModelNotFound,
-            CodexErrorDetails::InvalidPrompt { .. } => CodexErrorInfo::InvalidPrompt,
+            CodexErrorDetails::InvalidPrompt { .. }
+            | CodexErrorDetails::ContentPolicyViolation { .. } => CodexErrorInfo::InvalidPrompt,
             CodexErrorDetails::MisalignmentPolicyViolation { .. } => {
                 CodexErrorInfo::MisalignmentPolicyViolation
             }
             CodexErrorDetails::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
-            CodexErrorDetails::ConnectionFailed(_) | CodexErrorDetails::UnexpectedStatus(_) => {
-                CodexErrorInfo::HttpConnectionFailed {
-                    http_status_code: self.http_status_code_value(),
-                }
-            }
+            CodexErrorDetails::ConnectionFailed(_)
+            | CodexErrorDetails::WorkspaceAccessDenied(_)
+            | CodexErrorDetails::AccessProgramNotEnabled(_)
+            | CodexErrorDetails::UnexpectedStatus(_) => CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: self.http_status_code_value(),
+            },
             CodexErrorDetails::ResponseStreamFailed(_) => {
                 CodexErrorInfo::ResponseStreamConnectionFailed {
                     http_status_code: self.http_status_code_value(),
@@ -532,7 +636,8 @@ impl CodexErr {
             CodexErrorDetails::SessionConfiguredNotFirstEvent
             | CodexErrorDetails::InternalServerError
             | CodexErrorDetails::InternalAgentDied => CodexErrorInfo::InternalServerError,
-            CodexErrorDetails::UnsupportedOperation(_)
+            CodexErrorDetails::InvalidAudioInput { .. }
+            | CodexErrorDetails::UnsupportedOperation(_)
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
             CodexErrorDetails::Sandbox(_) => CodexErrorInfo::SandboxError,
@@ -549,6 +654,7 @@ impl CodexErr {
         ErrorEvent {
             message,
             codex_error_info: Some(self.to_codex_protocol_error()),
+            rejected_audio_file_ids: Vec::new(),
             misalignment: match &self.details {
                 CodexErrorDetails::MisalignmentPolicyViolation { misalignment, .. } => {
                     misalignment.clone()
@@ -561,9 +667,12 @@ impl CodexErr {
     pub fn http_status_code_value(&self) -> Option<u16> {
         let http_status_code = match &self.details {
             CodexErrorDetails::FlexUnavailable => Some(StatusCode::TOO_MANY_REQUESTS),
-            CodexErrorDetails::ModelNotFound { status, .. } => *status,
+            CodexErrorDetails::ModelNotFound { status, .. }
+            | CodexErrorDetails::ContentPolicyViolation { status, .. } => *status,
             CodexErrorDetails::RetryLimit(err) => Some(err.status),
-            CodexErrorDetails::UnexpectedStatus(err) => Some(err.status),
+            CodexErrorDetails::WorkspaceAccessDenied(err)
+            | CodexErrorDetails::AccessProgramNotEnabled(ProviderRejection::Http(err))
+            | CodexErrorDetails::UnexpectedStatus(err) => Some(err.status),
             CodexErrorDetails::ConnectionFailed(err) => err.source.status(),
             CodexErrorDetails::ResponseStreamFailed(err) => err.source.status(),
             _ => None,
@@ -603,6 +712,15 @@ impl std::fmt::Display for ResponseStreamFailed {
     }
 }
 
+/// A provider can reject a request before or after opening the response stream.
+#[derive(Debug, Error)]
+pub enum ProviderRejection {
+    #[error(transparent)]
+    Http(UnexpectedResponseError),
+    #[error("{0}")]
+    Stream(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct UnexpectedResponseError {
     pub status: StatusCode,
@@ -613,6 +731,39 @@ pub struct UnexpectedResponseError {
     pub request_id: Option<String>,
     pub identity_authorization_error: Option<String>,
     pub identity_error_code: Option<String>,
+}
+
+/// Runtime denial cannot be repaired by retrying the request or refreshing its original credential.
+/// Keep unavailable verification state and ordinary credential errors on their existing paths.
+pub fn is_runtime_auth_denial(
+    status: StatusCode,
+    body: &str,
+    identity_error_code: Option<&str>,
+) -> bool {
+    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return false;
+    }
+    let is_terminal = |code| {
+        matches!(
+            code,
+            Some(
+                "runtime_assertion_invalid"
+                    | "runtime_instance_paused"
+                    | "runtime_instance_revoked"
+                    | "invalid_agent_instance_assertion"
+            )
+        )
+    };
+    if is_terminal(identity_error_code) {
+        return true;
+    }
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    is_terminal(
+        body.pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+    )
 }
 
 const UNEXPECTED_RESPONSE_BODY_MAX_BYTES: usize = 1000;
@@ -631,7 +782,8 @@ impl UnexpectedResponseError {
         truncate_with_ellipsis(trimmed_body, UNEXPECTED_RESPONSE_BODY_MAX_BYTES)
     }
 
-    fn extract_error_message(&self) -> Option<String> {
+    /// Returns the provider message from a structured HTTP error body.
+    pub fn extract_error_message(&self) -> Option<String> {
         let json = serde_json::from_str::<serde_json::Value>(&self.body).ok()?;
         let message = json
             .get("error")

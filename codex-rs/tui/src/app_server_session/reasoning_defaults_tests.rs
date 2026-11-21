@@ -135,6 +135,7 @@ stream_max_retries = 0
             let turn = app_server
                 .turn_start(
                     started.session.thread_id,
+                    "user",
                     "tui-user-message".to_string(),
                     vec![UserInput::Text {
                         text: "hello".to_string(),
@@ -152,6 +153,7 @@ stream_max_retries = 0
                     /*collaboration_mode*/ None,
                     /*output_schema*/ None,
                     /*cyber_access_program*/ None,
+                    /*cloud_selection*/ None,
                 )
                 .await?;
             tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 30), async {

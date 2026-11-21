@@ -1,8 +1,9 @@
 //! Clipboard copy backend for the TUI's `/copy` command and `Ctrl+O` hotkey.
 //!
 //! Local copying uses the native clipboard, or the Windows clipboard directly on WSL.
+//! WSL sessions over SSH with a forwarded X11 display use the native clipboard instead.
 //! In tmux and Herdr, also forward to the attached terminal so clients attached after Codex
-//! started receive the copy. Over SSH without a multiplexer, send OSC 52 directly.
+//! started receive the copy. Over SSH, wrap OSC 52 for GNU screen when detected.
 //!
 //! Terminal writes have no delivery acknowledgement: a successful send must not
 //! suppress native copying. Both the host and attached client's clipboards may
@@ -100,15 +101,18 @@ fn copy_to_clipboard(
     osc52: impl Fn(&str) -> Result<(), String>,
 ) -> Result<CopyOutcome, String> {
     let wsl_deadline = std::time::Instant::now() + std::time::Duration::from_secs(/*secs*/ 5);
+    let ssh_session = is_ssh_session();
     let environment = CopyEnvironment {
         herdr_session: std::env::var("HERDR_ENV").is_ok_and(|value| value == "1"),
-        ssh_session: is_ssh_session(),
+        ssh_session,
+        forwarded_x11: ssh_session
+            && std::env::var("DISPLAY").is_ok_and(|display| !display.is_empty()),
         wsl_session: is_wsl_session(),
         tmux_session: is_tmux_session(),
     };
     #[cfg(not(target_os = "android"))]
     let native_copy = {
-        // Never contact WSLg before trying Windows: even native setup can block forever.
+        // Bound WSL native setup: even initialization can block forever.
         let clipboard = (!environment.wsl_session).then(arboard::Clipboard::new);
         move |text: &str, html: Option<&str>| {
             let clipboard = match clipboard {
@@ -172,6 +176,7 @@ impl ClipboardLease {
 struct CopyEnvironment {
     herdr_session: bool,
     ssh_session: bool,
+    forwarded_x11: bool,
     wsl_session: bool,
     tmux_session: bool,
 }
@@ -218,7 +223,7 @@ fn copy_to_clipboard_with(
         };
         arboard_copy_fn(text, html.as_deref()).map_err(|error| format!("native clipboard: {error}"))
     };
-    let native_result = if environment.wsl_session {
+    let native_result = if environment.wsl_session && !environment.forwarded_x11 {
         wsl_copy_fn(text).map(|()| None).or_else(|windows_error| {
             native_copy().map_err(|native_error| {
                 format!("Windows clipboard: {windows_error}; {native_error}")
@@ -291,12 +296,11 @@ fn arboard_copy(
 }
 
 /// Write text to the clipboard via the OSC 52 terminal escape sequence.
-fn osc52_copy(text: &str) -> Result<(), String> {
-    let sequence = osc52_sequence(text, std::env::var_os("TMUX").is_some())?;
+fn write_osc52(sequence: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-            Ok(tty) => match write_osc52_to_writer(tty, &sequence) {
+            Ok(tty) => match write_osc52_to_writer(tty, sequence) {
                 Ok(()) => return Ok(()),
                 Err(err) => tracing::debug!(
                     "failed to write OSC 52 to /dev/tty: {err}; falling back to stdout"
@@ -308,7 +312,7 @@ fn osc52_copy(text: &str) -> Result<(), String> {
         }
     }
 
-    write_osc52_to_writer(std::io::stdout().lock(), &sequence)
+    write_osc52_to_writer(std::io::stdout().lock(), sequence)
 }
 
 fn write_osc52_to_writer(mut writer: impl Write, sequence: &str) -> Result<(), String> {
@@ -320,7 +324,13 @@ fn write_osc52_to_writer(mut writer: impl Write, sequence: &str) -> Result<(), S
         .map_err(|e| format!("failed to flush OSC 52: {e}"))
 }
 
-fn osc52_sequence(text: &str, tmux: bool) -> Result<String, String> {
+enum Osc52Target {
+    Direct,
+    Tmux,
+    Screen,
+}
+
+fn osc52_sequence(text: &str, target: Osc52Target) -> Result<String, String> {
     let raw_bytes = text.len();
     if raw_bytes > OSC52_MAX_RAW_BYTES {
         return Err(format!(
@@ -329,11 +339,25 @@ fn osc52_sequence(text: &str, tmux: bool) -> Result<String, String> {
     }
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    if tmux {
-        Ok(format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\"))
-    } else {
-        Ok(format!("\x1b]52;c;{encoded}\x07"))
-    }
+    let osc = format!("\x1b]52;c;{encoded}\x07");
+    Ok(match target {
+        Osc52Target::Direct => osc,
+        Osc52Target::Tmux => format!("\x1bPtmux;\x1b{osc}\x1b\\"),
+        Osc52Target::Screen => {
+            // Screen buffers each DCS separately. Stay below even its older 256-byte
+            // string limit while forwarding one continuous OSC 52 to the outer terminal.
+            const CHUNK_SIZE: usize = 252;
+            let mut wrapped = String::new();
+            for start in (0..osc.len()).step_by(CHUNK_SIZE) {
+                let end = (start + CHUNK_SIZE).min(osc.len());
+                // OSC 52 contains only ASCII, so every byte offset is a character boundary.
+                wrapped.push_str("\x1bP");
+                wrapped.push_str(&osc[start..end]);
+                wrapped.push_str("\x1b\\");
+            }
+            wrapped
+        }
+    })
 }
 
 #[cfg(test)]
@@ -345,6 +369,7 @@ mod tests {
     use super::CopyFormat;
     use super::CopyOutcome;
     use super::OSC52_MAX_RAW_BYTES;
+    use super::Osc52Target;
     use super::copy_to_clipboard_with;
     use super::osc52_sequence;
     use super::write_osc52_to_writer;
@@ -353,6 +378,7 @@ mod tests {
         CopyEnvironment {
             herdr_session: false,
             ssh_session: true,
+            forwarded_x11: false,
             wsl_session: true,
             tmux_session: false,
         }
@@ -369,6 +395,7 @@ mod tests {
         CopyEnvironment {
             herdr_session: false,
             ssh_session: false,
+            forwarded_x11: false,
             wsl_session: false,
             tmux_session: false,
         }
@@ -385,7 +412,7 @@ mod tests {
     fn osc52_encoding_roundtrips() {
         use base64::Engine;
         let text = "# Hello\n\n```rust\nfn main() {}\n```\n";
-        let sequence = osc52_sequence(text, /*tmux*/ false).expect("OSC 52 sequence");
+        let sequence = osc52_sequence(text, Osc52Target::Direct).expect("OSC 52 sequence");
         let encoded = sequence
             .trim_start_matches("\u{1b}]52;c;")
             .trim_end_matches('\u{7}');
@@ -399,7 +426,7 @@ mod tests {
     fn osc52_rejects_payload_larger_than_limit() {
         let text = "x".repeat(OSC52_MAX_RAW_BYTES + 1);
         assert_eq!(
-            osc52_sequence(&text, /*tmux*/ false),
+            osc52_sequence(&text, Osc52Target::Direct),
             Err(format!(
                 "OSC 52 payload too large ({} bytes; max {OSC52_MAX_RAW_BYTES})",
                 OSC52_MAX_RAW_BYTES + 1
@@ -410,7 +437,7 @@ mod tests {
     #[test]
     fn osc52_wraps_tmux_passthrough() {
         assert_eq!(
-            osc52_sequence("hello", /*tmux*/ true),
+            osc52_sequence("hello", Osc52Target::Tmux),
             Ok("\u{1b}Ptmux;\u{1b}\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}\\".to_string())
         );
     }
@@ -421,6 +448,24 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(write_osc52_to_writer(&mut output, sequence), Ok(()));
         assert_eq!(output, sequence.as_bytes());
+    }
+
+    #[test]
+    fn ssh_on_wsl_with_forwarded_x11_uses_native_clipboard() {
+        let result = copy_to_clipboard_with(
+            "hello",
+            CopyFormat::PlainText,
+            CopyEnvironment {
+                forwarded_x11: true,
+                ..remote_tmux_environment()
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+            |_, _| Ok(Some(super::ClipboardLease::test())),
+            |_| panic!("forwarded X11 must not write to the Windows host clipboard"),
+        );
+
+        assert!(matches!(result, Ok(CopyOutcome::Copied(Some(_)))));
     }
 
     #[test]

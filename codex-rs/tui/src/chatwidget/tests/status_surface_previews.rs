@@ -3,14 +3,6 @@ use crate::bottom_pane::preview_line_for_title_items;
 use crate::chatwidget::ThreadUsageOutcome;
 use codex_app_server_protocol::ThreadUsage;
 use pretty_assertions::assert_eq;
-use ratatui::text::Line;
-
-fn line_text(line: Line<'static>) -> String {
-    line.spans
-        .into_iter()
-        .map(|span| span.content.into_owned())
-        .collect()
-}
 
 #[tokio::test]
 async fn thread_color_preview_matches_footer() {
@@ -28,16 +20,20 @@ async fn thread_color_preview_matches_footer() {
             let mut snapshot = Vec::new();
             let preview = chat.status_surface_preview_data();
             for use_colors in [true, false] {
-                let line = preview.status_line_for_items(items, use_colors).unwrap();
+                let line = preview
+                    .status_line_for_items(items, use_colors)
+                    .unwrap()
+                    .line;
                 let footer = crate::bottom_pane::status_line_from_segments(
                     items
                         .into_iter()
                         .map(|item| (item, chat.status_line_value_for_item(item).unwrap())),
                     use_colors,
                     Some(id),
+                    /*pull_request_url*/ None,
                 )
                 .unwrap();
-                assert_eq!(line, footer);
+                assert_eq!(line, footer.line);
                 snapshot.push(format!("colors={use_colors}: {line:?}"));
             }
             insta::assert_snapshot!(snapshot.join("\n"));
@@ -49,7 +45,7 @@ fn status_preview_line_option(chat: &mut ChatWidget, items: &[StatusLineItem]) -
     let preview_data = chat.status_surface_preview_data();
     preview_data
         .status_line_for_items(items.iter().copied(), /*use_theme_colors*/ true)
-        .map(line_text)
+        .map(|line| line.line.to_string())
 }
 
 fn status_preview_line(chat: &mut ChatWidget, items: &[StatusLineItem]) -> String {
@@ -60,7 +56,7 @@ fn title_preview_line(chat: &mut ChatWidget, items: &[TerminalTitleItem]) -> Str
     let preview_data = chat.terminal_title_preview_data();
     let preview =
         preview_line_for_title_items(items, &preview_data).expect("terminal title preview line");
-    line_text(preview)
+    preview.to_string()
 }
 
 fn combined_preview_snapshot(
@@ -158,6 +154,7 @@ async fn status_surface_preview_lines_live_only_snapshot() {
 #[tokio::test]
 async fn status_line_setup_popup_live_only_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.statusline_feature_enabled = true;
     cache_project_root(&mut chat, "preview-live-root");
     chat.status_line_branch = Some("feature/live-preview-branch".to_string());
     chat.thread_name = Some("Live preview thread".to_string());
@@ -169,6 +166,17 @@ async fn status_line_setup_popup_live_only_snapshot() {
 
     assert_chatwidget_snapshot!(
         "status_line_setup_popup_live_only",
+        status_line_popup_snapshot(&mut chat)
+    );
+}
+
+#[tokio::test]
+async fn status_line_setup_popup_cloud_hides_create() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.statusline_feature_enabled = true;
+    chat.thread_params_mode = crate::ThreadParamsMode::Cloud;
+    assert_chatwidget_snapshot!(
+        "status_line_setup_popup_native_cloud",
         status_line_popup_snapshot(&mut chat)
     );
 }
@@ -219,6 +227,8 @@ async fn status_line_setup_popup_hardcoded_only_snapshot() {
         "project-name".to_string(),
         "git-branch".to_string(),
         "thread-title".to_string(),
+        "profile".to_string(),
+        "provider".to_string(),
     ]);
 
     assert_chatwidget_snapshot!(
@@ -555,6 +565,17 @@ async fn missing_project_root_uses_different_status_and_title_preview_sources() 
 
     assert_eq!(status_preview, "my-project");
     assert_eq!(title_preview, "project");
+
+    chat.remote_connection = crate::status::remote_connection::remote_connection_status_value(
+        &crate::AppServerTarget::Cloud,
+        /*server_version*/ None,
+    );
+    chat.current_cwd = PathUri::try_from(LegacyAppPathString::from_string(r"D:\workspace\remote"))
+        .expect("absolute server path");
+    assert_snapshot!(
+        title_preview_line(&mut chat, &[TerminalTitleItem::Project]),
+        @"remote"
+    );
 }
 
 #[tokio::test]

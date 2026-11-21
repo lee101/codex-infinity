@@ -130,10 +130,11 @@ impl<'a> CatalogRenderingContext<'a> {
         });
 
         let render_policy = if step_state.discovery_v2 {
-            SkillCatalogRenderPolicy::DiscoveryV2
+            SkillCatalogRenderPolicy::DISCOVERY_V2
         } else {
-            SkillCatalogRenderPolicy::ExtensionCompatible
-        };
+            SkillCatalogRenderPolicy::EXTENSION_COMPATIBLE
+        }
+        .with_omitted_descriptions(step_state.config.omit_descriptions);
         Some(Self {
             input,
             step_state,
@@ -195,10 +196,7 @@ impl<'a> CatalogRenderingContext<'a> {
                     &entry.id.0,
                     entry.authority.kind.to_string(),
                     &entry.name,
-                    entry
-                        .short_description
-                        .as_ref()
-                        .unwrap_or(&entry.description),
+                    self.render_policy.description(entry),
                     entry.rendered_path(),
                     entry.alias_root(),
                     entry.alias_root_order(),
@@ -250,15 +248,29 @@ impl<'a> CatalogRenderingContext<'a> {
             );
             let host = PreparedSkillCatalog::new(
                 &catalogs.host.catalog,
-                SkillCatalogRenderPolicy::CoreCompatible,
+                SkillCatalogRenderPolicy::CORE_COMPATIBLE
+                    .with_omitted_descriptions(self.step_state.config.omit_descriptions),
             );
+            let grants = self
+                .input
+                .step_store
+                .get::<crate::TurnSkillFilesystemGrants>();
+            let primary_environment = self
+                .input
+                .environments
+                .first()
+                .map(|selection| selection.environment_id.as_str());
             for (catalog, rendered) in [
                 (&executor, &mut rendered.executor),
                 (&cloud, &mut rendered.cloud),
                 (&host, &mut rendered.host),
             ] {
                 if let Some(rendered) = rendered {
-                    rendered.entries = catalog.entries_for_render(rendered);
+                    rendered.entries = catalog.entries_for_render(
+                        rendered,
+                        grants.as_deref(),
+                        primary_environment,
+                    );
                 }
             }
         }
@@ -314,7 +326,8 @@ impl<'a> CatalogRenderingContext<'a> {
             ),
             &PreparedSkillCatalog::new(
                 &catalogs.host.catalog,
-                SkillCatalogRenderPolicy::CoreCompatible,
+                SkillCatalogRenderPolicy::CORE_COMPATIBLE
+                    .with_omitted_descriptions(self.step_state.config.omit_descriptions),
             ),
             self.metadata_budget,
             self.include_usage,
@@ -371,7 +384,8 @@ impl<'a> CatalogRenderingContext<'a> {
             &PreparedSkillCatalog::new(&SkillCatalog::default(), self.render_policy),
             &PreparedSkillCatalog::new(
                 &catalogs.host.catalog,
-                SkillCatalogRenderPolicy::CoreCompatible,
+                SkillCatalogRenderPolicy::CORE_COMPATIBLE
+                    .with_omitted_descriptions(self.step_state.config.omit_descriptions),
             ),
             filesystem_budget,
             self.include_usage,
@@ -437,6 +451,7 @@ impl<'a> CatalogRenderingContext<'a> {
                 CatalogDelta {
                     rendered,
                     include_usage: self.include_usage,
+                    tracks_grants: kind != CatalogKind::Cloud,
                     allocation: (kind == CatalogKind::Cloud).then_some(allocation),
                 },
                 self.input

@@ -1,3 +1,4 @@
+use crate::McpRefreshReason;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -9,6 +10,10 @@ use codex_features::Feature;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -184,7 +189,56 @@ impl Session {
             ensure_configs_stay_owner_provided(current_environments, &environments.environments)?;
         }
 
-        let mut updated = current.apply(updates, current_environments)?;
+        if updates.permission_profile.is_none() && updates.sandbox_policy.is_none() {
+            let mut updated = current.apply(updates, current_environments)?;
+            if let Some(provider) = self.provider_for_selected_model(current, &updated) {
+                updated.provider = provider;
+            }
+            return Ok(updated);
+        }
+
+        // Normalize a copy so preview leaves compatibility input available for admission.
+        let mut updates = updates.clone();
+        let sandbox_policy = updates.sandbox_policy.take();
+        let current_file_system = current.file_system_sandbox_policy(current_environments);
+        if let Some(profile) = updates.permission_profile.take() {
+            // Infer identity from the requested profile before merging current denials.
+            updates.active_permission_profile = updates.active_permission_profile.or_else(|| {
+                (profile == current.permission_profile())
+                    .then(|| current.active_permission_profile())
+                    .flatten()
+            });
+            let (mut file_system, network) = profile.to_runtime_permissions();
+            file_system.preserve_deny_read_restrictions_from(&current_file_system);
+            updates.permission_profile = Some(
+                PermissionProfile::from_runtime_permissions_with_enforcement(
+                    profile.enforcement(),
+                    &file_system,
+                    network,
+                ),
+            );
+        } else if let Some(policy) = sandbox_policy {
+            let cwd = updates.environments.as_ref().map_or_else(
+                || current.cwd(),
+                |environments| &environments.legacy_fallback_cwd,
+            );
+            let file_system =
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
+                    &policy,
+                    cwd,
+                    &current_file_system,
+                );
+            updates.permission_profile = Some(
+                PermissionProfile::from_runtime_permissions_with_enforcement(
+                    SandboxEnforcement::from_legacy_sandbox_policy(&policy),
+                    &file_system,
+                    NetworkSandboxPolicy::from(&policy),
+                ),
+            );
+            updates.active_permission_profile = None;
+            updates.profile_workspace_roots = Some(Vec::new());
+        }
+        let mut updated = current.apply(&updates, current_environments)?;
         if let Some(provider) = self.provider_for_selected_model(current, &updated) {
             updated.provider = provider;
         }
@@ -240,11 +294,9 @@ impl Session {
                 self.services
                     .turn_environments
                     .set_active_thread_defaults(configuration.inferred_environment_config());
-                if environments != self.services.turn_environments.selections() {
-                    self.services
-                        .turn_environments
-                        .update_selections(&environments);
-                }
+                self.services
+                    .turn_environments
+                    .activate_selections(&environments);
             }
             self.services.turn_environments.snapshot()
         };
@@ -397,7 +449,7 @@ impl Session {
         state.session_configuration.environments = future;
         if update_current {
             // Invalidate MCP before installed configuration can wake a waiting turn.
-            self.mark_mcp_runtime_dirty();
+            self.mark_mcp_runtime_dirty(McpRefreshReason::CurrentEnvironmentsChanged);
             self.services.turn_environments.update_selections(&current);
         }
         Ok(())

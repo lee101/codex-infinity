@@ -1,4 +1,5 @@
 use codex_utils_absolute_path::test_support::PathExt;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::FileTimes;
 #[cfg(unix)]
@@ -26,8 +27,8 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::RolloutRecorder;
 use crate::RolloutRecorderParams;
+use crate::RolloutSnippetMatcher;
 use crate::append_rollout_item_to_path;
-use crate::first_rollout_content_match_snippet;
 use crate::read_session_meta_line;
 use crate::search_rollout_matches;
 
@@ -95,12 +96,12 @@ async fn full_history_load_preserves_records_and_errors_across_representations()
 }
 
 #[tokio::test]
-async fn read_session_meta_line_stops_before_invalid_utf8_tail() -> anyhow::Result<()> {
+async fn metadata_and_preview_reads_stop_before_invalid_utf8_tail() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(16);
     let thread_id = ThreadId::from_string(&uuid.to_string())?;
     let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "ignored tail")?;
+    write_rollout(&rollout_path, thread_id, "first message")?;
     let mut contents = fs::read(&rollout_path)?;
     contents.resize(contents.len() + 64 * 1024, 0xff);
     fs::write(&rollout_path, contents)?;
@@ -108,16 +109,22 @@ async fn read_session_meta_line_stops_before_invalid_utf8_tail() -> anyhow::Resu
     let session_meta = read_session_meta_line(&rollout_path).await?;
 
     assert_eq!(session_meta.meta.id, thread_id);
+    let summary = crate::list::read_thread_item_from_rollout(rollout_path).await;
+    assert_eq!(
+        summary.and_then(|item| item.first_user_message),
+        Some("first message".to_string())
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn read_session_meta_line_stops_before_invalid_utf8_compressed_tail() -> anyhow::Result<()> {
+async fn metadata_and_preview_reads_stop_before_invalid_utf8_compressed_tail() -> anyhow::Result<()>
+{
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(17);
     let thread_id = ThreadId::from_string(&uuid.to_string())?;
     let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "ignored compressed tail")?;
+    write_rollout(&rollout_path, thread_id, "first message")?;
     let mut contents = fs::read(&rollout_path)?;
     contents.resize(contents.len() + 64 * 1024, 0xff);
     fs::write(&rollout_path, contents)?;
@@ -128,6 +135,11 @@ async fn read_session_meta_line_stops_before_invalid_utf8_compressed_tail() -> a
     assert_eq!(session_meta.meta.id, thread_id);
     assert!(!rollout_path.exists());
     assert!(compressed_rollout_path(&rollout_path).exists());
+    let summary = crate::list::read_thread_item_from_rollout(rollout_path).await;
+    assert_eq!(
+        summary.and_then(|item| item.first_user_message),
+        Some("first message".to_string())
+    );
     Ok(())
 }
 
@@ -301,10 +313,7 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
     )
     .await?;
 
-    assert_eq!(
-        matches.get(rollout_path.as_path()),
-        Some(&Some("targeted search term".to_string()))
-    );
+    assert_eq!(matches, std::collections::HashSet::from([rollout_path]));
     Ok(())
 }
 
@@ -343,7 +352,7 @@ async fn compressed_search_preserves_first_visible_snippet_and_no_match() -> any
             ("absent", None),
         ] {
             assert_eq!(
-                first_rollout_content_match_snippet(&path, query).await?,
+                RolloutSnippetMatcher::new(query).first_match(&path).await?,
                 expected.map(str::to_string),
                 "compressed={compressed}, query={query}"
             );
@@ -364,11 +373,14 @@ async fn compressed_search_only_reports_stream_errors_before_a_match() -> anyhow
     fs::write(&path, contents)?;
     compress_now(&path)?;
     assert_eq!(
-        first_rollout_content_match_snippet(&path, "needle").await?,
+        RolloutSnippetMatcher::new("needle")
+            .first_match(&path)
+            .await?,
         Some("needle before unreadable tail".to_owned())
     );
     assert_eq!(
-        first_rollout_content_match_snippet(&path, "absent")
+        RolloutSnippetMatcher::new("absent")
+            .first_match(&path)
             .await
             .unwrap_err()
             .kind(),
@@ -438,6 +450,12 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     let fresh_id = ThreadId::from_string(&fresh_uuid.to_string())?;
     let fresh_path = rollout_path(home.path(), "2025-01-05T12-00-00", fresh_uuid);
     write_rollout(&fresh_path, fresh_id, "fresh active")?;
+    // Reading this recently modified file would advance its old access time on relatime mounts.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&fresh_path)?
+        .set_times(FileTimes::new().set_accessed(SystemTime::UNIX_EPOCH))?;
+    let fresh_accessed = fs::metadata(&fresh_path)?.accessed()?;
 
     let stale_temp = active_path.with_file_name("rollout-stale.jsonl.zst.tmp");
     fs::write(&stale_temp, "stale temp")?;
@@ -465,6 +483,7 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     assert!(compressed_rollout_path(&archived_path).exists());
     assert!(fresh_path.exists());
     assert!(!compressed_rollout_path(&fresh_path).exists());
+    assert_eq!(fs::metadata(&fresh_path)?.accessed()?, fresh_accessed);
     assert!(!stale_temp.exists());
     assert!(fresh_temp.exists());
     let materialized_path = home.path().join("materialized.jsonl");
@@ -556,6 +575,7 @@ async fn worker_skips_unreadable_metadata_without_blocking_other_compression() -
 
     let unreadable_path = rollout_path(home.path(), "2025-01-03T12-00-01", Uuid::from_u128(21));
     fs::write(unreadable_path.as_path(), "{not json}\n")?;
+    set_old_mtime(&unreadable_path)?;
 
     worker::run(home.path().to_path_buf(), Startup).await?;
 
@@ -754,13 +774,36 @@ async fn worker_preserves_alternate_group_through_materialization() -> anyhow::R
     let original_group = fs::metadata(&path)?.gid();
     let groups = Command::new("id").arg("-G").output()?;
     assert!(groups.status.success());
-    let Some(group) = std::str::from_utf8(&groups.stdout)?
+    let groups = std::str::from_utf8(&groups.stdout)?
         .split_whitespace()
         .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .find(|group| *group != original_group)
-    else {
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(target_os = "linux")]
+    let groups = {
+        // Unmapped supplementary groups appear as the overflow GID in Bazel's
+        // user namespace, but chown cannot use them.
+        let gid_map = fs::read_to_string("/proc/self/gid_map")?;
+        let mapped_groups = gid_map
+            .lines()
+            .map(|line| {
+                let fields = line
+                    .split_whitespace()
+                    .map(str::parse::<u64>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                anyhow::ensure!(fields.len() == 3, "invalid GID mapping: {line}");
+                Ok(fields[0]..fields[0] + fields[2])
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        groups
+            .into_iter()
+            .filter(|group| {
+                mapped_groups
+                    .iter()
+                    .any(|range| range.contains(&u64::from(*group)))
+            })
+            .collect::<Vec<_>>()
+    };
+    let Some(group) = groups.into_iter().find(|group| *group != original_group) else {
         eprintln!("skipping ownership regression: no alternate supplementary group");
         return Ok(());
     };
@@ -1070,12 +1113,30 @@ async fn find_thread_path_by_id_handles_compressed_rollout_filenames() -> anyhow
     );
     assert_eq!(
         crate::find_rollout_path_by_rollout_id(home.path(), thread_id).await?,
-        Some(rollout_path)
+        Some(rollout_path.clone())
     );
     let missing_rollout_id = ThreadId::from_string(&Uuid::from_u128(2000).to_string())?;
     assert_eq!(
         crate::find_rollout_path_by_rollout_id(home.path(), missing_rollout_id).await?,
         None
+    );
+    let archived_id = ThreadId::new();
+    let archived_path = home
+        .path()
+        .join(crate::ARCHIVED_SESSIONS_SUBDIR)
+        .join(format!("rollout-2025-01-03T12-00-00-{archived_id}.jsonl"));
+    write_rollout(&archived_path, archived_id, "archived original")?;
+    compress_now(&archived_path)?;
+    assert_eq!(
+        crate::find_rollout_paths_by_rollout_ids(
+            home.path(),
+            &[thread_id, archived_id, missing_rollout_id],
+        )
+        .await,
+        HashMap::from([
+            (thread_id, rollout_path),
+            (archived_id, compressed_rollout_path(&archived_path)),
+        ])
     );
     assert_eq!(
         crate::find_thread_path_by_id_str(home.path(), "not-a-uuid", /*state_db_ctx*/ None).await?,
@@ -1121,6 +1182,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
     fs::create_dir_all(parent)?;
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            account_scoped: false,
             attached_thread: false,
             creator_user_id: None,
             creator_account_id: None,

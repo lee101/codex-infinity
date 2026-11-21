@@ -1,18 +1,20 @@
 use super::*;
 use crate::context::world_state::WorldStateSnapshot;
-use crate::context_manager::is_user_turn_boundary;
+use crate::context_manager::is_instruction_turn_boundary;
 use codex_history::ResponseItemEnvelope;
 use codex_history::TurnAttribution;
+use codex_protocol::ContextWindowId;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_utils_output_truncation::TruncationPolicy;
-use uuid::Uuid;
+use std::collections::BTreeSet;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItemEnvelope>,
+    pub(super) rejected_audio_file_ids: BTreeSet<String>,
     pub(crate) retained_context: codex_history::RetainedContext,
     pub(super) guardian_history: Option<codex_history::GuardianHistoryCheckpoint>,
     pub(super) last_started_turn_id: Option<String>,
@@ -21,17 +23,17 @@ pub(crate) struct RolloutReconstruction {
     pub(super) turn_attribution: Option<TurnAttribution>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
     pub(super) window_number: u64,
-    pub(super) first_window_id: Option<Uuid>,
-    pub(super) previous_window_id: Option<Uuid>,
-    pub(super) window_id: Option<Uuid>,
+    pub(super) first_window_id: Option<ContextWindowId>,
+    pub(super) previous_window_id: Option<ContextWindowId>,
+    pub(super) window_id: Option<ContextWindowId>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ReconstructedWindow {
     number: u64,
-    first_id: Option<Uuid>,
-    previous_id: Option<Uuid>,
-    id: Option<Uuid>,
+    first_id: Option<ContextWindowId>,
+    previous_id: Option<ContextWindowId>,
+    id: Option<ContextWindowId>,
 }
 
 #[derive(Debug, Default)]
@@ -191,13 +193,29 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
+        let policy = self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .guardian_retention;
+        let retention = policy.map(|policy| codex_history::MessageRetention {
+            thread_id: self.thread_id(),
+            policy,
+        });
         ContextManager::reconstruct_rollout(
             rollout_items,
             turn_context.history_mode,
-            ContextManager::for_session(
-                &turn_context.session_source,
-                &turn_context.config.features,
-            ),
+            |ids| {
+                ContextManager::for_session(
+                    turn_context.root_capabilities_restricted,
+                    &turn_context.config.features,
+                    turn_context.config.guardian_reuses_parent_compaction(),
+                    turn_context.config.guardian_context_budgeting(),
+                    ids,
+                    retention,
+                )
+            },
             turn_context.model_info().truncation_policy.into(),
         )
     }
@@ -208,9 +226,34 @@ impl ContextManager {
     pub(crate) fn reconstruct_rollout(
         rollout_items: &[RolloutItem],
         history_mode: ThreadHistoryMode,
-        mut history: Self,
+        create_history: impl FnOnce(codex_thread_context_ids::ThreadContextIds) -> Self,
         truncation_policy: TruncationPolicy,
     ) -> RolloutReconstruction {
+        // Reconstruction may mint temporary revisions before restoring durable ones.
+        // Use an independent allocator for replay.
+        let ids = codex_history::context_ids_from_rollout(rollout_items);
+        let mut history = create_history(ids);
+        // Rejection facts are durable across compaction boundaries. File IDs are immutable,
+        // so retaining a fact after rollback is conservative and cannot suppress a different
+        // future upload.
+        let mut rejected_audio_file_ids = BTreeSet::new();
+        for item in rollout_items {
+            match item {
+                RolloutItem::Compacted(compacted) => {
+                    if let Some(metadata) = &compacted.resume_metadata {
+                        rejected_audio_file_ids
+                            .extend(metadata.rejected_audio_file_ids.iter().cloned());
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TurnComplete(completed)) => {
+                    if let Some(error) = &completed.error {
+                        rejected_audio_file_ids
+                            .extend(error.rejected_audio_file_ids.iter().cloned());
+                    }
+                }
+                _ => {}
+            }
+        }
         // Select the compaction and suffix that can affect reconstruction.
         let has_legacy_compaction_without_window_number =
             rollout_items.iter().any(|item| {
@@ -242,7 +285,8 @@ impl ContextManager {
             .rev()
             .filter_map(|item| match item {
                 RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id.as_str()),
-                RolloutItem::SessionMeta(_)
+                RolloutItem::DynamicToolsUpdated { .. }
+                | RolloutItem::SessionMeta(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -256,9 +300,13 @@ impl ContextManager {
                 | RolloutItem::EventMsg(_) => None,
             })
             .peekable();
-        let last_started_turn_id = started_turn_ids
-            .peek()
-            .map(|id| (*id).to_owned())
+        let last_started_turn_id = replay_items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id.clone()),
+                _ => None,
+            })
             .or_else(|| resume_metadata.and_then(|metadata| metadata.last_started_turn_id.clone()));
         // Saved attribution still identifies the turn when continuation eligibility was cleared.
         let checkpoint_turn_id = resume_metadata.and_then(|metadata| {
@@ -431,7 +479,7 @@ impl ContextManager {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.counts_as_user_turn |=
-                        is_user_turn_boundary(&response_item.item);
+                        is_instruction_turn_boundary(response_item);
                 }
                 RolloutItem::InterAgentCommunication(_) => {
                     let active_segment =
@@ -439,6 +487,7 @@ impl ContextManager {
                     active_segment.counts_as_user_turn = true;
                 }
                 RolloutItem::EventMsg(_)
+                | RolloutItem::DynamicToolsUpdated { .. }
                 | RolloutItem::SessionMeta(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::RetainedContext(_)
@@ -505,8 +554,37 @@ impl ContextManager {
         }
         let rollout_suffix =
             history_checkpoint.map_or(rollout_items, |checkpoint| checkpoint.suffix);
+        // A compacted replacement may already contain a reconstructed hangup input.
+        let tail_ids = rollout_suffix
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::RealtimeItem(item) => match &item.content {
+                    codex_protocol::realtime::RealtimeItemContent::SessionInputSaved {
+                        reason: codex_protocol::realtime::SessionInputReason::SessionEnd,
+                        input_item_id,
+                        ..
+                    } => Some(input_item_id.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut saved_tails = history
+            .raw_items()
+            .filter_map(|item| item.id())
+            .filter(|id| tail_ids.contains(id.as_str()))
+            .map(ToString::to_string)
+            .collect::<std::collections::HashSet<_>>();
         for item in rollout_suffix {
             match item {
+                RolloutItem::RealtimeItem(item) => {
+                    if let Some(input) = Session::realtime_carryover_input(item)
+                        && let Some(id) = input.item.id()
+                        && saved_tails.insert(id.to_string())
+                    {
+                        history.replay_annotated_item(&input, truncation_policy);
+                    }
+                }
                 RolloutItem::RetainedContext(event) => {
                     history.record_retained_context(event);
                 }
@@ -532,13 +610,8 @@ impl ContextManager {
                         // prompt shape.
                         // TODO(ccunningham): if we drop support for None replacement_history compaction items,
                         // we can get rid of this second loop entirely and just build `history` directly in the first loop.
-                        let user_messages =
-                            compact::collect_annotated_user_messages(history.annotated_items());
-                        let rebuilt = compact::build_compacted_history(
-                            Vec::new(),
-                            &user_messages,
-                            &compacted.message,
-                        );
+                        let rebuilt =
+                            compact::build_compacted_history(&history, &compacted.message);
                         let retained_context = history.retained_context().clone();
                         history.replace_annotated(rebuilt);
                         history.restore_retained_context(Some(&retained_context));
@@ -549,10 +622,10 @@ impl ContextManager {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
-                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::DynamicToolsUpdated { .. }
                 | RolloutItem::SessionMeta(_) => {}
             }
         }
@@ -586,7 +659,8 @@ impl ContextManager {
                     };
                     baseline.apply_merge_patch(&world_state.state);
                 }
-                RolloutItem::SessionMeta(_)
+                RolloutItem::DynamicToolsUpdated { .. }
+                | RolloutItem::SessionMeta(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -612,6 +686,7 @@ impl ContextManager {
             guardian_history: history.guardian_history_checkpoint(),
             last_started_turn_id,
             history: history.into_annotated_items(),
+            rejected_audio_file_ids,
             previous_turn_settings,
             reference_context_item,
             turn_attribution,
@@ -624,31 +699,31 @@ impl ContextManager {
     }
 }
 
-fn parse_uuid_v7(value: &str) -> Option<Uuid> {
-    Uuid::parse_str(value)
-        .ok()
-        .filter(|uuid| uuid.get_version_num() == 7)
-}
-
 fn reconstructed_window_from_compaction(compacted: &CompactedItem) -> Option<ReconstructedWindow> {
     Some(ReconstructedWindow {
         number: compacted.window_number?,
-        first_id: compacted.first_window_id.as_deref().and_then(parse_uuid_v7),
+        first_id: compacted
+            .first_window_id
+            .as_ref()
+            .and_then(ContextWindowId::validated),
         previous_id: compacted
             .previous_window_id
-            .as_deref()
-            .and_then(parse_uuid_v7),
-        id: compacted.window_id.as_deref().and_then(parse_uuid_v7),
+            .as_ref()
+            .and_then(ContextWindowId::validated),
+        id: compacted
+            .window_id
+            .as_ref()
+            .and_then(ContextWindowId::validated),
     })
 }
 
 fn reconstructed_window_from_session_context_window(
     context_window: &SessionContextWindow,
 ) -> Option<ReconstructedWindow> {
-    let id = parse_uuid_v7(&context_window.window_id)?;
+    let id = context_window.window_id.validated()?;
     Some(ReconstructedWindow {
         number: 0,
-        first_id: Some(id),
+        first_id: Some(id.clone()),
         previous_id: None,
         id: Some(id),
     })

@@ -10,6 +10,7 @@ use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::Config;
+use codex_exec_server::BoundOutput;
 use codex_model_provider_info::WireApi;
 use codex_protocol::num_format::format_with_separators;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -45,7 +46,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
 impl EventProcessorWithHumanOutput {
     pub(crate) fn create_with_ansi(
         with_ansi: bool,
-        config: &Config,
+        config: Option<&Config>,
         last_message_path: Option<PathBuf>,
         stream_command_output_directly: bool,
     ) -> Self {
@@ -59,8 +60,8 @@ impl EventProcessorWithHumanOutput {
             magenta: style(Style::new().magenta(), Style::new()),
             red: style(Style::new().red(), Style::new()),
             yellow: style(Style::new().yellow(), Style::new()),
-            show_agent_reasoning: !config.hide_agent_reasoning,
-            show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+            show_agent_reasoning: config.is_none_or(|config| !config.hide_agent_reasoning),
+            show_raw_agent_reasoning: config.is_some_and(|config| config.show_raw_agent_reasoning),
             last_message_path,
             final_message: None,
             final_message_rendered: false,
@@ -221,14 +222,21 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         config: &Config,
         prompt: &str,
         session_configured_event: &SessionConfiguredEvent,
+        workspace_roots: &[PathUri],
     ) {
         const VERSION: &str = env!("CARGO_PKG_VERSION");
         eprintln!("OpenAI Codex v{VERSION}\n--------");
-        for (key, value) in config_summary_entries(config, session_configured_event) {
+        for (key, value) in
+            config_summary_entries(config, session_configured_event, workspace_roots)
+        {
             eprintln!("{} {}", format!("{key}:").style(self.bold), value);
         }
         eprintln!("--------");
         eprintln!("{}\n{}", "user".style(self.cyan), prompt);
+    }
+
+    fn print_thread_started(&mut self, thread_id: &str) {
+        eprintln!("thread id: {thread_id}");
     }
 
     fn process_server_notification(&mut self, notification: ServerNotification) -> CodexStatus {
@@ -402,12 +410,22 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         CodexStatus::Running
     }
 
-    fn print_final_output(&mut self) {
-        if self.emit_final_message_on_shutdown
-            && let Some(path) = self.last_message_path.as_deref()
+    fn print_final_output(&mut self, output: Option<BoundOutput>) -> anyhow::Result<()> {
+        let print_to_stdout = should_print_final_message_to_stdout(
+            self.emit_final_message_on_shutdown
+                .then_some(self.final_message.as_deref())
+                .flatten(),
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        );
+        let output_result = if self.emit_final_message_on_shutdown
+            && let (Some(path), Some(file)) = (self.last_message_path.as_deref(), output)
+            && !(print_to_stdout && file.is_stdout())
         {
-            handle_last_message(self.final_message.as_deref(), path);
-        }
+            handle_last_message(self.final_message.as_deref(), path, file)
+        } else {
+            Ok(())
+        };
 
         if let Some(usage) = &self.last_total_token_usage {
             eprintln!(
@@ -418,14 +436,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         }
 
         #[allow(clippy::print_stdout)]
-        if should_print_final_message_to_stdout(
-            self.emit_final_message_on_shutdown
-                .then_some(self.final_message.as_deref())
-                .flatten(),
-            std::io::stdout().is_terminal(),
-            std::io::stderr().is_terminal(),
-        ) && let Some(message) = self.final_message.as_deref()
-        {
+        if print_to_stdout && let Some(message) = self.final_message.as_deref() {
             println!("{message}");
         } else if should_print_final_message_to_tty(
             self.emit_final_message_on_shutdown
@@ -442,16 +453,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 message
             );
         }
+        output_result
     }
 }
 
 fn config_summary_entries(
     config: &Config,
     session_configured_event: &SessionConfiguredEvent,
+    workspace_roots: &[PathUri],
 ) -> Vec<(&'static str, String)> {
-    let permission_profile = config.permissions.effective_permission_profile();
     let mut entries = vec![
-        ("workdir", config.cwd.display().to_string()),
+        (
+            "workdir",
+            session_configured_event.cwd.display().to_string(),
+        ),
         ("model", session_configured_event.model.clone()),
         (
             "provider",
@@ -464,9 +479,9 @@ fn config_summary_entries(
         (
             "sandbox",
             summarize_permission_profile(
-                &permission_profile,
-                &PathUri::from_abs_path(&config.cwd),
-                &config.effective_workspace_roots(),
+                &session_configured_event.permission_profile,
+                &PathUri::from_abs_path(&session_configured_event.cwd),
+                workspace_roots,
             ),
         ),
     ];

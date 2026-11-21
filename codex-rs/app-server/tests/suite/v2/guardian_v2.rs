@@ -75,6 +75,9 @@ use super::mcp_tool::TEST_TOOL_NAME;
 use super::mcp_tool::start_mcp_server;
 use super::mcp_tool::start_mcp_server_with_tools;
 
+#[path = "guardian_v3_sync_tests.rs"]
+mod v3_sync;
+
 #[path = "guardian_sync_session_tests.rs"]
 mod sync_sessions;
 
@@ -2078,6 +2081,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             let mut denied_results = Vec::new();
             for entry in std::fs::read_dir(traces.path())? {
                 let bundle = entry?.path();
+                let mut reader = codex_rollout_trace::PayloadReader::new(&bundle);
                 for line in std::fs::read_to_string(bundle.join("trace.jsonl"))?.lines() {
                     let event: Value = serde_json::from_str(line)?;
                     let payload = &event["payload"];
@@ -2086,12 +2090,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                         && payload["tool_call_id"] == "guardian-action-0"
                     {
                         assert_eq!(payload["status"], "failed");
-                        let path = payload["runtime_payload"]["path"]
-                            .as_str()
-                            .expect("MCP runtime payload path");
-                        let result: Value =
-                            serde_json::from_reader(std::fs::File::open(bundle.join(path))?)?;
-                        denied_results.push(result);
+                        let reference = serde_json::from_value(payload["runtime_payload"].clone())?;
+                        denied_results.push(reader.read_json(&reference)?);
                     }
                 }
             }
@@ -2144,11 +2144,14 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         });
         assert_eq!(classification.is_some(), classifier_in_scope);
         if let Some(event) = classification {
+            let params = &event["event_params"];
+            let requests = responses_state.luna_requests.lock().expect("Luna requests");
+            let request_turn_id = requests[0]["client_metadata"]["turn_id"]
+                .as_str()
+                .expect("classifier request turn ID");
+            assert_eq!(params["classifier_turn_id"], request_turn_id);
             assert_eq!(
-                json!([
-                    event["event_params"]["outcome"],
-                    event["event_params"]["risk_level"]
-                ]),
+                json!([params["outcome"], params["risk_level"]]),
                 match risk {
                     GuardianRisk::Low | GuardianRisk::LowWithStreamFailure =>
                         json!(["success", "low"]),
@@ -2553,6 +2556,98 @@ async fn first_cua_review_does_not_wait_for_initial_score(
         timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
     assert_eq!(completed.thread_id, thread.id);
     assert_eq!(state.guardian_reviews.load(Ordering::SeqCst), 1);
+    app_server.shutdown_gracefully().await?;
+    mcp_server.abort();
+    responses_server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synchronous_cua_call_consumes_the_initial_call_allowance() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const SYNCHRONOUS_MODEL: &str = "synchronous-cua";
+    let state = Arc::new(MockResponsesState {
+        mcp_server_name: Some("cua_repl"),
+        mcp_tool_sequence: Some(&["js"]),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let responses_url = format!("http://{}", listener.local_addr()?);
+    let router = Router::new()
+        .route("/v1/responses", get(luna_websocket).post(parent_response))
+        .with_state(Arc::clone(&state));
+    let responses_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let (mcp_url, mcp_server) =
+        start_mcp_server_with_tools(&["js"], /*sensitive_action*/ None).await?;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_url)
+        .with_model(SYNCHRONOUS_MODEL)
+        .with_provider_config("supports_websockets = false")
+        .with_approval_policy("on-request")
+        .with_root_config("approvals_reviewer = \"auto_review\"")
+        .with_extra_config(&format!(
+            "[mcp_servers.cua_repl]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"auto\""
+        ))
+        .enable_feature(Feature::GuardianApproval)
+        .enable_feature(Feature::GuardianV2)
+        .write(codex_home.path())?;
+    let config = load_default_config_for_test(&codex_home).await;
+    let models = [
+        (
+            SYNCHRONOUS_MODEL,
+            codex_protocol::openai_models::GuardianReviewMode::Synchronous,
+        ),
+        (
+            MODEL,
+            codex_protocol::openai_models::GuardianReviewMode::Adaptive,
+        ),
+    ]
+    .map(|(slug, mode)| {
+        let mut model = codex_core::test_support::construct_model_info_offline(slug, &config);
+        model.node_repl_auto_review_required = true;
+        model.guardian = Some(codex_protocol::openai_models::GuardianModelPolicy {
+            computer_use: Some(mode),
+            ..Default::default()
+        });
+        model
+    });
+    write_models_cache_with_models(codex_home.path(), models.into()).await?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    // Both calls need fresh review: the synchronous first turn must consume the
+    // allowance before the second turn enables adaptive scoring. Scores stay pending.
+    for model in [SYNCHRONOUS_MODEL, MODEL] {
+        state.parent_requests.store(0, Ordering::SeqCst);
+        let expected_reviews = state.guardian_reviews.load(Ordering::SeqCst) + 1;
+        state.allow_guardian_review.notify_one();
+        let request_id = app_server
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                model: Some(model.to_owned()),
+                input: vec![UserInput::Text {
+                    text: USER_CONTEXT.to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse = timeout(TIMEOUT, app_server.read_response(request_id)).await??;
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+        assert_eq!(completed.thread_id, thread.id);
+        assert_eq!(
+            state.guardian_reviews.load(Ordering::SeqCst),
+            expected_reviews
+        );
+    }
     app_server.shutdown_gracefully().await?;
     mcp_server.abort();
     responses_server.abort();

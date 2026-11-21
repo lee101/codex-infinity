@@ -12,7 +12,7 @@ impl ChatWidget {
     pub(crate) fn overlay_message_images(&self) -> Vec<PathBuf> {
         let draft = self.bottom_pane.composer_local_images();
         if !draft.is_empty() {
-            return draft.into_iter().map(|image| image.path).collect();
+            return draft.iter().map(|image| image.path.clone()).collect();
         }
         self.last_message_images.clone()
     }

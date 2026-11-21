@@ -65,6 +65,10 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn custom_statusline_enabled(&self) -> bool {
+        self.statusline_feature_enabled
+    }
+
     fn on_session_configured_with_display_and_fork_parent_title(
         &mut self,
         session: ThreadSessionState,
@@ -90,9 +94,15 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = session.network_proxy.clone();
         let previous_thread_id = self.thread_id;
-        let connector_scope_changed = previous_thread_id != Some(session.thread_id)
-            || self.config.cwd.as_path() != session.cwd.as_path();
+        if previous_thread_id != Some(session.thread_id) || self.cloud_picker_selection.is_some() {
+            self.dismiss_stale_model_picker();
+        }
+        let cwd_changed = self.current_cwd != session.cwd;
+        let connector_scope_changed = previous_thread_id != Some(session.thread_id) || cwd_changed;
         self.thread_id = Some(session.thread_id);
+        self.read_only_history = session.read_only_history;
+        self.thread_settings_confirmed = session.thread_settings_confirmed;
+        self.sync_context_window_visibility();
         self.daybreak_enabled = self.config.features.enabled(Feature::CliDaybreak)
             && session.daybreak_enabled
             && !matches!(display, SessionConfiguredDisplay::SideConversation);
@@ -113,7 +123,7 @@ impl ChatWidget {
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
-            if (previous_thread_id.is_some() || self.config.cwd != session.cwd)
+            if (previous_thread_id.is_some() || cwd_changed)
                 && self.status_account_display == Some(StatusAccountDisplay::ApiKey)
             {
                 self.refresh_account_scoped_models();
@@ -124,7 +134,11 @@ impl ChatWidget {
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
             self.clear_thread_usage_state();
         }
+        let has_turn_history =
+            previous_thread_id == self.thread_id && self.turn_lifecycle.has_turn_history;
         self.turn_lifecycle.reset_thread();
+        self.turn_lifecycle.has_turn_history = has_turn_history;
+        self.safety_recourse = None;
         self.clear_safety_buffering();
         self.thread_name = session.thread_name.clone();
         self.current_goal_status_indicator = None;
@@ -132,18 +146,28 @@ impl ChatWidget {
         self.update_collaboration_mode_indicator();
         self.forked_from = session.forked_from_id;
         self.current_rollout_path = session.rollout_path.clone();
-        self.current_cwd = Some(session.cwd.to_path_buf());
-        self.config.cwd = session.cwd.clone();
+        self.primary_environment_cwd
+            .clone_from(&session.primary_environment_cwd);
+        self.current_cwd = session.cwd.clone();
+        if let Ok(native_cwd) = session.cwd.to_abs_path() {
+            self.config.cwd = native_cwd;
+        }
         self.config.model_provider_id = session.model_provider_id.clone();
+        if previous_thread_id.is_none()
+            && let Some(event) = crate::app::provider::refresh_list_if_present(self)
+        {
+            self.app_event_tx.send(AppEvent::Provider(event));
+        }
         self.set_daybreak_enabled(self.daybreak_enabled);
         if connector_scope_changed {
             self.invalidate_connector_scope();
         }
-        let runtime_workspace_roots = session.runtime_workspace_roots.clone();
-        self.config.workspace_roots = runtime_workspace_roots.clone();
-        self.config
-            .permissions
-            .set_workspace_roots(runtime_workspace_roots);
+        self.current_workspace_roots
+            .clone_from(&session.runtime_workspace_roots);
+        crate::session_state::sync_local_workspace_roots(
+            &mut self.config,
+            &self.current_workspace_roots,
+        );
         self.config.service_tier = session.service_tier.clone();
         self.effective_service_tier = session.service_tier.clone();
         if let Err(err) = self
@@ -157,7 +181,10 @@ impl ChatWidget {
                 Constrained::allow_only(session.approval_policy.to_core());
         }
         let permission_snapshot = PermissionProfileSnapshot::from_session_snapshot(
-            session.permission_profile.clone(),
+            crate::session_state::display_profile_for_roots(
+                session.permission_profile.clone(),
+                &session.runtime_workspace_roots,
+            ),
             session.active_permission_profile.clone(),
         );
         let permission_sync = self
@@ -255,7 +282,7 @@ impl ChatWidget {
         if self.daybreak_enabled && previous_thread_id != self.thread_id {
             self.add_info_message("Daybreak is on for new turns.".into(), /*hint*/ None);
         }
-        self.transcript.saw_copy_source_this_turn = false;
+        self.transcript.committed_turn_response = None;
         self.refresh_skills_for_current_cwd(/*force_reload*/ true);
         self.refresh_connector_mentions(/*force_refresh*/ false);
         let initial_user_message_pending = self.initial_user_message.is_some();
@@ -342,6 +369,7 @@ impl ChatWidget {
         retained_turns: &[Turn],
     ) {
         self.current_rollout_path = rollout_path;
+        self.clear_background_terminals();
         self.input_queue.clear();
         self.reset_realtime_conversation();
         // Finish any output not yet drained from the old runtime without live completion actions.
@@ -399,8 +427,8 @@ impl ChatWidget {
         )));
     }
 
-    /// Update status surfaces before a confirmed manual rename's server notification arrives.
-    pub(crate) fn expect_manual_thread_name(&mut self, thread_id: ThreadId, name: String) {
+    /// Show a provisional or manually chosen name before its server notification arrives.
+    pub(crate) fn display_thread_name(&mut self, thread_id: ThreadId, name: String) {
         if self.thread_id == Some(thread_id) {
             self.thread_name = Some(name);
             self.refresh_status_surfaces();

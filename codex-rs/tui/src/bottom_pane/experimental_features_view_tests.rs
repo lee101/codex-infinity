@@ -53,6 +53,8 @@ fn experimental_features_display_metadata() {
     for feature in [
         Feature::AnalyticsPlanHistory,
         Feature::LoginShellPackagePath,
+        Feature::RespectSystemProxy,
+        Feature::TuiExtensionsStatusLine,
     ] {
         let stage = feature.stage();
         let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -190,14 +192,10 @@ fn experimental_features_discovery_preserves_server_order_and_accepts_new_keys()
         .send(Err("Persistent write rejection".to_string()))
         .unwrap();
     view.pre_draw_tick(Instant::now());
-    // Cancel saves new special edits without retrying the failed generic write.
+    // Cancel discards new edits without retrying the failed write.
     view.features[2].enabled = true;
     view.handle_key_event(KeyEvent::from(KeyCode::Esc));
     assert!(view.is_complete());
-    assert!(
-        matches!(app_rx.try_recv().unwrap(), AppEvent::UpdateFeatureFlags { updates }
-        if updates == vec![(Feature::PreventIdleSleep, true)])
-    );
     assert!(app_rx.try_recv().is_err());
 }
 
@@ -238,6 +236,7 @@ fn experimental_features_empty_error_and_cancel_remain_usable() {
         let mut buffer = Buffer::empty(area);
         view.render(area, &mut buffer);
         insta::assert_snapshot!(snapshot, buffer_text(&buffer));
+        view.toggle_selected();
         view.on_ctrl_c();
         assert!(view.is_complete());
         assert!(app_rx.try_recv().is_err());

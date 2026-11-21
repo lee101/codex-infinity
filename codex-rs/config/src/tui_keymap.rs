@@ -135,6 +135,42 @@ impl KeybindingsSpec {
 pub struct TuiGlobalKeymap {
     /// Prefix for persistent, context-aware shortcut menus.
     pub leader: Option<KeybindingsSpec>,
+    /// Change where a new conversation runs.
+    pub change_host: Option<KeybindingsSpec>,
+    /// Choose a saved environment for a new Cloud conversation.
+    pub choose_cloud_environment: Option<KeybindingsSpec>,
+    /// Focus the main conversation composer.
+    pub focus_main_composer: Option<KeybindingsSpec>,
+    /// Focus the side conversation, or hide it when already focused.
+    pub focus_sidebar_content: Option<KeybindingsSpec>,
+    /// Open the sidebar tab chooser.
+    pub focus_sidebar_tabs: Option<KeybindingsSpec>,
+    /// Hide the focused sidebar pane.
+    pub hide_pane: Option<KeybindingsSpec>,
+    /// Close the active sidebar tab.
+    pub close_sidebar_tab: Option<KeybindingsSpec>,
+    /// Switch to the previous sidebar tab.
+    pub sidebar_up: Option<KeybindingsSpec>,
+    /// Switch to the next sidebar tab.
+    pub sidebar_down: Option<KeybindingsSpec>,
+    /// Focus the parent conversation.
+    pub focus_pane_left: Option<KeybindingsSpec>,
+    /// Focus the open side conversation.
+    pub focus_pane_right: Option<KeybindingsSpec>,
+    /// Minimize the focused pane width.
+    pub minimize_pane_width: Option<KeybindingsSpec>,
+    /// Maximize the focused pane width.
+    pub maximize_pane_width: Option<KeybindingsSpec>,
+    /// Equalize visible pane widths.
+    pub equalize_pane_widths: Option<KeybindingsSpec>,
+    /// Enter keyboard resize mode for visible dividers.
+    pub resize_panes: Option<KeybindingsSpec>,
+    /// Move the divider left when the side pane has focus.
+    pub move_divider_left: Option<KeybindingsSpec>,
+    /// Move the divider right when the side pane has focus.
+    pub move_divider_right: Option<KeybindingsSpec>,
+    /// Zoom or restore the focused pane.
+    pub toggle_pane_zoom: Option<KeybindingsSpec>,
     /// Open the shared agent-session overview.
     pub open_agents: Option<KeybindingsSpec>,
     /// Open the transcript overlay.
@@ -209,6 +245,10 @@ pub struct TuiComposerKeymap {
     pub history_search_previous: Option<KeybindingsSpec>,
     /// Move to the next match in reverse history search.
     pub history_search_next: Option<KeybindingsSpec>,
+    /// Undo the last edit to the composer draft.
+    pub undo: Option<KeybindingsSpec>,
+    /// Redo an undone composer edit.
+    pub redo: Option<KeybindingsSpec>,
 }
 
 /// Editor context keybindings for text editing inside text areas.
@@ -448,6 +488,8 @@ pub struct TuiPagerKeymap {
     pub close_transcript: Option<KeybindingsSpec>,
     /// Find text in a transcript pager.
     pub find: Option<KeybindingsSpec>,
+    /// Mark Markdown structure under the caret in transcript selection mode.
+    pub mark_markdown: Option<KeybindingsSpec>,
 }
 
 /// List selection context keybindings for popup-style selectable lists.
@@ -480,6 +522,10 @@ pub struct TuiListKeymap {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiAgentsKeymap {
+    /// Select the first task in the next group.
+    pub next_group: Option<KeybindingsSpec>,
+    /// Select the first task in the previous group.
+    pub previous_group: Option<KeybindingsSpec>,
     /// Open the session resume picker.
     pub resume: Option<KeybindingsSpec>,
     /// Search the available agent tasks.

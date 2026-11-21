@@ -34,6 +34,7 @@ use wiremock::Respond;
 use wiremock::ResponseTemplate;
 use wiremock::http::HeaderName;
 use wiremock::http::HeaderValue;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
@@ -104,6 +105,19 @@ fn assert_turn_id(body: &Value, key: &str, expected: Option<&str>) -> Result<()>
 
 #[derive(Debug, Clone)]
 pub struct ResponsesRequest(wiremock::Request);
+
+pub async fn received_analytics_events(server: &MockServer, event_type: &str) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/codex/analytics-events/events")
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .flat_map(|payload| payload["events"].as_array().cloned().unwrap_or_default())
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
+}
 
 pub async fn received_responses_requests(server: &MockServer) -> Vec<ResponsesRequest> {
     server
@@ -298,6 +312,22 @@ impl ResponsesRequest {
             .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_audio"))
             .filter_map(|span| {
                 span.get("audio_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Returns all `input_audio` `file_id` spans from `message` inputs for the provided role.
+    pub fn message_input_audio_file_ids(&self, role: &str) -> Vec<String> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_audio"))
+            .filter_map(|span| {
+                span.get("file_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
@@ -1130,6 +1160,20 @@ where
     response_mock
 }
 
+/// Choose a response from the decoded request, including compressed requests.
+pub async fn mount_response_handler(
+    server: &MockServer,
+    respond: impl Fn(ResponsesRequest) -> ResponseTemplate + Send + Sync + 'static,
+) -> ResponseMock {
+    let (mock, requests) = base_mock();
+    mock.respond_with(move |request: &wiremock::Request| {
+        respond(ResponsesRequest(request.clone()))
+    })
+    .mount(server)
+    .await;
+    requests
+}
+
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
@@ -1230,6 +1274,19 @@ pub async fn start_mock_server() -> MockServer {
     server
 }
 
+/// Start a server for tests that serve Responses over HTTP/SSE only.
+/// A 404 on WebSocket upgrade triggers retries; 426 selects the HTTP fallback immediately.
+pub async fn start_sse_server() -> MockServer {
+    let server = start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .and(header("upgrade", "websocket"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// Starts a lightweight WebSocket server for `/v1/responses` tests.
 ///
 /// Each connection consumes a queue of request/event sequences. For each
@@ -1270,6 +1327,7 @@ pub async fn start_websocket_server_with_headers(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
             let accept_res = tokio::select! {
                 _ = &mut shutdown_rx => return,
@@ -1342,102 +1400,105 @@ pub async fn start_websocket_server_with_headers(
                 log.push(Vec::new());
                 log.len() - 1
             };
-            let close_after_requests = connection.close_after_requests;
-            let mut response_complete = false;
-            let mut batches = connection.requests.into_iter().peekable();
-            while let Some(request_events) = batches.peek() {
-                let message = tokio::select! {
-                    _ = &mut shutdown_rx => return,
-                    message = ws_stream.next() => message,
-                };
-                let Some(Ok(message)) = message else {
-                    break;
-                };
-                if let Some(body) = parse_ws_request_body(message) {
-                    let late_interrupt = response_complete && body["type"] == "response.interrupt";
-                    let mut log = requests.lock().unwrap();
-                    if let Some(connection_log) = log.get_mut(connection_index) {
-                        connection_log.push(WebSocketRequest { body });
-                        let request_index = connection_log.len() - 1;
-                        let request = &connection_log[request_index];
-                        let request_body = request.body_json();
-                        eprintln!(
-                            "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
-                            start.elapsed().as_millis(),
-                            connection_index,
-                            request_index,
-                            request_body.get("type").and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("role"))
-                                .and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("content"))
-                                .and_then(Value::as_array)
-                                .and_then(|content| content.first())
-                                .and_then(|content| content.get("text"))
-                                .and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("content"))
-                                .and_then(Value::as_array)
-                                .and_then(|content| content.first())
-                                .and_then(|content| content.get("data"))
-                                .and_then(Value::as_str),
-                        );
-                    }
-                    request_log.notify_waiters();
-                    // A late interrupt cannot consume the next response's script.
-                    if late_interrupt {
-                        continue;
-                    }
-                }
-
-                eprintln!(
-                    "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
-                    start.elapsed().as_millis(),
-                    connection_index,
-                    request_events.len(),
-                    request_events
-                        .iter()
-                        .map(|event| event.get("type").and_then(Value::as_str))
-                        .collect::<Vec<_>>(),
-                    request_events
-                        .iter()
-                        .find_map(|event| event.get("delta").and_then(Value::as_str)),
-                );
-                for event in request_events {
-                    let Ok(payload) = serde_json::to_string(event) else {
-                        continue;
+            let requests = Arc::clone(&requests);
+            let request_log = Arc::clone(&request_log);
+            let gates = Arc::clone(&gates);
+            let closed_tx = closed_tx.clone();
+            handlers.spawn(async move {
+                let close_after_requests = connection.close_after_requests;
+                let mut response_complete = false;
+                let mut batches = connection.requests.into_iter().peekable();
+                while let Some(request_events) = batches.peek() {
+                    let message = ws_stream.next().await;
+                    let Some(Ok(message)) = message else {
+                        break;
                     };
-                    let gate = gates.lock().unwrap().remove(&payload);
-                    if let Some(gate) = gate {
-                        tokio::select! {
-                            _ = &mut shutdown_rx => return,
-                            _ = gate => {},
+                    if let Some(body) = parse_ws_request_body(message) {
+                        let late_interrupt = response_complete && body["type"] == "response.interrupt";
+                        let mut log = requests.lock().unwrap();
+                        if let Some(connection_log) = log.get_mut(connection_index) {
+                            connection_log.push(WebSocketRequest { body });
+                            let request_index = connection_log.len() - 1;
+                            let request = &connection_log[request_index];
+                            let request_body = request.body_json();
+                            eprintln!(
+                                "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
+                                start.elapsed().as_millis(),
+                                connection_index,
+                                request_index,
+                                request_body.get("type").and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("role"))
+                                    .and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("content"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|content| content.first())
+                                    .and_then(|content| content.get("text"))
+                                    .and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("content"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|content| content.first())
+                                    .and_then(|content| content.get("data"))
+                                    .and_then(Value::as_str),
+                            );
+                        }
+                        request_log.notify_waiters();
+                        // A late interrupt cannot consume the next response's script.
+                        if late_interrupt {
+                            continue;
                         }
                     }
-                    if ws_stream.send(Message::Text(payload.into())).await.is_err() {
-                        break;
-                    }
-                    response_complete = matches!(
-                        event["type"].as_str(),
-                        Some("response.completed" | "response.incomplete" | "response.failed")
-                    );
-                }
-                batches.next();
-            }
 
-            if close_after_requests {
-                let _ = ws_stream.close(None).await;
-                closed_tx.send_modify(|count| *count += 1);
-            } else {
-                let _ = shutdown_rx.await;
-                return;
-            }
+                    eprintln!(
+                        "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
+                        start.elapsed().as_millis(),
+                        connection_index,
+                        request_events.len(),
+                        request_events
+                            .iter()
+                            .map(|event| event.get("type").and_then(Value::as_str))
+                            .collect::<Vec<_>>(),
+                        request_events
+                            .iter()
+                            .find_map(|event| event.get("delta").and_then(Value::as_str)),
+                    );
+                    for event in request_events {
+                        let Ok(payload) = serde_json::to_string(event) else {
+                            continue;
+                        };
+                        let gate = gates.lock().unwrap().remove(&payload);
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
+                        if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                        response_complete = matches!(
+                            event["type"].as_str(),
+                            Some("response.completed" | "response.incomplete" | "response.failed")
+                        );
+                    }
+                    batches.next();
+                }
+
+                if close_after_requests {
+                    let _ = ws_stream.close(None).await;
+                    closed_tx.send_modify(|count| *count += 1);
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            });
 
             if connections.lock().unwrap().is_empty() {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {},
+                    _ = handlers.join_all() => {},
+                }
                 return;
             }
         }

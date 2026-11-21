@@ -1,4 +1,4 @@
-//! Secondary OAuth credentials delivered alongside the provider's primary authentication.
+//! Gateway credentials and their delivery alongside the provider's primary authentication.
 
 use codex_client::CHATGPT_ACCOUNT_ID_HEADER;
 use std::fmt;
@@ -9,7 +9,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::CredentialExportConfig;
 use crate::ModelProviderInfo;
+use crate::OAuthCredentialsStore;
 
 // Reserve authentication, routing/framing, and internal protocol headers.
 const RESERVED_GATEWAY_OAUTH_HEADERS: &[&str] = &[
@@ -27,24 +29,55 @@ const RESERVED_GATEWAY_OAUTH_HEADER_PREFIXES: &[&str] =
     &["x-codex-", "x-openai-", "sec-websocket-"];
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(
+    untagged,
+    deny_unknown_fields,
+    expecting = "choose one gateway credential source: credential_export or OAuth settings (authorization_url, token_url, and client_id)"
+)]
+pub enum GatewayOAuthConfig {
+    OAuth(GatewayOAuthSettings),
+    Export {
+        /// Command that prints a gateway access token.
+        credential_export: CredentialExportConfig,
+        #[serde(default)]
+        delivery: GatewayOAuthDelivery,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct GatewayOAuthConfig {
+pub struct GatewayOAuthSettings {
     pub authorization_url: String,
+    /// Optional device endpoint used when the terminal cannot open a browser for gateway sign-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_authorization_url: Option<String>,
     pub token_url: String,
     pub client_id: String,
     pub resource: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     pub redirect_port: Option<u16>,
+    /// Where Codex stores this gateway's OAuth credentials. Defaults to the keyring-backed store.
+    #[serde(default, skip_serializing_if = "is_keyring")]
+    pub credentials_store: OAuthCredentialsStore,
     /// Omit to send the gateway token via the Authorization header
     #[serde(default)]
     pub delivery: GatewayOAuthDelivery,
 }
 
+// Preserve the serialized provider and model cache identity for the default store.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde passes a reference to skip_serializing_if predicates"
+)]
+fn is_keyring(store: &OAuthCredentialsStore) -> bool {
+    *store == OAuthCredentialsStore::Keyring
+}
+
 impl fmt::Debug for GatewayOAuthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayOAuthConfig")
-            .field("delivery", &self.delivery)
+            .field("delivery", self.delivery())
             .finish_non_exhaustive()
     }
 }
@@ -106,22 +139,52 @@ fn bearer_scheme() -> String {
 }
 
 impl GatewayOAuthConfig {
+    pub fn delivery(&self) -> &GatewayOAuthDelivery {
+        match self {
+            Self::OAuth(settings) => &settings.delivery,
+            Self::Export { delivery, .. } => delivery,
+        }
+    }
+
+    pub fn uses_credential_export(&self) -> bool {
+        matches!(self, Self::Export { .. })
+    }
+
     /// Send the gateway bearer only to the configured endpoint.
     pub fn requires_gateway_origin(&self) -> bool {
-        self.delivery.is_authorization_bearer()
+        self.delivery().is_authorization_bearer() || self.uses_credential_export()
     }
 
     pub(crate) fn validate(&self, provider: &ModelProviderInfo) -> Result<(), String> {
         if provider.aws.is_some() || provider.is_amazon_bedrock() {
             return Err("provider gateway_oauth cannot be combined with AWS authentication".into());
         }
-        validate_endpoint_url(&self.authorization_url, "gateway_oauth.authorization_url")?;
-        validate_endpoint_url(&self.token_url, "gateway_oauth.token_url")?;
         let base_url = provider
             .base_url
             .as_deref()
             .ok_or("gateway_oauth requires base_url")?;
         let gateway = validate_endpoint_url(base_url, "base_url")?;
+        match self {
+            Self::Export {
+                credential_export, ..
+            } => credential_export.validate("gateway_oauth.credential_export")?,
+            Self::OAuth(settings) => {
+                validate_endpoint_url(
+                    &settings.authorization_url,
+                    "gateway_oauth.authorization_url",
+                )?;
+                if let Some(url) = &settings.device_authorization_url {
+                    validate_endpoint_url(url, "gateway_oauth.device_authorization_url")?;
+                }
+                validate_endpoint_url(&settings.token_url, "gateway_oauth.token_url")?;
+                if settings.client_id.trim().is_empty() || settings.redirect_port == Some(0) {
+                    return Err(
+                        "gateway_oauth requires a nonempty client_id and a nonzero redirect_port"
+                            .into(),
+                    );
+                }
+            }
+        }
         if self.requires_gateway_origin()
             && let Some(catalog) = provider.model_catalog_url.as_deref()
             && validate_endpoint_url(catalog, "model_catalog_url")?.origin() != gateway.origin()
@@ -133,12 +196,7 @@ impl GatewayOAuthConfig {
                     .into(),
             );
         }
-        if self.client_id.trim().is_empty() || self.redirect_port == Some(0) {
-            return Err(
-                "gateway_oauth requires a nonempty client_id and a nonzero redirect_port".into(),
-            );
-        }
-        let gateway_header = if self.delivery.is_authorization_bearer() {
+        let gateway_header = if self.delivery().is_authorization_bearer() {
             if provider.is_gcp() {
                 return Err("Google Cloud uses the Authorization header for its own token. Remove gateway_oauth to use the built-in Google Cloud provider".into());
             }
@@ -156,7 +214,7 @@ impl GatewayOAuthConfig {
             }
             http::header::AUTHORIZATION
         } else {
-            self.delivery
+            self.delivery()
                 .secondary_header()
                 .map_err(|reason| format!("gateway_oauth.delivery {reason}"))?
         };

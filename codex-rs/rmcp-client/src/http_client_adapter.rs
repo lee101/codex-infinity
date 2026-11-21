@@ -15,14 +15,15 @@ use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::AuthProviderResolver;
 use bytes::Bytes;
-use codex_api::SharedAuthProvider;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
 use codex_exec_server::HttpHeader;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpResponseBodyStream;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -79,11 +80,13 @@ pub enum StreamableHttpRedirectMode {
 pub(crate) struct StreamableHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
-    auth_provider: Option<SharedAuthProvider>,
+    auth_provider: Option<Arc<dyn AuthProviderResolver>>,
     event_stream_cancellations: Arc<Mutex<HashMap<RequestId, oneshot::Sender<()>>>>,
     has_configured_headers: bool,
     redirect_mode: StreamableHttpRedirectMode,
     initialize_deadline: Arc<Mutex<Option<Instant>>>,
+    // The SDK sends handshakes on its worker without request metadata.
+    handshake_trace: Option<W3cTraceContext>,
 }
 
 struct EventStreamCancellation {
@@ -118,7 +121,7 @@ impl StreamableHttpClientAdapter {
     pub(crate) fn new(
         http_client: Arc<dyn HttpClient>,
         default_headers: HeaderMap,
-        auth_provider: Option<SharedAuthProvider>,
+        auth_provider: Option<Arc<dyn AuthProviderResolver>>,
         has_configured_headers: bool,
         redirect_mode: StreamableHttpRedirectMode,
         initialize_deadline: Arc<Mutex<Option<Instant>>>,
@@ -131,6 +134,7 @@ impl StreamableHttpClientAdapter {
             has_configured_headers,
             redirect_mode,
             initialize_deadline,
+            handshake_trace: crate::trace_context::current_w3c_trace_context(),
         }
     }
 
@@ -167,7 +171,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let has_session_id = session_id.is_some();
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers)?;
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -235,7 +239,17 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         };
 
         let body = serde_json::to_value(&message).map_err(StreamableHttpError::Deserialize)?;
-        let request_span = crate::trace_context::request_span(&body);
+        let handshake_trace = if is_discovery_request || mcp_method.as_deref() == Some("initialize")
+        {
+            self.handshake_trace.as_ref()
+        } else {
+            None
+        };
+        let request_span = crate::trace_context::request_span_and_trace_headers(
+            &body,
+            &mut headers,
+            handshake_trace,
+        );
         let body = serde_json::to_vec(&body).map_err(StreamableHttpError::Deserialize)?;
         let has_authorization_header = headers.contains_key(AUTHORIZATION);
 
@@ -464,7 +478,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers)?;
+        self.add_auth_headers(&mut headers).await?;
         if let Some(auth_token) = auth_token {
             insert_header(
                 &mut headers,
@@ -521,7 +535,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     > {
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers)?;
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -606,17 +620,21 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
 }
 
 impl StreamableHttpClientAdapter {
-    fn add_auth_headers(
+    async fn add_auth_headers(
         &self,
         headers: &mut HeaderMap,
     ) -> Result<(), StreamableHttpError<StreamableHttpClientAdapterError>> {
-        if let Some(auth_provider) = &self.auth_provider {
-            headers.extend(
-                auth_provider
-                    .to_auth_headers()
-                    .map_err(StreamableHttpClientAdapterError::from)
-                    .map_err(StreamableHttpError::Client)?,
-            );
+        if let Some(resolver) = &self.auth_provider {
+            let provider = resolver
+                .resolve(headers)
+                .await
+                .map_err(StreamableHttpClientAdapterError::from)
+                .map_err(StreamableHttpError::Client)?;
+            *headers = provider
+                .apply_auth_headers(std::mem::take(headers))
+                .await
+                .map_err(StreamableHttpClientAdapterError::from)
+                .map_err(StreamableHttpError::Client)?;
         }
         Ok(())
     }
@@ -792,10 +810,15 @@ fn mcp_redirect_policy(
     headers: &HeaderMap,
     has_configured_headers: bool,
 ) -> HttpRedirectPolicy {
-    if headers
-        .get(HEADER_MCP_PROTOCOL_VERSION)
-        .and_then(|value| value.to_str().ok())
-        == Some(ProtocolVersion::V_2026_07_28.as_str())
+    if headers.contains_key("x-openai-agent-assertion")
+        || headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("AgentAssertion "))
+        || headers
+            .get(HEADER_MCP_PROTOCOL_VERSION)
+            .and_then(|value| value.to_str().ok())
+            == Some(ProtocolVersion::V_2026_07_28.as_str())
         || (mode == StreamableHttpRedirectMode::AgentPluginV1
             && (has_configured_headers || headers.contains_key(AUTHORIZATION)))
     {

@@ -3,10 +3,30 @@
 use codex_api::AccessPrograms;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::turn_input::CyberAccessProgram;
+use std::sync::Arc;
+
+/// Host requirement for every model request issued by this thread.
+///
+/// Install in thread extension data before startup and reapply on cold resume.
+/// Core snapshots it before extension callbacks; it is not inherited or persisted.
+/// Every request must resolve to one listed program; backend authorization remains authoritative.
+#[derive(Clone, Debug)]
+pub struct RequiredCyberAccessPrograms {
+    pub allowed: Vec<CyberAccessProgram>,
+}
+
+pub(crate) struct RequiredCyberAccessProgramsSnapshot(pub Arc<RequiredCyberAccessPrograms>);
+
+impl RequiredCyberAccessPrograms {
+    /// Read Core's startup snapshot, independent of later edits to the public attachment.
+    pub fn for_thread(data: &codex_extension_api::ExtensionData) -> Option<Arc<Self>> {
+        data.get::<RequiredCyberAccessProgramsSnapshot>()
+            .map(|snapshot| Arc::clone(&snapshot.0))
+    }
+}
 
 /// Configured support for explicit Cyber programs on API-key requests.
 #[derive(Clone, Copy, Debug)]
@@ -19,9 +39,22 @@ pub enum ApiKeyCyberAccessPrograms {
 impl ApiKeyCyberAccessPrograms {
     /// Captures the same provider and feature policy used by ordinary model requests.
     pub fn from_config(config: &crate::config::Config) -> Self {
-        if config.model_provider_id != OPENAI_PROVIDER_ID {
+        Self::for_provider(
+            &config.model_provider,
+            &config.model_provider_id,
+            &config.features,
+        )
+    }
+
+    /// Resolves API-key policy for the provider that will receive the request.
+    pub fn for_provider(
+        provider: &codex_model_provider_info::ModelProviderInfo,
+        provider_id: &str,
+        features: &codex_features::Features,
+    ) -> Self {
+        if !provider.supports_cyber_access_programs(provider_id) {
             Self::UnsupportedProvider
-        } else if config.features.enabled(Feature::ApiKeyCyberAccessPrograms) {
+        } else if features.enabled(Feature::ApiKeyCyberAccessPrograms) {
             Self::Enabled
         } else {
             Self::Disabled
@@ -30,10 +63,14 @@ impl ApiKeyCyberAccessPrograms {
 }
 
 pub(crate) fn for_provider(
-    provider_id: &str,
+    config: &crate::config::Config,
     program: Option<CyberAccessProgram>,
 ) -> Option<CyberAccessProgram> {
-    program.filter(|_| provider_id == OPENAI_PROVIDER_ID)
+    program.filter(|_| {
+        config
+            .model_provider
+            .supports_cyber_access_programs(&config.model_provider_id)
+    })
 }
 
 /// Resolves an explicit program using the request's current authentication.
@@ -48,7 +85,7 @@ pub fn for_auth(
     let Some(auth) = auth else {
         return Ok(None);
     };
-    if auth.is_chatgpt_auth() {
+    if auth.is_chatgpt_auth() || matches!(auth, CodexAuth::Headers(_)) {
         return Ok(Some(program.into()));
     }
     if !auth.is_api_key_auth() {

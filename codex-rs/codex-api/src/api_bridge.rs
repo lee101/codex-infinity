@@ -11,6 +11,7 @@ use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::ConnectionFailedError;
+use codex_protocol::error::ProviderRejection;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
@@ -24,20 +25,28 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::Retryable { retry_after, .. }
         | ApiError::RateLimitExceeded { retry_after, .. }
         | ApiError::ServerOverloaded { retry_after }
+        | ApiError::PolicyCapacityUnavailable { retry_after }
         | ApiError::Transport(TransportError::Http { retry_after, .. }) => *retry_after,
         ApiError::Transport(_)
         | ApiError::Api { .. }
         | ApiError::Stream(_)
+        | ApiError::WebsocketMessageTooLarge
         | ApiError::ContentFilter
         | ApiError::ResponseIncomplete(_)
         | ApiError::ContextWindowExceeded
+        | ApiError::SpendLimitExceeded(_)
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
+        | ApiError::SessionBudgetExceeded
         | ApiError::FlexUnavailable
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
+        | ApiError::AccessProgramNotEnabled { .. }
+        | ApiError::InvalidAudioInput { .. }
         | ApiError::ModelNotFound { .. }
         | ApiError::InvalidPrompt { .. }
+        | ApiError::InferenceHookDenied { .. }
+        | ApiError::ContentPolicyViolation { .. }
         | ApiError::CyberPolicy { .. }
         | ApiError::BioPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. } => None,
@@ -52,18 +61,28 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 fn map_api_error_details(err: ApiError) -> CodexErr {
     match err {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
+        ApiError::SpendLimitExceeded(scope) => {
+            CodexErrorDetails::APISpendLimitExceeded(scope).into()
+        }
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+        ApiError::SessionBudgetExceeded => CodexErr::SessionBudgetExceeded,
         ApiError::Retryable { message, .. } => CodexErr::Stream(message),
         ApiError::RateLimitExceeded { message, .. } => {
             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
         }
         ApiError::Stream(msg) => CodexErr::Stream(msg),
+        ApiError::WebsocketMessageTooLarge => {
+            CodexErr::new(CodexErrorDetails::WebsocketMessageTooLarge)
+        }
         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
         ApiError::ResponseIncomplete(incomplete) => {
             CodexErr::new(CodexErrorDetails::ResponseIncomplete(incomplete))
         }
         ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+        ApiError::PolicyCapacityUnavailable { .. } => {
+            CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable)
+        }
         ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
@@ -79,11 +98,27 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ApiError::AccessProgramNotEnabled { message } => {
+            CodexErrorDetails::AccessProgramNotEnabled(ProviderRejection::Stream(message)).into()
+        }
+        ApiError::InvalidAudioInput {
+            message,
+            per_recording,
+        } => CodexErr::new(CodexErrorDetails::InvalidAudioInput {
+            message,
+            per_recording,
+        }),
         ApiError::ModelNotFound { message, status } => {
             CodexErr::new(CodexErrorDetails::ModelNotFound { message, status })
         }
         ApiError::InvalidPrompt { message } => {
             CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
+        }
+        ApiError::InferenceHookDenied { message } => {
+            CodexErr::new(CodexErrorDetails::InferenceHookDenied { message })
+        }
+        ApiError::ContentPolicyViolation { message, status } => {
+            CodexErrorDetails::ContentPolicyViolation { message, status }.into()
         }
         ApiError::CyberPolicy { message } => {
             CodexErr::new(CodexErrorDetails::CyberPolicy { message })
@@ -115,6 +150,9 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                     && let Some(error) = provider_error
                 {
                     match error.get("code").and_then(Value::as_str) {
+                        Some("policy_capacity_unavailable") => {
+                            return CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable);
+                        }
                         Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
                         Some("slow_down") => {
                             return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
@@ -229,8 +267,6 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                                 Some(
                                     "insufficient_quota"
                                         | "credit_balance_exhausted"
-                                        | "organization_spend_limit_exceeded"
-                                        | "project_spend_limit_exceeded"
                                         | "organization_usage_limit_exceeded"
                                 )
                             )
@@ -244,7 +280,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                         request_id: extract_request_tracking_id(headers.as_ref()),
                     })
                 } else {
-                    CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                    let response = UnexpectedResponseError {
                         status,
                         user_message: api_error_user_message(status, &body_text),
                         body: body_text,
@@ -256,7 +292,26 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                             X_OPENAI_AUTHORIZATION_ERROR_HEADER,
                         ),
                         identity_error_code: extract_x_error_json_code(headers.as_ref()),
-                    })
+                    };
+                    let body_code = parsed_body.as_ref().and_then(|body| {
+                        ["/detail/code", "/error/code"]
+                            .into_iter()
+                            .find_map(|path| body.pointer(path)?.as_str())
+                    });
+                    let code = body_code.or(response.identity_error_code.as_deref());
+                    match (status, code) {
+                        (
+                            http::StatusCode::FORBIDDEN,
+                            Some("invalid_workspace_selected" | "codex_workspace_access_denied"),
+                        ) => CodexErrorDetails::WorkspaceAccessDenied(response).into(),
+                        (http::StatusCode::FORBIDDEN, Some("access_program_not_enabled")) => {
+                            CodexErrorDetails::AccessProgramNotEnabled(ProviderRejection::Http(
+                                response,
+                            ))
+                            .into()
+                        }
+                        _ => CodexErr::UnexpectedStatus(response),
+                    }
                 }
             }
             TransportError::RetryLimit => CodexErr::RetryLimit(RetryLimitReachedError {

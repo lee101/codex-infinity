@@ -3,6 +3,22 @@ use crate::app_event::HistoryLookupResponse;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn host_switch_snapshot_preserves_buffered_typing() {
+    for typed in ["x", "several keys"] {
+        let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
+        chat.insert_str("draft ");
+        for ch in typed.chars() {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            chat.composer_draft_snapshot().text,
+            format!("draft {typed}")
+        );
+    }
+}
+
+#[tokio::test]
 async fn initial_prompt_recall_precedes_cross_session_history() {
     for submit_follow_up in [false, true] {
         let (mut chat, mut events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -305,6 +321,7 @@ async fn startup_submission_escape_restores_editing_without_submitting() {
 async fn startup_submission_waits_for_protected_view_and_preserves_paste_provenance() {
     for payload in [
         "  !echo hi\n# visible tail".to_string(),
+        "!echo hi\n# visible tail".to_string(),
         format!("!echo {}", "x".repeat(/*n*/ 1000)),
     ] {
         let (mut source, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -331,7 +348,7 @@ async fn startup_submission_waits_for_protected_view_and_preserves_paste_provena
         chat.input_queue.suppress_queue_autosend = false;
         chat.thread_id = Some(ThreadId::new());
         chat.restore_startup_input_when_ready(&mut draft, &mut confirmed);
-        if payload.starts_with(' ') {
+        if payload == "!echo hi\n# visible tail" {
             assert!(op_rx.try_recv().is_err());
             assert_eq!(chat.bottom_pane.composer_text(), payload);
             chat.handle_key_event(KeyCode::Enter.into());
@@ -339,7 +356,7 @@ async fn startup_submission_waits_for_protected_view_and_preserves_paste_provena
                 if command == payload.trim_start().trim_start_matches('!'));
         } else {
             assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { items, .. } if items == vec![UserInput::Text {
-                text: payload, text_elements: Vec::new(),
+                text: payload.trim().to_string(), text_elements: Vec::new(),
             }]);
         }
         assert_no_submit_op(&mut op_rx);

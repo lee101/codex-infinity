@@ -5,7 +5,6 @@ use super::managed_worktree_creation::check_background_terminals;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_event::ManagedWorktreeTransition;
-use crate::app_server_session::ForkGoalContinuation::DeferUntilNextTurn;
 use crate::history_cell::McpInventoryLoadingCell as LoadingCell;
 use crate::terminal_visualization_instructions::with_terminal_visualization_instructions;
 
@@ -264,6 +263,7 @@ impl App {
             if let Some(message) = check_background_terminals(
                 app_server,
                 &self.app_server_target,
+                &self.config.features,
                 tracked_ids.iter().copied(),
             )
             .await
@@ -391,7 +391,10 @@ impl App {
             return;
         }
         let local_settings = self.local_settings.reloaded(&config);
-        let keymap = match RuntimeKeymap::from_config(&local_settings.tui.keymap) {
+        let keymap = match RuntimeKeymap::for_session(
+            &local_settings.tui.keymap,
+            local_settings.workspace_enabled(&config),
+        ) {
             Ok(keymap) => keymap,
             Err(error) => return self.chat_widget.add_error_message(error),
         };
@@ -440,8 +443,13 @@ impl App {
                 }
             }
         }
-        if let Some(message) =
-            check_background_terminals(app_server, &self.app_server_target, tracked_ids).await
+        if let Some(message) = check_background_terminals(
+            app_server,
+            &self.app_server_target,
+            &self.config.features,
+            tracked_ids,
+        )
+        .await
         {
             return self.working_directory_error(message);
         }
@@ -449,13 +457,10 @@ impl App {
         let preserve_history = has_rollout && !is_new_worktree;
         let transitioned = if preserve_history {
             app_server
-                .fork_thread_at(
+                .fork_thread_for_directory_change(
                     &local_settings,
                     config.clone(),
                     thread_id,
-                    /*last_turn_id*/ None,
-                    /*before_turn_id*/ None,
-                    DeferUntilNextTurn,
                     selected_profile.as_ref(),
                 )
                 .await
@@ -467,6 +472,7 @@ impl App {
                     /*session_start_source*/ None,
                     /*remote_cwd_override*/ None,
                     selected_profile.as_ref(),
+                    /*host_project_cwd*/ None,
                 )
                 .await
         };
@@ -493,8 +499,13 @@ impl App {
                     == config.permissions.active_permission_profile()
         };
         if session.thread_id == thread_id
-            || crate::session_resume::cwds_differ(session.cwd.as_path(), cwd.as_path())
-            || session.runtime_workspace_roots != config.workspace_roots
+            || crate::session_resume::cwds_differ(&session.cwd.to_path_buf(), cwd.as_path())
+            || session.runtime_workspace_roots
+                != config
+                    .workspace_roots
+                    .iter()
+                    .map(codex_utils_path_uri::PathUri::from_abs_path)
+                    .collect::<Vec<_>>()
             || !permissions_match
         {
             if session.thread_id != thread_id {
@@ -626,19 +637,36 @@ impl App {
         self.keymap = keymap;
         self.merge_startup_warnings(tui, &history_cell::StartupWarningsCell::default());
         self.restore_runtime_theme_from_config();
+        if !app_server.uses_remote_workspace()
+            && !crate::uses_remote_workspace_or_environment(
+                &self.app_server_target,
+                &self.environment_manager,
+            )
+        {
+            self.backend_preference_context.local_cwd = Some(cwd.to_path_buf());
+        }
         self.runtime_working_directory_override = Some(cwd.to_path_buf());
         if let Some(message) = project_config_warning(&self.config) {
             self.chat_widget.add_warning_message(message);
         }
         let message = format!("Working directory changed to: {}", cwd.display());
         self.chat_widget.add_info_message(message, /*hint*/ None);
+        self.review_folder_hooks_after_attach(app_server, cwd.to_path_buf())
+            .await;
+        tui.frame_requester().schedule_frame();
+    }
+
+    pub(super) async fn review_folder_hooks_after_attach(
+        &mut self,
+        app_server: &AppServerSession,
+        cwd: PathBuf,
+    ) {
         if !self.config.bypass_hook_trust {
             let load_review = crate::startup_hooks_review::load_startup_hooks_review_entry;
-            let hooks = load_review(app_server.request_handle(), cwd.to_path_buf()).await;
+            let hooks = load_review(app_server.request_handle(), cwd).await;
             if hooks.hooks.iter().any(crate::hooks_rpc::hook_needs_review) {
                 self.chat_widget.open_hooks_browser(hooks);
             }
         }
-        tui.frame_requester().schedule_frame();
     }
 }

@@ -18,8 +18,6 @@ use rmcp::model::ElicitRequest;
 use rmcp::model::ElicitRequestParams;
 use rmcp::model::ElicitationSchema;
 use rmcp::model::Implementation;
-use rmcp::model::InitializeRequestParams;
-use rmcp::model::InitializeResult;
 use rmcp::model::InputRequest;
 use rmcp::model::InputRequiredResult;
 use rmcp::model::JsonObject;
@@ -48,11 +46,12 @@ struct TestToolServer {
     tools: Arc<Vec<Tool>>,
     resources: Arc<Vec<Resource>>,
     resource_templates: Arc<Vec<ResourceTemplate>>,
-    supports_openai_form_elicitation: Arc<AtomicBool>,
     tools_discovered: Arc<AtomicBool>,
     invalidated_listing: Arc<AtomicBool>,
 }
 
+const STATUSLINE_RECORD: &str = "MCP_TEST_STATUSLINE_RECORD";
+const STATUSLINE_URI: &str = "ui://fixture/footer";
 const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
 const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
@@ -61,6 +60,23 @@ const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
 const DYNAMIC_SERVER_METADATA_ENV: &str = "MCP_TEST_DYNAMIC_SERVER_METADATA";
 const INITIALIZE_BARRIER_FILE_ENV: &str = "MCP_TEST_INITIALIZE_BARRIER_FILE";
 const SERVER_INSTRUCTIONS_ENV: &str = "MCP_TEST_SERVER_INSTRUCTIONS";
+
+const LEASE_EVENTS_FILE_ENV: &str = "MCP_TEST_LEASE_EVENTS_FILE";
+
+/// Record only the lease protocol for the app-server unload regression.
+fn record_lease_event(method: &str, id: &serde_json::Value) -> Result<(), McpError> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os(LEASE_EVENTS_FILE_ENV) {
+        let event = serde_json::json!([method, id]);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{event}"))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    }
+    Ok(())
+}
 
 fn dynamic_server_process_label() -> Option<String> {
     std::env::var_os(DYNAMIC_SERVER_METADATA_ENV)
@@ -141,6 +157,15 @@ impl TestToolServer {
         );
         encrypted_output_tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
+        if std::env::var_os(STATUSLINE_RECORD).is_some() {
+            sandbox_meta_tool
+                .meta
+                .get_or_insert_with(MetaObject::new)
+                .insert(
+                    "openai/ui".to_owned(),
+                    json!({"entrypoints": [{"type": "statusline", "resourceUri": STATUSLINE_URI}]}),
+                );
+        }
         let mut tools = vec![
             Self::echo_tool(),
             Self::echo_dash_tool(),
@@ -188,7 +213,6 @@ impl TestToolServer {
             tools: Arc::new(tools),
             resources: Arc::new(resources),
             resource_templates: Arc::new(resource_templates),
-            supports_openai_form_elicitation: Arc::new(AtomicBool::new(false)),
             tools_discovered: Arc::default(),
             invalidated_listing: Arc::default(),
         }
@@ -515,28 +539,6 @@ struct ImageScenarioArgs {
 }
 
 impl ServerHandler for TestToolServer {
-    async fn initialize(
-        &self,
-        request: InitializeRequestParams,
-        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<InitializeResult, McpError> {
-        if let Ok(barrier_file) = std::env::var(INITIALIZE_BARRIER_FILE_ENV) {
-            while !std::path::Path::new(&barrier_file).is_file() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        }
-        self.supports_openai_form_elicitation.store(
-            request
-                .capabilities
-                .extensions
-                .as_ref()
-                .is_some_and(|extensions| extensions.contains_key("openai/form")),
-            Ordering::Relaxed,
-        );
-        context.peer.set_peer_info(request);
-        Ok(self.get_info())
-    }
-
     fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -548,6 +550,17 @@ impl ServerHandler for TestToolServer {
             JsonObject::new(),
         )]));
 
+        if std::env::var_os(LEASE_EVENTS_FILE_ENV).is_some() {
+            capabilities
+                .extensions
+                .get_or_insert_default()
+                .insert("codex/connection-lease".to_owned(), JsonObject::new());
+        } else if std::env::var_os("MCP_TEST_EXPERIMENTAL_LEASE_ONLY").is_some() {
+            capabilities
+                .experimental
+                .get_or_insert_default()
+                .insert("codex/connection-lease".to_owned(), JsonObject::new());
+        }
         let server_info = ServerConfig::new(capabilities);
         let server_info = match dynamic_server_process_label() {
             Some(process_label) => server_info
@@ -669,8 +682,45 @@ impl ServerHandler for TestToolServer {
     async fn read_resource(
         &self,
         ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        if uri == STATUSLINE_URI
+            && let Some(path) = std::env::var_os(STATUSLINE_RECORD)
+        {
+            use std::io::Write;
+            let state = context
+                .meta
+                .0
+                .0
+                .get("com.openai/codex-statusline-state")
+                .ok_or_else(|| McpError::invalid_params("missing statusline state", None))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| writeln!(file, "{state}"))
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let thread = state["thread"]["id"].as_str().unwrap_or_default();
+            let mode = state["app"]["display_mode"].as_str().unwrap_or_default();
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+                    uri,
+                    mime_type: Some("APPLICATION/JSON; charset=utf-8".into()),
+                    text: json!({"type":"text", "children":[format!("Provider thread {thread} ({mode})")]})
+                        .to_string(),
+                    meta: None,
+                }])
+                .into(),
+            );
+        }
+        if uri == "test://codex/request-metadata" {
+            let metadata = serde_json::Value::Object(context.meta.0.0);
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                metadata.to_string(),
+                uri,
+            )])
+            .into());
+        }
         if uri == MEMO_URI {
             Ok(
                 ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
@@ -689,11 +739,44 @@ impl ServerHandler for TestToolServer {
         }
     }
 
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, McpError> {
+        if std::env::var_os(LEASE_EVENTS_FILE_ENV).is_none()
+            || !matches!(
+                request.method.as_str(),
+                "codex/connection/open" | "codex/connection/release"
+            )
+            || !context
+                .client_capabilities()
+                .and_then(|caps| caps.extensions)
+                .is_some_and(|caps| caps.contains_key("codex/connection-lease"))
+        {
+            return Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        }
+        let id = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("leaseId"))
+            .ok_or_else(|| McpError::invalid_params("missing lease ID", None))?;
+        record_lease_event(&request.method, id)?;
+        Ok(rmcp::model::CustomResult(serde_json::json!({})))
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if let Some(lease) = context.meta.get("codex/connectionLease") {
+            record_lease_event("tools/call", lease)?;
+        }
         match request.name.as_ref() {
             "search_tools" if std::env::var_os("MCP_TEST_DISCOVER_TOOLS").is_some() => {
                 self.tools_discovered.store(true, Ordering::Release);
@@ -742,9 +825,10 @@ impl ServerHandler for TestToolServer {
                 }
             }
             "client_capabilities" => Ok(Self::structured_result(json!({
-                "supportsOpenaiFormElicitation": self
-                    .supports_openai_form_elicitation
-                    .load(Ordering::Relaxed),
+                "supportsOpenaiFormElicitation": context
+                    .client_capabilities()
+                    .and_then(|capabilities| capabilities.extensions)
+                    .is_some_and(|extensions| extensions.contains_key("openai/form")),
             }))),
             "sandbox_meta" | "get_codex_security_daybreak_access" | "get_daybreak_access" => Ok(
                 Self::structured_result(serde_json::Value::Object(context.meta.0.0)),
@@ -1135,6 +1219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run the server with STDIO transport. If the client disconnects we simply
     // bubble up the error so the process exits.
     let service = TestToolServer::new();
+    // Hold both server/discover and initialize behind the startup barrier.
+    if let Some(barrier_file) = std::env::var_os(INITIALIZE_BARRIER_FILE_ENV) {
+        while !std::path::Path::new(&barrier_file).is_file() {
+            sleep(Duration::from_millis(/*millis*/ 10)).await;
+        }
+    }
     let running = service.serve(stdio()).await?;
 
     // A test can close an initialized transport without killing an arbitrary PID.

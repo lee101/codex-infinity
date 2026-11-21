@@ -5,6 +5,7 @@ fn user_verification_server_request(thread_id: ThreadId, request_id: i64) -> Ser
     ServerRequest::McpServerElicitationRequest {
         request_id: AppServerRequestId::Integer(request_id),
         params: McpServerElicitationRequestParams {
+            environment_id: None,
             thread_id: thread_id.to_string(),
             turn_id: Some("turn-verification".to_string()),
             server_name: "deployments".to_string(),
@@ -40,7 +41,11 @@ async fn inactive_thread_user_verification_replays_queued_request_once() -> Resu
     let primary_thread_id = ThreadId::new();
     let side_thread_id = ThreadId::new();
     let thread_id = ThreadId::new();
-    let request = user_verification_server_request(thread_id, /*request_id*/ 11);
+    let mut request = user_verification_server_request(thread_id, /*request_id*/ 11);
+    let ServerRequest::McpServerElicitationRequest { params, .. } = &mut request else {
+        panic!("expected MCP elicitation request");
+    };
+    params.environment_id = Some("env-b".to_string());
 
     app.primary_thread_id = Some(primary_thread_id);
     app.active_thread_id = Some(side_thread_id);
@@ -95,7 +100,7 @@ async fn inactive_thread_user_verification_replays_queued_request_once() -> Resu
 
 #[tokio::test]
 async fn side_toggle_surfaces_pending_verification_from_an_inactive_thread() -> Result<()> {
-    Box::pin(async {
+    let check_return = async |hide: bool| -> Result<()> {
         let (mut app, _events, _ops) = make_test_app_with_channels().await;
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
@@ -116,6 +121,8 @@ async fn side_toggle_surfaces_pending_verification_from_an_inactive_thread() -> 
             ),
         );
         let mut tui = crate::tui::test_support::make_test_tui()?;
+        enable_side_retention(&mut app)?;
+        tui.set_owned_screen(/*owned*/ true)?;
         app.select_agent_thread(&mut tui, &mut app_server, side_thread_id)
             .await?;
         assert_eq!(app.active_thread_id, Some(side_thread_id));
@@ -134,17 +141,26 @@ async fn side_toggle_surfaces_pending_verification_from_an_inactive_thread() -> 
         .await?;
         assert!(!app.chat_widget.has_active_view());
 
-        app.toggle_side_conversation(&mut tui, &mut app_server)
-            .await?;
+        if hide {
+            app.hide_focused_side_pane(&mut tui, &mut app_server)
+                .await?;
+        } else {
+            app.toggle_side_conversation(&mut tui, &mut app_server)
+                .await?;
+        }
         assert_eq!(app.active_thread_id, Some(primary_thread_id));
-        assert!(app.chat_widget.has_active_view());
+        assert!(
+            app.chat_widget.has_active_view(),
+            "missing verification prompt after return (hide={hide})"
+        );
         assert!(
             render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Approve deployment?")
         );
         app_server.shutdown().await?;
         Ok(())
-    })
-    .await
+    };
+    Box::pin(check_return(/*hide*/ false)).await?;
+    Box::pin(check_return(/*hide*/ true)).await
 }
 
 #[tokio::test]
@@ -244,6 +260,7 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
                 foreground_thread_id.to_string(),
                 "turn-foreground".to_string(),
                 ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "message-foreground".to_string(),
                     text: "The foreground answer continues.".to_string(),
                     phase: None,
@@ -276,6 +293,7 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
                 inline_visualization_context,
                 scrollback_reflow,
                 deferred_history_cell,
+                ..
             } => {
                 completed_messages.push(source.clone());
                 app.handle_consolidate_agent_message(

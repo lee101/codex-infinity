@@ -41,16 +41,24 @@ impl App {
         }
     }
 
-    pub(super) fn open_daemon_menu(&mut self) {
+    pub(super) fn open_daemon_menu(&mut self, policy_error: Option<&str>) {
         let status = self
             .chat_widget
             .remote_connection
             .as_ref()
             .filter(|_| matches!(self.app_server_target, AppServerTarget::LocalDaemon { .. }))
-            .map(|connection| format!("Running daemon: {}", connection.version))
+            .map(|connection| {
+                format!(
+                    "Running daemon: {}",
+                    connection.version.as_deref().unwrap_or("unknown")
+                )
+            })
             .unwrap_or_else(|| "Not connected to the local background server.".to_string());
         let mut header = vec![Line::from("Daemon".bold()), Line::from(status.dim())];
-        let unavailable = if matches!(self.app_server_target, AppServerTarget::Remote { .. }) {
+        let unavailable = if matches!(
+            self.app_server_target,
+            AppServerTarget::Remote { .. } | AppServerTarget::Cloud
+        ) {
             Some(
                 "Manage this server on its host. Local daemon updates are unavailable for remote connections.",
             )
@@ -59,6 +67,10 @@ impl App {
         } else {
             None
         };
+        let updates_allowed = policy_error.is_none();
+        if let Some(error) = policy_error {
+            header.push(Line::from(error.to_owned().dim()));
+        }
         if let Some(guidance) = unavailable {
             header.push(Line::from(guidance.dim()));
         }
@@ -79,6 +91,7 @@ impl App {
             (DaemonUpdateSource::ThisCli, "Use this CLI build"),
         ]
         .into_iter()
+        .filter(|_| updates_allowed)
         .map(|(source, name)| SelectionItem {
             name: name.to_string(),
             is_disabled: unavailable.is_some(),
@@ -160,7 +173,10 @@ impl App {
         let Some(executable) = &self.daemon_cli_executable else {
             return;
         };
-        if matches!(self.app_server_target, AppServerTarget::Remote { .. }) {
+        if matches!(
+            self.app_server_target,
+            AppServerTarget::Remote { .. } | AppServerTarget::Cloud
+        ) {
             return;
         }
         let mut explanation = match source {

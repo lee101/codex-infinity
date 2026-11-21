@@ -64,22 +64,41 @@ impl Layout {
     }
 }
 
-pub(super) fn render(source: &str, display: bool) -> Option<String> {
+#[derive(Debug, PartialEq)]
+pub(super) struct RenderedMath {
+    pub(super) text: String,
+    /// Spatial layouts must fit in full, including single-row matrices.
+    pub(super) required_width: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MathMode {
+    Inline,
+    Display,
+    NestedDisplay,
+}
+
+pub(super) fn render(source: &str, mode: MathMode) -> Option<RenderedMath> {
     let mut parser = MathParser {
         remaining: source.trim(),
         depth: 0,
-        display,
-        stack_annotations: display,
+        mode,
+        stack_annotations: mode != MathMode::Inline,
+        has_matrix: false,
     };
     let result = parser.sequence(SequenceEnd::Input)?;
-    (!result.rows.iter().all(|row| row.trim().is_empty())).then(|| result.rows.join("\n"))
+    (!result.rows.iter().all(|row| row.trim().is_empty())).then(|| RenderedMath {
+        required_width: (parser.has_matrix || result.rows.len() > 1).then(|| result.width()),
+        text: result.rows.join("\n"),
+    })
 }
 
 struct MathParser<'a> {
     remaining: &'a str,
     depth: usize,
-    display: bool,
+    mode: MathMode,
     stack_annotations: bool,
+    has_matrix: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -213,6 +232,7 @@ impl MathParser<'_> {
             return match self.take()? {
                 ',' | ';' | ':' | ' ' => Some(Layout::text(" ")),
                 '!' => Some(Layout::text("")),
+                '%' => Some(Layout::text("%")),
                 '{' => Some(Layout::text("{")),
                 '}' => Some(Layout::text("}")),
                 '|' => Some(Layout::text("‖")),
@@ -222,16 +242,18 @@ impl MathParser<'_> {
         let name = &self.remaining[..length];
         self.remaining = &self.remaining[length..];
         match name {
-            "sum" | "bigwedge" if self.stack_annotations => {
-                self.display_operator(if name == "sum" { "∑" } else { "⋀" })
+            "sum" | "bigwedge" | "int"
+                if self.stack_annotations && (name != "int" || self.mode == MathMode::Display) =>
+            {
+                self.display_operator(symbol(name)?)
             }
-            "begin" | "boxed" | "underset" | "overset" | "substack" | "mathcal" => {
+            "begin" | "boxed" | "underset" | "overset" | "underbrace" | "substack" | "mathcal" => {
                 self.structured_command(name)
             }
             "frac" | "dfrac" | "tfrac" => {
                 let numerator = self.compact_argument()?;
                 let denominator = self.compact_argument()?;
-                if !self.display {
+                if self.mode == MathMode::Inline {
                     return Some(Layout::text(format!(
                         "(({})/({}))",
                         numerator.single()?,
@@ -282,7 +304,7 @@ impl MathParser<'_> {
                 };
                 Some(Layout::text(text))
             }
-            "hat" | "widehat" | "bar" | "tilde" | "vec" | "dot" | "ddot" => {
+            "hat" | "widehat" | "bar" | "tilde" | "widetilde" | "vec" | "dot" | "ddot" => {
                 let arg = self.argument()?;
                 let text = arg.single()?;
                 if text.graphemes(/*is_extended*/ true).count() != 1
@@ -294,7 +316,7 @@ impl MathParser<'_> {
                 let accent = match name {
                     "hat" | "widehat" => '\u{0302}',
                     "bar" => '\u{0304}',
-                    "tilde" => '\u{0303}',
+                    "tilde" | "widetilde" => '\u{0303}',
                     "vec" => '\u{20d7}',
                     "dot" => '\u{0307}',
                     "ddot" => '\u{0308}',

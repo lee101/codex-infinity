@@ -13,7 +13,8 @@ impl App {
             .chat_widget
             .remote_connection
             .as_ref()
-            .and_then(|connection| connection.version.strip_prefix('v'))
+            .and_then(|connection| connection.version.as_deref())
+            .and_then(|version| version.strip_prefix('v'))
             .map(str::to_owned);
         let _ = self.initialize_server_version_notice(client_version, server_version.as_deref());
     }
@@ -50,6 +51,7 @@ impl App {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .server_version_notice = server_version.and_then(|server| {
             let guidance = if matches!(self.app_server_target, AppServerTarget::LocalDaemon { .. })
+                && self.config.features.enabled(Feature::DaemonUpdates)
             {
                 " · /daemon"
             } else {

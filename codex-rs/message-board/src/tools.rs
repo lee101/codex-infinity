@@ -40,8 +40,10 @@ use serde_json::Value;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-// Includes JSON escaping and metadata; applies equally to direct and Code Mode calls.
-const MAX_RESPONSE_BYTES: usize = 8_000;
+/// Maximum size of a message-board tool's raw JSON arguments, in KiB.
+pub const MAX_TOOL_ARGUMENT_KIB: usize = 128;
+/// Maximum response size including JSON escaping and metadata, for direct and Code Mode calls.
+pub const MAX_TOOL_RESPONSE_BYTES: usize = 8_000;
 
 /// Creates only the selected tools, in the supplied order, without registering them.
 /// The caller and its path must come from the host's authoritative tree metadata.
@@ -58,8 +60,7 @@ pub fn message_board_tools(
 ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
     tools
         .iter()
-        .copied()
-        .map(|tool| {
+        .map(|&tool| {
             let name = tool.name();
             let tool_message = tool_messages.and_then(|tools| tools.by_name(name));
             if tool_message.is_some_and(|tool| tool.parameters.is_some()) {
@@ -69,10 +70,10 @@ pub fn message_board_tools(
                 );
             }
             Arc::new(BoardTool {
-                board: board.clone(),
                 caller,
                 caller_path: caller_path.clone(),
                 tool,
+                board: Arc::clone(&board),
                 namespace: namespace.map(str::to_owned),
                 namespace_description: namespace_description.to_owned(),
                 description: tool_message.and_then(|tool| tool.description.clone()),
@@ -82,10 +83,10 @@ pub fn message_board_tools(
 }
 
 struct BoardTool {
-    board: Arc<dyn AgentMessageBoard>,
     caller: ThreadId,
     caller_path: AgentPath,
     tool: MessageBoardTool,
+    board: Arc<dyn AgentMessageBoard>,
     namespace: Option<String>,
     namespace_description: String,
     description: Option<String>,
@@ -104,14 +105,8 @@ impl<'call> ToolExecutor<ToolCall<'call>> for BoardTool {
         )
     }
     fn supports_parallel_tool_calls(&self) -> bool {
-        matches!(
-            self.tool,
-            MessageBoardTool::GetChannels
-                | MessageBoardTool::ListThreads
-                | MessageBoardTool::SearchPosts
-                | MessageBoardTool::ReadThread
-                | MessageBoardTool::ReadPost
-        )
+        MessageBoardTool::READ_ONLY.contains(&self.tool)
+            || self.tool == MessageBoardTool::SubscribedChannels
     }
 
     fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
@@ -120,10 +115,12 @@ impl<'call> ToolExecutor<ToolCall<'call>> for BoardTool {
     {
         Box::pin(async move {
             let raw = call.function_arguments()?;
-            if raw.len() > 128 * 1024 {
-                return Err(model_error("message-board arguments exceed 128 KiB"));
+            if raw.len() > MAX_TOOL_ARGUMENT_KIB * 1024 {
+                return Err(model_error(format!(
+                    "message-board arguments exceed {MAX_TOOL_ARGUMENT_KIB} KiB"
+                )));
             }
-            let budget = call.response_byte_budget(MAX_RESPONSE_BYTES);
+            let budget = call.response_byte_budget(MAX_TOOL_RESPONSE_BYTES);
             let (result, success) = match self.execute(raw, &call, budget).await {
                 Ok(result) => (result, true),
                 Err(BoardToolError::Model(error)) => return Err(error),
@@ -152,7 +149,6 @@ impl BoardTool {
         call: &ToolCall<'_>,
         budget: usize,
     ) -> Result<Value, BoardToolError> {
-        let board = &self.board;
         let caller = self.caller;
         let page_limit = |limit: Option<NonZeroU32>| limit.map_or(20, NonZeroU32::get).min(50);
         let preview_limit =
@@ -168,6 +164,7 @@ impl BoardTool {
                 SortDirection::OldestFirst
             }
         };
+        let board = &self.board;
         match self.tool {
             MessageBoardTool::UpsertChannel => {
                 let request = serde_json::from_str(raw).map_err(model_error)?;
@@ -214,14 +211,21 @@ impl BoardTool {
                 } = serde_json::from_str(raw).map_err(model_error)?;
                 let limit = page_limit(limit);
                 bounded_read(budget, limit, |scale| {
-                    board.list_channels(
-                        caller,
-                        ChannelQuery {
-                            query: query.clone(),
-                            direction: direction(recent_first),
-                            page: page(limit, cursor.clone(), scale),
-                        },
-                    )
+                    let request = ChannelQuery {
+                        query: query.clone(),
+                        direction: direction(recent_first),
+                        page: page(limit, cursor.clone(), scale),
+                    };
+                    board.list_channels(caller, request)
+                })
+                .await
+            }
+            MessageBoardTool::SubscribedChannels => {
+                let arguments::SubscribedChannels { limit, cursor } =
+                    serde_json::from_str(raw).map_err(model_error)?;
+                let limit = page_limit(limit);
+                bounded_read(budget, limit, |scale| {
+                    board.subscribed_channels(caller, page(limit, cursor.clone(), scale))
                 })
                 .await
             }
@@ -237,16 +241,14 @@ impl BoardTool {
                 let limit = page_limit(limit);
                 let max_chars_per_post = preview_limit(max_chars_per_post);
                 bounded_read(budget, limit.max(max_chars_per_post), |scale| {
-                    board.list_threads(
-                        caller,
-                        ThreadQuery {
-                            channel_name: channel_name.clone(),
-                            sort: sort.unwrap_or(ThreadSort::Created),
-                            direction: direction(recent_first),
-                            max_chars_per_post: nonzero(max_chars_per_post / scale),
-                            page: page(limit, cursor.clone(), scale),
-                        },
-                    )
+                    let request = ThreadQuery {
+                        channel_name: channel_name.clone(),
+                        sort: sort.unwrap_or(ThreadSort::Created),
+                        direction: direction(recent_first),
+                        max_chars_per_post: nonzero(max_chars_per_post / scale),
+                        page: page(limit, cursor.clone(), scale),
+                    };
+                    board.list_threads(caller, request)
                 })
                 .await
             }
@@ -267,17 +269,15 @@ impl BoardTool {
                 let limit = page_limit(limit);
                 let max_chars_per_post = preview_limit(max_chars_per_post);
                 bounded_read(budget, limit.max(max_chars_per_post), |scale| {
-                    board.search_posts(
-                        caller,
-                        PostQuery {
-                            channel_name: channel_name.clone(),
-                            query: query.clone(),
-                            after_message_id,
-                            author: author.clone(),
-                            max_chars_per_post: nonzero(max_chars_per_post / scale),
-                            page: page(limit, cursor.clone(), scale),
-                        },
-                    )
+                    let request = PostQuery {
+                        channel_name: channel_name.clone(),
+                        query: query.clone(),
+                        after_message_id,
+                        author: author.clone(),
+                        max_chars_per_post: nonzero(max_chars_per_post / scale),
+                        page: page(limit, cursor.clone(), scale),
+                    };
+                    board.search_posts(caller, request)
                 })
                 .await
             }
@@ -291,14 +291,12 @@ impl BoardTool {
                 let limit = page_limit(limit);
                 let max_chars_per_post = preview_limit(max_chars_per_post);
                 bounded_read(budget, limit.max(max_chars_per_post), |scale| {
-                    board.read_thread(
-                        caller,
-                        ReadThreadRequest {
-                            thread_id,
-                            max_chars_per_post: nonzero(max_chars_per_post / scale),
-                            page: page(limit, cursor.clone(), scale),
-                        },
-                    )
+                    let request = ReadThreadRequest {
+                        thread_id,
+                        max_chars_per_post: nonzero(max_chars_per_post / scale),
+                        page: page(limit, cursor.clone(), scale),
+                    };
+                    board.read_thread(caller, request)
                 })
                 .await
             }
@@ -310,14 +308,12 @@ impl BoardTool {
                 } = serde_json::from_str(raw).map_err(model_error)?;
                 let limit_chars = limit_chars.map_or(20_000, NonZeroU32::get).min(20_000);
                 bounded_read(budget, limit_chars, |scale| {
-                    board.read_post(
-                        caller,
-                        ReadPostRequest {
-                            message_id,
-                            offset_chars: offset_chars.unwrap_or_default(),
-                            limit_chars: nonzero(limit_chars / scale),
-                        },
-                    )
+                    let request = ReadPostRequest {
+                        message_id,
+                        offset_chars: offset_chars.unwrap_or_default(),
+                        limit_chars: nonzero(limit_chars / scale),
+                    };
+                    board.read_post(caller, request)
                 })
                 .await
             }

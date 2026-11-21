@@ -1,6 +1,7 @@
 use crate::ConfigPathContext;
 use crate::ConfigRequirementsToml;
 use crate::ManagedHooksRequirementsToml;
+use crate::OtelRequirementsToml;
 use crate::RequirementSource;
 use crate::RequirementsExecPolicyToml;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -66,7 +67,7 @@ impl RequirementsLayerEntry {
             base_dir,
             path_context: _,
         } = self;
-        let toml = parse_layer_toml(&toml, &source)?;
+        let toml = parse_layer_toml(toml, &source)?;
         Ok((source, toml, base_dir))
     }
 }
@@ -99,7 +100,7 @@ impl ComposableRequirementsLayer {
             let _guard = base_dir
                 .as_ref()
                 .map(|base_dir| AbsolutePathBufGuard::new(base_dir.as_path()));
-            let mut regular_toml = parse_layer_toml(&toml, &source)?;
+            let mut regular_toml = parse_layer_toml(toml, &source)?;
 
             if matches!(source, RequirementSource::EnterpriseManaged { .. })
                 && regular_toml.get("config_server").is_some()
@@ -109,6 +110,58 @@ impl ComposableRequirementsLayer {
                     message: "config_server may only be configured in local managed requirements"
                         .into(),
                 });
+            }
+
+            if matches!(source, RequirementSource::EnterpriseManaged { .. })
+                && ["features", "feature_requirements"].into_iter().any(|key| {
+                    regular_toml
+                        .get(key)
+                        .and_then(|features| features.get("daemon_updates"))
+                        .is_some()
+                })
+            {
+                return Err(RequirementsCompositionError::Parse {
+                    layer_source: source.clone(),
+                    message: "features.daemon_updates may only be configured in local managed requirements".into(),
+                });
+            }
+
+            if let Some(otel) = regular_toml.get("otel")
+                && (otel.get("headers_helper").is_some()
+                    || otel.get("headers_helper_refresh_interval_ms").is_some())
+                && !matches!(
+                    source,
+                    RequirementSource::SystemRequirementsToml { .. }
+                        | RequirementSource::MdmManagedPreferences { .. }
+                )
+            {
+                return Err(RequirementsCompositionError::Parse {
+                    layer_source: source,
+                    message:
+                        "OTel headers helpers may only be configured in local managed requirements"
+                            .into(),
+                });
+            }
+
+            if let Some(command) = regular_toml
+                .get("otel")
+                .and_then(|otel| otel.get("headers_helper"))
+                .and_then(TomlValue::as_str)
+            {
+                let convention = path_context.as_ref().map_or_else(
+                    crate::path_context::convention,
+                    ConfigPathContext::convention,
+                );
+                if codex_utils_path_uri::PathUri::resolve_config_path_uri(
+                    command, convention, /*base*/ None, /*user_home_dir*/ None,
+                )
+                .is_err()
+                {
+                    return Err(RequirementsCompositionError::Parse {
+                        layer_source: source,
+                        message: "otel.headers_helper must be an absolute executable path in managed requirements".into(),
+                    });
+                }
             }
 
             // These fields can only be set locally; ignore them before validating cloud policy.
@@ -153,10 +206,17 @@ impl ComposableRequirementsLayer {
         {
             table.insert("features".to_string(), features);
         }
-        if let Some(table) = regular_toml.as_table_mut()
-            && let Some(network) = table.remove("experimental_network")
+        if let Some(legacy) = &requirements.network
+            && let Some(nested) = requirements
+                .permissions
+                .as_ref()
+                .and_then(|p| p.network.as_deref())
+            && !legacy.describes_same_policy(nested)
         {
-            table.insert("network_proxy".to_string(), network);
+            return Err(RequirementsCompositionError::Parse {
+                layer_source: source,
+                message: "legacy and permissions.network requirements must describe the same network policy".into(),
+            });
         }
 
         // Hostname lookup is configuration-driven and may block on DNS, so only
@@ -178,6 +238,7 @@ impl ComposableRequirementsLayer {
                 hooks: requirements.hooks,
                 permissions: requirements.permissions,
                 auto_review: requirements.auto_review,
+                otel: requirements.otel,
             },
         })
     }
@@ -189,22 +250,23 @@ pub(super) struct DomainMergedRequirementsFields {
     pub(super) hooks: Option<ManagedHooksRequirementsToml>,
     pub(super) permissions: Option<crate::config_requirements::PermissionsRequirementsToml>,
     pub(super) auto_review: Option<crate::config_requirements::AutoReviewRequirementsToml>,
+    pub(super) otel: Option<Box<OtelRequirementsToml>>,
 }
 
 fn parse_layer_toml(
-    toml: &RequirementsLayerToml,
+    toml: RequirementsLayerToml,
     source: &RequirementSource,
 ) -> Result<TomlValue, RequirementsCompositionError> {
     match toml {
         RequirementsLayerToml::String(contents) => {
-            toml::from_str(contents).map_err(|err: toml::de::Error| {
+            toml::from_str(&contents).map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::Parse {
                     layer_source: source.clone(),
                     message: err.to_string(),
                 }
             })
         }
-        RequirementsLayerToml::Value(value) => Ok(value.clone()),
+        RequirementsLayerToml::Value(value) => Ok(value),
     }
 }
 
@@ -285,6 +347,7 @@ fn toml_value_from_serializable<T: serde::Serialize>(
 fn strip_special_fields(layer_toml: &mut TomlValue) {
     remove_top_level_field(layer_toml, "rules");
     remove_top_level_field(layer_toml, "hooks");
+    remove_top_level_field(layer_toml, "otel");
     remove_nested_field_and_prune_empty(layer_toml, &["permissions", "filesystem", "deny_read"]);
     remove_nested_field_and_prune_empty(layer_toml, &["auto_review", "required_on_models"]);
 }
@@ -297,11 +360,14 @@ pub(crate) fn strip_cloud_auth_requirements(source: &RequirementSource, value: &
     }
 }
 
-fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue> {
+pub(super) fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue> {
     value.as_table_mut()?.remove(key)
 }
 
-fn remove_nested_field_and_prune_empty(value: &mut TomlValue, path: &[&str]) -> Option<TomlValue> {
+pub(super) fn remove_nested_field_and_prune_empty(
+    value: &mut TomlValue,
+    path: &[&str],
+) -> Option<TomlValue> {
     let (key, remaining) = path.split_first()?;
     let table = value.as_table_mut()?;
     if remaining.is_empty() {

@@ -547,6 +547,9 @@ def _normalized_schema_bundle_text(schema_dir: Path) -> str:
                 required.remove(field)
         for name, definition in definitions.items():
             if isinstance(definition, dict):
+                if name == "ReviewDelivery":
+                    # Preserve ReviewDelivery.inline when only one delivery mode remains.
+                    definition["x-enum-field-as-literal"] = False
                 if name == "CodexErrorInfo":
                     _normalize_open_ended_enum(definition)
                 _flatten_string_enum_one_of(definition)
@@ -602,22 +605,50 @@ def generate_v2_all(schema_dir: Path, *, format_output: bool = True) -> None:
             + (["--formatters", "ruff-format"] if format_output else []),
             cwd=sdk_root() if format_output else Path(td),
         )
-    _preserve_inline_image_class_names(out_path)
+    _preserve_inline_media_class_names(out_path)
     _add_legacy_image_generation_thread_item_alias(out_path)
     _preserve_open_enum(out_path, "CodexErrorInfoValue", allow_empty=True)
+    _preserve_open_enum(out_path, "DaybreakAvailability")
     _preserve_reasoning_effort_enum(out_path)
     _preserve_thread_source_enum(out_path)
     _preserve_open_enum(out_path, "PlanType")
     _normalize_generated_timestamps(out_path)
+    _add_answer_display_fallback(out_path)
 
 
-def _preserve_inline_image_class_names(out_path: Path) -> None:
-    """Keep the public class names used before ImageReference was introduced."""
+def _add_answer_display_fallback(out_path: Path) -> None:
+    """Keep items readable and restricted when their display instruction is unsupported."""
+    source = out_path.read_text()
+    header = "class AgentMessageModeration(BaseModel):"
+    if source.count(header) != 1:
+        raise RuntimeError("Generated SDK is missing a unique AgentMessageModeration class")
+    source = source.replace(
+        "from pydantic import ", "from pydantic import ValidationError, model_validator, ", 1
+    )
+    validator = """
+    @model_validator(mode="before")
+    @classmethod
+    def _read_display(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "moderated" not in data or data.get("display") is None:
+            return data
+        try:
+            return {**data, "display": AgentMessageDisplay.model_validate(data["display"])}
+        except ValidationError:
+            return {**data, "moderated": True, "display": None}
+"""
+    out_path.write_text(source.replace(header, header + "\n" + validator, 1))
+
+
+def _preserve_inline_media_class_names(out_path: Path) -> None:
+    """Keep the public inline class names used before file references were introduced."""
     source = out_path.read_text()
     stable_names = {
         "UrlUserInput": "ImageUserInput",
         "ImageUrlContentItem": "InputImageContentItem",
         "ImageUrlFunctionCallOutputContentItem": "InputImageFunctionCallOutputContentItem",
+        "UrlUserInput1": "AudioUserInput",
+        "AudioUrlContentItem": "InputAudioContentItem",
+        "AudioUrlFunctionCallOutputContentItem": "InputAudioFunctionCallOutputContentItem",
     }
     for generated_name, stable_name in stable_names.items():
         if source.count(f"class {generated_name}(") != 1:

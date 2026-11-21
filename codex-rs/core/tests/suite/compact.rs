@@ -24,6 +24,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AdditionalContextEntry;
+use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -53,6 +55,7 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_path_buf;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use core_test_support::responses::ev_assistant_message;
@@ -996,6 +999,139 @@ async fn manual_compact_uses_custom_prompt() {
     }
 }
 
+#[test_case::test_case(false; "local_messages")]
+#[test_case::test_case(true; "remote_tool_outputs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn additional_context_survives_compaction(remote: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (provider, summary) = if remote {
+        (
+            openai_model_provider(&server),
+            remote_v2_compaction_response(),
+        )
+    } else {
+        (
+            local_compaction_provider(&server),
+            sse(vec![
+                ev_assistant_message("summary", "Compacted."),
+                ev_completed("compact"),
+            ]),
+        )
+    };
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_completed("first")]),
+            sse(vec![ev_completed("second")]),
+            summary,
+            sse(vec![ev_completed("follow-up")]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = provider;
+            set_test_compact_prompt(config);
+            config
+                .features
+                .set_enabled(Feature::UntrustedAsToolOutput, remote)
+                .expect("set context tool-output format");
+            config
+                .features
+                .enable(Feature::RetainClientDeveloperMessages)
+                .expect("retain client developer messages");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    let untrusted = |value: &str| {
+        AdditionalContextEntry::new(value.to_owned(), AdditionalContextKind::Untrusted)
+    };
+    let mut context = BTreeMap::from([
+        ("page".to_owned(), untrusted("old selection")),
+        ("removed".to_owned(), untrusted("closed tab")),
+        (
+            "app".to_owned(),
+            AdditionalContextEntry::new("editor".to_owned(), AdditionalContextKind::Application),
+        ),
+    ]);
+    let submit = async |prompt: &str, context| -> Result<()> {
+        test.codex
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: prompt.to_owned(),
+                    text_elements: Vec::new(),
+                }])
+                .with_additional_context(context),
+            )
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        Ok(())
+    };
+    submit("first", context.clone()).await?;
+    context.remove("removed");
+    context.insert("page".to_owned(), untrusted("current selection"));
+    submit("second", context.clone()).await?;
+
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    submit("follow-up", context).await?;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 4);
+    let follow_up = &requests[3];
+    assert!(!follow_up.body_contains_text("closed tab"));
+    assert!(!follow_up.body_contains_text("old selection"));
+    let app_messages = follow_up
+        .message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text == "<app>editor</app>")
+        .collect::<Vec<_>>();
+    assert_eq!(app_messages, ["<app>editor</app>"]);
+    // The context belongs to the compacted window, before the preserved second prompt.
+    let input = follow_up.input();
+    let second_prompt = input
+        .iter()
+        .position(|item| item["content"][0]["text"] == "second")
+        .expect("preserved second prompt");
+    assert!(
+        input[..second_prompt]
+            .iter()
+            .any(|item| item["output"] == "current selection"
+                || item["content"][0]["text"]
+                    == "<external_page>current selection</external_page>")
+    );
+    if remote {
+        let page_outputs = follow_up
+            .inputs_of_type("function_call_output")
+            .into_iter()
+            .filter(|item| item["namespace"] == "agent" && item["name"] == "page")
+            .map(|item| item["output"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(page_outputs, [json!("current selection")]);
+    } else {
+        let page_messages = follow_up
+            .message_input_texts("user")
+            .into_iter()
+            .filter(|text| text.starts_with("<external_page>"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page_messages,
+            ["<external_page>current selection</external_page>"]
+        );
+    }
+    Ok(())
+}
+
 #[test_case::test_case(false; "success")]
 #[test_case::test_case(true; "failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1140,36 +1276,138 @@ async fn reasoning_effort_override_remote_v2_compaction_resets_pinned_effort(
     Ok(())
 }
 
-#[test_case::test_case(json!({"input_tokens": 120_000, "output_tokens": 30_000, "total_tokens": 150_000}); "reported_usage")]
-#[test_case::test_case(Value::Null; "missing_usage")]
+#[test_case::test_case(non_openai_model_provider, 403, json!({"detail": {"code": "invalid_workspace_selected"}}); "local workspace denial")]
+#[test_case::test_case(openai_model_provider, 403, json!({"detail": {"code": "invalid_workspace_selected"}}); "remote workspace denial")]
+#[test_case::test_case(non_openai_model_provider, 400, json!({"error": {"code": "content_policy_violation", "param": "input"}}); "local content policy denial")]
+#[test_case::test_case(openai_model_provider, 400, json!({"error": {"code": "content_policy_violation", "param": "input"}}); "remote content policy denial")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incomplete_response_during_compaction_is_terminal_and_counted(
-    reported_usage: Value,
+async fn explicit_denial_stops_compaction_on_model_downshift(
+    provider: fn(&MockServer) -> ModelProviderInfo,
+    status: u16,
+    body: Value,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
-    for (provider, expected_error) in [
+    let server = start_mock_server().await;
+    let previous = "gpt-5.4";
+    let selected = "gpt-5.2";
+    let model_provider = provider(&server);
+    let test = test_codex()
+        .with_model(previous)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_provider.stream_max_retries = Some(2);
+            config.model_catalog = Some(ModelsResponse {
+                models: vec![
+                    model_info_with_context_window(previous, /*context_window*/ 273_000),
+                    model_info_with_context_window(selected, /*context_window*/ 125_000),
+                ],
+            });
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("message", "First reply"),
+            ev_completed_with_tokens("first", /*total_tokens*/ 120_000),
+        ]),
+    )
+    .await;
+    test.submit_turn("first turn").await?;
+
+    let denied = responses::mount_response_handler(&server, move |_| {
+        wiremock::ResponseTemplate::new(status).set_body_json(&body)
+    })
+    .await;
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "continue on the smaller model",
+            test.cwd.path().to_path_buf(),
+            selected.to_string(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(denied.single_request().body_json()["model"], previous);
+    Ok(())
+}
+
+#[test_case::test_case(
+    json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "incomplete-compaction",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 120_000, "output_tokens": 30_000, "total_tokens": 150_000}
+        }
+    }),
+    "Incomplete response returned, reason: max_output_tokens",
+    CodexErrorInfo::Other,
+    270_000;
+    "incomplete_reported_usage"
+)]
+#[test_case::test_case(
+    json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "incomplete-compaction",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": null
+        }
+    }),
+    "Incomplete response returned, reason: max_output_tokens",
+    CodexErrorInfo::Other,
+    120_000;
+    "incomplete_missing_usage"
+)]
+#[test_case::test_case(
+    json!({
+        "type": "error",
+        "error": {"code": "inference_hook_denied", "message": "Blocked by the workspace hook."}
+    }),
+    "Blocked by the workspace hook.",
+    CodexErrorInfo::InferenceHookDenied,
+    120_000;
+    "inference_hook_denied_error"
+)]
+#[test_case::test_case(
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": "denied-compaction",
+            "error": {"code": "inference_hook_denied", "message": "Blocked by the workspace hook."}
+        }
+    }),
+    "Blocked by the workspace hook.",
+    CodexErrorInfo::InferenceHookDenied,
+    120_000;
+    "inference_hook_denied_response_failed"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_compaction_failure_preserves_usage_and_history(
+    failure_event: Value,
+    expected_error: &str,
+    expected_error_info: CodexErrorInfo,
+    expected_total_tokens: i64,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    for (provider, error_prefix) in [
         (
             non_openai_model_provider as fn(&MockServer) -> ModelProviderInfo,
-            "Incomplete response returned, reason: max_output_tokens",
+            "",
         ),
-        (
-            openai_model_provider,
-            "Error running remote compact task: Incomplete response returned, reason: max_output_tokens",
-        ),
+        (openai_model_provider, "Error running remote compact task: "),
     ] {
         let server = start_mock_server().await;
         let previous_model = "gpt-5.4";
         let selected_model = "gpt-5.2";
-        let incomplete = sse(vec![
-            ev_assistant_message("discarded", "DISCARDED_INCOMPLETE_SUMMARY"),
-            json!({
-                "type": "response.incomplete",
-                "response": {
-                    "id": "incomplete-compaction",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "usage": reported_usage
-                }
-            }),
+        let failure = sse(vec![
+            ev_assistant_message("discarded", "DISCARDED_FAILED_SUMMARY"),
+            failure_event.clone(),
         ]);
         let response_mock = mount_sse_sequence(
             &server,
@@ -1178,8 +1416,8 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
                     ev_assistant_message("initial", "Initial reply."),
                     ev_completed_with_tokens("initial", /*total_tokens*/ 120_000),
                 ]),
-                incomplete.clone(),
-                incomplete,
+                failure.clone(),
+                failure,
             ],
         )
         .await;
@@ -1210,7 +1448,7 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
         // includes request overhead that the local history estimate does not count.
         test.submit_turn(&"x".repeat(440_000)).await?;
         // A smaller selected model forces compaction with the previous model.
-        // An incomplete result must stop both retries and fallback to the selected model.
+        // A terminal failure must stop both retries and fallback to the selected model.
         test.codex
             .start_or_steer_turn(
                 TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1233,29 +1471,33 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
         let mut errors = Vec::new();
         wait_for_event(&test.codex, |event| {
             match event {
-                EventMsg::Error(error) => errors.push(error.message.clone()),
+                EventMsg::Error(error) => {
+                    errors.push((error.message.clone(), error.codex_error_info.clone()));
+                }
                 EventMsg::StreamError(value) => panic!("unexpected compaction retry: {value:?}"),
                 EventMsg::RawResponseCompleted(value) => {
-                    panic!("incomplete response marked complete: {value:?}")
+                    panic!("failed response marked complete: {value:?}")
                 }
                 _ => {}
             }
             matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
-        assert_eq!(errors, vec![expected_error]);
+        assert_eq!(
+            errors,
+            vec![(
+                format!("{error_prefix}{expected_error}"),
+                Some(expected_error_info.clone())
+            )]
+        );
         assert_eq!(
             test.codex
                 .token_usage_info()
                 .await
-                .expect("partial usage")
+                .expect("token usage")
                 .total_token_usage
                 .total_tokens,
-            if reported_usage.is_null() {
-                120_000
-            } else {
-                270_000
-            },
+            expected_total_tokens,
         );
         assert_eq!(
             response_mock
@@ -1286,7 +1528,7 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
         );
         assert!(!body_contains_text(
             &requests[2].body_json().to_string(),
-            "DISCARDED_INCOMPLETE_SUMMARY",
+            "DISCARDED_FAILED_SUMMARY",
         ));
     }
     Ok(())
@@ -1398,6 +1640,148 @@ async fn failed_compaction_preserves_history_after_restart() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(retained_items, original_items);
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_compaction_only_installs_and_bills_after_its_post_hook() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let responses = ["seed", "interrupted", "accepted"].map(|id| {
+        sse(vec![
+            ev_assistant_message(id, id),
+            ev_completed_with_tokens(id, /*total_tokens*/ 42),
+        ])
+    });
+    let model = mount_sse_sequence(&server, responses.to_vec()).await;
+    let hook_server = start_mock_server().await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let held = Arc::new(tokio::sync::Notify::new());
+    let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(gate);
+    core_test_support::hooks::mount_hook_mcp(&hook_server, "observer", &["pre", "post"], {
+        let calls = Arc::clone(&calls);
+        let held = Arc::clone(&held);
+        move |params| {
+            let input = &params["arguments"];
+            if input["kind"] == "foreground_compaction" {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((params["name"].clone(), input["response_id"].clone()));
+                if input["response_id"] == "interrupted" {
+                    held.notify_one();
+                    // Dropping the sender also releases the mock if an assertion fails.
+                    let _ = gate.lock().unwrap().recv();
+                }
+            }
+            json!({"content":[]})
+        }
+    })
+    .await;
+    let url = format!("{}/repl", hook_server.uri());
+    let provider = non_openai_model_provider(&server);
+    let accounting = Arc::new(super::rollout_budget::HostAccounting::default());
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(accounting.clone());
+    let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            let hook = |tool, input| {
+                json!([{ "hooks": [{
+                    "type": "mcp_tool",
+                    "server": "observer",
+                    "tool": tool,
+                    "input": input
+                }] }])
+            };
+            let config = json!({
+                "hooks": {
+                    "PreModelRequest": hook("pre", json!({ "kind": "${kind}" })),
+                    "PostModelRequest": hook("post", json!({
+                        "kind": "${kind}",
+                        "response_id": "${response_id}"
+                    }))
+                },
+                "mcp_servers": { "observer": {
+                    "url": url,
+                    "environment_id": super::rmcp_client::remote_aware_environment_id()
+                } }
+            });
+            fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+        })
+        .with_config(move |config| {
+            config.response_process_mode =
+                codex_config::config_toml::ResponseProcessMode::AfterCompleteResponse;
+            config.model_provider = provider;
+            set_test_compact_prompt(config);
+            trust_discovered_hooks(config);
+        })
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_turn("seed history").await?;
+    let charged_turns = || {
+        accounting
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.turn_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let seed_charges = charged_turns();
+    assert_eq!(seed_charges.len(), 1);
+
+    test.codex.submit(Op::Compact).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(15), held.notified()).await?;
+    test.codex.flush_rollout().await?;
+    let history = test.codex.load_history(/*include_archived*/ false).await?;
+    assert!(
+        !history
+            .items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::Compacted(_)))
+    );
+    assert_eq!(charged_turns(), seed_charges);
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    release.send(())?;
+
+    let accepted_turn = test.codex.submit(Op::Compact).await?;
+    wait_for_event(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(done) if done.turn_id == accepted_turn),
+    )
+    .await;
+    test.codex.flush_rollout().await?;
+    let history = test.codex.load_history(/*include_archived*/ false).await?;
+    let checkpoints: Vec<_> = history
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(checkpoint) => {
+                Some(checkpoint.compaction_response_id.as_deref())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checkpoints, [Some("accepted")]);
+    let mut expected_charges = seed_charges;
+    expected_charges.push(accepted_turn);
+    assert_eq!(charged_turns(), expected_charges);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            (json!("pre"), Value::Null),
+            (json!("post"), json!("interrupted")),
+            (json!("pre"), Value::Null),
+            (json!("post"), json!("accepted")),
+        ]
+    );
+    assert_eq!(model.requests().len(), 3);
     Ok(())
 }
 
@@ -3274,8 +3658,10 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     );
 }
 
+/// Only a recoverable compaction error can replay on the same or a different model.
+#[test_case::test_case("server_error", true; "transient")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are_exhausted() {
+async fn pre_sampling_compact_replays_only_recoverable_errors(code: &str, recoverable: bool) {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -3292,19 +3678,17 @@ async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are
     )
     .await;
 
-    let compaction_failure = sse_failed(
-        "compact-failure",
-        "server_error",
-        "previous-model compaction failed",
-    );
-    let request_log = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_assistant_message("m1", "before switch"),
-                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
-            ]),
-            compaction_failure.clone(),
+    let compaction_failure =
+        sse_failed("compact-failure", code, "previous-model compaction failed");
+    let mut responses = vec![
+        sse(vec![
+            ev_assistant_message("m1", "before switch"),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
+        ]),
+        compaction_failure.clone(),
+    ];
+    if recoverable {
+        responses.extend([
             compaction_failure.clone(),
             compaction_failure,
             remote_v2_compaction_response(),
@@ -3312,9 +3696,9 @@ async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are
                 ev_assistant_message("m3", "after switch"),
                 ev_completed_with_tokens("r3", /*total_tokens*/ 100),
             ]),
-        ],
-    )
-    .await;
+        ]);
+    }
+    let request_log = mount_sse_sequence(&server, responses).await;
 
     let mut model_provider = openai_model_provider(&server);
     model_provider.stream_max_retries = Some(2);
@@ -3348,6 +3732,15 @@ async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are
         ))
         .await
         .expect("submit selected-model turn");
+    if !recoverable {
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(request_log.requests().len(), 2);
+        return;
+    }
     assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
 
     let actual_models = request_log
@@ -3494,6 +3887,37 @@ async fn pre_sampling_compact_advised_errors_fall_back_then_retry_on_selected_mo
         expected_models.push(selected_model); // Sampling after compaction succeeds.
     }
     assert_eq!(actual_models, expected_models);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_local_compaction_retries_only_when_the_error_allows_it() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let overload = wiremock::ResponseTemplate::new(503)
+        .set_body_json(json!({ "error": { "code": "server_is_overloaded" } }));
+    for (failure, expected_requests) in [
+        (invalid_request_response("invalid compact input"), 1),
+        (overload.clone(), 1),
+        (overload.insert_header("Retry-After", "0"), 2),
+    ] {
+        let server = start_mock_server().await;
+        let requests = responses::mount_response_handler(&server, move |_| failure.clone()).await;
+        let mut provider = local_compaction_provider(&server);
+        provider.request_max_retries = Some(0);
+        provider.stream_max_retries = Some(1);
+        let test = test_codex()
+            .with_config(move |config| config.model_provider = provider)
+            .build_with_auto_env(&server)
+            .await?;
+
+        test.codex.submit(Op::Compact).await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(requests.requests().len(), expected_requests);
+    }
+    Ok(())
 }
 
 /// Manual compaction keeps the configured retry limit even when the server supplies advice.
@@ -4432,22 +4856,25 @@ async fn manual_compact_retries_after_context_window_error() {
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed("r1"),
     ]);
-    let compact_failed = sse_failed(
-        "resp-fail",
-        "context_length_exceeded",
-        CONTEXT_LIMIT_MESSAGE,
-    );
+    let compact_failed = wiremock::ResponseTemplate::new(/*s*/ 400).set_body_json(json!({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": CONTEXT_LIMIT_MESSAGE,
+            "param": "input",
+        }
+    }));
     let compact_succeeds = sse(vec![
         ev_assistant_message("m2", SUMMARY_TEXT),
         ev_completed("r2"),
     ]);
 
-    let request_log = mount_sse_sequence(
+    let request_log = mount_response_sequence(
         &server,
         vec![
-            user_turn.clone(),
-            compact_failed.clone(),
-            compact_succeeds.clone(),
+            sse_response(user_turn),
+            compact_failed,
+            sse_response(compact_succeeds),
         ],
     )
     .await;
@@ -4705,6 +5132,16 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let mail = json!({
+        "type": "agent_message", "id": "agent_pending-result",
+        "author": "/root/worker", "recipient": "/root",
+        "content": [{"type": "input_text", "text": "Message Type: FINAL_ANSWER\nThe worker found a release blocker."}],
+    });
+    codex
+        .inject_response_items(vec![serde_json::from_value(mail.clone()).unwrap()])
+        .await
+        .unwrap();
+
     codex.submit(Op::Compact).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -4730,6 +5167,11 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = responses_mock.requests();
+    assert_eq!(
+        responses::strip_metadata_from_json(json!(requests[2].inputs_of_type("agent_message"))),
+        json!([mail]),
+    );
+    assert!(requests[4].inputs_of_type("agent_message").is_empty());
     assert_eq!(
         requests.len(),
         5,
@@ -5590,8 +6032,18 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum ContinueThread {
+    Live,
+    Fork,
+    Restart,
+}
+
+#[test_case::test_case(ContinueThread::Live; "live")]
+#[test_case::test_case(ContinueThread::Fork; "fork")]
+#[test_case::test_case(ContinueThread::Restart; "cold resume")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compact_accounts_for_encrypted_reasoning() {
+async fn auto_compact_accounts_for_encrypted_reasoning(continuation: ContinueThread) {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -5629,26 +6081,53 @@ async fn auto_compact_accounts_for_encrypted_reasoning() {
     )
     .await;
 
-    let test = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_model_info_override("gpt-5.5", |model| {
-            model.use_responses_lite = true;
-        })
-        .with_config(|config| {
-            config.model = Some("gpt-5.5".to_string());
-            set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(81);
-        })
+    let builder = || {
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_model_info_override("gpt-5.5", |model| {
+                model.use_responses_lite = true;
+            })
+            .with_config(|config| {
+                config.model = Some("gpt-5.5".to_string());
+                set_test_compact_prompt(config);
+                config.model_auto_compact_token_limit = Some(81);
+            })
+    };
+    let mut test = builder()
         .build_with_auto_env(&server)
         .await
         .expect("build codex");
 
-    for user in [
-        "FIRST_REASONING",
-        "SECOND_REASONING",
-        "BELOW_COMPACT_LIMIT",
-        "AT_COMPACT_LIMIT",
-    ] {
+    for user in ["FIRST_REASONING", "SECOND_REASONING"] {
+        test.submit_text_turn(user).await.expect("submit user turn");
+    }
+
+    match continuation {
+        ContinueThread::Live => {}
+        ContinueThread::Restart => {
+            test = builder()
+                .restart_with_auto_env(&server, &test)
+                .await
+                .expect("restart");
+        }
+        ContinueThread::Fork => {
+            let path = test
+                .session_configured
+                .rollout_path
+                .clone()
+                .expect("rollout path");
+            let options = test.start_thread_options().await;
+            test.codex.shutdown_and_wait().await.expect("flush rollout");
+            test.codex = test
+                .thread_manager
+                .fork_legacy_thread(usize::MAX, options, path)
+                .await
+                .expect("fork")
+                .thread;
+        }
+    }
+
+    for user in ["BELOW_COMPACT_LIMIT", "AT_COMPACT_LIMIT"] {
         test.submit_text_turn(user).await.expect("submit user turn");
     }
 
@@ -5661,6 +6140,76 @@ async fn auto_compact_accounts_for_encrypted_reasoning() {
             .map(|request| request.inputs_of_type("compaction_trigger").len())
             .collect::<Vec<_>>(),
         vec![0, 0, 0, 1, 0],
+    );
+}
+
+#[test_case::test_case("response.incomplete", true, true; "incomplete_with_usage")]
+#[test_case::test_case("response.incomplete", false, true; "incomplete_without_usage")]
+#[test_case::test_case("response.completed", false, true; "completed_without_usage")]
+#[test_case::test_case("response.incomplete", false, false; "non_lite_incomplete_without_usage")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_accounts_for_unreported_reasoning(
+    event_type: &str,
+    with_usage: bool,
+    use_responses_lite: bool,
+) {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let mut responses = vec![sse(vec![
+        ev_assistant_message("initial", "Initial reply."),
+        ev_completed_with_tokens("initial", /*total_tokens*/ 80),
+    ])];
+    for id in ["partial-1", "partial-2"] {
+        let usage = with_usage.then(|| {
+            ev_completed_with_tokens(id, /*total_tokens*/ 15)["response"]["usage"].clone()
+        });
+        responses.push(sse(vec![
+            ev_reasoning_item(id, &["partial"], &[&"r".repeat(12_000)]),
+            json!({
+                "type": event_type,
+                "response": {
+                    "id": id,
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": usage
+                }
+            }),
+        ]));
+    }
+    responses.push(remote_v2_compaction_response());
+    responses.push(sse(vec![
+        ev_assistant_message("final", FINAL_REPLY),
+        ev_completed_with_tokens("final", /*total_tokens*/ 1),
+    ]));
+    let request_log = mount_sse_sequence(&server, responses).await;
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model_info_override("gpt-5.5", move |model| {
+            model.use_responses_lite = use_responses_lite;
+        })
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(5_000);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    for user in ["INITIAL", "PARTIAL_ONE", "PARTIAL_TWO", "CONTINUE"] {
+        test.submit_text_turn(user).await.expect("submit user turn");
+    }
+
+    // The saved count is 80. Each partial response retains about 3,000 tokens:
+    // one stays below the 5,000-token limit, but two must compact before CONTINUE.
+    assert_eq!(
+        request_log
+            .requests()
+            .iter()
+            .map(|request| request.inputs_of_type("compaction_trigger").len())
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 1, 0],
+        "retained reasoning must trigger compaction before the continuation request",
     );
 }
 

@@ -10,21 +10,25 @@ use crate::model::ConversationPart;
 use crate::model::ConversationRole;
 use crate::model::ExecutionStatus;
 use crate::model::ProducerRef;
+use crate::model::RolloutStatus;
 use crate::model::ToolCallKind;
 use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
 use crate::raw_event::RawTraceEventPayload;
+use crate::reducer::test_support::ROOT_THREAD_ID;
 use crate::reducer::test_support::append_inference_completion;
 use crate::reducer::test_support::append_inference_start;
 use crate::reducer::test_support::create_started_writer;
 use crate::reducer::test_support::expect_replay_error;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::start_thread;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::trace_context;
 use crate::replay_bundle;
 
 #[test]
-fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> anyhow::Result<()> {
+fn request_snapshots_reuse_history_across_reload_without_deduping_new_identical_items()
+-> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -36,6 +40,17 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
         }),
     )?;
     append_inference_start(&writer, "inference-1", "turn-1", first_request)?;
+
+    // Reload reopens the same logical thread, retaining its original start and history.
+    let before_reload = replay_bundle(temp.path())?;
+    writer.append(RawTraceEventPayload::ThreadEnded {
+        thread_id: "thread-root".to_string(),
+        status: RolloutStatus::Completed,
+    })?;
+    writer.append(RawTraceEventPayload::ThreadResumed {
+        thread_id: "thread-root".to_string(),
+    })?;
+    assert_eq!(replay_bundle(temp.path())?.threads, before_reload.threads);
     start_turn(&writer, "turn-2")?;
 
     let second_request = writer.write_json_payload(
@@ -93,6 +108,19 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
     );
 
     Ok(())
+}
+
+#[test]
+fn resume_from_an_earlier_trace_is_unsupported() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    writer.append(RawTraceEventPayload::ThreadResumed {
+        thread_id: "previous-trace-child".to_string(),
+    })?;
+    expect_replay_error(
+        &temp,
+        "resuming threads from an earlier trace is not supported",
+    )
 }
 
 #[test]
@@ -196,7 +224,10 @@ fn response_outputs_require_harness_acceptance() -> anyhow::Result<()> {
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::HistoryItemAccepted {
+            source_tool_call_id: None,
             item_id: "msg-accepted".into(),
+            agent_message_payload: None,
+            tool_output_payload: None,
         },
     )?;
 
@@ -522,6 +553,62 @@ fn request_reuses_prior_tool_outputs_with_internal_metadata() -> anyhow::Result<
         assert_eq!(rollout.conversation_items.len(), 2);
     }
 
+    Ok(())
+}
+
+#[test]
+fn tool_search_outputs_keep_the_evidence_for_each_version() -> anyhow::Result<()> {
+    let long_text = "prefix".repeat(340);
+    let a = json!(format!("{long_text}A"));
+    let b = json!(format!("{long_text}B"));
+    let null = json!(null);
+    for body_cap in [512, 8192] {
+        let (root, writer) = crate::writer::capture_tests::limited_trace(body_cap, 128 << 10)?;
+        start_thread(&writer, ROOT_THREAD_ID, "/root")?;
+        let mut requests = Vec::new();
+        for (index, (first, second)) in [
+            (&a, &null),
+            (&b, &null),
+            (&b, &null),
+            (&null, &b),
+            (&null, &null),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let turn = format!("turn-{index}");
+            start_turn(&writer, &turn)?;
+            let mut output = json!({"type": "tool_search_output", "call_id": "search", "tools": [
+                {"name": "one", "text": first}, {"name": "two", "text": second}
+            ]});
+            if index == 2 {
+                output["internal_chat_message_metadata_passthrough"] = json!({"text": a});
+            }
+            let request = writer
+                .write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input":[output]}))?;
+            assert_eq!(
+                request.is_complete(),
+                body_cap > long_text.len() || index == 4
+            );
+            requests.push(request.raw_payload_id.clone());
+            append_inference_start(&writer, &format!("inference-{index}"), &turn, request)?;
+        }
+        drop(writer);
+        let rollout = replay_bundle(root.path())?;
+        // A changed value or a moved missing slot gets its own evidence. An exact repeat
+        // reuses the first sighting, and genuine JSON nulls form a distinct observation.
+        for (index, source) in [0, 1, 1, 3, 4].into_iter().enumerate() {
+            let item_id =
+                &rollout.inference_calls[&format!("inference-{index}")].request_item_ids[0];
+            let [ConversationPart::Json { raw_payload_id, .. }] =
+                rollout.conversation_items[item_id].body.parts.as_slice()
+            else {
+                panic!("expected JSON tool-search output");
+            };
+            assert_eq!(raw_payload_id, &requests[source]);
+        }
+        assert_eq!(rollout.conversation_items.len(), 4);
+    }
     Ok(())
 }
 
@@ -1346,17 +1433,31 @@ fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> 
 
 #[test]
 fn late_tool_start_links_model_call_and_output_versions_in_order() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
+    late_tool_start_with_image_limit(/*body_limit*/ 2048)
+}
+
+#[test]
+fn missing_image_preserves_message_order_and_late_tool_links() -> anyhow::Result<()> {
+    late_tool_start_with_image_limit(/*body_limit*/ 512)
+}
+
+fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
+    let (temp, writer) =
+        crate::writer::capture_tests::limited_trace(body_limit, /*bundle*/ 64 << 10)?;
+    start_thread(&writer, ROOT_THREAD_ID, "/root")?;
     start_turn(&writer, "turn-1")?;
 
-    let request = writer.write_json_payload(
-        RawPayloadKind::InferenceRequest,
-        &json!({
-            // Cross the 9/10 item-ID boundary so lexical order differs from history order.
-            "input": vec![message("user", "run tests"); 7]
-        }),
-    )?;
+    // Cross the 9/10 item-ID boundary; one photo may be missing, but its message
+    // and every subsequent request, tool and output retain their original positions.
+    let mut input = vec![message("user", "run tests"); 6];
+    input.push(
+        json!({"type":"message", "id":"photo", "role":"user", "content":[
+        {"type":"input_text","text":"before"},
+        {"type":"input_image","image_url":format!("data:image/png;base64,{}", "x".repeat(1024))},
+        {"type":"input_text","text":"after"}]}),
+    );
+    let request =
+        writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input":input}))?;
     append_inference_start(&writer, "inference-1", "turn-1", request)?;
 
     let response = writer.write_json_payload(
@@ -1429,10 +1530,30 @@ fn late_tool_start_links_model_call_and_output_versions_in_order() -> anyhow::Re
         },
     )?;
 
+    drop(writer);
     let rollout = replay_bundle(temp.path())?;
     let first_inference = &rollout.inference_calls["inference-1"];
     let second_inference = &rollout.inference_calls["inference-2"];
     let tool_call = &rollout.tool_calls["tool-1"];
+    let photo = &rollout.conversation_items[&first_inference.request_item_ids[6]];
+    assert_eq!(photo.responses_item_id.as_deref(), Some("photo"));
+    let [
+        ConversationPart::Text { text: before },
+        ConversationPart::PayloadRef { raw_payload_id, .. },
+        ConversationPart::Text { text: after },
+    ] = photo.body.parts.as_slice()
+    else {
+        panic!("expected an image between its two text parts");
+    };
+    assert_eq!((before.as_str(), after.as_str()), ("before", "after"));
+    assert_eq!(
+        rollout.raw_payloads[raw_payload_id].is_complete(),
+        body_limit >= 1024
+    );
+    assert_eq!(
+        second_inference.request_item_ids[..7],
+        first_inference.request_item_ids
+    );
     let output_item_ids = &second_inference.request_item_ids[8..];
 
     assert_eq!(

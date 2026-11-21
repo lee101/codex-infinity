@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -6,13 +8,17 @@ use crate::model::CodeCellRuntimeStatus;
 use crate::model::ConversationItemKind;
 use crate::model::ExecutionStatus;
 use crate::model::ProducerRef;
+use crate::model::RolloutStatus;
 use crate::model::ToolCallKind;
 use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
 use crate::raw_event::RawToolCallRequester;
 use crate::raw_event::RawTraceEventPayload;
 use crate::reducer::test_support::append_inference_request;
+use crate::reducer::test_support::append_inference_start;
+use crate::reducer::test_support::append_inference_start_for_thread;
 use crate::reducer::test_support::create_started_writer;
+use crate::reducer::test_support::generic_summary;
 use crate::reducer::test_support::message;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::start_turn_for_thread;
@@ -21,7 +27,8 @@ use crate::reducer::test_support::trace_context_for_thread;
 use crate::replay_bundle;
 
 #[test]
-fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<()> {
+fn code_cell_lifecycle_links_nested_tools_and_outputs_without_inferring_legacy_wait()
+-> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -32,14 +39,7 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
             "input": [message("user", "count files")]
         }),
     )?;
-    writer.append(RawTraceEventPayload::InferenceStarted {
-        inference_call_id: "inference-1".to_string(),
-        thread_id: "thread-root".to_string(),
-        codex_turn_id: "turn-1".to_string(),
-        model: "gpt-test".to_string(),
-        provider_name: "test-provider".to_string(),
-        request_payload: request,
-    })?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
     let response = writer.write_json_payload(
         RawPayloadKind::InferenceResponse,
         &json!({
@@ -123,14 +123,7 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
             }]
         }),
     )?;
-    writer.append(RawTraceEventPayload::InferenceStarted {
-        inference_call_id: "inference-2".to_string(),
-        thread_id: "thread-root".to_string(),
-        codex_turn_id: "turn-2".to_string(),
-        model: "gpt-test".to_string(),
-        provider_name: "test-provider".to_string(),
-        request_payload: followup,
-    })?;
+    append_inference_start(&writer, "inference-2", "turn-2", followup)?;
     let wait_request = writer.write_json_payload(
         RawPayloadKind::ToolInvocation,
         &json!({
@@ -194,7 +187,8 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
     assert_eq!(cell.execution.status, ExecutionStatus::Completed);
     assert_eq!(cell.runtime_cell_id, Some("1".to_string()));
     assert_eq!(cell.nested_tool_call_ids, vec!["nested-tool-1"]);
-    assert_eq!(cell.wait_tool_call_ids, vec!["wait-tool-1"]);
+    // The legacy request alone does not establish that the host resolved a target.
+    assert!(cell.wait_tool_call_ids.is_empty());
     assert_eq!(cell.output_item_ids, vec![output_item_id.clone()]);
     assert_eq!(
         rollout.conversation_items[output_item_id].produced_by,
@@ -220,6 +214,22 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
     let mut input: Vec<_> = (0..7)
         .map(|index| message("user", &format!("context {index}")))
         .collect();
+    for (dispatch_id, call_id) in [("outer", "call-code"), ("no-cell", "other-exec")] {
+        writer.append_with_context(
+            trace_context("turn-1"),
+            RawTraceEventPayload::ToolCallStarted {
+                tool_call_id: dispatch_id.into(),
+                model_visible_call_id: Some(call_id.into()),
+                code_mode_runtime_tool_id: None,
+                requester: RawToolCallRequester::Model,
+                kind: ToolCallKind::Other {
+                    name: "exec".into(),
+                },
+                summary: generic_summary("exec"),
+                invocation_payload: None,
+            },
+        )?;
+    }
     append_inference_request(
         &writer,
         "thread-root",
@@ -306,6 +316,11 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
     let cell = &rollout.code_cells[&code_cell_id];
 
     assert_eq!(
+        rollout.tool_calls["outer"].started_code_cell_id.as_ref(),
+        Some(&cell.code_cell_id)
+    );
+    assert_eq!(rollout.tool_calls["no-cell"].started_code_cell_id, None);
+    assert_eq!(
         cell.output_item_ids,
         vec!["conversation_item:9", "conversation_item:12"]
     );
@@ -345,14 +360,7 @@ fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
             "input": [message("user", "count files")]
         }),
     )?;
-    writer.append(RawTraceEventPayload::InferenceStarted {
-        inference_call_id: "inference-1".to_string(),
-        thread_id: "thread-root".to_string(),
-        codex_turn_id: "turn-1".to_string(),
-        model: "gpt-test".to_string(),
-        provider_name: "test-provider".to_string(),
-        request_payload: request,
-    })?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
     let response = writer.write_json_payload(
         RawPayloadKind::InferenceResponse,
         &json!({
@@ -399,17 +407,15 @@ fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
 }
 
 #[test]
-fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
+fn runtime_code_cell_ids_can_repeat_across_threads_and_after_resume() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
+    let writer = Arc::new(create_started_writer(&temp)?);
+    let mut pending_dispatches = Vec::new();
     writer.append(RawTraceEventPayload::ThreadStarted {
         thread_id: "thread-child".to_string(),
         agent_path: "/root/child".to_string(),
         metadata_payload: None,
     })?;
-    start_turn_for_thread(&writer, "thread-root", "turn-root")?;
-    start_turn_for_thread(&writer, "thread-child", "turn-child")?;
-
     for (thread_id, turn_id, inference_call_id, call_id) in [
         ("thread-root", "turn-root", "inference-root", "call-root"),
         (
@@ -418,21 +424,30 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
             "inference-child",
             "call-child",
         ),
+        (
+            "thread-child",
+            "turn-resumed",
+            "inference-resumed",
+            "call-resumed",
+        ),
     ] {
+        if turn_id == "turn-resumed" {
+            writer.append(RawTraceEventPayload::ThreadEnded {
+                thread_id: thread_id.to_string(),
+                status: RolloutStatus::Completed,
+            })?;
+            writer.append(RawTraceEventPayload::ThreadResumed {
+                thread_id: thread_id.to_string(),
+            })?;
+        }
+        start_turn_for_thread(&writer, thread_id, turn_id)?;
         let request = writer.write_json_payload(
             RawPayloadKind::InferenceRequest,
             &json!({
                 "input": [message("user", "run code")]
             }),
         )?;
-        writer.append(RawTraceEventPayload::InferenceStarted {
-            inference_call_id: inference_call_id.to_string(),
-            thread_id: thread_id.to_string(),
-            codex_turn_id: turn_id.to_string(),
-            model: "gpt-test".to_string(),
-            provider_name: "test-provider".to_string(),
-            request_payload: request,
-        })?;
+        append_inference_start_for_thread(&writer, thread_id, turn_id, inference_call_id, request)?;
         writer.append_with_context(
             trace_context_for_thread(thread_id, turn_id),
             RawTraceEventPayload::CodeCellStarted {
@@ -441,10 +456,46 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
                 source_js: "text('hi')".to_string(),
             },
         )?;
+        let waits: &[(&str, Option<&str>, &str)] = match turn_id {
+            "turn-root" => &[("rejected", None, "{")],
+            "turn-child" => &[
+                ("confirmed", None, r#"{"cell_id":"1"}"#),
+                ("late", None, r#"{"cell_id":"1"}"#),
+            ],
+            _ => &[("foreign", Some("fixture"), r#"{"cell_id":"1"}"#)],
+        };
+        for &(wait_id, namespace, arguments) in waits {
+            let dispatch = crate::ToolDispatchTraceContext::start(
+                Arc::clone(&writer),
+                crate::ToolDispatchInvocation {
+                    thread_id: thread_id.into(),
+                    codex_turn_id: turn_id.into(),
+                    tool_call_id: wait_id.into(),
+                    tool_name: "wait".into(),
+                    tool_namespace: namespace.map(str::to_owned),
+                    requester: crate::ToolDispatchRequester::Model {
+                        model_visible_call_id: wait_id.into(),
+                    },
+                    payload: crate::ToolDispatchPayload::Function {
+                        arguments: arguments.into(),
+                    },
+                },
+            );
+            if wait_id == "rejected" {
+                dispatch.record_failed("invalid wait arguments");
+                continue;
+            }
+            // Replay these dispatches while they are still pending.
+            pending_dispatches.push(dispatch);
+            if wait_id == "confirmed" {
+                crate::CodeCellTraceContext::enabled(Arc::clone(&writer), thread_id, turn_id, "1")
+                    .record_wait_target(wait_id);
+            }
+        }
         let response = writer.write_json_payload(
             RawPayloadKind::InferenceResponse,
             &json!({
-                "response_id": format!("resp-{thread_id}"),
+                "response_id": format!("resp-{turn_id}"),
                 "output_items": [{
                     "type": "custom_tool_call",
                     "name": "exec",
@@ -455,10 +506,15 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
         )?;
         writer.append(RawTraceEventPayload::InferenceCompleted {
             inference_call_id: inference_call_id.to_string(),
-            response_id: Some(format!("resp-{thread_id}")),
+            response_id: Some(format!("resp-{turn_id}")),
             upstream_request_id: None,
             response_payload: response,
         })?;
+        if turn_id == "turn-resumed" {
+            // The pre-resume wait is confirmed after the new cell has reused its handle.
+            crate::CodeCellTraceContext::enabled(Arc::clone(&writer), thread_id, "turn-child", "1")
+                .record_wait_target("late");
+        }
         writer.append_with_context(
             trace_context_for_thread(thread_id, turn_id),
             RawTraceEventPayload::CodeCellEnded {
@@ -472,9 +528,14 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
     let rollout = replay_bundle(temp.path())?;
     let root_cell_id = test_reduced_code_cell_id("call-root");
     let child_cell_id = test_reduced_code_cell_id("call-child");
+    let resumed_cell_id = test_reduced_code_cell_id("call-resumed");
 
     assert_eq!(rollout.code_cells[&root_cell_id].thread_id, "thread-root");
     assert_eq!(rollout.code_cells[&child_cell_id].thread_id, "thread-child");
+    assert_eq!(
+        rollout.code_cells[&resumed_cell_id].thread_id,
+        "thread-child"
+    );
     assert_eq!(
         rollout.code_cells[&root_cell_id].runtime_cell_id,
         Some("1".to_string())
@@ -483,6 +544,41 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
         rollout.code_cells[&child_cell_id].runtime_cell_id,
         Some("1".to_string())
     );
+    assert_eq!(
+        rollout.code_cells[&resumed_cell_id].runtime_cell_id,
+        Some("1".to_string())
+    );
+    assert_eq!(
+        rollout.code_cells[&child_cell_id].wait_tool_call_ids,
+        ["confirmed"]
+    );
+    assert!(
+        rollout.code_cells[&root_cell_id]
+            .wait_tool_call_ids
+            .is_empty()
+    );
+    assert!(
+        rollout.code_cells[&resumed_cell_id]
+            .wait_tool_call_ids
+            .is_empty()
+    );
+    for id in ["confirmed", "late"] {
+        assert_eq!(
+            rollout.tool_calls[id]
+                .resolved_wait_runtime_cell_id
+                .as_deref(),
+            Some("1")
+        );
+    }
+    assert!(
+        rollout.tool_calls["confirmed"]
+            .execution
+            .ended_seq
+            .is_none()
+    );
+    for id in ["rejected", "foreign"] {
+        assert_eq!(rollout.tool_calls[id].resolved_wait_runtime_cell_id, None);
+    }
 
     Ok(())
 }

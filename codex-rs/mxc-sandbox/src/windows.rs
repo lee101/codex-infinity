@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::ensure;
 use codex_utils_path_uri::PathUri;
-use mxc_sdk::mxc_common::filesystem_object::ExistingObjectComparison;
-use mxc_sdk::mxc_common::filesystem_object::compare_existing_filesystem_objects;
 use windows_sys::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
@@ -32,7 +31,17 @@ impl Drop for ComUninitializeGuard {
     }
 }
 
+pub(super) fn log_launch(event: impl std::fmt::Display) {
+    let pid = std::process::id();
+    codex_windows_sandbox::log_runtime_note(&format!("MXC pid={pid} {event}"));
+}
+
 pub(super) fn run() -> Result<i32> {
+    if let Some(codex_home) = std::env::args_os().nth(2) {
+        codex_windows_sandbox::init_runtime_log(Path::new(&codex_home));
+    }
+    log_launch("phase=prepare_request");
+    let preparing = Instant::now();
     ensure!(
         crate::is_available(),
         "native MXC is unavailable on this Windows build"
@@ -53,10 +62,20 @@ pub(super) fn run() -> Result<i32> {
     // Serde errors can quote arbitrary payload values; do not print them to stderr.
     let command = crate::transport::decode(&mut env)
         .map_err(|_| anyhow::anyhow!("invalid MXC launcher request"))?;
-    // The transport itself proves this is an explicit child environment; it
-    // may intentionally contain no variables once launcher state is removed.
+    let kind = match command.command.as_slice() {
+        [_, arg] if arg == "--codex-run-as-fs-helper" => "fs_helper",
+        _ => "command",
+    };
+    log_launch(format_args!("phase=prepare_volumes kind={kind}"));
     let command_cwd = std::env::current_dir()?;
     let volumes = volume_roots(&command.sandbox_policy_cwd, &command_cwd)?;
+    let volume_count = volumes.len();
+    log_launch(format_args!(
+        "phase=prepare_known_folders volumes={volume_count}"
+    ));
+    let platform_roots = platform_read_roots()?;
+    // The transport itself proves this is an explicit child environment; it
+    // may intentionally contain no variables once launcher state is removed.
     let request = crate::policy::build_request(
         &command,
         &command_cwd,
@@ -64,9 +83,11 @@ pub(super) fn run() -> Result<i32> {
             .map(|(key, value)| format!("{key}={value}"))
             .collect(),
         &volumes,
-        &platform_read_roots()?,
+        &platform_roots,
     )?;
-    crate::native::launch(&request)
+    let prep_ms = preparing.elapsed().as_millis();
+    log_launch(format_args!("phase=spawn prep_ms={prep_ms}"));
+    crate::native::launch(request)
 }
 
 pub(super) fn volume_roots(
@@ -92,8 +113,8 @@ pub(super) fn volume_roots(
     Ok(volumes)
 }
 
-// Omit only implicit network roots whose object identity MXC cannot inspect.
-// Keep healthy shares and cwd volumes; explicit grants follow the normal path.
+// Default reads cover local volumes and cwd shares, not unrelated network shares.
+// Explicit grants follow the normal policy path.
 pub(super) fn implicit_read_roots(
     volume_roots: &[PathBuf],
     policy_cwd: &Path,
@@ -111,7 +132,6 @@ pub(super) fn implicit_read_roots(
             drive_type != DRIVE_REMOTE
                 || policy_cwd.starts_with(root)
                 || command_cwd.starts_with(root)
-                || compare_existing_filesystem_objects(root, root) == ExistingObjectComparison::Same
         })
         .map(PathUri::from_host_native_path)
         .collect()

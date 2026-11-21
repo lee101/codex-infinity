@@ -73,6 +73,9 @@ pub(crate) fn skill_tools(
         .get::<SkillsSessionState>()
         .and_then(|state| state.mcp_resources.clone());
     let analytics = SkillAnalytics::from_stores(session_store, thread_store);
+    let metrics = step_store
+        .get::<Arc<dyn ExtensionMetrics>>()
+        .map(|metrics| Arc::clone(metrics.as_ref()));
     let context = SkillToolContext {
         thread_id: thread_store.level_id().to_string(),
         providers,
@@ -87,10 +90,14 @@ pub(crate) fn skill_tools(
         }),
         Arc::new(read::ReadTool {
             context: context.clone(),
+            metrics: metrics.clone(),
         }),
     ];
     if context.step_state.discovery_v2 {
-        tools.push(Arc::new(installations::InstallationsTool { context }));
+        tools.push(Arc::new(installations::InstallationsTool {
+            context,
+            metrics,
+        }));
     }
     tools
 }
@@ -217,7 +224,7 @@ impl SkillToolContext {
     fn matching_packages<'a>(
         &'a self,
         package: &SkillLocator,
-    ) -> Vec<(&'a SkillCatalogEntry, SkillSourceLocation)> {
+    ) -> Result<Vec<(&'a SkillCatalogEntry, SkillSourceLocation)>, FunctionCallError> {
         let catalog = &self.step_state.catalog.merged;
         let matching_entries = |resolved_package: &str, alias_source: Option<&SkillSourceKind>| {
             catalog
@@ -236,14 +243,40 @@ impl SkillToolContext {
                 })
                 .collect::<Vec<_>>()
         };
-        let exact = matching_entries(package.as_str(), /*alias_source*/ None);
-        if !exact.is_empty() || package.alias_source().is_none() {
-            return exact;
+        let locator = package.as_str();
+        let exact = matching_entries(locator, /*alias_source*/ None);
+        if !exact.is_empty() || locator.starts_with("skill://") {
+            return Ok(exact);
         }
-        let resolved_package = self.step_state.catalog.aliases.resolve(package);
-        resolved_package.map_or_else(Vec::new, |resolved| {
-            matching_entries(&resolved, package.alias_source())
-        })
+        if let Some(source) = package.alias_source() {
+            let resolved = self.step_state.catalog.aliases.resolve(package);
+            return Ok(resolved.map_or_else(Vec::new, |id| matching_entries(&id, Some(source))));
+        }
+
+        let named = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.is_model_visible())
+            .filter(|entry| entry.name == locator || list::listed_name(&entry.name) == locator)
+            .filter_map(|entry| {
+                entry.source_locations().find_map(|source| {
+                    SkillToolAuthority::from_authority(&source.authority)?;
+                    Some((entry, source))
+                })
+            })
+            .collect::<Vec<_>>();
+        // Separate environments can each have an installation of the same package.
+        if let Some(((_, first), rest)) = named.split_first()
+            && rest.iter().any(|(_, source)| {
+                source.authority != first.authority || source.package != first.package
+            })
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "skill name is ambiguous; use skills.list and pass the package for the intended skill"
+                    .to_string(),
+            ));
+        }
+        Ok(named)
     }
 }
 

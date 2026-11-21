@@ -258,9 +258,17 @@ async fn login_and_logout_persist_only_cloud_managed_mcp_oauth_credentials() -> 
         .mount(&fixture.server)
         .await;
 
-    let mut command = fixture.command(&["mcp", "login", MANAGED_SERVER_NAME])?;
-    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut command = fixture.command(&["mcp", "login", MANAGED_SERVER_NAME, "--no-browser"])?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
     let mut child = command.spawn()?;
+    // Keep input open through child.wait() so the HTTP callback cannot race EOF.
+    let _stdin = child
+        .stdin
+        .take()
+        .context("MCP login did not provide stdin")?;
     let stdout = child
         .stdout
         .take()
@@ -470,6 +478,48 @@ async fn mock_startup_bundle(server: &MockServer, status: u16, config: &str, req
         .expect(1..)
         .mount(server)
         .await;
+}
+
+#[tokio::test]
+async fn tcp_tunnel_ssh_enforces_cloud_requirements_before_gateway_connection() -> Result<()> {
+    for (config, requirements, expected_error) in [
+        (
+            "",
+            "[application.network.domains]\n'example.com' = 'allow'",
+            "destination denied by application network policy",
+        ),
+        (
+            "forced_login_method = 'api'",
+            "",
+            "ChatGPT OAuth login required for SSH",
+        ),
+        (
+            "forced_chatgpt_workspace_id = 'different-workspace'",
+            "",
+            "ChatGPT OAuth login required for SSH",
+        ),
+    ] {
+        let Some(fixture) = CloudManagedConfigFixture::for_backend().await? else {
+            return Ok(());
+        };
+        mock_startup_bundle(&fixture.server, /*status*/ 200, config, requirements).await;
+        let output = fixture
+            .command(&[
+                "tcp-tunnel",
+                "--environment-id",
+                "ccarenv_fixture",
+                "--port",
+                "22",
+            ])?
+            .output()
+            .await?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(expected_error), "{stderr}");
+        fixture.server.verify().await;
+    }
+    Ok(())
 }
 
 async fn successful_json(command: &mut Command) -> Result<Value> {

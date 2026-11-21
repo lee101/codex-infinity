@@ -6,6 +6,13 @@ use codex_app_server_protocol::PluginAvailability;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
+#[track_caller]
+pub(crate) fn assert_pending_steers_unadmitted(input: &ThreadInputState) {
+    for steer in &input.pending_steers {
+        assert_eq!(steer.admitted_turn_id, None);
+    }
+}
+
 pub(super) async fn test_config() -> (tempfile::TempDir, Config) {
     // Start from the built-in defaults so tests do not inherit host/system config.
     let codex_home = tempfile::Builder::new()
@@ -38,6 +45,17 @@ pub(super) fn truncated_path_variants(path: &str) -> Vec<String> {
     (1..chars.len())
         .map(|len| chars[..len].iter().collect::<String>())
         .collect()
+}
+
+/// Keep the running indicator stable in snapshots of selection and layout.
+pub(crate) fn normalize_working_snapshot(text: String) -> String {
+    let text = normalize_snapshot_paths(text)
+        .replace("◦ Working", "• Working")
+        .replace("◦ Wor…", "• Wor…");
+    regex_lite::Regex::new(r"• Working \(\d+s")
+        .expect("valid working timer pattern")
+        .replace_all(&text, "• Working (0s")
+        .into_owned()
 }
 
 pub(crate) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
@@ -90,6 +108,9 @@ pub(crate) fn normalize_agent_center_snapshot(text: impl AsRef<str>) -> String {
                         normalized = normalized
                             .replace(&windows_path, unix_path)
                             .replace(&windows_path.replace('\\', "/"), unix_path);
+                    }
+                    if normalized.trim() == r"C:\" || normalized.trim() == "C:/" {
+                        normalized = normalized.replace(normalized.trim(), "/");
                     }
                     // Only ASCII path bytes change, so this is also the removed cell width.
                     let padding = pane.len().saturating_sub(normalized.len());
@@ -309,6 +330,10 @@ pub(crate) fn set_chatgpt_auth(chat: &mut ChatWidget) {
     chat.model_catalog = test_model_catalog(&chat.config);
 }
 
+pub(crate) fn set_test_model_catalog(chat: &mut ChatWidget, models: Vec<ModelPreset>) {
+    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+}
+
 fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> ModelInfo {
     let mut service_tiers = Vec::new();
     if supports_fast_mode {
@@ -496,7 +521,7 @@ fn token_usage_breakdown(usage: TokenUsage) -> codex_app_server_protocol::TokenU
         total_tokens: usage.total_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
-        cache_write_input_tokens: 0,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
     }
@@ -918,6 +943,7 @@ pub(super) fn replay_agent_message(
 ) {
     chat.replay_thread_item(
         AppServerThreadItemPayload::AgentMessage {
+            moderation: None,
             id: item_id.to_string(),
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
@@ -1074,6 +1100,7 @@ pub(super) fn complete_assistant_message(
             chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
             "turn-1".to_string(),
             AppServerThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: item_id.to_string(),
                 text: text.to_string(),
                 phase,
@@ -1091,6 +1118,8 @@ pub(super) fn complete_assistant_message(
 pub(super) fn pending_steer(text: &str) -> PendingSteer {
     PendingSteer {
         client_id: "test-submission".to_string(),
+        admitted_turn_id: None,
+        optimistically_rendered: false,
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
         source: UserMessageSource::Prompt,

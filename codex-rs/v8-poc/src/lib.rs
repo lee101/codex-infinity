@@ -36,11 +36,17 @@ mod tests {
 
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
+
+        evaluate_script(scope, expression).to_rust_string_lossy(scope)
+    }
+
+    fn evaluate_script<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        expression: &str,
+    ) -> v8::Local<'s, v8::Value> {
         let source = v8::String::new(scope, expression).expect("expression should be valid UTF-8");
         let script = v8::Script::compile(scope, source, None).expect("expression should compile");
-        let result = script.run(scope).expect("expression should evaluate");
-
-        result.to_rust_string_lossy(scope)
+        script.run(scope).expect("expression should evaluate")
     }
 
     #[test]

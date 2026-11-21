@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use rmcp::model::ClientRequest;
+use rmcp::model::DiscoverRequestMethod;
 use rmcp::model::ErrorCode;
+use rmcp::model::ErrorData;
 use rmcp::model::JsonRpcMessage;
 use rmcp::model::RequestId;
 use rmcp::model::ServerResult;
@@ -18,11 +20,12 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::io::AsyncRead;
-use tokio::process::ChildStderr;
-use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
 use crate::bounded_stdio_transport::BoundedStdioTransport;
+use crate::local_stdio_io::LocalStdio;
+use crate::local_stdio_io::Stderr;
+use crate::local_stdio_io::Stdin;
 use crate::protocol_mode::McpProtocolMode;
 use codex_utils_pty::Child;
 
@@ -104,6 +107,19 @@ impl Discovery {
         // protocol error can be classified as a discovery reply without an ID.
         if matches_probe || (idless && (!legacy || modern)) {
             self.probe_id = None;
+            // Some legacy helpers answer unknown methods with {}. Let rmcp initialize
+            // on this pipe, or skip the empty reply if initialize is already in flight.
+            if !matches!(self.outcome, Some(DiscoveryOutcome::Reply))
+                && let JsonRpcMessage::Response(response) = reply
+                && matches!(response.result, ServerResult::EmptyResult(_))
+            {
+                *message = Some(JsonRpcMessage::error(
+                    ErrorData::method_not_found::<DiscoverRequestMethod>(),
+                    Some(response.id.clone()),
+                ));
+                self.outcome = Some(DiscoveryOutcome::RetryLegacy);
+                return legacy;
+            }
             if legacy {
                 // Auto sent initialize before receiving the reply to its earlier probe.
                 if !modern && matches!(reply, JsonRpcMessage::Error(_)) {
@@ -138,7 +154,7 @@ impl Discovery {
 
 enum StdioTransport {
     /// Preserve rmcp's existing framing for servers using the initialize handshake.
-    Legacy(AsyncRwTransport<RoleClient, Box<dyn AsyncRead + Unpin + Send>, ChildStdin>),
+    Legacy(AsyncRwTransport<RoleClient, Box<dyn AsyncRead + Unpin + Send>, Stdin>),
     /// Bound frames and skip messages unknown to the client during 2026-07-28 discovery.
     Modern(BoundedStdioTransport),
     Closed,
@@ -146,19 +162,16 @@ enum StdioTransport {
 
 impl LocalStdioTransport {
     pub(super) fn new(
-        mut child: Child,
+        stdio: LocalStdio,
         program_name: String,
         protocol_mode: McpProtocolMode,
-    ) -> io::Result<(Self, Option<ChildStderr>)> {
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("MCP server stdin was not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("MCP server stdout was not piped"))?;
-        let stderr = child.stderr.take();
+    ) -> (Self, Option<Stderr>) {
+        let LocalStdio {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        } = stdio;
         let transport = match protocol_mode {
             McpProtocolMode::Legacy => {
                 StdioTransport::Legacy(AsyncRwTransport::new(Box::new(stdout), stdin))
@@ -167,14 +180,14 @@ impl LocalStdioTransport {
                 StdioTransport::Modern(BoundedStdioTransport::new(stdin, stdout, program_name))
             }
         };
-        Ok((
+        (
             Self {
                 child: Some(Box::new(child)),
                 transport,
                 discovery: None,
             },
             stderr,
-        ))
+        )
     }
 
     pub(super) fn watch_discovery(
@@ -237,6 +250,9 @@ impl Transport<RoleClient> for LocalStdioTransport {
             match transport.into_legacy_pipes() {
                 Ok((stdout, stdin)) => {
                     probe.initialize_id = Some(request.id.clone());
+                    // Discovery must not terminate an initialize that is still within the
+                    // configured startup timeout.
+                    probe.retry_at = None;
                     self.transport = StdioTransport::Legacy(AsyncRwTransport::new(stdout, stdin));
                 }
                 Err(error) => return futures::future::err(error).boxed(),

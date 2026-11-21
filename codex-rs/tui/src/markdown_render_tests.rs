@@ -81,6 +81,31 @@ fn table_url_with_tilde_keeps_complete_hyperlink() {
 }
 
 #[test]
+fn links_keep_their_columns_after_styled_fragments() {
+    let input = "**界** [a](https://example.com/a) _b_ [`c`](https://example.com/c) [d](https://example.com/d)\n\n[e](https://example.com/e)";
+    let lines = super::render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+        input,
+        /*width*/ None,
+        /*cwd*/ None,
+        &|_| true,
+    );
+    let links = lines
+        .iter()
+        .flat_map(|line| line.hyperlinks.iter())
+        .map(|link| (link.columns.clone(), link.destination.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![
+            (3..4, "https://example.com/a"),
+            (7..8, "https://example.com/c"),
+            (9..10, "https://example.com/d"),
+            (0..1, "https://example.com/e"),
+        ],
+    );
+}
+
+#[test]
 fn merged_text_events_preserve_entity_decoding() {
     let source = "https://example.com/a&amp;b~c";
     let destination = "https://example.com/a&b~c";
@@ -930,7 +955,7 @@ fn web_link_labels_keep_link_style_in_wrapped_prose_and_tables() {
 #[test]
 fn web_link_labels_have_a_visible_underline_snapshot() {
     let text = render_markdown_text(
-        "plain [plain](https://example.com) `code` [`code`](https://example.com)",
+        "plain [plain](https://example.com) `code` [`code`](https://example.com) [thread](codex://threads/019e60fc-0518-7c21-9596-980fe97225ba)",
     );
     assert_debug_snapshot!(text);
 }
@@ -2160,4 +2185,89 @@ fn table_key_value_fallback_preserves_rich_values_and_themed_labels() {
             .iter()
             .any(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
     }));
+}
+
+#[test]
+fn narrow_header_only_table_retains_local_file_target() {
+    let rendered = render_markdown_lines_with_width_and_cwd(
+        "| 👩‍💻 [Guide](./guide.md) | A | B | C | D | E |\n| --- | --- | --- | --- | --- | --- |",
+        Some(32),
+        /*cwd*/ None,
+    );
+    let first = &rendered[0];
+    let text = first.line.to_string();
+    assert!(text.starts_with("| 👩‍💻"), "{text}");
+    let (before, _) = text.split_once("./guide.md").expect("visible file path");
+    let column = crate::width::display_width(before);
+    let links = first
+        .hyperlinks
+        .iter()
+        .map(|link| {
+            (
+                link.columns.clone(),
+                link.destination.as_str(),
+                link.terminal_destination(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![(column..column + "./guide.md".len(), "./guide.md", None)]
+    );
+}
+
+#[test]
+fn narrow_header_only_table_preserves_link_columns_and_escaped_pipes() {
+    let rendered = super::render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+        "| 👩**‍💻** [Docs](https://example.com) | x\\|́y | B | C | D | E |\n| --- | --- | --- | --- | --- | --- |",
+        Some(/*width*/ 32),
+        /*cwd*/ None,
+        &|_| true,
+    );
+    let first = &rendered[0];
+    assert!(first.line.to_string().contains("x\\|́y"));
+    assert_eq!(
+        first
+            .hyperlinks
+            .iter()
+            .map(|link| (link.columns.clone(), link.destination.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(5..9, "https://example.com")]
+    );
+}
+
+#[test]
+fn narrow_table_record_labels_keep_local_file_targets() {
+    let markdown = "| [Guide](./guide.md) | A | B | C | D | E | F | G |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |";
+    for width in [20, 50] {
+        let rendered =
+            render_markdown_lines_with_width_and_cwd(markdown, Some(width), /*cwd*/ None);
+        let first = &rendered[0];
+        let text = first.line.to_string();
+        assert!(text.starts_with(" Guide"), "{text}");
+        let (before, _) = text.split_once("./guide.md").expect("visible file path");
+        let column = crate::width::display_width(before);
+        assert_eq!(
+            first
+                .hyperlinks
+                .iter()
+                .map(|link| (link.columns.clone(), link.destination.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(column..column + "./guide.md".len(), "./guide.md")],
+        );
+    }
+}
+
+#[test]
+fn posix_file_uri_keeps_literal_backslash_in_preview_target() {
+    let rendered = render_markdown_lines_with_width_and_cwd(
+        "[Guide](file:///tmp/Guide%5Cnotes.md)",
+        /*width*/ None,
+        /*cwd*/ None,
+    );
+    assert!(rendered[0].line.to_string().contains("/tmp/Guide/notes.md"));
+    assert_eq!(
+        rendered[0].hyperlinks[0].destination,
+        r"/tmp/Guide\notes.md"
+    );
 }

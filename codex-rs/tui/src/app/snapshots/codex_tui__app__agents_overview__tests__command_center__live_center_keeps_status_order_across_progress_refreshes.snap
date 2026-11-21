@@ -31,12 +31,12 @@ After subagents fail under Alpha and Ready task:
     ! Needs input                                         │ Alpha
                                                           │ ● Working
   Working  3                                              │
-    ● Bravo                                               │ Model: Unknown
-    ● Charlie                                             │ Reasoning: Unknown
-  › ● Alpha                                               │
+    ● 📌  Charlie                                          │ Model: Unknown
+  › ● Alpha                                               │ Reasoning: Unknown
+    ● Bravo                                               │
                                                           │ Project
   Ready  1                                                │ /tmp/project
-    ○ Ready task                                          │
+    ○ 📌  Ready task                                       │
                                                           │ Prompt
                                                           │ Progress update 3
                                                           │

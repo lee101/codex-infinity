@@ -20,48 +20,16 @@ pub(crate) enum GlobalWildcard {
 #[derive(Clone)]
 pub struct DomainPatternSet {
     patterns: Arc<[Vec<u8>]>,
+    restricted_ip_literals: Arc<HashSet<IpAddr>>,
 }
 
 impl DomainPatternSet {
     pub(crate) fn new(patterns: &[String], global_wildcard: GlobalWildcard) -> Result<Self> {
         let mut compiled = Vec::new();
+        let mut restricted_ip_literals = HashSet::new();
         let mut seen = HashSet::new();
         for pattern in patterns {
-            if global_wildcard == GlobalWildcard::Reject
-                && is_global_wildcard_domain_pattern(pattern)
-            {
-                bail!(
-                    "unsupported global wildcard domain pattern \"*\"; use exact hosts or scoped wildcards like *.example.com or **.example.com"
-                );
-            }
-            let raw = pattern.trim();
-            ensure!(
-                !raw.contains(['{', '}', '\\', '/']) && !raw.chars().any(char::is_whitespace),
-                "unsupported domain pattern syntax: {pattern}"
-            );
-            let host = raw
-                .strip_prefix("**.")
-                .or_else(|| raw.strip_prefix("*."))
-                .unwrap_or(raw);
-            ensure!(
-                !host.contains("**"),
-                "unsupported repeated wildcard: {pattern}"
-            );
-            if host.contains(['[', ']']) {
-                let literal = host.strip_prefix('[').and_then(|s| s.split_once(']'));
-                ensure!(
-                    literal.is_some_and(|(ip, suffix)| {
-                        let normalized = normalize_dns_host_or_ip_literal(ip);
-                        let unscoped = normalized.split('%').next().unwrap_or_default();
-                        !ip.contains(['[', ']'])
-                            && (normalized == "*" || unscoped.parse::<Ipv6Addr>().is_ok())
-                            && !suffix.contains(['[', ']'])
-                            && (suffix.chars().all(|c| c == '.') || suffix.starts_with(':'))
-                    }),
-                    "brackets are only supported for IPv6 literals or [*]: {pattern}"
-                );
-            }
-            let pattern = normalize_pattern(pattern);
+            let pattern = validated_pattern(pattern, global_wildcard)?;
             // Supported domain patterns:
             // - "example.com": match the exact host
             // - "*.example.com": match any subdomain (not the apex)
@@ -72,12 +40,19 @@ impl DomainPatternSet {
                 if !seen.insert(candidate.clone()) {
                     continue;
                 }
-                ensure!(!candidate.is_empty(), "domain pattern is empty");
+                // Keep exact address equivalence separate from ordinary allowlist
+                // matching. A scoped IP rule must never apply to other interfaces.
+                if !candidate.contains('%')
+                    && let Some(ip) = crate::policy::numeric_host_address(&candidate)
+                {
+                    restricted_ip_literals.insert(ip.to_canonical());
+                }
                 compiled.push(candidate.into_bytes());
             }
         }
         Ok(Self {
             patterns: compiled.into(),
+            restricted_ip_literals: Arc::new(restricted_ip_literals),
         })
     }
 
@@ -85,6 +60,123 @@ impl DomainPatternSet {
         let host = host.as_ref().as_bytes();
         self.patterns.iter().any(|pattern| matches(pattern, host))
     }
+
+    /// Conservatively include wildcard patterns that could match a canonical IP spelling.
+    pub(crate) fn may_restrict_ip(&self) -> bool {
+        !self.restricted_ip_literals.is_empty()
+            || self.patterns.iter().any(|p| {
+                p.iter().any(|b| matches!(b, b'*' | b'?'))
+                    && p.iter()
+                        .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.' | b'*' | b'?'))
+                    // Dots occur only in the decimal IPv4 tail, including mapped IPv6.
+                    && p.iter().skip_while(|b| **b != b'.')
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'*' | b'?'))
+            })
+    }
+
+    /// An IPv4 address and its IPv4-mapped IPv6 form can dial the same peer.
+    /// Check both spellings for restrictive rules, without expanding allowlists.
+    pub(crate) fn restricts_ip(&self, ip: IpAddr) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let ip = ip.to_canonical();
+        if self.restricted_ip_literals.contains(&ip) {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(ip) => {
+                self.is_match(ip.to_string()) || self.is_match(ip.to_ipv6_mapped().to_string())
+            }
+            IpAddr::V6(ip) => self.is_match(ip.to_string()),
+        }
+    }
+}
+
+/// Validate and normalize an allow selector using the proxy matcher's syntax.
+pub fn canonical_allow_pattern(pattern: &str) -> Result<String> {
+    let host = canonical_pattern(pattern, GlobalWildcard::Allow)?;
+    // A wildcard in a stripped port still disqualifies this rule from the local-binding
+    // exception. Retain a wildcard port in the comparison key for that case.
+    if pattern.contains(['*', '?'])
+        && !host.contains(['*', '?'])
+        && crate::policy::is_local_literal(&host)
+    {
+        return Ok(if host.contains(':') {
+            format!("[{host}]:*")
+        } else {
+            format!("{host}:*")
+        });
+    }
+    Ok(host)
+}
+
+/// Validate and normalize a deny selector, including the restriction on global wildcards.
+pub fn canonical_deny_pattern(pattern: &str) -> Result<String> {
+    canonical_pattern(pattern, GlobalWildcard::Reject).map(restrictive_pattern_identity)
+}
+
+/// Review rules allow global wildcards and, like denials, compare unscoped IPv6 literals by address.
+pub fn canonical_review_pattern(pattern: &str) -> Result<String> {
+    canonical_pattern(pattern, GlobalWildcard::Allow).map(restrictive_pattern_identity)
+}
+
+fn restrictive_pattern_identity(pattern: String) -> String {
+    match pattern.parse::<Ipv6Addr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => pattern,
+    }
+}
+
+fn canonical_pattern(pattern: &str, global_wildcard: GlobalWildcard) -> Result<String> {
+    let pattern = validated_pattern(pattern, global_wildcard)?;
+    // Subdomains-only selectors compile to one byte glob with this prefix. Treat the
+    // explicitly written glob as the same selector for list/constraint comparisons.
+    if let Some(domain) = pattern.strip_prefix("?*.") {
+        return Ok(format!("*.{domain}"));
+    }
+    Ok(pattern)
+}
+
+fn validated_pattern(pattern: &str, global_wildcard: GlobalWildcard) -> Result<String> {
+    if global_wildcard == GlobalWildcard::Reject && is_global_wildcard_domain_pattern(pattern) {
+        bail!(
+            "unsupported global wildcard domain pattern \"*\"; use exact hosts or scoped wildcards like *.example.com or **.example.com"
+        );
+    }
+    let raw = pattern.trim();
+    ensure!(
+        !raw.contains(['{', '}', '\\', '/']) && !raw.chars().any(char::is_whitespace),
+        "unsupported domain pattern syntax: {pattern}"
+    );
+    let host = raw
+        .strip_prefix("**.")
+        .or_else(|| raw.strip_prefix("*."))
+        .unwrap_or(raw);
+    ensure!(
+        !host.contains("**"),
+        "unsupported repeated wildcard: {pattern}"
+    );
+    if host.contains(['[', ']']) {
+        let literal = host.strip_prefix('[').and_then(|s| s.split_once(']'));
+        ensure!(
+            literal.is_some_and(|(ip, suffix)| {
+                let normalized = normalize_dns_host_or_ip_literal(ip);
+                let unscoped = normalized.split('%').next().unwrap_or_default();
+                !ip.contains(['[', ']'])
+                    && (normalized == "*" || unscoped.parse::<Ipv6Addr>().is_ok())
+                    && !suffix.contains(['[', ']'])
+                    && (suffix.chars().all(|c| c == '.') || suffix.starts_with(':'))
+            }),
+            "brackets are only supported for IPv6 literals or [*]: {pattern}"
+        );
+    }
+    let pattern = normalize_pattern(pattern);
+    ensure!(
+        !matches!(pattern.as_str(), "" | "*." | "**."),
+        "domain pattern is empty"
+    );
+    Ok(pattern)
 }
 
 /// Normalize host fragments for policy matching (trim whitespace, strip ports/brackets, lowercase).

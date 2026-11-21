@@ -76,6 +76,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
     for msg in [
         EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
             server: "pending".to_string(),
+            environment_id: None,
             status: McpStartupStatus::Starting,
         }),
         EventMsg::McpStartupComplete(McpStartupCompleteEvent::default()),
@@ -126,11 +127,13 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
         ops.push(sub.op);
     }
     assert!(
-        ops.iter().any(|op| matches!(op, Op::Interrupt)),
+        ops.iter()
+            .any(|op| matches!(op.as_protocol(), Some(Op::Interrupt))),
         "expected Interrupt op after cancellation"
     );
     assert!(
-        ops.iter().any(|op| matches!(op, Op::Shutdown)),
+        ops.iter()
+            .any(|op| matches!(op.as_protocol(), Some(Op::Shutdown))),
         "expected Shutdown op after cancellation"
     );
 }
@@ -152,7 +155,7 @@ async fn forward_ops_preserves_submission_trace_context() {
 
     let submission = Submission {
         id: "sub-1".to_string(),
-        op: Op::Interrupt,
+        op: Op::Interrupt.into(),
         turn_extension_init: None,
         trace: Some(codex_protocol::protocol::W3cTraceContext {
             traceparent: Some(
@@ -165,7 +168,7 @@ async fn forward_ops_preserves_submission_trace_context() {
         residency_guard: None,
         message_delivery: None,
     };
-    tx_ops.send(submission).await.unwrap();
+    tx_ops.send(Box::new(submission)).await.unwrap();
     drop(tx_ops);
 
     let forwarded = timeout(Duration::from_secs(1), rx_sub.recv())
@@ -173,7 +176,7 @@ async fn forward_ops_preserves_submission_trace_context() {
         .expect("forward_ops hung")
         .expect("forwarded submission missing");
     assert_eq!("sub-1", forwarded.id);
-    assert!(matches!(forwarded.op, Op::Interrupt));
+    assert!(matches!(forwarded.op.as_protocol(), Some(Op::Interrupt)));
     assert_eq!(
         forwarded.trace,
         Some(codex_protocol::protocol::W3cTraceContext {
@@ -262,11 +265,7 @@ async fn delegate_start_analytics_honors_child_opt_out_with_enabled_parent() {
         .services
         .analytics_events_client = client.clone();
     parent_session
-        .set_app_server_client_info(
-            Some("codex-test".to_string()),
-            Some("1.0.0".to_string()),
-            /*mcp_elicitations_auto_deny*/ false,
-        )
+        .set_app_server_client_info(Some("codex-test".to_string()), Some("1.0.0".to_string()))
         .await
         .expect("set parent client metadata");
 

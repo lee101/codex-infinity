@@ -25,6 +25,7 @@ mod terminal;
 #[path = "tool/mcp_tests.rs"]
 mod mcp_tests;
 
+pub(super) use agents::NativeToolDelivery;
 pub(super) use agents::ObservedAgentResultEdge;
 pub(super) use agents::PendingAgentInteractionEdge;
 pub(super) use agents::spawn_edge_id;
@@ -122,11 +123,6 @@ impl TraceReducer {
             .invocation_payload
             .as_ref()
             .map(|payload| payload.raw_payload_id.clone());
-        self.link_wait_tool_call_from_request_payload(
-            &thread_id,
-            &tool_call_id,
-            started.invocation_payload.as_ref(),
-        )?;
 
         self.rollout.tool_calls.insert(
             tool_call_id.clone(),
@@ -135,6 +131,8 @@ impl TraceReducer {
                 mcp_call_id: None,
                 model_visible_call_id,
                 code_mode_runtime_tool_id: started.code_mode_runtime_tool_id,
+                started_code_cell_id: None,
+                resolved_wait_runtime_cell_id: None,
                 thread_id,
                 started_by_codex_turn_id: codex_turn_id,
                 execution: ExecutionWindow {
@@ -429,7 +427,7 @@ impl TraceReducer {
         Ok(())
     }
 
-    fn single_tool_for_model_visible_call(
+    pub(super) fn single_tool_for_model_visible_call(
         &self,
         model_visible_call_id: &str,
     ) -> Result<Option<ToolCallId>> {

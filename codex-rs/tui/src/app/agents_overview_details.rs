@@ -6,16 +6,18 @@ use super::App;
 use super::ThreadBufferedEvent;
 use super::ThreadEventAttachment;
 use super::agents_overview_view::AgentsOverviewGroup;
+use crate::chatwidget::ChatWidget;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::ThreadId;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::collections::HashMap;
@@ -35,9 +37,10 @@ pub(super) fn preview_markdown(text: &str) -> String {
 
 #[derive(Clone, Default)]
 pub(super) struct AgentsOverviewDetails {
+    pub(super) latest_prompt: Option<String>,
     pub(super) lines: Vec<Line<'static>>,
     pub(super) usage_lines: Vec<Line<'static>>,
-    pub(super) last_message: Option<(String, AbsolutePathBuf)>,
+    pub(super) last_message: Option<(String, LegacyAppPathString)>,
 }
 
 pub(super) fn preview_text(text: &str) -> String {
@@ -50,8 +53,9 @@ pub(super) fn preview_text(text: &str) -> String {
 
 #[derive(Default)]
 pub(super) struct AgentsOverviewActivity {
+    pub(super) latest_prompt: Option<String>,
     reasoning: Option<ReasoningPreview>,
-    last_message: Option<String>,
+    pub(super) last_message: Option<String>,
 }
 
 struct ReasoningPreview {
@@ -102,6 +106,22 @@ impl App {
                 reasoning.header = crate::chatwidget::extract_first_bold(&reasoning.buffer)
                     .map(|header| preview_text(&header));
                 had_header || reasoning.header.is_some()
+            }
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                item:
+                    codex_app_server_protocol::ThreadItem {
+                        payload: ThreadItemPayload::UserMessage { content, .. },
+                        ..
+                    },
+                ..
+            }) if self.agents_overview.threads[&thread_id]
+                .as_ref()
+                .is_some_and(|thread| thread.history_mode == ThreadHistoryMode::Legacy) =>
+            {
+                activity.latest_prompt = Some(preview_markdown(
+                    &ChatWidget::user_message_display_from_inputs(content).message,
+                ));
+                true
             }
             ServerNotification::ItemCompleted(ItemCompletedNotification {
                 item:
@@ -219,10 +239,22 @@ impl App {
             .or_else(|| self.agents_overview.last_messages.get(&thread_id))
             .filter(|message| !message.trim().is_empty())
             .map(|message| (message.clone(), source.cwd.clone()));
+        let root_id = ThreadId::from_string(&root.id).ok();
         AgentsOverviewDetails {
+            latest_prompt: root_id.and_then(|id| {
+                self.agents_overview
+                    .activity
+                    .get(&id)?
+                    .latest_prompt
+                    .clone()
+            }),
             lines,
-            usage_lines: ThreadId::from_string(&root.id)
-                .ok()
+            usage_lines: root_id
+                .filter(|id| {
+                    self.backend_registry
+                        .owner(*id)
+                        .is_none_or(|owner| self.app_server_backend_id == Some(owner))
+                })
                 .and_then(|id| self.agents_overview.usage.get(&id))
                 .map(|usage| {
                     super::agents_overview_usage::usage_lines(

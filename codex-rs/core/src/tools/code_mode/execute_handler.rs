@@ -4,9 +4,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_features::Feature;
 use codex_prompts::ResolvedModelMessages;
-use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use std::borrow::Cow;
@@ -56,18 +54,12 @@ impl CodeModeExecuteHandler {
             .config
             .code_mode
             .tool_input_schema_max_bytes;
-        let tool_description_first = step_context
-            .turn
-            .config
-            .features
-            .enabled(Feature::CodeModeToolDescriptionFirst);
         let mut enabled_tools = Vec::with_capacity(self.nested_tool_specs.len());
         for (spec, cached_runtime) in &self.nested_tool_specs {
             let definitions = prepare_code_mode_tool_definitions(
                 cached_runtime.as_deref(),
                 || Cow::Borrowed(spec.as_ref()),
                 code_mode_input_schema_max_bytes,
-                tool_description_first,
             );
             match definitions {
                 Cow::Borrowed(definitions) => enabled_tools.extend_from_slice(definitions),
@@ -77,12 +69,11 @@ impl CodeModeExecuteHandler {
         enabled_tools.sort_by(|left, right| left.name.cmp(&right.name));
         enabled_tools.dedup_by(|left, right| left.name == right.name);
         let model_messages = ResolvedModelMessages::from_model(&step_context.settings.model_info);
-        IndirectNamespacePrefixes::new(
-            model_messages.indirect_description_prefixes(),
-            step_context.tool_router.mcp_namespaces(),
-        )
-        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
-        .apply_code_mode(&mut enabled_tools);
+        step_context
+            .tool_router
+            .indirect_namespace_prefixes(model_messages.indirect_description_prefixes())
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+            .apply_code_mode(&mut enabled_tools);
         let started_at = std::time::Instant::now();
         let started_cell = exec
             .session
@@ -172,6 +163,7 @@ impl CodeModeExecuteHandler {
             &step_context.settings.model_info,
             response,
             args.max_output_tokens,
+            exec.session.services.code_mode_service.output_truncation(),
             wall_time,
             exec.turn.config.code_mode.experimental_show_cell_overhead,
         ))

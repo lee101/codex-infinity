@@ -173,6 +173,7 @@ struct McpToolApprovalDisplayParam {
 pub(crate) struct McpServerElicitationFormRequest {
     thread_id: ThreadId,
     server_name: String,
+    environment_id: Option<String>,
     request_id: AppServerRequestId,
     message: String,
     approval_display_params: Vec<McpToolApprovalDisplayParam>,
@@ -197,6 +198,7 @@ impl McpServerElicitationFormRequest {
     ) -> Option<Self> {
         let McpServerElicitationRequestParams {
             server_name,
+            environment_id,
             request,
             ..
         } = request;
@@ -210,24 +212,7 @@ impl McpServerElicitationFormRequest {
         };
 
         let requested_schema = serde_json::to_value(requested_schema).ok()?;
-        Self::from_parts(
-            thread_id,
-            server_name.clone(),
-            request_id,
-            meta.as_ref(),
-            message.clone(),
-            requested_schema,
-        )
-    }
-
-    fn from_parts(
-        thread_id: ThreadId,
-        server_name: String,
-        request_id: AppServerRequestId,
-        meta: Option<&Value>,
-        message: String,
-        requested_schema: Value,
-    ) -> Option<Self> {
+        let meta = meta.as_ref();
         let tool_suggestion = parse_tool_suggestion_request(meta);
         let is_tool_approval = meta
             .and_then(Value::as_object)
@@ -328,9 +313,10 @@ impl McpServerElicitationFormRequest {
 
         Some(Self {
             thread_id,
-            server_name,
+            server_name: server_name.clone(),
+            environment_id: environment_id.clone(),
             request_id,
-            message,
+            message: message.clone(),
             approval_display_params,
             response_mode,
             is_tool_approval,
@@ -812,12 +798,7 @@ impl McpServerElicitationOverlay {
         ComposerDraft {
             text: self.composer.current_text(),
             text_elements: self.composer.text_elements(),
-            local_image_paths: self
-                .composer
-                .local_images()
-                .into_iter()
-                .map(|img| img.path)
-                .collect(),
+            local_image_paths: self.composer.local_image_paths(),
             pending_pastes: self.composer.pending_pastes(),
         }
     }
@@ -956,10 +937,17 @@ impl McpServerElicitationOverlay {
     }
 
     fn current_prompt_text(&self) -> String {
-        let request_message = format_tool_approval_display_message(
+        let mut request_message = format_tool_approval_display_message(
             &self.request.message,
             &self.request.approval_display_params,
         );
+        if self.request.environment_id.is_some() {
+            let server = crate::app_server_approval_conversions::mcp_server_label(
+                &self.request.server_name,
+                self.request.environment_id.as_deref(),
+            );
+            request_message = format!("Server: {server}\n\n{request_message}");
+        }
         let Some(field) = self.current_field() else {
             return request_message;
         };
@@ -1267,12 +1255,7 @@ impl McpServerElicitationOverlay {
     }
 
     fn apply_submission_to_draft(&mut self, text: String, text_elements: Vec<TextElement>) {
-        let local_image_paths = self
-            .composer
-            .local_images()
-            .into_iter()
-            .map(|img| img.path)
-            .collect::<Vec<_>>();
+        let local_image_paths = self.composer.local_image_paths();
         if let Some(answer) = self.current_answer_mut() {
             answer.draft = ComposerDraft {
                 text: text.clone(),
@@ -1758,6 +1741,7 @@ mod tests {
         meta: Option<Value>,
     ) -> McpServerElicitationRequestParams {
         McpServerElicitationRequestParams {
+            environment_id: None,
             thread_id: "thread-1".to_string(),
             turn_id: Some("turn-1".to_string()),
             server_name: "server-1".to_string(),
@@ -1884,6 +1868,7 @@ mod tests {
         assert_eq!(
             request,
             McpServerElicitationFormRequest {
+                environment_id: None,
                 thread_id,
                 server_name: "server-1".to_string(),
                 request_id: request_id("request-1"),
@@ -1955,6 +1940,7 @@ mod tests {
         assert_eq!(
             request,
             McpServerElicitationFormRequest {
+                environment_id: None,
                 thread_id,
                 server_name: "server-1".to_string(),
                 request_id: request_id("request-1"),
@@ -2013,6 +1999,7 @@ mod tests {
         assert_eq!(
             request,
             McpServerElicitationFormRequest {
+                environment_id: None,
                 thread_id,
                 server_name: "server-1".to_string(),
                 request_id: request_id("request-1"),
@@ -2604,6 +2591,7 @@ mod tests {
                 thread_id,
                 request_id("request-2"),
                 &McpServerElicitationRequestParams {
+                    environment_id: None,
                     thread_id: "thread-1".to_string(),
                     turn_id: Some("turn-2".to_string()),
                     server_name: "server-1".to_string(),
@@ -2685,21 +2673,24 @@ mod tests {
         let (tx, _rx) = test_sender();
         let request = from_form_request(
             ThreadId::default(),
-            form_request(
-                "Allow this request?",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "title": "Confirm",
-                            "description": "Approve the pending action.",
-                        }
-                    },
-                    "required": ["confirmed"],
-                }),
-                /*meta*/ None,
-            ),
+            McpServerElicitationRequestParams {
+                environment_id: Some("env-b".to_string()),
+                ..form_request(
+                    "Allow this request?",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "confirmed": {
+                                "type": "boolean",
+                                "title": "Confirm",
+                                "description": "Approve the pending action.",
+                            }
+                        },
+                        "required": ["confirmed"],
+                    }),
+                    /*meta*/ None,
+                )
+            },
         )
         .expect("expected supported form");
         let overlay = McpServerElicitationOverlay::new(

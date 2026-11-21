@@ -10,6 +10,8 @@
 //! - `rules.prefix_rules` append high-priority rules first.
 //! - `hooks` append high-priority event groups first while failing closed on
 //!   active managed-dir conflicts.
+//! - `otel` replaces exact managed values, treats exporters atomically, and
+//!   merges span attributes and fields within each tracestate member by key.
 //! - `permissions.filesystem.deny_read` is a high-priority-first union across
 //!   layers.
 //! - `auto_review.required_on_models` is a high-priority-first union across layers.
@@ -18,6 +20,7 @@ use crate::ConfigRequirementsToml;
 use crate::ConfigRequirementsWithSources;
 use crate::RequirementSource;
 use crate::Sourced;
+use crate::config_requirements::merge_otel_requirements;
 use crate::merge::merge_toml_values;
 use std::cell::OnceCell;
 use std::io;
@@ -49,6 +52,30 @@ pub enum RequirementsCompositionError {
         incoming_source: RequirementSource,
         message: String,
     },
+}
+
+impl From<RequirementsCompositionError> for crate::CloudConfigBundleLoadError {
+    fn from(error: RequirementsCompositionError) -> Self {
+        // Parser messages can contain the submitted TOML, including credentials.
+        let reason = match error {
+            RequirementsCompositionError::Parse { layer_source, .. } => {
+                format!("invalid requirements in {layer_source}")
+            }
+            RequirementsCompositionError::Conflict {
+                existing_source,
+                incoming_source,
+                ..
+            } => {
+                format!("conflicting requirements from {existing_source} and {incoming_source}")
+            }
+            RequirementsCompositionError::ComposedParse { .. } => "invalid requirements".to_owned(),
+        };
+        Self::new(
+            crate::CloudConfigBundleLoadErrorCode::InvalidBundle,
+            /*status_code*/ None,
+            format!("invalid cloud config bundle: {reason}"),
+        )
+    }
 }
 
 impl From<RequirementsCompositionError> for io::Error {
@@ -146,10 +173,11 @@ impl RequirementsLayerStack {
         self,
     ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
         let Self {
-            layers,
+            mut layers,
             hook_directory_field,
         } = self;
 
+        let network = super::network::compose(&mut layers)?;
         let mut merged_toml = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
             // An endpoint and its credentials must come from the same requirements layer.
@@ -169,6 +197,25 @@ impl RequirementsLayerStack {
             })?;
         let mut output = ConfigRequirementsWithSources::default();
         populate_merged_regular_fields_with_sources(&mut output, requirements, &layers);
+        output.permissions_network = network;
+
+        // Merge OTEL requirements so higher-priority exact values replace
+        // lower-priority values while exporters stay atomic.
+        let mut otel = None;
+        let mut otel_sources = Vec::new();
+        for layer in &layers {
+            if let Some(incoming) = layer.domain_fields.otel.as_deref()
+                && merge_otel_requirements(&mut otel, incoming)
+            {
+                otel_sources.push(layer.source.clone());
+            }
+        }
+        output.otel = otel.map(|value| {
+            Box::new(Sourced::new(
+                value,
+                RequirementSource::composite(otel_sources.into_iter().rev()),
+            ))
+        });
         let mut rules = None;
         let mut hooks = HookMergeState::new(hook_directory_field);
         let mut hooks_output = None;
@@ -251,10 +298,11 @@ fn populate_merged_regular_fields_with_sources(
         mcp_servers,
         plugins,
         marketplaces,
+        otel: _,
         apps,
         rules: _,
         enforce_residency,
-        network,
+        network: _,
         application,
         permissions,
         auto_review,
@@ -314,9 +362,30 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(marketplaces, &["marketplaces"]);
     set_sourced!(apps, &["apps"]);
     set_sourced!(enforce_residency, &["enforce_residency"]);
-    set_sourced!(network, &["network_proxy"]);
     set_sourced!(application, &["application"]);
-    set_sourced!(permissions, &["permissions"]);
+    let permission_sources = |contributes: fn(&toml::Table) -> bool| {
+        RequirementSource::composite(
+            layers
+                .iter()
+                .rev()
+                .filter(|layer| {
+                    layer
+                        .regular_toml
+                        .get("permissions")
+                        .and_then(TomlValue::as_table)
+                        .is_some_and(contributes)
+                })
+                .map(|layer| layer.source.clone()),
+        )
+    };
+    output.permissions = permissions.map(|value| {
+        let source = if value.filesystem.is_some() {
+            permission_sources(|table| table.contains_key("filesystem"))
+        } else {
+            permission_sources(|table| table.keys().any(|key| key != "network"))
+        };
+        Sourced::new(value, source)
+    });
     set_sourced!(models, &["models"]);
     set_sourced!(
         additional_developer_instructions,

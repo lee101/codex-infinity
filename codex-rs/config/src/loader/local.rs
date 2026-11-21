@@ -13,6 +13,7 @@ use super::system_config_toml_file_with_overrides;
 use super::system_requirements_toml_file_with_overrides;
 use crate::CONFIG_TOML_FILE;
 use crate::ConfigLayerSource;
+use crate::ConfigRequirements;
 use crate::LoaderOverrides;
 use crate::RequirementSource;
 use crate::RequirementsLayerEntry;
@@ -110,7 +111,7 @@ pub(super) async fn load_local_config_layers_with_overrides(
     let loaded_managed = layer_io::load_config_layers_internal(
         fs,
         codex_home.as_path(),
-        overrides.clone(),
+        overrides,
         /*strict_config*/ false,
     )
     .await?;
@@ -160,8 +161,10 @@ pub(super) async fn load_local_config_layers_with_overrides(
             "feature_requirements".to_string(),
             "credential_masking".to_string(),
         ],
-        vec!["experimental_network".to_string(), "enabled".to_string()],
-        vec!["network_proxy".to_string(), "enabled".to_string()],
+        // Keep the tables intact so discovery validates the same declarations as startup.
+        vec!["experimental_network".to_string()],
+        vec!["network_proxy".to_string()],
+        vec!["permissions".to_string(), "network".to_string()],
     ]);
     let effective_requirements =
         compose_requirements(broker_requirements.layers.into_iter().map(|layer| {
@@ -171,7 +174,7 @@ pub(super) async fn load_local_config_layers_with_overrides(
         .unwrap_or_default();
     apply_credential_broker_requirements(
         &mut trust_context,
-        &effective_requirements,
+        &ConfigRequirements::try_from(effective_requirements)?,
         &trusted_broker_config,
     );
     let project_layers = discover_project_layers(
@@ -219,7 +222,6 @@ pub(super) async fn load_local_config_layers_with_overrides(
             .as_table()
             .into_iter()
             .flatten()
-            .filter(|(name, _)| name.as_str() != "filesystem")
             .map(|(name, profile)| {
                 (
                     name.clone(),
@@ -232,6 +234,12 @@ pub(super) async fn load_local_config_layers_with_overrides(
                         .and_then(|network| network.get("mitm"))
                         .is_some(),
                 )
+            })
+            .filter(|(name, parent, has_mitm)| match name.as_str() {
+                "filesystem" | "network" => false,
+                // Older hosts can still interpret this raw table as a managed sandbox profile.
+                "credentials" => parent.is_some() || *has_mitm,
+                _ => true,
             }),
     )?;
 

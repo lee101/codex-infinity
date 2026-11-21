@@ -78,7 +78,7 @@ impl PluginRequestProcessor {
             && let Some(remote_scope) = remote_scope
         {
             let page = search_remote_plugins(
-                &remote_plugin_service_config(&config),
+                &remote_plugin_service_config(&self.thread_manager, &config)?,
                 auth.as_ref(),
                 RemotePluginSearchRequest {
                     query: search_term,
@@ -115,7 +115,11 @@ impl PluginRequestProcessor {
                     continue;
                 }
                 remote_results.push(plugin_search_result(
-                    remote_plugin_summary_to_info(plugin, plugin_policy),
+                    remote_plugin_summary_to_info(
+                        plugin,
+                        plugin_policy,
+                        /*local_version*/ None,
+                    ),
                     plugin_id.marketplace_name,
                     /*marketplace_path*/ None,
                 ));

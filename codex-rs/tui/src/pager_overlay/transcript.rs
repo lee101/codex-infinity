@@ -24,13 +24,21 @@ pub(crate) struct TranscriptOverlay {
     content_area: Rect,
     cursor: Option<(u16, u16)>,
     notice: Option<String>,
-    pub(crate) key_chord_hint: Option<Vec<(String, String)>>,
+    pub(crate) pending_thread_link: Option<codex_protocol::ThreadId>,
     pub(crate) browsing_footer: Option<Line<'static>>,
     find_transcript: Vec<crate::key_hint::KeyBinding>,
     select_transcript: Vec<crate::key_hint::KeyBinding>,
     pub(super) pending_follow_close: Option<(u64, bool)>,
     pending_select_mode: bool,
     is_done: bool,
+}
+
+impl Overlay {
+    pub(crate) fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
+        if let Self::Transcript(view) = self {
+            view.set_keymap_bindings(keymap);
+        }
+    }
 }
 
 impl TranscriptOverlay {
@@ -65,7 +73,7 @@ impl TranscriptOverlay {
             content_area: Rect::default(),
             cursor: None,
             notice: None,
-            key_chord_hint: None,
+            pending_thread_link: None,
             browsing_footer: None,
             find_transcript: Vec::new(),
             select_transcript: Vec::new(),
@@ -116,11 +124,7 @@ impl TranscriptOverlay {
         .intersection(area);
         self.cursor = None;
         if browsing && let Some(footer) = &self.browsing_footer {
-            if let Some(items) = &self.key_chord_hint {
-                crate::bottom_pane::footer_hint_items_line(items).render(status, buf);
-            } else {
-                Widget::render(footer, status, buf);
-            }
+            Widget::render(footer, status, buf);
             return;
         }
         let hints = Rect::new(area.x, status.bottom(), area.width, /*height*/ 2).intersection(area);
@@ -165,11 +169,6 @@ impl TranscriptOverlay {
                     .render(status, buf);
             }
             self.render_hints(hints, buf);
-        }
-        if let Some(items) = &self.key_chord_hint {
-            let row = Rect::new(hints.x, hints.y, hints.width, 1).intersection(area);
-            Clear.render(row, buf);
-            crate::bottom_pane::footer_hint_items_line(items).render(row, buf);
         }
     }
 
@@ -261,6 +260,7 @@ impl TranscriptOverlay {
     }
 
     pub(crate) fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
+        self.keymap.clone_from(&keymap.pager);
         self.find_transcript.clone_from(&keymap.app.find_transcript);
         self.select_transcript
             .clone_from(&keymap.app.select_transcript);
@@ -350,6 +350,11 @@ impl TranscriptOverlay {
             .iter()
             .rposition(|cell| is_session_history_prefix_cell(cell.as_ref()))
             .map_or(/*default*/ 0, |index| index + 1);
+        self.insert_history_page(index, cells);
+        index
+    }
+
+    pub(crate) fn insert_history_page(&mut self, index: usize, cells: Vec<Arc<dyn HistoryCell>>) {
         let added = cells.len();
         self.cells.splice(index..index, cells);
         for highlight in [&mut self.highlight_cell, &mut self.pending_highlight] {
@@ -359,7 +364,6 @@ impl TranscriptOverlay {
         }
         self.view.set_highlight(self.highlight_cell);
         self.view.history_loaded(&self.cells, index..index + added);
-        index
     }
 
     pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
@@ -549,10 +553,12 @@ impl TranscriptOverlay {
                 Ok(status) => status.message("selection"),
                 Err(error) => error,
             });
-        } else if let ViewAction::OpenLink(url) = action
-            && let Err(error) = webbrowser::open(&url)
-        {
-            self.notice = Some(format!("Could not open link: {error}"));
+        } else if let ViewAction::OpenLink(url) = action {
+            if let Some(thread_id) = crate::thread_links::thread_id(&url) {
+                self.pending_thread_link = Some(thread_id);
+            } else if let Err(error) = webbrowser::open(&url) {
+                self.notice = Some(format!("Could not open link: {error}"));
+            }
         }
     }
 

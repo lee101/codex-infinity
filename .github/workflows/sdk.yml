@@ -3,6 +3,10 @@ name: sdk
 on:
   workflow_call:
 
+env:
+  CODEX_BAZEL_GCS_BUCKET: ${{ secrets.CODEX_BAZEL_GCS_BUCKET }}
+  CODEX_BAZEL_GCS_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.CODEX_BAZEL_GCS_WORKLOAD_IDENTITY_PROVIDER }}
+
 jobs:
   python-sdk-installation:
     runs-on:
@@ -36,10 +40,15 @@ jobs:
             '
 
   sdks:
+    permissions:
+      contents: read
+      id-token: write
+    # Keep the Bazel CLI build advisory until the public build and cache rollout is verified.
+    continue-on-error: true
     runs-on:
       group: ${{ github.event.repository.name }}-runners
       labels: ${{ github.event.repository.name }}-linux-x64
-    timeout-minutes: 20
+    timeout-minutes: 90
     environment:
       name: bazel
       deployment: false
@@ -76,13 +85,11 @@ jobs:
 
       - name: Build codex and the code-mode host with Bazel
         id: build_bazel
-        env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           # Use the shared CI wrapper so fork PRs fall back cleanly when
-          # BuildBuddy credentials are unavailable. This workflow needs the
+          # This workflow needs the
           # built binaries on disk afterwards, so ask the wrapper to override
           # CI's default remote_download_minimal behavior.
           ./.github/scripts/run-bazel-ci.sh \

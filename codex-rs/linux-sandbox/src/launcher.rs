@@ -38,7 +38,11 @@ struct SystemBwrapCapabilities {
 
 static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
 
-pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> ! {
+pub(crate) fn exec_bwrap(
+    mut argv: Vec<String>,
+    preserved_files: Vec<File>,
+    transparent_tcp: bool,
+) -> ! {
     if argv
         .iter()
         .take_while(|arg| arg.as_str() != "--")
@@ -53,7 +57,11 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
                 translate_legacy_bwrap_fd_mounts(&mut argv)
                     .unwrap_or_else(|error| panic!("invalid legacy bubblewrap fd mount: {error}"));
             }
-            exec_system_bwrap(&launcher.program, argv, preserved_files)
+            make_files_inheritable(&preserved_files);
+            if transparent_tcp {
+                crate::tcp_net_setup::exec_setup(launcher.program.as_path(), &argv[1..]);
+            }
+            exec_system_bwrap(&launcher.program, argv)
         }
         BubblewrapLauncher::Bundled(launcher) => launcher.exec(argv, preserved_files),
         BubblewrapLauncher::Unavailable => {
@@ -135,6 +143,7 @@ fn translate_legacy_bwrap_fd_mounts(argv: &mut Vec<String>) -> Result<(), String
 pub(crate) fn initialize_bwrap_launcher(
     file_system_policy: &FileSystemSandboxPolicy,
     sandbox_policy_cwd: &Path,
+    require_system: bool,
 ) {
     LAUNCHER.get_or_init(|| {
         if let Some(path) = find_system_bwrap_in_path(file_system_policy, sandbox_policy_cwd)
@@ -143,6 +152,9 @@ pub(crate) fn initialize_bwrap_launcher(
             return BubblewrapLauncher::System(launcher);
         }
 
+        if require_system {
+            panic!("transparent TCP requires a supported distro bubblewrap on PATH");
+        }
         match bundled_bwrap::launcher() {
             Some(launcher) => BubblewrapLauncher::Bundled(launcher),
             None => BubblewrapLauncher::Unavailable,
@@ -219,14 +231,7 @@ fn system_bwrap_capabilities(system_bwrap_path: &Path) -> Option<SystemBwrapCapa
     })
 }
 
-fn exec_system_bwrap(
-    program: &AbsolutePathBuf,
-    argv: Vec<String>,
-    preserved_files: Vec<File>,
-) -> ! {
-    // System bwrap runs across an exec boundary, so preserved fds must survive exec.
-    make_files_inheritable(&preserved_files);
-
+fn exec_system_bwrap(program: &AbsolutePathBuf, argv: Vec<String>) -> ! {
     let program_path = program.as_path().display().to_string();
     let program = CString::new(program.as_path().as_os_str().as_bytes())
         .unwrap_or_else(|err| panic!("invalid system bubblewrap path: {err}"));

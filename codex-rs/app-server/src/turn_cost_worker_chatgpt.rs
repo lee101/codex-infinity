@@ -30,11 +30,15 @@ impl WorkerRuntime {
                 .or_default()
                 .push(turn_id.clone());
         }
-        let client = BackendClient::from_auth(
+        let client = BackendClient::from_auth_with_runtime(
             self.config.chatgpt_base_url.clone(),
             auth,
             http_client_factory,
-        );
+            self.runtime_auth.as_ref(),
+            /*headers*/ &Default::default(),
+        )
+        .await
+        .map_err(RequestError::Other)?;
         let costs = client.query_chatgpt_turn_costs(&threads).await?;
         let mut settled_costs = Vec::new();
         for thread in costs {
@@ -49,14 +53,13 @@ impl WorkerRuntime {
                     continue;
                 };
                 let (Some(micros), Some(settled_ids)) =
-                    (cost.estimated_usage_usd_micros, cost.settled_response_ids)
+                    (cost.visible_total_usd_micros(), cost.settled_response_ids)
                 else {
                     continue;
                 };
                 // Missing/hidden dollars are not zero. A projection can appear before
                 // all responses settle, so require every locally observed response.
-                if micros < 0
-                    || entry.expected_response_ids.is_empty()
+                if entry.expected_response_ids.is_empty()
                     || !entry
                         .expected_response_ids
                         .iter()

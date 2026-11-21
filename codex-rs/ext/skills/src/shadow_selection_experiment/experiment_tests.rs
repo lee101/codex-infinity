@@ -79,6 +79,7 @@ async fn turn_input_and_history_advance_while_ranking_is_blocked()
     let config = SkillsExtensionConfig {
         include_instructions: false,
         catalog_deltas_enabled: false,
+        omit_descriptions: false,
         max_context_tokens: None,
         bundled_skills_enabled: false,
         cloud_skill_enabled: false,
@@ -140,7 +141,7 @@ async fn turn_input_and_history_advance_while_ranking_is_blocked()
                 TurnInputContext {
                     step_store: &turn_store,
                     turn_id: turn_id.to_string(),
-                    user_input: vec![UserInput::Skill {
+                    user_input: &[UserInput::Skill {
                         name: "selected".to_string(),
                         path: "selected/SKILL.md".into(),
                     }],

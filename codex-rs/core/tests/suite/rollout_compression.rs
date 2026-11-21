@@ -90,6 +90,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .fork_prepared_thread(
             codex_core::StartThreadOptions::new(test.config.clone()),
             prepared,
+            codex_thread_store::InheritedHistoryVisibility::Full,
         )
         .await?;
     turn(
@@ -137,8 +138,11 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .features
         .enable(Feature::LocalThreadStoreCompression)?;
     // Use production feature wiring, rather than manually writing zstd files or calling the worker.
-    let store =
-        codex_core::thread_store_from_config(&config, codex_core::init_state_db(&config).await);
+    let store = codex_core::ThreadStoreBuilder::from_config(
+        &config,
+        codex_core::init_state_db(&config).await,
+    )
+    .build();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if paths

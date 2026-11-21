@@ -17,6 +17,7 @@ use codex_config::RequirementSource;
 use codex_config::TomlValue;
 use codex_config::version_for_toml;
 use codex_plugin::PluginHookSource;
+use codex_plugin::bundled_hook_app_connector_id;
 use codex_plugin::is_allowlisted_bundled_cleanup_hook;
 use codex_protocol::protocol::HookEventName;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -648,6 +649,36 @@ fn append_matcher_groups(
             }
         };
         for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
+            let on_failure = match &handler {
+                HookHandlerConfig::Command { on_failure, .. }
+                | HookHandlerConfig::McpTool { on_failure, .. } => *on_failure,
+                HookHandlerConfig::Prompt {} | HookHandlerConfig::Agent {} => None,
+            };
+            if on_failure == Some(codex_config::HookFailurePolicy::Block)
+                && (matches!(
+                    event_name,
+                    HookEventName::SessionEnd
+                        | HookEventName::PreModelRequest
+                        | HookEventName::PostModelRequest
+                ) || matches!(handler, HookHandlerConfig::Command { r#async: true, .. }))
+            {
+                source.record_load_failure(
+                    format!(
+                        "onFailure:block requires a synchronous hook that supports blocking in {}",
+                        source.path.display()
+                    ),
+                    warnings,
+                );
+                continue;
+            }
+            let expected_app_connector_id = source.plugin_id.as_deref().and_then(|plugin_id| {
+                bundled_hook_app_connector_id(
+                    plugin_id,
+                    event_name,
+                    group.matcher.as_deref(),
+                    &handler,
+                )
+            });
             let normalized = match handler {
                 HookHandlerConfig::Command {
                     command,
@@ -655,6 +686,7 @@ fn append_matcher_groups(
                     timeout_sec,
                     r#async,
                     status_message,
+                    on_failure,
                     additional_context_limit,
                 } => {
                     let command = if cfg!(windows) {
@@ -709,6 +741,7 @@ fn append_matcher_groups(
                         timeout_sec: Some(timeout_sec),
                         r#async,
                         status_message: status_message.clone(),
+                        on_failure,
                         additional_context_limit: normalized_additional_context_limit,
                     };
                     let command = source.env.iter().fold(command, |command, (key, value)| {
@@ -732,6 +765,7 @@ fn append_matcher_groups(
                     input,
                     timeout_sec,
                     status_message,
+                    on_failure,
                 } => {
                     if event_name == HookEventName::SessionEnd {
                         source.record_load_failure(
@@ -766,10 +800,12 @@ fn append_matcher_groups(
                         input: input.clone(),
                         timeout_sec: Some(timeout_sec),
                         status_message: status_message.clone(),
+                        on_failure,
                     };
                     NormalizedHandler {
                         config,
                         kind: ConfiguredHandlerKind::McpTool {
+                            expected_app_connector_id,
                             server,
                             tool,
                             input,
@@ -819,6 +855,7 @@ fn append_matcher_groups(
                     /*app_connector_id*/ None,
                 )
             });
+            let builtin = builtin || expected_app_connector_id.is_some();
             let plugin_content_hash = match source.plugin_content_hash {
                 Some(Ok(hash)) => Some(hash.as_str()),
                 Some(Err(err)) if !builtin && !source.bypass_hook_trust => {
@@ -929,6 +966,7 @@ fn append_matcher_groups(
                     matcher: compiled_matcher.clone(),
                     timeout_sec,
                     status_message,
+                    on_failure: on_failure.unwrap_or_default(),
                     additional_context_limit: AdditionalContextLimit::from_config(
                         additional_context_limit,
                     ),
@@ -1188,6 +1226,7 @@ mod tests {
                 timeout_sec: None,
                 r#async: false,
                 status_message: None,
+                on_failure: None,
                 additional_context_limit: None,
             }],
         }
@@ -1204,6 +1243,7 @@ mod tests {
                 timeout_sec: None,
                 r#async: false,
                 status_message: None,
+                on_failure: None,
                 additional_context_limit: Some(additional_context_limit),
             }],
         }
@@ -1238,6 +1278,7 @@ mod tests {
                     input,
                     timeout_sec: Some(30),
                     status_message: Some("Scanning file".to_string()),
+                    on_failure: None,
                 }],
             }],
         );
@@ -1279,6 +1320,7 @@ mod tests {
                     input: serde_json::Map::new(),
                     timeout_sec: None,
                     status_message: None,
+                    on_failure: None,
                 }],
             }],
         );
@@ -1319,6 +1361,7 @@ mod tests {
                         input: serde_json::Map::new(),
                         timeout_sec: None,
                         status_message: None,
+                        on_failure: None,
                     },
                     HookHandlerConfig::McpTool {
                         server: "security".to_string(),
@@ -1326,6 +1369,7 @@ mod tests {
                         input: serde_json::Map::new(),
                         timeout_sec: Some(600),
                         status_message: None,
+                        on_failure: None,
                     },
                 ],
             }],
@@ -1382,6 +1426,52 @@ mod tests {
             }],
         );
         (handlers.remove(0), entries.remove(0), warnings)
+    }
+
+    #[test]
+    fn failure_policy_is_preserved_in_discovery_and_trust_hashes() {
+        for mut hook in [
+            serde_json::json!({"type": "command", "command": "echo hello"}),
+            serde_json::json!({"type": "mcp_tool", "server": "scanner", "tool": "check"}),
+        ] {
+            let source_path = source_path();
+            let hook_states = std::collections::HashMap::new();
+            let mut handlers = Vec::new();
+            let mut entries = Vec::new();
+            let mut warnings = Vec::new();
+            let mut display_order = 0;
+            for policy in [None, Some("continue"), Some("block")] {
+                if let Some(policy) = policy {
+                    hook["onFailure"] = serde_json::json!(policy);
+                }
+                append_matcher_groups(
+                    &mut handlers,
+                    &mut entries,
+                    &mut warnings,
+                    &mut display_order,
+                    &mut hook_handler_source(&source_path, &hook_states),
+                    HookEventName::PreToolUse,
+                    vec![MatcherGroup {
+                        matcher: None,
+                        hooks: vec![serde_json::from_value(hook.clone()).expect("hook")],
+                    }],
+                );
+            }
+            assert!(warnings.is_empty());
+            assert_eq!(
+                handlers
+                    .iter()
+                    .map(|handler| handler.on_failure)
+                    .collect::<Vec<_>>(),
+                vec![
+                    codex_config::HookFailurePolicy::Continue,
+                    codex_config::HookFailurePolicy::Continue,
+                    codex_config::HookFailurePolicy::Block,
+                ]
+            );
+            assert_ne!(entries[0].current_hash, entries[2].current_hash);
+            assert_ne!(entries[1].current_hash, entries[2].current_hash);
+        }
     }
 
     #[test]
@@ -1473,6 +1563,7 @@ mod tests {
                 matcher: None,
                 timeout_sec: 600,
                 status_message: None,
+                on_failure: Default::default(),
                 additional_context_limit: Default::default(),
                 source_path: source_path.clone().into(),
                 source: hook_source(),
@@ -1514,6 +1605,7 @@ mod tests {
                 matcher: Some(HookMatcher::new("^Bash$").expect("valid matcher")),
                 timeout_sec: 600,
                 status_message: None,
+                on_failure: Default::default(),
                 additional_context_limit: Default::default(),
                 source_path: source_path.clone().into(),
                 source: hook_source(),
@@ -1552,6 +1644,7 @@ mod tests {
                         timeout_sec: None,
                         r#async: false,
                         status_message: None,
+                        on_failure: None,
                         additional_context_limit: None,
                     },
                     HookHandlerConfig::Command {
@@ -1560,6 +1653,7 @@ mod tests {
                         timeout_sec: Some(600),
                         r#async: true,
                         status_message: None,
+                        on_failure: None,
                         additional_context_limit: None,
                     },
                 ],
@@ -1642,6 +1736,7 @@ mod tests {
                     timeout_sec: Some(600),
                     r#async: true,
                     status_message: None,
+                    on_failure: None,
                     additional_context_limit: None,
                 }],
             }],
@@ -1833,6 +1928,7 @@ mod tests {
                         timeout_sec: None,
                         r#async: false,
                         status_message: None,
+                        on_failure: None,
                         additional_context_limit: None,
                     }],
                 }],
@@ -1864,6 +1960,7 @@ mod tests {
                     timeout_sec: None,
                     r#async: false,
                     status_message: None,
+                    on_failure: None,
                     additional_context_limit: None,
                 }],
             }],

@@ -192,6 +192,11 @@ impl App {
     /// Show detailed history in the owned viewport or the inline session's transcript overlay.
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
         if tui.is_owned_screen() {
+            if self.scrollback_has_older_history
+                && !self.transcript_view.history.has_unloaded_history()
+            {
+                self.transcript_view.history = TranscriptHistoryState::Partial;
+            }
             self.transcript_view.set_presentation(
                 /*detailed*/ true,
                 self.chat_widget.history_render_mode(),
@@ -391,6 +396,9 @@ impl App {
     /// source of truth for the active cell and its cache invalidation key, and because `App` owns
     /// overlay lifecycle and frame scheduling for animations.
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        let hud = self
+            .key_chord_matcher
+            .guide(&self.keymap.chords, &tui.frame_requester());
         let select_exit_key = Self::transcript_select_exit_key(&event);
         if matches!(
             &event,
@@ -439,15 +447,21 @@ impl App {
                 }
             });
             // Refresh visible rows before selection captures this live revision.
-            let result =
-                if input { t.draw(tui) } else { Ok(()) }.and_then(|()| t.handle_event(tui, event));
+            let result = tui.with_shortcut_hud(hud, |tui| {
+                if input { t.draw(tui) } else { Ok(()) }.and_then(|()| t.handle_event(tui, event))
+            });
             if result.is_err() {
                 let _ = tui.set_mouse_capture(tui::MouseCapture::Inherit);
             }
             let completed_copy = result?;
-            let close_overlay = t.is_done();
+            let thread_link = t.pending_thread_link.take();
+            let close_overlay = t.is_done() || thread_link.is_some();
             let select_mode_closed = was_select_mode && (!t.is_select_mode() || close_overlay);
             let pending_follow_id = t.pending_follow_id();
+            if let Some(thread_id) = thread_link {
+                self.app_event_tx
+                    .send(AppEvent::OpenThreadLink { thread_id });
+            }
             if !close_overlay
                 && active_key.is_some_and(|key| key.animation_tick.is_some())
                 && t.is_scrolled_to_bottom()
@@ -478,7 +492,7 @@ impl App {
         }
 
         if let Some(overlay) = &mut self.overlay {
-            overlay.handle_event(tui, event)?;
+            tui.with_shortcut_hud(hud, |tui| overlay.handle_event(tui, event))?;
             if overlay.is_done() {
                 self.close_transcript_overlay(tui);
                 tui.frame_requester().schedule_frame();

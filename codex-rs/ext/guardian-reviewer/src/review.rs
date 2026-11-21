@@ -42,6 +42,7 @@ pub trait ReviewHost: Clone + Send + Sync + 'static {
     fn servicing_turn(&self) -> impl Future<Output = Option<(String, Arc<ModelInfo>)>> + Send;
     /// Returns the owning turn and optional target item after validating the action.
     fn validate_action(&self) -> Result<(&str, Option<&str>), ReviewDecision>;
+    /// Prepares evidence and accounting, with a client event only for supported actions.
     fn prepare(
         &self,
         approval_id: &str,
@@ -115,9 +116,9 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                 Ok(prepared) => prepared,
                 Err(decision) => return Some(decision),
             };
-            self.host
-                .emit(EventMsg::GuardianAssessment(report.started_event()))
-                .await;
+            if let Some(event) = report.started_event() {
+                self.host.emit(EventMsg::GuardianAssessment(event)).await;
+            }
             let prepared = Arc::new(prepared);
             let cancellation = self.cancellation.child_token();
             let attempts = Arc::new(AtomicI64::new(/*v*/ 0));
@@ -186,9 +187,32 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                 analytics,
                 completed_at_ms.try_into().unwrap_or_default(),
             );
-            if self.log_assessments && !cached_approval {
+            tracing::event!(
+                target: "codex_otel.log_only",
+                tracing::Level::INFO,
+                event.name = "codex.guardian_probe_comparison",
+                stage = "sync_guardian",
+                thread_id = %self.thread_id,
+                turn_id = self.turn_id,
+                call_id = self.tool_call_id,
+                review_id = self.approval_id,
+                model = self.sampling_model,
+                guardian_context_mode = completed.analytics.guardian_context_mode.unwrap_or("not_reported"),
+                sync_outcome = if cached_approval { "async_approval" } else if completed.assessment_outcome.is_some() { "completed" } else { "failure" },
+                sync_decision = match completed.assessment_outcome {
+                    Some(GuardianAssessmentOutcome::Allow) => "allow",
+                    Some(GuardianAssessmentOutcome::Deny) => "deny",
+                    None => "not_reported",
+                },
+                failure_reason = ?completed.analytics.failure_reason,
+                "Guardian probe comparison"
+            );
+            if self.log_assessments
+                && !cached_approval
+                && let Some(event) = &completed.event
+            {
                 self.telemetry
-                    .guardian_assessment(&completed.event, completed.assessment_outcome);
+                    .guardian_assessment(event, completed.assessment_outcome);
             }
             report.track(
                 self.telemetry,
@@ -204,14 +228,13 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
             }
             if completed.assessment_outcome.is_some()
                 && let Some(evidence) = evidence
+                && let Some(event) = &completed.event
             {
-                self.host
-                    .record_evidence(&prepared, evidence, &completed.event)
-                    .await;
+                self.host.record_evidence(&prepared, evidence, event).await;
             }
-            self.host
-                .emit(EventMsg::GuardianAssessment(completed.event))
-                .await;
+            if let Some(event) = completed.event {
+                self.host.emit(EventMsg::GuardianAssessment(event)).await;
+            }
             if cached_approval {
                 return Some(self.cached_approval().await);
             }
@@ -234,6 +257,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                                 ErrorEvent {
                                     message,
                                     codex_error_info: Some(CodexErrorInfo::TooManyDenials),
+                                    rejected_audio_file_ids: Vec::new(),
                                     misalignment: None,
                                 },
                             )

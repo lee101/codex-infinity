@@ -130,7 +130,10 @@ impl CodeModeWaitHandler {
                     exec.session
                         .services
                         .code_mode_service
-                        .terminate(cell_id.clone())
+                        .terminate(codex_code_mode::TerminateRequest {
+                            cell_id: cell_id.clone(),
+                            max_output_tokens: args.max_tokens,
+                        })
                         .await
                 } else {
                     exec.session
@@ -140,7 +143,7 @@ impl CodeModeWaitHandler {
                             codex_code_mode::WaitRequest {
                                 cell_id: cell_id.clone(),
                                 yield_time_ms: args.yield_time_ms,
-                                max_output_tokens: None,
+                                max_output_tokens: args.max_tokens,
                             },
                             step_context.preempt.clone(),
                         )
@@ -151,11 +154,23 @@ impl CodeModeWaitHandler {
                     FunctionCallError::RespondToModel(error)
                 })?;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
+                    // Dispatch already records failed waits. Re-parsing {"cell_id": 5} during
+                    // replay used to abort the whole trace, and even a valid string can name
+                    // a closed cell. Only the host can confirm which cell this wait reached.
                     let runtime_cell_id = match response {
                         RuntimeResponse::Yielded { cell_id, .. }
                         | RuntimeResponse::Terminated { cell_id, .. }
                         | RuntimeResponse::Result { cell_id, .. } => cell_id,
                     };
+                    let cell_trace = exec
+                        .session
+                        .services
+                        .rollout_thread_trace
+                        .code_cell_trace_context(
+                            exec.turn.sub_id.as_str(),
+                            runtime_cell_id.as_str(),
+                        );
+                    cell_trace.record_wait_target(&call_id);
                     tracing::Span::current().record("cell.id", trace_id(runtime_cell_id.as_str()));
                     telemetry.cell_id = Some(runtime_cell_id.to_string());
                     exec.session
@@ -171,14 +186,7 @@ impl CodeModeWaitHandler {
                                     .unwrap_or_default(),
                             },
                         );
-                        exec.session
-                            .services
-                            .rollout_thread_trace
-                            .code_cell_trace_context(
-                                exec.turn.sub_id.as_str(),
-                                runtime_cell_id.as_str(),
-                            )
-                            .record_ended(response);
+                        cell_trace.record_ended(response);
                         exec.session
                             .services
                             .code_mode_service
@@ -208,6 +216,7 @@ impl CodeModeWaitHandler {
                     &step_context.settings.model_info,
                     wait_response.into(),
                     args.max_tokens,
+                    exec.session.services.code_mode_service.output_truncation(),
                     wall_time,
                     exec.turn.config.code_mode.experimental_show_cell_overhead,
                 )))

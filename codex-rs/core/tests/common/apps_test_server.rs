@@ -1,6 +1,8 @@
+use crate::PathExt;
 use crate::test_codex::TestCodexBuilder;
 use crate::test_codex::test_codex;
 use anyhow::Result;
+use codex_config::types::AppToolApproval;
 use codex_core::config::Config;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::McpServerContribution;
@@ -9,6 +11,7 @@ use codex_extension_api::McpServerContributor;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::config_types::ApprovalsReviewer;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -34,8 +37,8 @@ const DISCOVERABLE_CALENDAR_ID: &str = "connector_2128aebfecb84f64a069897515042a
 const DISCOVERABLE_GMAIL_ID: &str = "connector_68df038e0ba48191908c8434991bbac2";
 const CONNECTOR_DESCRIPTION: &str = "Plan events and manage your calendar.";
 const CODEX_APPS_META_KEY: &str = "_codex_apps";
-const CODEX_APPS_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
-const HOSTED_PLUGIN_RUNTIME_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
+const CODEX_APPS_MCP_PATH_REGEX: &str = "^/(?:api/codex|backend-api)/ps/mcp/?$";
+const HOSTED_PLUGIN_RUNTIME_MCP_PATH_REGEX: &str = "^/(?:api/codex|backend-api)/ps/mcp/?$";
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "codex-apps-test";
 const SERVER_VERSION: &str = "1.0.0";
@@ -325,6 +328,25 @@ pub fn apps_enabled_builder(apps_base_url: impl Into<String>) -> TestCodexBuilde
         .with_config(move |config| configure_apps(config, apps_base_url.as_str()))
 }
 
+pub fn set_default_app_approval_mode_and_reviewer(
+    config: &mut Config,
+    approval_mode: AppToolApproval,
+    reviewer: ApprovalsReviewer,
+) {
+    let path = config.codex_home.join("config.toml").abs();
+    let user_config = serde_json::from_value(json!({
+        "apps": { "_default": {
+            "approvals_reviewer": reviewer,
+            "default_tools_approval_mode": approval_mode,
+        } }
+    }))
+    .expect("apps config should parse");
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(&path, user_config)
+        .expect("apps user config should be valid");
+}
+
 pub fn search_capable_apps_builder(apps_base_url: impl Into<String>) -> TestCodexBuilder {
     let apps_base_url = apps_base_url.into();
     test_codex()
@@ -348,8 +370,10 @@ pub async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value> {
         .into_iter()
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
-            (request.url.path() == "/api/codex/ps/mcp"
-                && body.get("method").and_then(Value::as_str) == Some("tools/call"))
+            (matches!(
+                request.url.path(),
+                "/api/codex/ps/mcp" | "/backend-api/ps/mcp"
+            ) && body.get("method").and_then(Value::as_str) == Some("tools/call"))
             .then_some(body)
         })
         .collect()

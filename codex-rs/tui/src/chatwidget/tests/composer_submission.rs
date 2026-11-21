@@ -14,11 +14,71 @@ use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
 #[tokio::test]
+async fn reconnect_queues_enter_and_resumes_ordinary_next_turn_submission() {
+    let (mut chat, mut events, _operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.codex_op_target = CodexOpTarget::AppEvent;
+    chat.thread_stream_disconnected = true;
+    chat.apply_external_edit("queued prompt".into());
+    chat.handle_key_event(KeyCode::Enter.into());
+    chat.apply_external_edit("still editing".into());
+    assert_eq!(chat.queued_user_message_texts(), ["queued prompt"]);
+    assert!(
+        !std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+    );
+
+    let frame = render_bottom_popup(&chat, /*width*/ 80);
+    let visible: Vec<_> = frame
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("queued prompt") || line.contains("still editing"))
+        .collect();
+    insta::assert_snapshot!(visible.join("\n"), @r"
+    ↳ queued prompt
+    › still editing
+    ");
+
+    chat.thread_stream_disconnected = false;
+    assert!(chat.maybe_send_next_queued_input());
+    assert_eq!(chat.composer_text_with_pending(), "still editing");
+    let mut sequence = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) if cell.as_any().is::<UserHistoryCell>() => {
+                sequence.push("prompt")
+            }
+            AppEvent::CodexOp(AppCommand::UserTurn {
+                cloud_submission,
+                items,
+                ..
+            }) => {
+                assert_eq!(
+                    cloud_submission,
+                    crate::app_command::CloudSubmissionIntent::StartIfIdle
+                );
+                assert_eq!(
+                    items,
+                    vec![UserInput::Text {
+                        text: "queued prompt".into(),
+                        text_elements: vec![]
+                    }]
+                );
+                sequence.push("submit");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(sequence, ["prompt", "submit"]);
+}
+
+#[tokio::test]
 async fn composer_submission_sends_once_and_requests_latest() {
     let (mut chat, mut events, mut operations) =
         make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.apply_external_edit("send once".to_string());
+    let prompt = "**send once**";
+    chat.apply_external_edit(prompt.to_string());
     while events.try_recv().is_ok() {}
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     assert_eq!(
@@ -33,7 +93,7 @@ async fn composer_submission_sends_once_and_requests_latest() {
     assert_eq!(
         items,
         vec![UserInput::Text {
-            text: "send once".into(),
+            text: prompt.into(),
             text_elements: Vec::new(),
         }]
     );
@@ -389,6 +449,7 @@ async fn parent_owned_thread_preserves_queued_input_before_draining() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     let queued_message = QueuedUserMessage {
         user_message: UserMessage::from("keep this queued prompt"),
+        prepared_images: None,
         action: QueuedInputAction::Plain,
         delivery: MessageDelivery::Unsent,
         pending_pastes: vec![("[Image 1]".to_string(), "pasted contents".to_string())],
@@ -416,12 +477,161 @@ async fn parent_owned_thread_preserves_queued_input_before_draining() {
 }
 
 #[tokio::test]
+async fn handoff_image_survives_model_rejection_and_submission_failure() {
+    let (mut source, _events, mut source_ops) =
+        make_chatwidget_manual(/*model_override*/ None).await;
+    source.thread_id = Some(ThreadId::new());
+    let mut models = source.model_catalog.try_list_models().unwrap();
+    for model in &mut models {
+        model
+            .input_modalities
+            .retain(|modality| *modality != InputModality::Image);
+    }
+    source.model_catalog = Arc::new(ModelCatalog::new(models));
+    source.sync_image_paste_enabled();
+    let path = PathBuf::from("image.png");
+    let action = source.handle_restricted_key(
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+        RestrictedInputMode::DraftHandoff,
+    );
+    let KeyEventAction::PasteImage { context, .. } = action else {
+        panic!("expected handoff image paste");
+    };
+    source.attach_image(path.clone(), context);
+    let draft = source.composer_draft_snapshot();
+    assert_eq!(
+        draft.local_images,
+        vec![LocalImageAttachment {
+            placeholder: "[Image #1]".into(),
+            path,
+        }],
+    );
+    insta::assert_snapshot!(source.bottom_pane.composer_text(), @"[Image #1]");
+    source.handle_restricted_key(KeyCode::Enter.into(), RestrictedInputMode::DraftHandoff);
+    assert_no_submit_op(&mut source_ops);
+
+    // A failed switch leaves the source active: submission must reject but retain the image.
+    source.handle_key_event(KeyCode::Enter.into());
+    assert_no_submit_op(&mut source_ops);
+    assert_eq!(
+        source.bottom_pane.composer_draft_snapshot().local_images,
+        draft.local_images
+    );
+
+    let (mut destination, _events, mut destination_ops) =
+        make_chatwidget_manual(/*model_override*/ None).await;
+    destination.thread_id = Some(ThreadId::new());
+    destination.restore_startup_draft(draft.clone());
+    let mut supported_models = destination.model_catalog.try_list_models().unwrap();
+    let current_model = destination.current_model().to_string();
+    let model = supported_models
+        .iter_mut()
+        .find(|model| model.model == current_model)
+        .expect("current model");
+    if !model.input_modalities.contains(&InputModality::Image) {
+        model.input_modalities.push(InputModality::Image);
+    }
+    let mut unsupported_models = supported_models.clone();
+    for model in &mut unsupported_models {
+        model
+            .input_modalities
+            .retain(|modality| *modality != InputModality::Image);
+    }
+    destination.model_catalog = Arc::new(ModelCatalog::new(unsupported_models));
+    destination.handle_key_event(KeyCode::Enter.into());
+    assert_no_submit_op(&mut destination_ops);
+    assert_eq!(
+        destination
+            .bottom_pane
+            .composer_draft_snapshot()
+            .local_images,
+        draft.local_images
+    );
+
+    // A capable destination admits the image; a subsequent submission failure restores it.
+    destination.model_catalog = Arc::new(ModelCatalog::new(supported_models));
+    destination.handle_key_event(KeyCode::Enter.into());
+    assert_matches!(next_submit_op(&mut destination_ops), Op::UserTurn { .. });
+    let client_id = destination
+        .input_queue
+        .pending_user_message_client_id
+        .clone()
+        .expect("pending submission");
+    destination.restore_rejected_user_message(&client_id, "submission failed".into());
+    assert_eq!(
+        destination
+            .bottom_pane
+            .composer_draft_snapshot()
+            .local_images,
+        draft.local_images
+    );
+    insta::assert_snapshot!(destination.bottom_pane.composer_text(), @"[Image #1]");
+    assert_no_submit_op(&mut destination_ops);
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_clipboard_image_does_not_turn_a_held_bang_into_a_shell_command() {
+    let (mut chat, _events, mut operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
+    chat.handle_key_event(KeyCode::Char('!').into());
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+    assert_eq!(chat.bottom_pane.composer_recovery_snapshot().text, "!");
+
+    let paste = chat.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    let KeyEventAction::PasteImage { context, .. } = paste else {
+        panic!("expected a clipboard image request");
+    };
+    let image_path = PathBuf::from("image.png");
+    chat.attach_image(image_path.clone(), context);
+    chat.handle_key_event(KeyCode::Enter.into());
+
+    let draft = chat.bottom_pane.composer_recovery_snapshot();
+    assert_eq!(draft.text, "[Image #1]!\n");
+    assert_eq!(draft.shell_mode, Some(false));
+    while let Ok(op) = operations.try_recv() {
+        assert!(
+            !matches!(op, Op::RunUserShellCommand { .. } | Op::UserTurn { .. }),
+            "{op:?}"
+        );
+    }
+
+    tokio::time::advance(Duration::from_secs(/*secs*/ 1)).await;
+    chat.handle_paste_burst_tick(FrameRequester::test_dummy());
+    chat.handle_key_event(KeyCode::Enter.into());
+
+    let Op::UserTurn { items, .. } = next_submit_op(&mut operations) else {
+        panic!("expected submitted user turn");
+    };
+    let placeholder = "[Image #1]";
+    assert_eq!(
+        items,
+        vec![
+            UserInput::LocalImage {
+                path: image_path,
+                detail: None,
+            },
+            UserInput::Text {
+                text: format!("{placeholder}!"),
+                text_elements: vec![
+                    TextElement::new((0..placeholder.len()).into(), Some(placeholder.to_string()))
+                        .into(),
+                ],
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -435,7 +645,7 @@ async fn submission_preserves_text_elements_and_local_images() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -532,6 +742,9 @@ async fn submission_includes_configured_active_permission_profile() {
     };
     let expected_active_permission_profile = ActivePermissionProfile::new("custom");
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -545,7 +758,7 @@ async fn submission_includes_configured_active_permission_profile() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: expected_permission_profile,
         active_permission_profile: Some(expected_active_permission_profile.clone()),
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -588,6 +801,9 @@ async fn submission_omits_active_permission_profile_for_legacy_snapshot() {
         file_system: ManagedFileSystemPermissions::Unrestricted,
     };
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -601,7 +817,7 @@ async fn submission_omits_active_permission_profile_for_legacy_snapshot() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: expected_permission_profile,
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -634,6 +850,9 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -647,7 +866,7 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -735,6 +954,9 @@ async fn enter_with_only_remote_images_submits_user_turn() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -748,7 +970,7 @@ async fn enter_with_only_remote_images_submits_user_turn() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -805,6 +1027,9 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -818,7 +1043,7 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -847,6 +1072,9 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -860,7 +1088,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -889,6 +1117,9 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -902,7 +1133,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -934,6 +1165,9 @@ async fn submission_prefers_selected_duplicate_skill_path() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -947,7 +1181,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -995,6 +1229,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             mention: "figma".to_string(),
             path: user_skill_path.to_string_lossy().into_owned(),
         }],
+        crate::bottom_pane::ShellPrefixHandling::Interpret,
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -1174,6 +1409,56 @@ async fn blocked_image_restore_with_remote_images_keeps_local_placeholder_mappin
 }
 
 #[tokio::test]
+async fn draft_handoffs_preserve_literal_and_shell_bang() {
+    for text in [
+        "!echo literal",
+        "!echo literal\nsecond line",
+        "  !echo literal",
+    ] {
+        let (mut source, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        source.bottom_pane.insert_str(&format!("x{text}"));
+        source.bottom_pane.set_composer_cursor(/*cursor*/ 0);
+        source.handle_key_event(KeyEvent::from(KeyCode::Delete));
+        let draft = source.composer_draft_snapshot();
+        assert_eq!(draft.text, text);
+        assert_eq!(draft.shell_mode, Some(false));
+
+        let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.restore_startup_draft(draft.clone());
+        assert_eq!(chat.bottom_pane.composer_draft_snapshot(), draft);
+        let input = chat.capture_thread_input_state();
+        chat.restore_thread_input_state(
+            input,
+            ThreadInputStateRestoreMode {
+                preserve_in_flight_turn: false,
+            },
+        );
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_hidden_shell_payload_is_literal(ops.try_recv(), text.trim().to_string());
+    }
+
+    let (mut source, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    source
+        .bottom_pane
+        .set_composer_text("!pwd".into(), Vec::new(), Vec::new());
+    let draft = source.composer_draft_snapshot();
+    assert_eq!(draft.shell_mode, Some(true));
+    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.restore_startup_draft(draft);
+    let input = chat.capture_thread_input_state();
+    chat.restore_thread_input_state(
+        input,
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_matches!(ops.try_recv(), Ok(Op::RunUserShellCommand { command }) if command == "pwd");
+}
+
+#[tokio::test]
 async fn startup_draft_handoff_preserves_cursor_and_large_paste() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let paste = "x".repeat(/*n*/ 1_001);
@@ -1187,6 +1472,12 @@ async fn startup_draft_handoff_preserves_cursor_and_large_paste() {
     chat.restore_startup_draft(startup_draft.clone());
 
     assert_eq!(chat.bottom_pane.composer_draft_snapshot(), startup_draft);
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(7)));
+    assert!(chat.bottom_pane.composer_is_empty());
+    chat.handle_key_event(KeyEvent::new(KeyCode::F(7), KeyModifiers::SHIFT));
+    let mut restored = chat.bottom_pane.composer_draft_snapshot();
+    restored.last_composer_activity_at = startup_draft.last_composer_activity_at;
+    assert_eq!(restored, startup_draft);
 }
 
 #[tokio::test]
@@ -1212,6 +1503,8 @@ async fn startup_draft_handoff_merges_existing_prompt_images_and_large_pastes() 
     );
     let initial_paste = "y".repeat(/*n*/ 1_001);
     chat.bottom_pane.handle_paste(initial_paste.clone());
+    chat.bottom_pane
+        .set_composer_cursor(image_placeholder.len() + 1);
     let existing_draft = chat.bottom_pane.composer_draft_snapshot();
     let existing_placeholder = existing_draft.pending_pastes[0].0.clone();
 
@@ -1241,6 +1534,15 @@ async fn startup_draft_handoff_merges_existing_prompt_images_and_large_pastes() 
             }],
         )
     );
+    let merged = chat.bottom_pane.composer_draft_snapshot();
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(7)));
+    let mut undone = chat.bottom_pane.composer_draft_snapshot();
+    undone.last_composer_activity_at = existing_draft.last_composer_activity_at;
+    assert_eq!(undone, existing_draft);
+    chat.handle_key_event(KeyEvent::new(KeyCode::F(7), KeyModifiers::SHIFT));
+    let mut redone = chat.bottom_pane.composer_draft_snapshot();
+    redone.last_composer_activity_at = merged.last_composer_activity_at;
+    assert_eq!(redone, merged);
 }
 
 #[tokio::test]
@@ -1863,6 +2165,51 @@ async fn pending_steer_interrupt_uses_remapped_binding() {
 }
 
 #[tokio::test]
+async fn resumed_steers_reconcile_by_client_id_and_hold_unmatched_admissions() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    // Both messages have the same text; only one has a receipt in the resumed history.
+    chat.input_queue.pending_steers = VecDeque::from([
+        PendingSteer {
+            client_id: "confirmed".into(),
+            admitted_turn_id: Some("finished".into()),
+            ..pending_steer("same text")
+        },
+        PendingSteer {
+            client_id: "unmatched".into(),
+            admitted_turn_id: Some("finished".into()),
+            ..pending_steer("same text")
+        },
+    ]);
+    chat.input_queue
+        .queued_user_messages
+        .push_back(UserMessage::from("next draft").into());
+    chat.input_queue
+        .queued_user_message_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+    let mut input = chat
+        .capture_thread_input_state()
+        .expect("saved session input");
+    input.reconcile_confirmed_messages(&["confirmed".into()]);
+    chat.restore_thread_input_state(
+        Some(input),
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["same text", "next draft"]
+    );
+    assert_eq!(
+        chat.input_queue.queued_user_messages[0].delivery,
+        MessageDelivery::Unconfirmed(Some("unmatched".into()))
+    );
+    assert!(!chat.maybe_send_next_queued_input());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
 async fn restore_thread_input_state_applies_running_state_policy() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -1877,6 +2224,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         text_elements: Vec::new(),
     });
     let input_state = ThreadInputState {
+        provider_error: None,
         questions: None,
         pending_thread_settings: None,
         initial_user_message: None,
@@ -2438,10 +2786,13 @@ async fn reconnect_resumes_unsent_input_and_reconciles_confirmed_submissions() {
     for pending_start in [false, true] {
         let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
         chat.thread_id = Some(ThreadId::new());
-        if !pending_start {
+        if pending_start {
+            chat.prepare_safety_recourse_rewrite("first message")
+                .unwrap();
+        } else {
             handle_turn_started(&mut chat, "turn-1");
+            chat.submit_user_message("first message".into());
         }
-        chat.submit_user_message("first message".into());
         let client_id = if pending_start {
             chat.input_queue
                 .pending_user_message_client_id
@@ -2455,7 +2806,28 @@ async fn reconnect_resumes_unsent_input_and_reconciles_confirmed_submissions() {
             .push_back(UserMessage::from("follow-up").into());
         chat.pause_for_disconnect();
         let mut input = chat.capture_thread_input_state();
+        let saved_source = input.as_ref().unwrap().safety_buffering_source;
+        assert_eq!(saved_source, UserMessageSource::Prompt);
+        if !pending_start {
+            let mut running_input = input.clone().unwrap();
+            running_input.reconcile_confirmed_messages(std::slice::from_ref(&client_id));
+            let (mut restored, _rx, mut ops) =
+                make_chatwidget_manual(/*model_override*/ None).await;
+            restored.restore_thread_input_state(
+                Some(running_input),
+                ThreadInputStateRestoreMode {
+                    preserve_in_flight_turn: true,
+                },
+            );
+            assert!(restored.turn_lifecycle.agent_turn_running);
+            assert!(restored.input_queue.pending_steers.is_empty());
+            assert!(!restored.input_queue.submit_pending_steers_after_interrupt);
+            restored.on_interrupted_turn(TurnAbortReason::Interrupted);
+            assert_no_submit_op(&mut ops);
+        }
         // Missing history and unrelated receipts never authorize resubmitting uncertain input.
+        // Each pass restores state captured from the prior pass, so an exact receipt discovered
+        // on a later resume still releases the ordinary follow-up exactly once.
         for ids in [
             vec![],
             vec!["different-submission".into()],
@@ -2667,8 +3039,8 @@ async fn image_preparation_failure_restores_full_input_without_submitting() {
         let pixels = image::RgbImage::new(/*width*/ 2, /*height*/ 2);
         pixels.save(&path).unwrap();
         chat.set_remote_image_urls(vec!["https://example.com/remote.png".into()]);
-        chat.handle_paste(path.display().to_string());
-        chat.handle_paste("describe $file".into());
+        chat.bottom_pane.attach_image(path.clone());
+        chat.handle_paste(" describe $file".into());
         chat.bottom_pane.set_composer_text_with_mention_bindings(
             chat.bottom_pane.composer_text(),
             chat.bottom_pane.composer_text_elements(),
@@ -2678,6 +3050,7 @@ async fn image_preparation_failure_restores_full_input_without_submitting() {
                 mention: "file".into(),
                 path: "/tmp/skills/file/SKILL.md".into(),
             }],
+            crate::bottom_pane::ShellPrefixHandling::Interpret,
         );
         let draft = chat.bottom_pane.composer_draft_snapshot();
         if oversized {
@@ -2832,6 +3205,7 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                 if scenario == "rate_limit_recovery" {
                     chat.input_queue.rate_limit_recovery_pending = true;
                     chat.on_images_prepared(id);
+                    std::fs::remove_file(&message.local_images[0].path).unwrap();
                     assert_eq!(
                         chat.input_queue
                             .queued_user_messages
@@ -2840,6 +3214,10 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                             .collect::<Vec<_>>(),
                         vec![message, UserMessage::from("x")],
                     );
+                    chat.input_queue.rate_limit_recovery_pending = false;
+                    assert!(chat.maybe_send_next_queued_input());
+                    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { items, .. }
+                        if matches!(items.first(), Some(UserInput::Image { .. })));
                 } else if scenario == "model_change" {
                     chat.handle_paste("new draft".into());
                     let mut models = chat.model_catalog.try_list_models().unwrap();
@@ -2912,4 +3290,95 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                 assert!(chat.pending_image_submission.is_none());
             });
     }
+}
+
+#[tokio::test]
+async fn archived_view_preserves_pending_steer_when_interrupt_arrives() {
+    let (mut chat, _events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    let mut steer = pending_steer("pending steer");
+    steer.admitted_turn_id = Some("turn-1".into());
+    chat.input_queue.pending_steers.push_back(steer.clone());
+    chat.input_queue.submit_pending_steers_after_interrupt = true;
+    chat.restore_user_message_to_composer("retained draft".into());
+
+    chat.show_read_only_thread(ReadOnlyThread::Archived);
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    let saved = chat.capture_thread_input_state().unwrap();
+    assert_eq!(saved.pending_steers, VecDeque::from([steer]));
+    assert_eq!(chat.bottom_pane.composer_text(), "retained draft");
+    assert_no_submit_op(&mut ops);
+}
+
+#[tokio::test]
+async fn archived_view_preserves_initial_prompt_and_dismisses_search() {
+    for vim in [false, true] {
+        let (mut chat, _events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.initial_user_message = Some("CLI prompt".into());
+        chat.restore_user_message_to_composer("typed draft".into());
+        chat.bottom_pane.set_vim_enabled(vim);
+        chat.handle_key_event(if vim {
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
+        } else {
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        });
+        assert!(!chat.no_modal_or_popup_active());
+        chat.show_read_only_thread(ReadOnlyThread::Archived);
+        chat.submit_initial_user_message_if_pending();
+        assert!(chat.no_modal_or_popup_active());
+        assert_eq!(chat.composer_text_with_pending(), "CLI prompt\ntyped draft");
+        assert_no_submit_op(&mut ops);
+    }
+}
+
+#[tokio::test]
+async fn provider_error_recovers_only_the_rejected_steer() {
+    let (mut chat, _events, mut operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut accepted = pending_steer("Focus on the backend");
+    accepted.client_id = "accepted".into();
+    let mut rejected = pending_steer("Also add tests");
+    rejected.client_id = "rejected".into();
+    chat.input_queue
+        .pending_steers
+        .extend([accepted.clone(), rejected.clone()]);
+
+    chat.show_provider_error(
+        codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+            model_provider: "old-provider".into(),
+            required_model_provider: "required-provider".into(),
+        },
+        Some("rejected"),
+    );
+
+    assert_eq!(chat.input_queue.pending_steers, VecDeque::from([accepted]));
+    assert_eq!(
+        chat.input_queue.rejected_steers_queue,
+        VecDeque::from([rejected.user_message])
+    );
+    assert!(chat.input_queue.suppress_queue_autosend);
+    assert!(operations.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn provider_error_recovers_the_rejected_initial_prompt() {
+    let (mut chat, _events, mut operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.submit_user_message(UserMessage::from("Keep this prompt"));
+    let Op::UserTurn {
+        client_user_message_id,
+        ..
+    } = next_submit_op(&mut operations)
+    else {
+        panic!("expected user turn");
+    };
+    chat.show_provider_error(
+        codex_app_server_protocol::ModelProviderError::ModelProviderNotConfigured {
+            model_provider: "old-provider".into(),
+        },
+        Some(&client_user_message_id),
+    );
+    assert_eq!(chat.queued_user_message_texts(), vec!["Keep this prompt"]);
+    assert!(!chat.input_queue.user_turn_pending_start);
+    assert!(operations.try_recv().is_err());
 }

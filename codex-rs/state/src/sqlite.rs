@@ -2,6 +2,7 @@
 //! New databases use DELETE on NFS and WAL elsewhere.
 //! Writable pools preserve existing settings unless managed policy requires DELETE on NFS.
 //! Startup retries SQLITE_BUSY and reports other errors to callers.
+//! Schema version checks and migrations share one transaction and retry contention together.
 //! The configured logs directory is created and locked only when opening its database.
 
 #![expect(
@@ -413,7 +414,21 @@ impl SqliteConfig {
             if matches!(spec.kind, DbKind::State) {
                 repair_legacy_recency_migration_version(&pool, migrator).await?;
             }
-            migrator.run(&pool).await.map_err(anyhow::Error::from)
+            // SQLx's SQLite migration lock is a no-op. Keep version checks and changes in
+            // one transaction, retrying from a fresh snapshot after a concurrent migration.
+            // A current schema needs only a read lock, including when opened on NFS.
+            retry_on_busy(|| async {
+                let mut transaction = pool.begin().await?;
+                if let Err(error) = migrator
+                    .run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
+                    .await
+                {
+                    transaction.rollback().await?;
+                    return Err(error.into());
+                }
+                transaction.commit().await.map_err(anyhow::Error::from)
+            })
+            .await
         }
         .await;
         telemetry::record_init_result(
@@ -430,6 +445,24 @@ impl SqliteConfig {
             );
         }
         Ok(pool)
+    }
+
+    /// Open a private database that lasts for the lifetime of this pool.
+    pub async fn open_in_memory_pool() -> Result<SqlitePool, Error> {
+        // Keep the sole connection alive. Disabling the checkout ping also keeps
+        // a cancelled acquire from discarding the connection and its database.
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .test_before_acquire(false)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .pragma("temp_store", "MEMORY")
+                    .log_statements(LevelFilter::Off),
+            )
+            .await
     }
 
     /// Open a writable Codex SQLite database, creating it if necessary.

@@ -122,7 +122,7 @@ struct PendingRead {
 
 struct Response {
     result: CopyResult,
-    terminal_text: Option<String>,
+    terminal_sequence: Option<String>,
 }
 
 #[derive(Default)]
@@ -237,19 +237,24 @@ impl ClipboardWorker {
             self.start(
                 frames,
                 |text, format, setup| {
-                    let terminal_text = Cell::new(/*value*/ None);
+                    let terminal_sequence = Cell::new(/*value*/ None);
                     let result = super::copy_to_clipboard(
                         text,
                         format,
                         || setup.begin_delivery(),
                         |text| {
-                            // Validate the limit before accepting a deferred terminal send.
-                            super::osc52_sequence(text, std::env::var_os("TMUX").is_some())?;
-                            terminal_text.set(Some(text.to_owned()));
+                            let target = if std::env::var_os("TMUX").is_some() {
+                                super::Osc52Target::Tmux
+                            } else if std::env::var_os("STY").is_some() {
+                                super::Osc52Target::Screen
+                            } else {
+                                super::Osc52Target::Direct
+                            };
+                            terminal_sequence.set(Some(super::osc52_sequence(text, target)?));
                             Ok(())
                         },
                     );
-                    (result, terminal_text.into_inner())
+                    (result, terminal_sequence.into_inner())
                 },
                 crate::clipboard_paste::text::reader,
             )?;
@@ -304,6 +309,21 @@ impl ClipboardWorker {
             .map_err(|_| "clipboard worker stopped".to_string())?;
         read.response = Some(receiver);
         Ok(())
+    }
+
+    /// The original budget follows the read until its owner consumes the result.
+    pub(crate) fn text_read_deadline(&self, request: &Arc<()>) -> Option<Instant> {
+        let request = Arc::downgrade(request);
+        self.pending_read
+            .as_ref()
+            .filter(|read| read.owner.ptr_eq(&request))
+            .map(|read| read.deadline)
+            .or_else(|| {
+                self.read_result
+                    .as_ref()
+                    .filter(|(_, owner, _)| owner.ptr_eq(&request))
+                    .map(|(deadline, _, _)| *deadline)
+            })
     }
 
     pub(crate) fn take_text_result(&mut self) -> Option<Result<String, String>> {
@@ -377,7 +397,7 @@ impl ClipboardWorker {
                 // An ordinary copy must not relinquish PRIMARY, or vice versa.
                 let mut primary_lease: Option<ClipboardLease> = None;
                 while let Ok(request) = incoming.recv() {
-                    let (outcome, terminal_text) = match request {
+                    let (outcome, terminal_sequence) = match request {
                         Request::WarmTextReader => {
                             LazyCell::force(&read);
                             continue;
@@ -425,7 +445,7 @@ impl ClipboardWorker {
                     if outgoing
                         .send(Response {
                             result,
-                            terminal_text,
+                            terminal_sequence,
                         })
                         .is_err()
                     {
@@ -501,8 +521,8 @@ impl ClipboardWorker {
                         return self.completed.as_ref();
                     }
                     let mut result = response.result;
-                    if let Some(text) = response.terminal_text
-                        && let Err(error) = super::osc52_copy(&text)
+                    if let Some(sequence) = response.terminal_sequence
+                        && let Err(error) = super::write_osc52(&sequence)
                         && result != Ok(CopyStatus::Confirmed)
                     {
                         result = Err(error);

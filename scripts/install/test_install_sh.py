@@ -135,6 +135,65 @@ class InstallShTest(unittest.TestCase):
             )
             self.assertTrue(os.access(host_path, os.X_OK))
 
+    def test_shell_lookup_after_adding_and_updating_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            for name in ["literal$HOME", r'quote" back\tslash and !tick`']:
+                install_dir = root / name
+                result, _ = run_installer_in(
+                    root,
+                    VERSION,
+                    install_dir=install_dir,
+                    metadata_json=metadata,
+                    archive_path=archive,
+                    checksum_path=checksum,
+                    force_macos=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+                env = {"HOME": str(root / "home"), "PATH": "/usr/bin:/bin"}
+                lookup = subprocess.check_output(
+                    ["/bin/sh", "-c", '. "$HOME/.profile" && command -v codex'],
+                    env=env,
+                    text=True,
+                )
+                self.assertEqual(lookup.rstrip("\n"), str(install_dir / "codex"))
+
+                instructions = result.stdout.split("Current terminal: ", 1)[1]
+                launched = subprocess.check_output(
+                    ["/bin/sh", "-c", instructions.splitlines()[0]], env=env, text=True
+                )
+                self.assertEqual(launched.strip(), f"codex-cli {VERSION}")
+
+    def test_noninteractive_install_detects_npm_by_shebang(self) -> None:
+        for launcher, is_npm in (
+            ("#!/usr/bin/env node\n", True),
+            ("\x7fELF\0#!/usr/bin/env node\n", False),
+        ):
+            with self.subTest(is_npm=is_npm), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                archive, checksum, metadata = create_package_release(root)
+                (root / "bin").mkdir()
+                write_executable(root / "bin" / "codex", launcher)
+
+                result, _ = run_installer_in(
+                    root,
+                    VERSION,
+                    metadata_json=metadata,
+                    archive_path=archive,
+                    checksum_path=checksum,
+                    force_macos=True,
+                    install_dir_on_path=True,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    "Leaving the existing npm-managed Codex installed" in result.stderr,
+                    is_npm,
+                )
+                self.assertEqual((root / "home" / ".profile").exists(), is_npm)
+
     def test_releases_latest_installs_verified_package_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -321,12 +380,77 @@ class InstallShTest(unittest.TestCase):
             self.assertEqual(guarded.returncode, 0, guarded.stderr)
             self.assertTrue(managed.exists())
 
+    def test_macos_release_inspection_preserves_lsof_matches(self) -> None:
+        # Exercise the macOS branch on every platform, including lsof's absolute path.
+        function = (
+            INSTALL_SCRIPT.read_text()
+            .split("record_standalone_releases_in_use() {", 1)[1]
+            .split("\n}\n", 1)[0]
+        )
+        function = "record_standalone_releases_in_use() {" + function + "\n}\n"
+        function = function.replace("/usr/sbin/lsof ", "mock_lsof ")
+        matches = "p123\nn/releases/active/bin/codex\n"
+        device = os.stat(tempfile.gettempdir()).st_dev
+        warning = (
+            "lsof: WARNING: can't stat() hfs file system {mount}\n"
+            "      Output information may be incomplete.\n"
+            '      assuming "dev={device}" from mount table\n'
+        )
+        unrelated = warning.format(mount="/Volumes/unrelated", device=f"{device + 1:x}")
+        for status, output, error, expected in (
+            (0, matches, "", 0),
+            (1, "", "", 0),
+            (1, matches, "", 0),
+            (1, matches, unrelated, 0),
+            (
+                1,
+                matches,
+                warning.format(mount="/Volumes/unrelated", device=f"00{device:X}"),
+                1,
+            ),
+            (
+                1,
+                matches,
+                warning.format(mount=tempfile.gettempdir(), device=f"{device + 1:x}"),
+                1,
+            ),
+            (1, matches, unrelated.rsplit("\n", 2)[0] + "\n", 1),
+            (1, matches, unrelated + "inspection failed\n", 1),
+            (0, matches, "inspection failed\n", 1),
+            (1, matches, "inspection failed\n", 1),
+            (2, "", "", 1),
+            (2, matches, "", 1),
+        ):
+            with self.subTest(status=status, output=output, error=error):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    script = (
+                        "set -eu\n"
+                        "os=macos\n"
+                        f"releases={shlex.quote(temp_dir)}\n"
+                        f"tmp_dir={shlex.quote(temp_dir)}\n"
+                        # Avoid depending on other processes on the test host.
+                        'ps() { printf "%s codex\\n" "$(id -u)"; }\n'
+                        "mock_lsof() {\n"
+                        f"  printf '%s' {shlex.quote(output)}\n"
+                        f"  printf '%s' {shlex.quote(error)} >&2\n"
+                        f"  return {status}\n"
+                        "}\n" + function + "record_standalone_releases_in_use\n"
+                    )
+                    result = subprocess.run(
+                        ["sh"], input=script, text=True, capture_output=True
+                    )
+                    self.assertEqual(
+                        (result.returncode, result.stdout, result.stderr),
+                        (expected, "", ""),
+                    )
+                    self.assertEqual((Path(temp_dir) / "in-use").read_text(), output)
+
     def test_standalone_retains_previous_and_running_releases_across_installs(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Exercise real process inspection, including paths containing spaces.
-            root = Path(temp_dir).resolve() / "codex install"
+            # macOS lsof can escape the non-ASCII bytes in the installation path.
+            root = Path(temp_dir).resolve() / "André codex install"
             root.mkdir()
             system = os.uname()
             if system.sysname == "Linux":
@@ -516,6 +640,15 @@ class InstallShTest(unittest.TestCase):
                 os.close(ready_fd)
                 os.close(resume_fd)
                 fake_mv.unlink()
+
+            if system.sysname == "Darwin":
+                # An external process can hold just the release directory open.
+                with subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE, cwd=oldest):
+                    held, _ = run_installer_in(
+                        root, "latest", **install_options[VERSION]
+                    )
+                    self.assertEqual(held.returncode, 0, held.stderr)
+                    self.assertTrue(oldest.is_dir(), held.stderr)
 
             # A no-op latest install (also the codex update path) cleans up the
             # now-unused release without rotating previous to current.
@@ -943,6 +1076,8 @@ def run_installer_in(
     root: Path,
     release: str,
     *,
+    installer_path: Path = INSTALL_SCRIPT,
+    install_dir: Path | None = None,
     metadata_failure: bool = False,
     metadata_json: str | None = None,
     releases_metadata_json: str | None = None,
@@ -958,6 +1093,7 @@ def run_installer_in(
     fail_ps: bool = False,
     daemon_only: bool = False,
     manual_update: bool = False,
+    install_dir_on_path: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -1085,11 +1221,15 @@ def run_installer_in(
 
     home = root / "home"
     home.mkdir(exist_ok=True)
+    install_dir = install_dir or root / "install-bin"
+    path = f"{bin_dir}:/usr/bin:/bin"
+    if install_dir_on_path:
+        path = f"{bin_dir}:{install_dir}:/usr/bin:/bin"
     env = os.environ.copy()
     env.update(
         {
             "CODEX_HOME": str(root / "codex-home"),
-            "CODEX_INSTALL_DIR": str(root / "install-bin"),
+            "CODEX_INSTALL_DIR": str(install_dir),
             "CODEX_NON_INTERACTIVE": "1",
             "CODEX_RELEASE": release,
             "CODEX_INSTALL_DAEMON_ONLY": "1" if daemon_only else "0",
@@ -1113,7 +1253,7 @@ def run_installer_in(
             "CODEX_TEST_RELEASES_MODE": releases_mode,
             "CODEX_TEST_REQUEST_LOG": str(request_log),
             "HOME": str(home),
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PATH": path,
             "SHELL": "/bin/sh",
         }
     )
@@ -1134,7 +1274,7 @@ def run_installer_in(
             "TRUE" if use_mirror else "false"
         )
     result = subprocess.run(
-        ["/bin/sh", str(INSTALL_SCRIPT)],
+        ["/bin/sh", str(installer_path)],
         capture_output=True,
         check=False,
         env=env,
@@ -1161,14 +1301,17 @@ def create_package_release(
     metadata_version: str = VERSION,
     binary_version: str = VERSION,
     target: str = "aarch64-apple-darwin",
+    include_exec_server: bool = False,
 ) -> tuple[Path, Path, str]:
     package_dir = root / "package"
     (package_dir / "bin").mkdir(parents=True)
     (package_dir / "codex-path").mkdir()
+    metadata = {"version": binary_version, "target": target, "entrypoint": "bin/codex"}
+    if include_exec_server:
+        metadata["execServer"] = "bin/codex-exec-server"
+        write_executable(package_dir / "bin/codex-exec-server", "#!/bin/sh\nexit 0\n")
     (package_dir / "codex-package.json").write_text(
-        json.dumps(
-            {"version": binary_version, "target": target, "entrypoint": "bin/codex"}
-        ),
+        json.dumps(metadata),
         encoding="utf-8",
     )
     write_executable(

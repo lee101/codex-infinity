@@ -90,6 +90,7 @@ impl NoiseRendezvousConnectProvider for Registry {
                     .map_err(|_| ExecServerError::Protocol("test lookup failed".to_owned()))?;
             }
             Ok(NoiseRendezvousConnectBundle {
+                http_headers: Default::default(),
                 websocket_url: target.url,
                 environment_id: "environment".to_owned(),
                 executor_registration_id: target.registration,
@@ -206,7 +207,7 @@ impl Executor {
                         let validator = validator.clone();
                         connections.spawn(async move {
                             let socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-                            run_multiplexed_environment(socket, processor, "environment".to_owned(), executor.registration, executor.identity, validator).await;
+                            run_multiplexed_environment(socket, processor, "environment".to_owned(), executor.registration, executor.identity, validator, /*admission*/ None).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -348,6 +349,7 @@ async fn refresh_retires_a_still_connected_old_executor() -> Result<()> {
     ));
     let cache = crate::ExecutorCapabilityDiscoveryV2Cache::default();
     let request = crate::DiscoverV2CapabilitiesRequest {
+        force_reload: false,
         cwd: codex_utils_path_uri::PathUri::from_host_native_path(&root)?,
         sandbox: None,
     };
@@ -696,8 +698,13 @@ async fn failed_replacement_connection_keeps_old_handles_retired_and_get_retries
         drop(unavailable.accept().await.unwrap());
     }));
     *registry.target.lock().unwrap() = target;
+    // The refresh now exhausts the transport retry window. Resume time to let it expire,
+    // then freeze it again for the following Noise handshake.
+    tokio::time::resume();
+    let refresh = client.refresh_connection().await;
+    tokio::time::pause();
     assert!(matches!(
-        client.refresh_connection().await,
+        refresh,
         Err(ExecServerError::ConnectionAttempt(_))
     ));
     assert!(original.inner.retired.is_cancelled());

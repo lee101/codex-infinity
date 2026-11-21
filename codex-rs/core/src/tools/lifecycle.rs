@@ -30,6 +30,10 @@ pub(crate) async fn notify_tool_start(
     if contributors.is_empty() {
         return;
     }
+    invocation
+        .turn
+        .extension_data
+        .insert_arc(Arc::clone(&invocation.turn.config));
     let thread_store = &invocation.session.services.thread_extension_data;
     let conversation_history = invocation.session.conversation_history_snapshot().await;
     let root_turn_id = invocation.turn.turn_metadata_state.root_turn_id();
@@ -41,6 +45,13 @@ pub(crate) async fn notify_tool_start(
     for contributor in contributors {
         contributor
             .on_tool_start(ToolStartInput {
+                sampling_model: &invocation.step_context.settings.model_info.slug,
+                serving_assessment: invocation
+                    .step_context
+                    .serving_assessment
+                    .as_ref()
+                    .map(|value| value.requires_review),
+                guardian_probe: invocation.step_context.guardian_probe,
                 session_store: &invocation.session.services.session_extension_data,
                 thread_store,
                 turn_store: invocation.turn.extension_data.as_ref(),

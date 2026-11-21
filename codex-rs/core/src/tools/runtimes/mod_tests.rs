@@ -23,6 +23,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxSelection;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -94,6 +95,101 @@ async fn test_network_proxy_with_config(
         .await
 }
 
+async fn prepare_proxy_capture(
+    cwd: &AbsolutePathBuf,
+    proxy: &NetworkProxy,
+    environment_id: Option<&str>,
+) -> codex_protocol::error::Result<crate::sandboxing::PreparedLocalExecRequest> {
+    crate::exec::build_exec_request(
+        crate::exec::ExecParams {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf '%s' "${CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE:-unset}""#.into(),
+            ],
+            cwd: cwd.clone(),
+            env: HashMap::new(),
+            network: Some(proxy.clone()),
+            network_environment_id: environment_id.map(str::to_owned),
+            expiration: ExecExpiration::DefaultTimeout,
+            capture_policy: ExecCapturePolicy::ShellTool,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            justification: None,
+            arg0: None,
+        },
+        &PermissionProfile::read_only(),
+        cwd,
+        &[],
+        &None,
+        &None,
+        SandboxType::None,
+        /*use_legacy_landlock*/ false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn capture_reports_proxy_setup_errors_for_the_requested_environment() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let cwd = AbsolutePathBuf::from_absolute_path(dir.path())?;
+    let proxy = test_network_proxy().await?.for_execution(
+        "owner",
+        "capture",
+        "test-token".into(),
+        /*environment_policy*/ None,
+        /*fallback_policy_decider*/ None,
+    )?;
+    let error = prepare_proxy_capture(&cwd, &proxy, Some("other"))
+        .await
+        .expect_err("a proxy scoped to owner must reject other");
+    assert!(matches!(
+        error.details(),
+        codex_protocol::error::CodexErrorDetails::Io(_)
+    ));
+    assert_eq!(
+        error.to_string(),
+        "failed to prepare network proxy for environment `other`: execution-scoped network proxy belongs to environment `owner`, not `other`"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn capture_preserves_the_proxy_environment_bound_by_build_exec_request() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let cwd = AbsolutePathBuf::from_absolute_path(dir.path())?;
+    let proxy = test_network_proxy_with_config(NetworkProxyConfig {
+        enabled: true,
+        ..Default::default()
+    })
+    .await?;
+    let before_reload = prepare_proxy_capture(&cwd, &proxy, /*environment_id*/ None).await?;
+    let mut config = proxy.current_cfg().await?;
+    config.set_credential_broker_enabled(/*enabled*/ true);
+    proxy
+        .replace_config_state(codex_network_proxy::build_config_state(
+            config,
+            Default::default(),
+            codex_utils_path_uri::Platform::native(),
+        )?)
+        .await?;
+    let after_reload = prepare_proxy_capture(&cwd, &proxy, /*environment_id*/ None).await?;
+    for (request, expected) in [(before_reload, "unset"), (after_reload, "1")] {
+        let output = crate::sandboxing::execute_env(
+            request.into_exec_request(),
+            /*stdout_stream*/ None,
+        )
+        .await?;
+        assert_eq!(
+            (output.exit_code, output.stdout.text.as_str()),
+            (0, expected)
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::Result<()> {
     let proxy = test_network_proxy().await?;
@@ -121,7 +217,7 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox_override: SandboxOverride::NoOverride,
-        sandbox: SandboxType::None,
+        local_selection: SandboxSelection::Explicit(SandboxType::None),
         sandbox_requested: false,
         permissions: &permissions,
         exec_server_permissions: &permissions,
@@ -150,22 +246,22 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
         .await
         .expect("prepare exec request");
 
-    assert_eq!(exec_request.cwd, PathUri::from_abs_path(&command_cwd));
+    assert_eq!(*exec_request.cwd(), PathUri::from_abs_path(&command_cwd));
     assert_eq!(
-        exec_request.windows_sandbox_policy_cwd,
+        *exec_request.sandbox_policy_cwd(),
         PathUri::from_abs_path(&native_sandbox_policy_cwd)
     );
-    assert_eq!(exec_request.network, None);
+    assert!(!exec_request.has_network_proxy());
     for key in PROXY_ENV_KEYS {
-        assert_eq!(exec_request.env.get(*key), None, "{key} should be unset");
+        assert_eq!(exec_request.env().get(*key), None, "{key} should be unset");
     }
     for key in CUSTOM_CA_ENV_KEYS {
-        assert_eq!(exec_request.env.get(key), None, "{key} should be unset");
+        assert_eq!(exec_request.env().get(key), None, "{key} should be unset");
     }
     #[cfg(target_os = "macos")]
-    assert_eq!(exec_request.env.get(PROXY_GIT_SSH_COMMAND_ENV_KEY), None);
+    assert_eq!(exec_request.env().get(PROXY_GIT_SSH_COMMAND_ENV_KEY), None);
     assert_eq!(
-        exec_request.env.get("CUSTOM_ENV"),
+        exec_request.env().get("CUSTOM_ENV"),
         Some(&"kept".to_string())
     );
 

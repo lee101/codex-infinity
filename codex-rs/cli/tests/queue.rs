@@ -278,6 +278,8 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
     use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadQueueListParams;
     use codex_app_server_protocol::ThreadQueueListResponse;
+    use codex_app_server_protocol::ThreadReadParams;
+    use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadSetNameParams;
     use codex_app_server_protocol::ThreadSetNameResponse;
     use codex_app_server_protocol::ThreadStartParams;
@@ -301,7 +303,7 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
         .respond_with(responses::sse_response(
             create_final_assistant_message_sse_response("queued message consumed")?,
         ))
-        .expect(2)
+        .expect(4)
         .mount_as_scoped(&model)
         .await;
     MockResponsesConfig::new(&model.uri())
@@ -335,6 +337,7 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
 
     let endpoint = format!("unix://{}", socket_path.as_path().display());
     let mut app = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        required_human_approval: false,
         endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
         client_name: "queue-e2e-test".to_string(),
         client_version: "0.1.0".to_string(),
@@ -414,6 +417,60 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
     let metadata: Value = serde_json::from_str(request.headers["x-codex-turn-metadata"].to_str()?)?;
     assert_eq!(metadata["turn_trigger"], "queue");
 
+    let exec_home = TempDir::new()?;
+    for args in [
+        vec!["exec", "--remote", &endpoint, "--json", "new task"],
+        vec![
+            "exec",
+            "resume",
+            "--remote",
+            &endpoint,
+            &thread_id,
+            "continue task",
+        ],
+    ] {
+        let output = Command::new(&codex)
+            .env("CODEX_HOME", exec_home.path())
+            .env_remove("CODEX_QUEUE_SERVER_API_KEY")
+            .current_dir(exec_home.path())
+            .args(args)
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(stdout.contains("queued message consumed"));
+        if stdout.starts_with('{') {
+            let events = stdout
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            assert_ne!(events[0]["thread_id"], thread_id);
+            assert!(events.iter().any(|event| event["type"] == "turn.completed"));
+        } else {
+            let stderr = String::from_utf8(output.stderr)?;
+            let header = stderr
+                .lines()
+                .find(|line| line.starts_with("thread id: "))
+                .context("missing remote exec header")?
+                .replace(&thread_id, "[thread-id]");
+            insta::assert_snapshot!(header, @"thread id: [thread-id]");
+        }
+    }
+    let shared: ThreadReadResponse = app
+        .request_typed(ClientRequest::ThreadRead {
+            request_id: RequestId::Integer(20),
+            params: ThreadReadParams {
+                thread_id: thread_id.clone(),
+                include_turns: true,
+            },
+        })
+        .await?;
+    assert_eq!(shared.thread.turns.len(), 2);
+
     let name = "remote-session-lifecycle";
     let _: ThreadSetNameResponse = app
         .request_typed(ClientRequest::ThreadSetName {
@@ -471,6 +528,9 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
                 .request_typed(ClientRequest::ThreadList {
                     request_id: RequestId::Integer(4),
                     params: ThreadListParams {
+                        include_attached_threads: false,
+                        current_account_only: false,
+                        included_thread_ids: None,
                         excluded_thread_ids: None,
                         attached_to_thread_id: None,
                         cursor: None,
@@ -535,11 +595,89 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
             .await?;
             let requests = model_requests.received_requests().await;
             assert!(
-                requests[1].body_json::<Value>()?["input"]
+                requests[3].body_json::<Value>()?["input"]
                     .to_string()
                     .contains(cold_message)
             );
+            // The mock receives the request before the resumed turn finishes. Deletion
+            // requires an idle thread, and archiving removed our original subscription.
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    let read: ThreadReadResponse = app
+                        .request_typed(ClientRequest::ThreadRead {
+                            request_id: RequestId::Integer(5),
+                            params: ThreadReadParams {
+                                thread_id: thread_id.clone(),
+                                include_turns: true,
+                            },
+                        })
+                        .await?;
+                    if let Some(last) = read.thread.turns.last()
+                        && last.id != completed.turn.id
+                        && last.status == TurnStatus::Completed
+                        && matches!(
+                            read.thread.status,
+                            ThreadStatus::Idle | ThreadStatus::NotLoaded
+                        )
+                    {
+                        return anyhow::Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .context("resumed queued turn did not finish before deletion")??;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn remote_exec_rejects_conflicting_endpoints() -> Result<()> {
+    for command in [vec!["exec"], vec!["exec", "resume"]] {
+        let output = std::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+            .env_remove("CODEX_TEST_REMOTE_TOKEN")
+            .args([
+                "--remote",
+                "wss://a.example:443",
+                "--remote-auth-token-env",
+                "CODEX_TEST_REMOTE_TOKEN",
+            ])
+            .args(command)
+            .args(["--remote", "wss://b.example:443"])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr)?.contains("conflicting remote server endpoints"));
+    }
+    Ok(())
+}
+
+#[test]
+fn tui_session_commands_reject_conflicting_remotes_before_token_lookup() -> Result<()> {
+    const MISSING_TOKEN: &str = "CODEX_TEST_MISSING_TUI_REMOTE_TOKEN";
+    for command in ["resume", "fork"] {
+        let output = std::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+            .env_remove(MISSING_TOKEN)
+            .args([
+                "--remote",
+                "wss://a.example:443",
+                "--remote-auth-token-env",
+                MISSING_TOKEN,
+                command,
+                "--remote",
+                "wss://b.example:443",
+                THREAD_ID,
+            ])
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains(&format!(
+                "`codex {command}` received conflicting remote server endpoints"
+            )),
+            "{command}: {stderr}"
+        );
+        assert!(!stderr.contains(MISSING_TOKEN), "{command}: {stderr}");
     }
     Ok(())
 }

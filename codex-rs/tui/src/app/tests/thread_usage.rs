@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::layout::Size;
 
 async fn app_with_pending_thread_usage()
--> Result<(Box<App>, AppServerSession, tui::Tui, ThreadId, u64)> {
+-> Result<(Box<App>, AppServerSession, tui::Tui, ThreadId, Uuid)> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     app.chat_widget.handle_thread_session(test_thread_session(
@@ -51,7 +51,7 @@ async fn app_with_pending_thread_usage()
     Ok((app, app_server, tui, thread_id, request_id))
 }
 
-fn successful_thread_usage(thread_id: ThreadId, request_id: u64) -> AppEvent {
+fn successful_thread_usage(thread_id: ThreadId, request_id: Uuid) -> AppEvent {
     AppEvent::ThreadUsageLoaded {
         thread_id,
         request_id,
@@ -95,6 +95,7 @@ async fn account_updated_with_backend_only_auth_enables_thread_usage() -> Result
         &app_server,
         AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
             AccountUpdatedNotification {
+                reason: None,
                 auth_mode: Some(AuthMode::AgentIdentity),
                 plan_type: Some(PlanType::Business),
             },
@@ -254,6 +255,7 @@ async fn account_change_discards_thread_usage_deferred_while_overlay_is_open() -
         &app_server,
         AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
             AccountUpdatedNotification {
+                reason: None,
                 auth_mode: Some(AuthMode::AgentIdentity),
                 plan_type: Some(PlanType::Business),
             },

@@ -8,6 +8,7 @@ use codex_core::context::GuardianContextMode;
 use codex_extension_api::ExtensionMetrics;
 
 use super::decisions::DecisionsError;
+use super::probe_shadow::ProbeComparison;
 use super::sampler::LunaSamplerError;
 
 pub(super) const CLASSIFICATION_METRIC: &str = "codex.guardian_v2.classification";
@@ -46,18 +47,26 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
+            ApiError::WebsocketMessageTooLarge => "websocket_message_too_large",
             ApiError::ResponseIncomplete(_) => "incomplete_response",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
-            ApiError::QuotaExceeded => "quota_exceeded",
+            ApiError::SpendLimitExceeded(_) | ApiError::QuotaExceeded => "quota_exceeded",
             ApiError::UsageNotIncluded => "usage_not_included",
+            ApiError::SessionBudgetExceeded => "session_budget_exceeded",
             ApiError::Retryable { .. } => "retryable_api_error",
             ApiError::RateLimitExceeded { .. } | ApiError::RateLimit(_) => "rate_limit",
             ApiError::ModelNotFound { .. } => "model_not_found",
-            ApiError::InvalidRequest { .. } | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::InvalidRequest { .. }
+            | ApiError::InvalidAudioInput { .. }
+            | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::AccessProgramNotEnabled { .. } => "access_program_not_enabled",
+            ApiError::ContentPolicyViolation { .. } => "content_policy_violation",
             ApiError::CyberPolicy { .. }
             | ApiError::BioPolicy { .. }
+            | ApiError::InferenceHookDenied { .. }
             | ApiError::MisalignmentPolicyViolation { .. } => "policy_error",
             ApiError::ServerOverloaded { .. } => "server_overloaded",
+            ApiError::PolicyCapacityUnavailable { .. } => "policy_capacity_unavailable",
             ApiError::FlexUnavailable => "flex_unavailable",
         },
     }
@@ -65,11 +74,23 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
 
 pub(super) fn record_classification(
     metrics: Option<&dyn ExtensionMetrics>,
+    probe_comparison: Option<&ProbeComparison>,
     context_mode: GuardianContextMode,
     duration: Duration,
     outcome: &str,
+    classification_risk: Option<&str>,
     failure_reason: Option<&str>,
 ) {
+    // Shadow comparisons cover every reported classification outcome, including early exits.
+    if let Some(comparison) = probe_comparison {
+        comparison.record(
+            context_mode,
+            outcome,
+            classification_risk,
+            duration,
+            failure_reason,
+        );
+    }
     if outcome == "failure" {
         tracing::warn!(
             failure_reason,

@@ -1,8 +1,10 @@
 //! Restores compacted retained evidence and checks complete synchronous requests.
 //! Restored records are budgeted and persisted before sampling, including continuations.
+//! Recovery uses the section policy captured with those records.
 //! Admitted sampling inputs are observed once per step, independent of transport retries.
 
 use codex_api::ResponsesApiRequest;
+use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_guardian_context::HistoryTruncation;
 use codex_guardian_context::REQUEST_TOKENS_BOUNDARIES;
@@ -12,12 +14,14 @@ use codex_guardian_context::effective_input_token_limit;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
+use super::input_budget::PreparedReviewContext;
 use super::input_budget::RetainedReviewContext;
 use crate::context::ContextualUserFragment;
-use crate::context::GuardianBudgetOmission;
 use crate::context::GuardianRetainedInstructions;
 use crate::context_manager::estimate_item_token_count;
 use crate::session::session::Session;
@@ -78,18 +82,23 @@ pub(crate) async fn prepare_prompt(
             metadata,
             /*include_internal*/ true,
         )?;
-        let mut context = retained.context.clone();
-        context.retain_new_instructions(&history.for_prompt_annotated(&model.input_modalities));
+        let context = PreparedReviewContext::prepare(
+            retained.context.clone(),
+            retained.elastic.as_ref(),
+            &history
+                .for_prompt_annotated(
+                    &model.input_modalities,
+                    session.services.image_store.as_ref(),
+                )
+                .await,
+        )
+        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         let context = context
             .enforce_budget(
                 RequestBudget {
                     max_input_tokens: maximum,
                     existing_context_tokens: estimate_request_tokens(&baseline),
                 },
-                GuardianBudgetOmission
-                    .render()
-                    .into_text()
-                    .unwrap_or_default(),
                 HistoryTruncation::Preserve,
             )
             .map_err(|error| {
@@ -120,6 +129,14 @@ pub(crate) async fn prepare_prompt(
                             "expected restored Guardian text".to_owned(),
                         ));
                     };
+                    // Elastic text has already passed allocation and delivery chunking.
+                    if retained.elastic.is_some() {
+                        return Ok(AnnotatedContent::text(
+                            text,
+                            ContentItemKind(GuardianRetainedInstructions::KIND.to_owned()),
+                            ContentItemMetadata::harness(),
+                        ));
+                    }
                     Ok(GuardianRetainedInstructions::try_from(text)?
                         .render_fragment()
                         .into_parts()
@@ -131,7 +148,7 @@ pub(crate) async fn prepare_prompt(
             })?;
         }
         restored = session
-            .prepare_annotated_conversation_items_for_history(step.turn.as_ref(), model, messages)
+            .prepare_conversation_items_for_history(step.turn.as_ref(), model, messages)
             .await
             .0;
         prompt
@@ -166,6 +183,7 @@ pub(crate) async fn prepare_prompt(
     {
         step.turn.extension_data.insert(RetainedReviewContext {
             context: retained.context.clone(),
+            elastic: retained.elastic.clone(),
             history_version,
         });
     }

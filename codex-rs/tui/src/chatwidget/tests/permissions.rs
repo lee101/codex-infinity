@@ -1162,6 +1162,9 @@ async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
         create_initial_user_message(Some(initial_prompt.clone()), Vec::new(), Vec::new());
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
@@ -1175,7 +1178,7 @@ async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::workspace_write(),
         active_permission_profile: None,
-        cwd: test_project_path().abs(),
+        cwd: test_project_path().abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
@@ -1612,6 +1615,9 @@ async fn permissions_selection_marks_auto_review_current_after_session_configure
         .set_enabled(Feature::GuardianApproval, /*enabled*/ true);
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
@@ -1625,7 +1631,7 @@ async fn permissions_selection_marks_auto_review_current_after_session_configure
         approvals_reviewer: ApprovalsReviewer::AutoReview,
         permission_profile: PermissionProfile::workspace_write(),
         active_permission_profile: None,
-        cwd: test_project_path().abs(),
+        cwd: test_project_path().abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
@@ -1666,6 +1672,9 @@ async fn permissions_selection_marks_auto_review_current_with_custom_workspace_w
     let permission_profile = app_server_workspace_write_profile(extra_root);
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
@@ -1679,7 +1688,7 @@ async fn permissions_selection_marks_auto_review_current_with_custom_workspace_w
         approvals_reviewer: ApprovalsReviewer::AutoReview,
         permission_profile,
         active_permission_profile: None,
-        cwd,
+        cwd: cwd.into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,

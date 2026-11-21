@@ -1048,6 +1048,7 @@ async fn test_login(
                         params: codex_app_server_protocol::LoginAccountParams::AmazonBedrock {
                             api_key,
                             region,
+                            provider_id: None,
                         },
                     },
                     request_id,
@@ -1167,6 +1168,9 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
         println!("< initialize response: {initialize:?}");
 
         let response = client.thread_list(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -1271,11 +1275,10 @@ fn live_elicitation_timeout_pause(
         (None, None) => "ws://127.0.0.1:4222".to_string(),
     };
 
-    let script_path = script.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("live_elicitation_hold.sh")
-    });
+    let script_path = match script {
+        Some(script) => script,
+        None => codex_utils_cargo_bin::find_resource!("scripts/live_elicitation_hold.sh")?,
+    };
     if !script_path.is_file() {
         bail!("helper script not found: {}", script_path.display());
     }
@@ -1608,6 +1611,7 @@ impl CodexClient {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
+                    required_human_approval: false,
                     explicit_gateway_oauth: false,
                     experimental_api,
                     request_attestation: false,

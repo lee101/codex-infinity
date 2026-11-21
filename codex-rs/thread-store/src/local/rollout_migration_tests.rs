@@ -1,3 +1,4 @@
+use codex_thread_context_ids_test_support::thread_context_ids;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -21,6 +22,7 @@ use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::McpResourceOrigin;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ImageDetail;
@@ -33,7 +35,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -43,6 +44,7 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageAudioKind;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::UserMessageImageKind;
 use codex_protocol::user_input::UserInput;
@@ -169,6 +171,7 @@ fn user_message(text: &str) -> RolloutItem {
 
 fn agent_message(text: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        moderation: None,
         message: text.to_string(),
         phase: None,
         memory_citation: None,
@@ -220,6 +223,7 @@ fn exec_completion(turn_id: &str, call_id: &str, output: &str) -> RolloutItem {
 
 fn item_completed(turn_id: &str, item_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        content_token_count: None,
         thread_id: ThreadId::new(),
         turn_id: turn_id.to_string(),
         item: TurnItem::Reasoning(ReasoningItem {
@@ -340,6 +344,11 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
         file_ids: Some(vec!["file_123".to_string()]),
         file_id_details: vec![Some(ImageDetail::High)],
         image_order: vec![UserMessageImageKind::File, UserMessageImageKind::Inline],
+        audio: Some(vec!["data:audio/wav;base64,YXVkaW8=".into()]),
+        audio_references: Some(vec![AudioReference::File {
+            file_id: "file_audio".into(),
+        }]),
+        audio_order: vec![UserMessageAudioKind::File, UserMessageAudioKind::Inline],
         ..Default::default()
     };
     let path = write_rollout(
@@ -402,6 +411,16 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
                 image_url: "https://example.com/image.png".to_string(),
             },
             detail: Some(ImageDetail::Original),
+        },
+        UserInput::Audio {
+            audio: AudioReference::File {
+                file_id: "file_audio".into(),
+            },
+        },
+        UserInput::Audio {
+            audio: AudioReference::Inline {
+                audio_url: "data:audio/wav;base64,YXVkaW8=".into(),
+            },
         },
     ];
     assert_eq!(user_item.map(|item| &item.content), Some(&expected_content));
@@ -489,6 +508,7 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
             sort_direction: SortDirection::Asc,
             sort_key: ItemSortKey::CreatedAtOrdinal,
             after_updated_at_ordinal: None,
+            before_updated_at_ordinal: None,
         })
         .await
         .expect("read projected items");
@@ -558,6 +578,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             failure: expected_item.failure.clone(),
             saved_path: expected_item.saved_path.clone(),
             input_images: Vec::new(),
+            generation_id: expected_item.generation_id.clone(),
         }));
     let path = write_rollout(
         home.path(),
@@ -609,7 +630,7 @@ async fn migration_preserves_image_generation_input_observations() {
             sha256: "ab".repeat(32),
         }],
         imagegen_request_id: None,
-        generation_id: None,
+        generation_id: Some("gen-image-123".to_string()),
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -621,6 +642,7 @@ async fn migration_preserves_image_generation_input_observations() {
             failure: expected_item.failure.clone(),
             saved_path: expected_item.saved_path.clone(),
             input_images: expected_item.input_images.clone(),
+            generation_id: expected_item.generation_id.clone(),
         }));
     let path = write_rollout(
         home.path(),
@@ -709,6 +731,7 @@ async fn migration_keeps_late_completions_in_their_original_turn() {
             sort_direction: SortDirection::Asc,
             sort_key: ItemSortKey::CreatedAtOrdinal,
             after_updated_at_ordinal: None,
+            before_updated_at_ordinal: None,
         })
         .await
         .expect("read projected late completion");
@@ -921,6 +944,10 @@ async fn migration_rolls_back_response_and_inter_agent_user_boundaries() {
             )),
             rollout_response_item(input_response_message(
                 "developer",
+                "<catalog_apps_instructions>context only</catalog_apps_instructions>",
+            )),
+            rollout_response_item(input_response_message(
+                "developer",
                 "<permissions instructions>context only</permissions instructions>",
             )),
             rollout_response_item(input_response_message(
@@ -1008,6 +1035,9 @@ async fn migration_coalesces_response_first_user_message_rollback_boundary() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
     let file_id = "file_123".to_string();
+    let audio = AudioReference::File {
+        file_id: "file_audio".into(),
+    };
     let response = ResponseItem::Message {
         status: None,
         encrypted_content: None,
@@ -1023,6 +1053,9 @@ async fn migration_coalesces_response_first_user_message_rollback_boundary() {
                 },
                 detail: None,
             },
+            ContentItem::InputAudio {
+                audio: audio.clone(),
+            },
         ],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -1030,6 +1063,8 @@ async fn migration_coalesces_response_first_user_message_rollback_boundary() {
     let event = UserMessageEvent {
         message: "remove question".to_string(),
         file_ids: Some(vec![file_id]),
+        audio_references: Some(vec![audio]),
+        audio_order: vec![UserMessageAudioKind::File],
         ..Default::default()
     };
     let path = write_rollout(
@@ -1192,6 +1227,7 @@ async fn migration_keeps_late_completions_for_surviving_turns_across_rollback() 
             sort_direction: SortDirection::Asc,
             sort_key: ItemSortKey::CreatedAtOrdinal,
             after_updated_at_ordinal: None,
+            before_updated_at_ordinal: None,
         })
         .await
         .expect("read late-completion rollback items");
@@ -1302,8 +1338,8 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         .retained_context
         .as_mut()
         .expect("retained context");
-    context.record(&answer_event);
-    context.record(&wake_answer_event);
+    context.record(&answer_event, &thread_context_ids());
+    context.record(&wake_answer_event, &thread_context_ids());
     let path = write_rollout(
         home.path(),
         thread_id,
@@ -1401,7 +1437,7 @@ async fn migration_preserves_answers_before_a_rolled_back_steer() {
             .retained_context
             .as_mut()
             .expect("retained context")
-            .record(&answer);
+            .record(&answer, &thread_context_ids());
         answers.push(answer);
     }
     // Delayed delivery must use the original call boundary, not the turn's latest steer.
@@ -1523,12 +1559,13 @@ async fn migration_rolls_back_nested_deliveries_by_acceptance_order() {
             }))
             .expect("retained instruction"),
             codex_rollout::RetainedInputSource::Local(Some(order)),
+            &thread_context_ids(),
         );
     }
-    context.record(&deliveries[0]);
+    context.record(&deliveries[0], &thread_context_ids());
     let first_retained_message =
         serde_json::to_value(&*context).expect("retained context")["assistant_messages"][0].clone();
-    context.record(&deliveries[1]);
+    context.record(&deliveries[1], &thread_context_ids());
     let outer_call = serde_json::from_value(json!({
         "type": "function_call", "call_id": "exec", "name": "exec", "arguments": "{}"
     }))
@@ -1701,6 +1738,76 @@ async fn migration_preserves_reverse_replay_anchor_after_pre_compaction_rollback
         })
         .expect("retained compaction");
     assert!(replacement_history.is_empty());
+}
+
+#[tokio::test]
+async fn migration_does_not_count_session_end_input_in_checkpoint_rollback() {
+    let first = input_response_message("user", "first turn");
+    let tail = input_response_message(
+        "user",
+        "<environment_context>saved speech</environment_context>",
+    );
+    let next = input_response_message("user", "next turn");
+    let mut saved_tail = codex_rollout::ResponseItemEnvelope::new(tail.clone());
+    saved_tail
+        .metadata
+        .get_or_insert_default()
+        .realtime_session_end_input = true;
+
+    let migrated = migrate_after_rollback(vec![
+        rollout_response_item(first.clone()),
+        RolloutItem::ResponseItem(saved_tail.clone()),
+        rollout_response_item(next.clone()),
+    ])
+    .await;
+    assert!(migrated.iter().any(|item| {
+        matches!(item, RolloutItem::ResponseItem(response) if response == &saved_tail)
+    }));
+
+    for (before_checkpoint, after_checkpoint, expected) in [
+        (
+            vec![rollout_response_item(first.clone())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            vec![rollout_response_item(first.clone())],
+            vec![
+                started("next-turn"),
+                rollout_response_item(next.clone()),
+                completed("next-turn"),
+            ],
+            vec![first.clone(), tail],
+        ),
+    ] {
+        let mut checkpoint = compacted(Vec::new());
+        let RolloutItem::Compacted(item) = &mut checkpoint else {
+            unreachable!();
+        };
+        item.replacement_history = Some(vec![first.clone().into(), saved_tail.clone()]);
+        let migrated = migrate_after_rollback(
+            before_checkpoint
+                .into_iter()
+                .chain([checkpoint])
+                .chain(after_checkpoint)
+                .collect(),
+        )
+        .await;
+        let replacement = migrated
+            .into_iter()
+            .find_map(|item| match item {
+                RolloutItem::Compacted(item) => item.replacement_history,
+                _ => None,
+            })
+            .expect("surviving checkpoint");
+        assert_eq!(
+            replacement
+                .into_iter()
+                .map(codex_rollout::ResponseItemEnvelope::into_item)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -2187,14 +2294,13 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("child-turn".to_string()),
                 root_turn_id: None,
+                direct_only_tool_namespaces: None,
                 disabled_plugin_ids: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: None,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
+                permission_profile: codex_protocol::models::PermissionProfile::read_only(),
                 active_permission_profile: None,
-                file_system_sandbox_policy: None,
                 model: "test-model".to_string(),
                 comp_hash: None,
                 collaboration_mode: None,
@@ -2639,6 +2745,7 @@ async fn migration_preserves_legacy_displayed_thread_names() {
         }
         let page = store
             .list_threads(ListThreadsParams {
+                included_thread_ids: None,
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -3171,6 +3278,76 @@ async fn migration_skips_empty_rollout_files() {
             .expect("read thread metadata")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn selected_migration_prunes_unrelated_indexed_rollouts() {
+    let home = TempDir::new().expect("create Codex home");
+    let owner = ThreadId::new();
+    let original = write_rollout(home.path(), owner, SessionSource::Cli, vec![]);
+    let directory = original.parent().expect("rollout directory");
+    let legacy = directory.join("rollout-imported.jsonl");
+    let reverted = directory.join(format!(
+        "rollout-2025-01-03T12-00-00-{owner}_{}.jsonl",
+        ThreadId::new()
+    ));
+    fs::copy(&original, &legacy).expect("copy legacy rollout");
+    fs::rename(&original, &reverted).expect("rename reverted rollout");
+    let reverted = compress_rollout(&reverted);
+    let other = write_rollout(home.path(), ThreadId::new(), SessionSource::Cli, vec![]);
+    fs::copy(&other, &original).expect("put another owner's metadata under the selected filename");
+    let archived_owner = ThreadId::new();
+    let archived_reverted = directory.join(format!(
+        "rollout-2025-01-03T12-00-00-{archived_owner}_{}.jsonl",
+        ThreadId::new()
+    ));
+    let archived = write_rollout(home.path(), archived_owner, SessionSource::Cli, vec![]);
+    fs::rename(archived, &archived_reverted).expect("rename unrelated reverted rollout");
+    let archived_reverted = move_to_archived(home.path(), archived_reverted);
+    let misnamed = directory.join(format!(
+        "rollout-2025-01-03T12-00-00-{}.jsonl",
+        ThreadId::new()
+    ));
+    fs::copy(&legacy, &misnamed).expect("copy under a different canonical thread ID");
+    let config = test_config(home.path());
+    let db = codex_state::StateRuntime::init(config.sqlite.clone(), "test-provider".to_string())
+        .await
+        .expect("initialize SQLite");
+    for path in [&other, &archived_reverted, &reverted, &misnamed] {
+        let mut row = codex_rollout::builder_from_items(&[], path)
+            .expect("read indexed filename")
+            .build("test-provider");
+        if path == &misnamed {
+            row.id = ThreadId::new();
+        }
+        db.upsert_thread(&row).await.expect("index rollout");
+    }
+    db.close().await;
+    // SQLite still points to the plain file after compression.
+    compress_rollout(&archived_reverted);
+    let store = LocalThreadStore::new(config, /*state_db*/ None);
+    let mut inspected = 0;
+    let report = store
+        .migrate_rollouts_with_progress(
+            RolloutMigrationOptions {
+                thread_ids: vec![owner],
+                ..Default::default()
+            },
+            |_| inspected += 1,
+        )
+        .await
+        .expect("inspect selected rollouts");
+    let mut actual = report
+        .outcomes
+        .into_iter()
+        .map(|outcome| outcome.rollout_path)
+        .collect::<Vec<_>>();
+    let mut expected = vec![legacy, reverted, misnamed];
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    // The unindexed file with another owner's header also needs inspection.
+    assert_eq!(inspected, expected.len() + 1);
 }
 
 #[tokio::test]

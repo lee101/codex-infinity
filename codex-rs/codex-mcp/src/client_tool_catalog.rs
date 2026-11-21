@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::watch;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use crate::tools::ToolInfo;
 
@@ -117,6 +118,7 @@ impl ClientToolCatalog {
     }
 
     /// Captures tools and their client-local revision together, without retaining them in the client.
+    #[tracing::instrument(name = "mcp.catalog.read_snapshot", skip_all)]
     async fn read_current(&self) -> (RwLockReadGuard<'_, CatalogState>, ToolCatalogSnapshot) {
         loop {
             {
@@ -232,22 +234,43 @@ impl ClientToolCatalog {
         result
     }
 
-    /// Serialize fetching and publication, leaving the current catalog usable during the fetch.
-    /// The publication callback runs alongside the exact-client update under the write lock.
+    /// Validate under the caller's publication guard after fetching and draining calls.
+    /// The guard covers both shared-provider publication and this client's revision update.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "refreshes must remain serialized through fetching and catalog publication"
     )]
-    pub(crate) async fn refresh<C, R, F, Fut, P>(&self, fetch: F, publish: P) -> Result<R>
+    pub(crate) async fn refresh<C, R, Fut, G>(
+        &self,
+        fetch: impl FnOnce() -> Fut,
+        validate: impl FnOnce() -> Option<G>,
+        publish: impl FnOnce(&[ToolInfo], Option<Arc<serde_json::Value>>, C) -> R,
+    ) -> Result<Option<R>>
     where
-        F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>, C)>>,
-        P: FnOnce(&[ToolInfo], Option<Arc<serde_json::Value>>, C) -> R,
     {
-        let _refresh = self.refresh_lock.lock().await;
-        let (tools, meta, context) = fetch().await?;
-        let _calls = self.calls.write().await;
-        let mut current = self.current.write().await;
+        let _refresh = self
+            .refresh_lock
+            .lock()
+            .instrument(tracing::info_span!("mcp.catalog.refresh_lock_wait"))
+            .await;
+        let (tools, meta, context) = fetch()
+            .instrument(tracing::info_span!("mcp.catalog.fetch"))
+            .await?;
+        let _calls = self
+            .calls
+            .write()
+            .instrument(tracing::info_span!("mcp.catalog.active_calls_wait"))
+            .await;
+        let mut current = self
+            .current
+            .write()
+            .instrument(tracing::info_span!("mcp.catalog.publication_lock_wait"))
+            .await;
+        let Some(_validity) = validate() else {
+            return Ok(None);
+        };
+        let _publication = tracing::info_span!("mcp.catalog.publish").entered();
         let result = publish(&tools, meta.clone(), context);
         match &mut current.source {
             CatalogSource::Local {
@@ -269,7 +292,7 @@ impl ClientToolCatalog {
         }
         current.revision += 1;
         current.last_refresh_revision = current.revision;
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Reject stale calls before preparation. Explicit refreshes wait for execution;
@@ -323,7 +346,7 @@ fn catalogs_match(left: &[ToolInfo], right: &[ToolInfo]) -> bool {
     for tools in [&mut left, &mut right] {
         tools.sort_by_key(|tool| {
             (
-                tool.server_name.as_str(),
+                tool.server_key(),
                 tool.tool.name.as_ref(),
                 tool.connector_id.as_deref(),
                 tool.callable_namespace.as_str(),

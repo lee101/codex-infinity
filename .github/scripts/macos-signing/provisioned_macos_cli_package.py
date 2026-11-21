@@ -19,7 +19,7 @@ CODE_SIGNING_ID = "codex"
 APP = Path("CodexCLI.app")
 EXECUTABLE = APP / "Contents/MacOS/codex"
 SIGNING = Path(__file__).resolve().parent
-HELPERS = ("bin/codex-code-mode-host", "codex-path/rg")
+HELPERS = ("bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg")
 LAUNCHER = """#!/bin/sh
 set -eu
 entry="$0"
@@ -188,15 +188,20 @@ def verify(package, reports, expected_target, configuration: ProfileConfiguratio
         binary = package / relative
         target = package / APP if relative == EXECUTABLE else binary
         prefix = reports / f"{binary.name}-cert-"
-        subprocess.run(
-            ["codesign", "-d", f"--extract-certificates={prefix}", str(target)],
-            check=True,
-        )
-        if (
-            hashlib.sha256(Path(f"{prefix}0").read_bytes()).hexdigest()
-            != configuration.certificate_sha256
-        ):
-            raise ValueError(f"Unexpected signing certificate: {relative}")
+        verify_certificate(target, prefix, configuration)
+
+
+def verify_certificate(target, prefix, configuration: ProfileConfiguration):
+    """Require the independently approved leaf certificate for each signed executable."""
+    subprocess.run(
+        ["codesign", "-d", f"--extract-certificates={prefix}", str(target)],
+        check=True,
+    )
+    if (
+        hashlib.sha256(Path(f"{prefix}0").read_bytes()).hexdigest()
+        != configuration.certificate_sha256
+    ):
+        raise ValueError(f"Unexpected signing certificate: {target}")
 
 
 def parse_profile_args(parser, configuration: ProfileConfiguration | None):

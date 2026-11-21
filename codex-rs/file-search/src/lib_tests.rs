@@ -48,6 +48,86 @@ fn tie_breakers_sort_by_path_when_scores_equal() {
 }
 
 #[test]
+fn matching_filenames_survive_the_path_result_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("viewmodel");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("build.gradle.kts"), "").unwrap();
+    let source = Path::new("feature").join("src");
+    fs::create_dir_all(root.path().join(&source)).unwrap();
+    let filename = source.join("ChatViewModel.kt");
+    fs::write(root.path().join(&filename), "").unwrap();
+
+    let search = |query, limit| {
+        run(
+            query,
+            vec![root.path().to_path_buf()],
+            FileSearchOptions {
+                limit: NonZero::new(limit).unwrap(),
+                ..Default::default()
+            },
+            /*cancel_flag*/ None,
+        )
+        .unwrap()
+        .matches
+    };
+    for i in 0..80 {
+        fs::create_dir_all(root.path().join(format!("parent-{i}/viewmodel"))).unwrap();
+    }
+    let hits = search("ViewModel", 2);
+    assert_eq!(hits[0].match_type, MatchType::Directory);
+    assert_eq!(hits[1].path, filename);
+    assert_eq!(search("VM", 1)[0].path, filename);
+    fs::create_dir(root.path().join("src")).unwrap();
+    for i in 0..80 {
+        fs::write(root.path().join(format!("source-{i}.rs")), "").unwrap();
+    }
+    assert_eq!(search("src", 1)[0].path, Path::new("src"));
+    fs::write(root.path().join(&source).join("src"), "").unwrap();
+    assert_eq!(search("src", 1)[0].path, source.join("src"));
+    assert_eq!(
+        search(&format!("viewmodel{}", std::path::MAIN_SEPARATOR), 1)[0].path,
+        Path::new("viewmodel").join("build.gradle.kts")
+    );
+}
+
+#[test]
+fn overlapping_roots_share_result_slots_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().to_path_buf();
+    let child = parent.join("sub");
+    fs::create_dir(&child).unwrap();
+    let expected = [parent.clone(), child.clone()].map(|root| (root, PathBuf::from("target.txt")));
+    for (root, path) in &expected {
+        fs::write(root.join(path), "").unwrap();
+    }
+
+    for roots in [
+        vec![parent.clone(), child.clone(), parent.clone()],
+        vec![child.clone(), parent, child],
+    ] {
+        let result = run(
+            "target",
+            roots,
+            FileSearchOptions {
+                limit: NonZero::new(2).unwrap(),
+                ..Default::default()
+            },
+            /*cancel_flag*/ None,
+        )
+        .unwrap();
+        let mut paths: Vec<_> = result
+            .matches
+            .into_iter()
+            .map(|m| (m.root, m.path))
+            .collect();
+        paths.sort();
+        assert_eq!(result.total_match_count, expected.len());
+        assert_eq!(paths, expected);
+    }
+}
+
+#[test]
 fn file_name_from_path_uses_basename() {
     assert_eq!(file_name_from_path("foo/bar.txt"), "bar.txt");
 }
@@ -179,22 +259,66 @@ fn session_scanned_file_count_is_monotonic_across_queries() {
 
 #[test]
 fn session_streams_updates_before_walk_complete() {
-    let dir = create_temp_tree(/*file_count*/ 600);
+    let dir = tempfile::tempdir().unwrap();
     let reporter = Arc::new(RecordingReporter::default());
-    let session = create_session(
-        vec![dir.path().to_path_buf()],
-        FileSearchOptions::default(),
-        reporter.clone(),
-        /*cancel_flag*/ None,
-    )
-    .expect("session");
+    let (work_tx, work_rx) = unbounded();
+    let notify_tx = work_tx.clone();
+    let nucleo = Nucleo::new(
+        Config::DEFAULT.match_paths(),
+        Arc::new(move || {
+            let _ = notify_tx.send(WorkSignal::NucleoNotify);
+        }),
+        /*num_threads*/ Some(1),
+        /*columns*/ 1,
+    );
+    let injector = nucleo.injector();
+    let inner = Arc::new(SessionInner {
+        search_directories: vec![dir.path().to_path_buf()],
+        limit: 50,
+        threads: 1,
+        compute_indices: false,
+        respect_gitignore: true,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        shutdown: Arc::new(AtomicBool::new(false)),
+        reporter: reporter.clone(),
+        work_tx,
+    });
+    let session = FileSearchSession {
+        inner: inner.clone(),
+    };
+    let worker = thread::spawn(move || matcher_worker(inner, work_rx, nucleo));
 
+    // Feed a walk result directly so a fast filesystem cannot finish the walk
+    // before the matcher has a chance to publish a streaming update.
+    injector.push(
+        IndexedEntry::Ascii {
+            root_idx: 0,
+            match_type: MatchType::File,
+        },
+        |_, columns| columns[0] = Utf32String::from("file-0000.txt"),
+    );
     session.update_query("file-0");
-    let completed = reporter.wait_for_complete(Duration::from_secs(5));
-
-    assert!(completed);
-    let updates = reporter.updates();
-    assert!(updates.iter().any(|snapshot| !snapshot.walk_complete));
+    assert!(reporter.wait_until(
+        &reporter.updates,
+        &reporter.update_cv,
+        Duration::from_secs(5),
+        |updates| updates.iter().any(|snapshot| {
+            !snapshot.walk_complete
+                && snapshot.query == "file-0"
+                && snapshot
+                    .matches
+                    .iter()
+                    .any(|matched| matched.path == Path::new("file-0000.txt"))
+        }),
+    ));
+    session
+        .inner
+        .work_tx
+        .send(WorkSignal::WalkComplete)
+        .unwrap();
+    assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+    drop(session);
+    worker.join().unwrap().unwrap();
 }
 
 #[test]

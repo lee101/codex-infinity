@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::ThreadItemPayload;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
@@ -41,6 +42,7 @@ use codex_protocol::realtime::RealtimeItem;
 use codex_protocol::realtime::RealtimeItemContent;
 use codex_protocol::realtime::RealtimeSessionOutcome;
 use codex_protocol::realtime::RealtimeTranscriptRole;
+use codex_rollout::ResponseItemEnvelope;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
@@ -138,7 +140,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
             Vec::new(),
         )
         .with_history_mode(ThreadHistoryMode::Paginated)
-        .with_initial_window_id("window-1".to_string()),
+        .with_initial_window_id(codex_protocol::ContextWindowId::new_uuid_v7()),
     )
     .await
     .expect("create paginated rollout");
@@ -173,6 +175,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
 
     let threads = store
         .list_threads(ListThreadsParams {
+            included_thread_ids: None,
             page_size: 10,
             cursor: None,
             sort_key: ThreadSortKey::CreatedAt,
@@ -236,6 +239,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "done".to_string(),
@@ -330,6 +334,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "done".to_string(),
@@ -524,6 +529,7 @@ async fn paginated_mcp_history_caps_large_results() {
     let tool_call = McpToolCallItem {
         id: "mcp-1".to_string(),
         server: "test".to_string(),
+        environment_id: None,
         tool: "large_result".to_string(),
         arguments: arguments.clone(),
         connector_id: None,
@@ -615,6 +621,35 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .await
         .expect("persist thread metadata");
 
+    let mut handoff_input = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
+        id: Some(ResponseItemId::from_server("msg_input_handoff".to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "use the smaller logo".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    handoff_input.set_turn_id_if_missing("turn-1");
+    let handoff_input = RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: handoff_input,
+        metadata: Some(
+            serde_json::from_value(serde_json::json!({
+                "realtime_handoff": {
+                    "event_id": "voice:handoff",
+                    "realtime_session_id": "voice",
+                    "observed_at_ms": 42,
+                    "handoff_id": "handoff",
+                    "mode": "start",
+                    "source_event_ids": ["voice:transcript:0"]
+                }
+            }))
+            .expect("deserialize handoff provenance"),
+        ),
+    });
+
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -622,20 +657,24 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "voice:started".to_string(),
                     realtime_session_id: "voice".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::RealtimeSessionStarted,
                 }),
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "voice:transcript:0".to_string(),
                     realtime_session_id: "voice".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::TranscriptSegment {
                         role: RealtimeTranscriptRole::Assistant,
                         text: "Here is the result.".to_string(),
                     },
                 }),
                 turn_started("turn-1"),
+                handoff_input,
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "voice:promoted:agent-1".to_string(),
                     realtime_session_id: "voice".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::BemItemPromoted {
                         turn_id: "turn-1".to_string(),
                         item_id: "agent-1".to_string(),
@@ -646,6 +685,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "Result".to_string(),
@@ -659,7 +699,9 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "voice:closed".to_string(),
                     realtime_session_id: "voice".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::RealtimeSessionClosed {
+                        final_frame_sequence: None,
                         outcome: RealtimeSessionOutcome::Ended,
                     },
                 }),
@@ -676,22 +718,23 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .expect("read canonical rollout")
         .lines()
         .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
-        .filter_map(|line| match line.item {
-            RolloutItem::RealtimeItem(item) => Some((
-                item.id,
-                i64::try_from(line.ordinal.expect("paginated rollout ordinal"))
-                    .expect("ordinal fits SQLite integer"),
-                chrono::DateTime::parse_from_rfc3339(line.timestamp.as_str())
-                    .expect("valid rollout timestamp")
-                    .timestamp_millis(),
-                serde_json::to_value(item.content)
-                    .expect("serialize realtime content")
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("realtime content discriminator")
-                    .to_string(),
-            )),
-            _ => None,
+        .filter_map(|line| {
+            line.item.realtime_item().map(|item| {
+                (
+                    item.id.clone(),
+                    i64::try_from(line.ordinal.expect("paginated rollout ordinal"))
+                        .expect("ordinal fits SQLite integer"),
+                    chrono::DateTime::parse_from_rfc3339(line.timestamp.as_str())
+                        .expect("valid rollout timestamp")
+                        .timestamp_millis(),
+                    serde_json::to_value(&item.content)
+                        .expect("serialize realtime content")
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("realtime content discriminator")
+                        .to_string(),
+                )
+            })
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -702,8 +745,9 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         vec![
             ("voice:started", 1, "realtime_session_started"),
             ("voice:transcript:0", 2, "transcript_segment"),
-            ("voice:promoted:agent-1", 4, "bem_item_promoted"),
-            ("voice:closed", 6, "realtime_session_closed"),
+            ("voice:handoff", 4, "turn_input_accepted"),
+            ("voice:promoted:agent-1", 5, "bem_item_promoted"),
+            ("voice:closed", 7, "realtime_session_closed"),
         ]
     );
 
@@ -771,8 +815,9 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal: None,
-            initial_window_id: "window-1".to_string(),
+            initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(home.path().to_path_buf()),
@@ -792,6 +837,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
             items: vec![RolloutItem::RealtimeItem(RealtimeItem {
                 id: "legacy:started".to_string(),
                 realtime_session_id: "legacy".to_string(),
+                observed_at_ms: None,
                 content: RealtimeItemContent::RealtimeSessionStarted,
             })],
         })
@@ -1482,6 +1528,7 @@ async fn subagent_prefix_advances_projection_without_materializing_history() {
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "parent:started".to_string(),
                     realtime_session_id: "parent".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::RealtimeSessionStarted,
                 }),
                 turn_started("parent-turn"),
@@ -1499,6 +1546,7 @@ async fn subagent_prefix_advances_projection_without_materializing_history() {
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "child:started".to_string(),
                     realtime_session_id: "child".to_string(),
+                    observed_at_ms: None,
                     content: RealtimeItemContent::RealtimeSessionStarted,
                 }),
                 completed_item(
@@ -1573,6 +1621,7 @@ async fn projection_preserves_exact_lifecycle_timestamps() {
     for (index, (started_at_ms, completed_at_ms)) in timestamps.iter().enumerate() {
         items.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
             ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".to_string(),
                 item: TurnItem::UserMessage(UserMessageItem {
@@ -1791,13 +1840,13 @@ async fn summary_items_use_final_answers_and_ignore_nonterminal_messages() {
     )
     .await
     .expect("state runtime");
-    let mut builder = codex_state::ThreadMetadataBuilder::new(
+    let builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
         home.path().join("missing-rollout.jsonl"),
         Utc::now(),
         SessionSource::Cli,
-    );
-    builder.history_mode = ThreadHistoryMode::Paginated;
+    )
+    .with_history_mode(ThreadHistoryMode::Paginated);
     runtime
         .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
         .await
@@ -2164,7 +2213,7 @@ SELECT
 }
 
 #[tokio::test]
-async fn synchronized_catch_up_does_not_replay_old_rows() {
+async fn flush_projects_only_the_durable_suffix() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let thread_id = ThreadId::default();
@@ -2192,7 +2241,8 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
         .live_rollout_path(thread_id)
         .await
         .expect("rollout path");
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+    store
+        .flush_thread(thread_id)
         .await
         .expect("catch up synchronized rollout");
 
@@ -2204,6 +2254,32 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
             .await
             .expect("read projected turn");
     assert_eq!(status, "sentinel");
+
+    // The writer can flush without new items while the projector is behind on disk.
+    for (ordinal, item, compress) in [
+        (2, user_message("suffix"), false),
+        (3, turn_completed("turn-1"), true),
+    ] {
+        append_suffix(
+            &rollout_path,
+            &format!("{}\n", rollout_line(Some(ordinal), item)),
+        );
+        let end = fs::metadata(&rollout_path).expect("metadata").len();
+        if compress {
+            compress_rollout(&rollout_path);
+        }
+        store
+            .flush_thread(thread_id)
+            .await
+            .expect("flush durable suffix");
+        assert_eq!(
+            projection_state(&pool, thread_id).await,
+            (
+                i64::try_from(end).unwrap(),
+                i64::try_from(ordinal + 1).unwrap()
+            )
+        );
+    }
 }
 
 /// Large records keep their byte positions and remain pending until their newline is durable.
@@ -2524,7 +2600,10 @@ async fn paused_projection_releases_writer_and_retains_progress_when_stopped() {
             rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         super::read_projection_batches(
-            rollout_path.as_path(),
+            &super::ProjectionRollout {
+                path: rollout_path.clone(),
+                reads: Default::default(),
+            },
             before.0 as u64,
             before.1 as u64,
             thread_id,
@@ -2718,7 +2797,10 @@ async fn blank_and_rejected_rollout_lines_advance_projection() {
     let checks = Cell::new(0);
     assert!(
         super::read_projection_batches(
-            rollout_path.as_path(),
+            &super::ProjectionRollout {
+                path: rollout_path.clone(),
+                reads: Default::default(),
+            },
             /*start_offset*/ 0,
             /*expected_ordinal*/ 0,
             thread_id,
@@ -3086,8 +3168,9 @@ async fn create_paginated_subagent_thread(
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Paginated,
             history_base,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal,
-            initial_window_id: "window-1".to_string(),
+            initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),
@@ -3165,6 +3248,7 @@ fn contains_user_message(items: &[RolloutItem], expected: &str) -> bool {
 
 fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        content_token_count: None,
         thread_id,
         turn_id: turn_id.to_string(),
         item,
@@ -3175,6 +3259,7 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
 
 fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
     TurnItem::AgentMessage(AgentMessageItem {
+        moderation: None,
         id: id.to_string(),
         content: vec![AgentMessageContent::Text {
             text: id.to_string(),

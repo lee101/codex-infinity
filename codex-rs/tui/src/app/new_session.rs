@@ -2,6 +2,7 @@
 //!
 //! Build the replacement configuration without replacing the active task's settings.
 
+use super::resume_preparation::BackendSettings;
 use super::*;
 use codex_config::ConfigLayerSource;
 use codex_protocol::config_types::ServiceTier;
@@ -64,7 +65,20 @@ impl App {
         &mut self,
         app_server: &AppServerSession,
     ) -> Result<(Config, crate::local_settings::LocalSettings)> {
+        let settings = self.backend_settings();
         let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
+        self.load_new_session_config_from(app_server, &settings, cwd, /*cloud_switch*/ None)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("Only a Cloud switch can be canceled"))
+    }
+
+    pub(super) async fn load_new_session_config_from(
+        &mut self,
+        app_server: &AppServerSession,
+        settings: &BackendSettings,
+        cwd: PathBuf,
+        mut cloud_switch: Option<&mut tui::Tui>,
+    ) -> Result<Option<(Config, crate::local_settings::LocalSettings)>> {
         let defaults_cwd = match app_server.thread_params_mode() {
             crate::app_server_session::ThreadParamsMode::Embedded => cwd.as_path(),
             crate::app_server_session::ThreadParamsMode::Remote
@@ -72,20 +86,45 @@ impl App {
                 app_server.remote_cwd_override().unwrap_or(Path::new("."))
             }
         };
-        let defaults = crate::config_update::read_effective_config_if_supported(
-            app_server.request_handle(),
-            defaults_cwd,
-        )
-        .await?;
+        let refresh = self.rebuild_config_for_cwd_from(
+            &settings.config,
+            &settings.local_settings,
+            &settings.target,
+            cwd.clone(),
+        );
+        let load = async {
+            let defaults = crate::config_update::read_effective_config_if_supported(
+                app_server.request_handle(),
+                defaults_cwd,
+            )
+            .await?;
+            Ok::<_, color_eyre::eyre::Report>((defaults, refresh.await))
+        };
+        let Some((defaults, refreshed_config)) = if let Some(tui) = cloud_switch.as_deref_mut() {
+            let events = tui.event_stream();
+            super::cloud_switch_wait::wait_for_cloud_switch(
+                self,
+                tui,
+                load,
+                events,
+                super::cloud_switch_wait::ClipboardHandoff::ContinueEditing,
+            )
+            .await
+        } else {
+            load.await.map(Some)
+        }?
+        else {
+            return Ok(None);
+        };
         // Stage local preferences and permission carryover without changing the active task.
-        let (mut config, local_settings) = match self.rebuild_config_for_cwd(cwd).await {
+        let (mut config, local_settings) = match refreshed_config {
             Ok(config) => {
-                let settings = self.local_settings.reloaded(&config);
-                (config, settings)
+                let local_settings = settings.local_settings.reloaded(&config);
+                (config, local_settings)
             }
             Err(err) => {
                 tracing::warn!(%err, "failed to refresh local settings before a new thread");
-                (self.config.clone(), self.local_settings.clone())
+                (settings.config.clone(), settings.local_settings.clone())
             }
         };
         if let Some(defaults) = defaults.as_ref() {
@@ -97,7 +136,22 @@ impl App {
                 defaults,
             );
         }
-        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::ExplicitOnly)?;
+        if let Err(error) = self.apply_runtime_policy_overrides_with_reviewer(
+            &mut config,
+            RuntimePolicyOverrideScope::ExplicitOnly,
+            settings.config.approvals_reviewer,
+        ) {
+            if let Some(tui) = cloud_switch {
+                let events = tui.event_stream();
+                if super::cloud_switch_wait::finish_failed_cloud_switch(self, tui, events)
+                    .await
+                    .is_break()
+                {
+                    return Ok(None);
+                }
+            }
+            return Err(error);
+        }
         if let Some(defaults) = defaults.as_ref() {
             overlay_new_session_defaults(
                 &mut config,
@@ -106,6 +160,12 @@ impl App {
                 &self.harness_overrides,
             );
         }
-        Ok((config, local_settings))
+        apply_managed_new_thread_defaults(
+            &mut config,
+            app_server.managed_new_thread_defaults(),
+            &self.cli_kv_overrides,
+            &self.harness_overrides,
+        );
+        Ok(Some((config, local_settings)))
     }
 }

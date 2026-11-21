@@ -3,6 +3,7 @@
 //! Byte caps cover inline URLs and file ID strings, not referenced file contents.
 //! Consumers still choose source visibility and model-specific image detail.
 //! Continuations compare prepared image references against their own admitted history.
+//! Sync admission also applies prompt and model-window budgets.
 
 use crate::ComposedContext;
 use crate::ContextSection;
@@ -10,6 +11,9 @@ use crate::SectionContributor;
 use crate::SectionError;
 use crate::SectionInput;
 use crate::SectionScope;
+use crate::TruncationObservation;
+use crate::composition::SectionContent;
+use crate::composition::SectionDelivery;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
@@ -50,12 +54,28 @@ impl ComposedContext {
             }
             images
         });
-        self.retain_images(|image, detail| {
-            let Some(prepared) = prepare(image, detail) else {
-                return false;
+        for section in &mut self.sections {
+            let SectionDelivery::UserContent(items) = &mut section.delivery else {
+                continue;
             };
-            !retained_images.contains(&prepared.as_ref())
-        });
+            items.retain_mut(|item| {
+                let SectionContent::Other(ContentItem::InputImage { image, detail }) =
+                    &mut item.content
+                else {
+                    return true;
+                };
+                let Some(prepared) = prepare(image, detail) else {
+                    self.truncations.push(TruncationObservation {
+                        source: None,
+                        component: section.id,
+                        original_bytes: item.content.evidence_bytes(),
+                        retained_bytes: 0,
+                    });
+                    return false;
+                };
+                !retained_images.contains(&prepared.as_ref())
+            });
+        }
     }
 }
 

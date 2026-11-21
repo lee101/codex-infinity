@@ -67,6 +67,7 @@ fn bare_urls_keep_link_style_when_wrapped_in_tables() {
 
 fn terminal(name: TerminalName) -> TerminalInfo {
     TerminalInfo {
+        backend: None,
         name,
         term_program: None,
         version: None,
@@ -90,6 +91,7 @@ fn supporting_terminals_render_only_the_styled_label_and_keep_its_target() {
         TerminalName::Ghostty,
         TerminalName::Iterm2,
         TerminalName::WezTerm,
+        TerminalName::Rex,
         TerminalName::Kitty,
         TerminalName::VsCode,
         TerminalName::Alacritty,
@@ -143,21 +145,6 @@ fn supporting_terminals_render_only_the_styled_label_and_keep_its_target() {
 }
 
 #[test]
-fn rex_renders_only_the_label() {
-    let mut rex = terminal(TerminalName::Unknown);
-    rex.term_program = Some("rex".to_string());
-    let markdown = "[label](https://example.com)";
-    assert_eq!(
-        render(
-            markdown,
-            /*width*/ 80,
-            WebLinkDisplay::for_terminal(&rex, /*term*/ None),
-        ),
-        render(markdown, /*width*/ 80, WebLinkDisplay::LabelOnly),
-    );
-}
-
-#[test]
 fn unknown_terminals_and_multiplexers_keep_visible_destinations() {
     let mut tmux = terminal(TerminalName::Ghostty);
     tmux.multiplexer = Some(Multiplexer::Tmux { version: None });
@@ -205,6 +192,35 @@ fn empty_web_link_labels_keep_a_visible_destination() {
         assert_eq!(
             render(markdown, /*width*/ 80, WebLinkDisplay::LabelOnly),
             render(markdown, /*width*/ 80, WebLinkDisplay::WithDestination),
+        );
+    }
+}
+
+#[test]
+fn empty_reader_local_links_keep_a_visible_destination() {
+    for markdown in [
+        "[](empty.md)",
+        "[](./empty.md)",
+        "[](src/empty.md#L42)",
+        "[ ](./empty.md)",
+        "[\u{200d}](./empty.md)",
+    ] {
+        let lines = render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+            markdown,
+            Some(80),
+            /*cwd*/ None,
+            &crate::markdown_render::hide_reader_link_destination,
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.line.to_string().contains("empty.md"))
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.hyperlinks)
+                .any(|link| link.destination.contains("empty.md"))
         );
     }
 }

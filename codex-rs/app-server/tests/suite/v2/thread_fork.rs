@@ -116,6 +116,9 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -238,6 +241,20 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     let thread_path = thread.path.clone().expect("thread path");
     assert!(thread_path.as_path().is_absolute());
     assert_ne!(thread_path.as_path(), original_path);
+    assert_eq!(
+        (
+            read_session_meta_line(&original_path)
+                .await?
+                .meta
+                .account_scoped,
+            read_session_meta_line(thread_path.as_path())
+                .await?
+                .meta
+                .account_scoped,
+        ),
+        (false, true),
+        "forking legacy history creates a newly account-scoped thread"
+    );
     assert!(thread.cwd.as_path().is_absolute());
     assert_eq!(thread.source, SessionSource::VsCode);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
@@ -900,7 +917,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
         .with_codex_home(codex_home.path())
         .build_initialized()
         .await?;
-    let _: ThreadResumeResponse = resumed
+    let reopened: ThreadResumeResponse = resumed
         .request(|request_id| ClientRequest::ThreadResume {
             request_id,
             params: ThreadResumeParams {
@@ -920,6 +937,34 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
         })
         .await?;
     assert!(after_resume.data.is_empty());
+
+    if history_mode == ThreadHistoryMode::Paginated {
+        assert_eq!(reopened.thread.preview, "first");
+        // The source is closed. Place the next fork boundary immediately after a compaction
+        // whose replacement history no longer contains the opening user message.
+        for item in [
+            RolloutItem::Compacted(serde_json::from_value(json!({
+                "message": "summary", "replacement_history": [], "window_number": 1
+            }))?),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(serde_json::from_value(json!({
+                "turn_id": "after-compaction"
+            }))?)),
+        ] {
+            append_rollout_item_to_path(&source_path, &item).await?;
+        }
+        let fork: ThreadForkResponse = resumed
+            .request(|request_id| ClientRequest::ThreadFork {
+                request_id,
+                params: ThreadForkParams {
+                    thread_id: source_thread.id,
+                    before_turn_id: Some("after-compaction".to_string()),
+                    exclude_turns: true,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        assert_eq!(fork.thread.preview, "first");
+    }
 
     Ok(())
 }
@@ -1603,6 +1648,15 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     assert_eq!(forked_thread.forked_from_id, Some(conversation_id.clone()));
     assert_eq!(forked_thread.turns.len(), 1);
     let forked_thread_id = forked_thread.id.clone();
+    let listed = list_threads(&mut mcp).await?;
+    assert_eq!(
+        listed
+            .data
+            .iter()
+            .find(|thread| thread.id == forked_thread_id)
+            .map(|thread| thread.preview.as_str()),
+        Some("Saved user message")
+    );
     let forked_path = forked_thread.path.expect("forked rollout path");
     assert!(!std::fs::read_to_string(forked_path.as_path())?.contains("Saved user message"));
     let meta = read_session_meta_line(forked_path.as_path()).await?;
@@ -1628,6 +1682,15 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let listed = list_threads(&mut mcp).await?;
+    assert_eq!(
+        listed
+            .data
+            .iter()
+            .find(|thread| thread.id == forked_thread_id)
+            .map(|thread| thread.preview.as_str()),
+        Some("Saved user message")
+    );
     let requests = server.received_requests().await.expect("wiremock requests");
     let response_request = requests
         .iter()
@@ -1909,6 +1972,7 @@ async fn thread_fork_freezes_active_paginated_turn_as_interrupted(
     };
     let completed_user_item = |id: &str, completed_at_ms| {
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            content_token_count: None,
             thread_id: source_id,
             turn_id: "active-turn".to_string(),
             item: CoreTurnItem::UserMessage(UserMessageItem {
@@ -1942,6 +2006,11 @@ async fn thread_fork_freezes_active_paginated_turn_as_interrupted(
         &completed_user_item("before-fork", /*completed_at_ms*/ 1),
     )
     .await?;
+    let pending_call = serde_json::from_value(json!({
+        "type": "response_item",
+        "payload": {"type": "custom_tool_call", "call_id": "pending", "name": "apply_patch", "input": "patch"}
+    }))?;
+    append_rollout_item_to_path(&source_path, &pending_call).await?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -2077,6 +2146,11 @@ async fn thread_fork_freezes_active_paginated_turn_as_interrupted(
         .body_json::<Value>()?["input"]
         .clone();
     let serialized_input = serde_json::to_string(&input)?;
+    assert!(input.as_array().expect("model input").iter().any(|item| {
+        item["type"] == "custom_tool_call_output"
+            && item["call_id"] == "pending"
+            && item["output"] == "aborted"
+    }));
     assert!(serialized_input.contains("before-fork model input"));
     assert!(!serialized_input.contains("after-fork model input"));
     assert!(input.as_array().is_some_and(|items| {
@@ -3022,10 +3096,7 @@ async fn fork_option_disables_mcp_servers(
     )?;
     MockResponsesConfig::new(&server.uri())
         .with_model("gpt-5.4")
-        .with_root_config(&format!(
-            "model_catalog_json = {}\nfeatures.incremental_tools = {incremental_tools}",
-            serde_json::to_string(&catalog)?
-        ))
+        .with_root_config(&format!("features.incremental_tools = {incremental_tools}"))
         .with_extra_config(&format!(
             "[mcp_servers.fixture]\nurl = \"{}/mcp\"\nrequired = true\n",
             mcp_server.uri()
@@ -3038,6 +3109,8 @@ async fn fork_option_disables_mcp_servers(
     let parent = app
         .start_thread(ThreadStartParams {
             history_mode: Some(history_mode),
+            // Only the parent catalog advertises the capability used by the prediction fork.
+            config: Some([("model_catalog_json".into(), json!(catalog))].into()),
             ..Default::default()
         })
         .await?;

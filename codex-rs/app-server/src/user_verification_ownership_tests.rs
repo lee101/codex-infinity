@@ -17,6 +17,7 @@ fn request(thread_id: ThreadId) -> ServerRequestPayload {
         thread_id: thread_id.to_string(),
         turn_id: Some("turn-1".into()),
         server_name: "plugin-service".into(),
+        environment_id: None,
         request: McpServerElicitationRequest::UserVerification {
             meta: None,
             title: "Approve".into(),
@@ -63,8 +64,12 @@ async fn verification_is_delivered_to_one_owner_and_other_connections_cannot_res
             .await
             .contains_key(&id)
     );
+    outgoing.connection_initialized(ConnectionId(2)).await;
     outgoing
-        .replay_requests_to_connection_for_thread(ConnectionId(2), thread_id)
+        .replay_requests_to_connection(
+            ConnectionId(2),
+            outgoing.pending_requests_for_thread(thread_id).await,
+        )
         .await;
     assert!(messages.try_recv().is_err());
     outgoing

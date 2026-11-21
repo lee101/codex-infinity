@@ -1,4 +1,4 @@
-//! Verifies V2 discovery, plugin acceptance across auth changes, and cache behavior.
+//! Verifies executor discovery, merged plugin routing, acceptance across auth changes, and caching.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -14,11 +14,9 @@ use codex_core_plugins::PluginProvider;
 use codex_core_plugins::PluginProviderFuture;
 use codex_core_plugins::PluginSourceLocation;
 use codex_exec_server::DiscoverV2CapabilitiesResponse;
-use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
 use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::HttpRequestBodyDeltaNotification;
 use codex_exec_server::HttpRequestParams;
-use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;
@@ -28,8 +26,6 @@ use codex_extension_api::SelectedPluginSnapshot;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
-use codex_extension_api::WorldStateContributionInput;
-use codex_extension_api::WorldStateSectionContribution;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -58,6 +54,7 @@ use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::environment_config_for_selection;
 use core_test_support::test_codex::test_codex;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -65,6 +62,8 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -78,9 +77,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::task::AbortOnDropHandle;
 
 struct DiscoveryRecorder {
+    mcp_projections: AtomicUsize,
     snapshots: Arc<Mutex<Vec<ExecutorCapabilityDiscoveryV2Snapshot>>>,
     selected_plugins: Arc<Mutex<Option<SelectedPluginSnapshot>>>,
-    mcp_snapshots_per_step: Arc<Mutex<Vec<usize>>>,
 }
 
 impl McpServerContributor<Config> for DiscoveryRecorder {
@@ -93,6 +92,7 @@ impl McpServerContributor<Config> for DiscoveryRecorder {
         context: McpServerContributionContext<'a, Config>,
     ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
         Box::pin(async move {
+            self.mcp_projections.fetch_add(1, Ordering::Relaxed);
             if let Some(snapshots) = context.executor_capability_discovery_v2() {
                 self.snapshots.lock().await.extend_from_slice(snapshots);
             }
@@ -177,38 +177,40 @@ impl codex_extension_api::ToolContributor for DiscoveryRecorder {
     }
 }
 
-impl ContextContributor for DiscoveryRecorder {
-    fn contribute_world_state<'a>(
-        &'a self,
-        _input: WorldStateContributionInput<'a>,
-    ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
-        Box::pin(async move {
-            let snapshot_count = self.snapshots.lock().await.len();
-            self.mcp_snapshots_per_step
-                .lock()
-                .await
-                .push(snapshot_count);
-            Vec::new()
-        })
-    }
-}
-
-struct Executor {
-    url: String,
-    inventory: Arc<Mutex<Option<Value>>>,
-    requests: Arc<Mutex<Vec<Value>>>,
+pub(super) struct Executor {
+    pub(super) url: String,
+    pub(super) inventory: Arc<Mutex<Option<Value>>>,
+    pub(super) requests: Arc<Mutex<Vec<Value>>>,
+    discovery_pause: Arc<Mutex<Option<DiscoveryPause>>>,
     _task: AbortOnDropHandle<Result<()>>,
 }
 
+struct DiscoveryPause {
+    started: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
 #[derive(Clone, Copy)]
-enum DiscoveryFailure {
+pub(super) enum DiscoveryFailure {
     None,
     Server,
     Disconnect,
+    NoReply,
+    #[cfg_attr(windows, expect(dead_code, reason = "executor hook tests run on Unix"))]
+    TurnGrant,
 }
 
 impl Executor {
-    async fn start(supports_v2: bool, failure: DiscoveryFailure) -> Result<Self> {
+    async fn discovery_count(&self) -> usize {
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request["method"] == "capabilities/discoverV2")
+            .count()
+    }
+
+    pub(super) async fn start(supports_v2: bool, failure: DiscoveryFailure) -> Result<Self> {
         Self::start_with_version(supports_v2, failure, "0.164.0").await
     }
 
@@ -223,6 +225,8 @@ impl Executor {
         let inventory = Arc::new(Mutex::new(None::<Value>));
         let served_inventory = Arc::clone(&inventory);
         let recorded = Arc::clone(&requests);
+        let discovery_pause = Arc::new(Mutex::new(None::<DiscoveryPause>));
+        let pause = Arc::clone(&discovery_pause);
         let discovery_attempts = Arc::new(AtomicUsize::new(0));
         let http = codex_exec_server::Environment::create_for_tests(/*exec_server_url*/ None)?
             .get_http_client();
@@ -230,6 +234,7 @@ impl Executor {
             let mut connections = tokio::task::JoinSet::new();
             while let Ok((stream, _)) = listener.accept().await {
                 let recorded = Arc::clone(&recorded);
+                let pause = Arc::clone(&pause);
                 let inventory = Arc::clone(&served_inventory);
                 let discovery_attempts = Arc::clone(&discovery_attempts);
                 let http = Arc::clone(&http);
@@ -260,28 +265,17 @@ impl Executor {
                             }
                             continue;
                         }
-                        if request["method"] == "capabilities/discoverV2" {
-                            let attempt = discovery_attempts.fetch_add(1, Ordering::Relaxed);
-                            match failure {
-                                // Exhaust the environment's one transport replay so the cache sees Err.
-                                DiscoveryFailure::Disconnect if attempt < 2 => break,
-                                DiscoveryFailure::Server if attempt == 0 => {
-                                    socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32004,"message":"fixture discovery failure"}}).to_string().into())).await?;
-                                    continue;
-                                }
-                                DiscoveryFailure::None | DiscoveryFailure::Server | DiscoveryFailure::Disconnect => {}
-                            }
-                        }
+
                         let result = match request["method"].as_str() {
                             Some("initialize") => Some(json!({"sessionId":"acquisition-only", "environmentInfo": {
                                 "shell":{"name":"bash","path":"/bin/bash"},
                                 "executorVersion":version,
-                                "capabilities":{"sandboxedFileStreaming":true,"capabilityDiscoveryV2":supports_v2}
+                                "capabilities":{"sandboxedFileStreaming":true,"capabilityDiscoverySandbox":true,"capabilityDiscoveryV2":supports_v2}
                             }})),
                             Some("environment/info") => Some(json!({
                                 "shell":{"name":"bash","path":"/bin/bash"},
                                 "executorVersion":version,
-                                "capabilities":{"sandboxedFileStreaming":true,"capabilityDiscoveryV2":supports_v2}
+                                "capabilities":{"sandboxedFileStreaming":true,"capabilityDiscoverySandbox":true,"capabilityDiscoveryV2":supports_v2}
                             })),
                             Some("capabilityRoots/discoverV1") => Some(json!({
                                 "roots": request["params"]["roots"].as_array().context("V1 roots")?
@@ -316,6 +310,29 @@ impl Executor {
                             Some("fs/walk") => Some(json!({"entries":[],"errors":[],"truncated":false})),
                             _ => None,
                         };
+                        if request["method"] == "capabilities/discoverV2" {
+                            let pause = pause.lock().await.take();
+                            if let Some(pause) = pause {
+                                let _ = pause.started.send(());
+                                pause.resume.await?;
+                            }
+                            let attempt = discovery_attempts.fetch_add(1, Ordering::Relaxed);
+                            match failure {
+                                // Keep the transport usable while leaving startup discovery unanswered.
+                                DiscoveryFailure::NoReply if attempt == 0 => continue,
+                                // Exhaust the environment's one transport replay so the cache sees Err.
+                                DiscoveryFailure::Disconnect if attempt < 2 => break,
+                                DiscoveryFailure::TurnGrant if request["params"]["sandbox"].to_string().contains("turn-only-skills") => {
+                                    socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32004,"message":"turn discovery failed"}}).to_string().into())).await?;
+                                    continue;
+                                }
+                                DiscoveryFailure::Server if attempt == 0 => {
+                                    socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32603,"message":"fixture discovery failure"}}).to_string().into())).await?;
+                                    continue;
+                                }
+                                DiscoveryFailure::None | DiscoveryFailure::Server | DiscoveryFailure::Disconnect | DiscoveryFailure::NoReply | DiscoveryFailure::TurnGrant => {}
+                            }
+                        }
                         let response = match result {
                             Some(result) => json!({"id":request["id"],"result":result}),
                             None => json!({"id":request["id"],"error":{"code":-32004,"message":"fixture discovery failure"}}),
@@ -331,6 +348,7 @@ impl Executor {
             url,
             inventory,
             requests,
+            discovery_pause,
             _task: AbortOnDropHandle::new(task),
         })
     }
@@ -342,24 +360,34 @@ async fn v2_disabled_skips_inventory_discovery() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_shares_inventory_with_mcp_and_skills_until_next_turn() -> Result<()> {
-    check_acquisition(/*enabled*/ true, "0.164.0").await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Result<()> {
+async fn v2_captured_inventory_survives_refresh_without_restoring_revoked_mcp() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     #[derive(Default)]
     struct InventoryRecorder {
-        projections: AtomicUsize,
+        thread: OnceLock<Weak<codex_core::CodexThread>>,
+        invalidated_during_capture: AtomicBool,
         projected: Mutex<Option<Arc<DiscoverV2CapabilitiesResponse>>>,
+        captured_before_invalidation: Mutex<Option<Arc<DiscoverV2CapabilitiesResponse>>>,
         steps: Mutex<
             Vec<(
                 Arc<DiscoverV2CapabilitiesResponse>,
                 Arc<DiscoverV2CapabilitiesResponse>,
             )>,
         >,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for InventoryRecorder {
+        fn on_thread_start<'a>(
+            &'a self,
+            input: codex_extension_api::ThreadStartInput<'a, Config>,
+        ) -> ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                input
+                    .session_store
+                    .insert_arc(input.mcp_resource_client.expect("MCP resource client"));
+            })
+        }
     }
 
     impl McpServerContributor<Config> for InventoryRecorder {
@@ -372,7 +400,6 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
             context: McpServerContributionContext<'a, Config>,
         ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
             Box::pin(async move {
-                self.projections.fetch_add(1, Ordering::SeqCst);
                 *self.projected.lock().await = context
                     .executor_capability_discovery_v2()
                     .and_then(|snapshots| snapshots.first())
@@ -383,12 +410,72 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
         }
     }
 
+    impl codex_extension_api::TurnLifecycleContributor for InventoryRecorder {
+        fn refresh_catalog_for_step<'a>(
+            &'a self,
+            input: codex_extension_api::CatalogRefreshInput<'a>,
+        ) -> ExtensionFuture<'a, bool> {
+            Box::pin(async move {
+                if !self
+                    .invalidated_during_capture
+                    .swap(true, Ordering::Relaxed)
+                {
+                    let projected = self.projected.lock().await.clone();
+                    *self.captured_before_invalidation.lock().await = projected;
+                    let client = input
+                        .session_store
+                        .get::<McpResourceClient>()
+                        .expect("MCP resource client");
+                    assert!(client.has_server("revoked").await);
+                    let thread = self
+                        .thread
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .expect("live test thread");
+                    let selection = thread
+                        .environment_selections()
+                        .await
+                        .into_iter()
+                        .find(|selection| {
+                            selection.environment_id == codex_exec_server::REMOTE_ENVIRONMENT_ID
+                        })
+                        .expect("selected executor");
+                    let mut config = environment_config_for_selection(
+                        thread.config().await.as_ref(),
+                        &selection,
+                    );
+                    config.mcp_policy = Some(codex_protocol::mcp_policy::EnvironmentMcpPolicy {
+                        servers: Some(Default::default()),
+                        ..Default::default()
+                    });
+                    thread
+                        .environment_ready(&selection, config)
+                        .await
+                        .expect("revoke MCP server");
+                    thread.invalidate_executor_discovery();
+                    // A cloud catalog change needs another MCP projection, using the
+                    // executor inventory this step already captured before invalidation.
+                    return true;
+                }
+                false
+            })
+        }
+    }
+
     impl codex_extension_api::ToolContributor for InventoryRecorder {
         fn prepare_for_step<'a>(
             &'a self,
             input: codex_extension_api::StepPreparationInput<'a>,
         ) -> ExtensionFuture<'a, ()> {
             Box::pin(async move {
+                let client = input
+                    .session_store
+                    .get::<McpResourceClient>()
+                    .expect("MCP resource client");
+                assert!(
+                    !client.has_server("revoked").await,
+                    "the published runtime must enforce revocation even with the step's old inventory"
+                );
                 let snapshots = input
                     .executor_capability_discovery_v2
                     .expect("captured inventories");
@@ -400,24 +487,36 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
                 let projected = self.projected.lock().await.clone().expect("MCP inventory");
                 let mut steps = self.steps.lock().await;
                 steps.push((inventory, projected));
-                // Model a fresh inventory after each step, without changing selected roots.
-                input
-                    .thread_store
-                    .insert(ExecutorCapabilityDiscoveryV2Cache::default());
             })
         }
     }
 
     let executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
     let model = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount(&model).await?;
     let recorder = Arc::new(InventoryRecorder::default());
     let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(recorder.clone());
     extensions.tool_contributor(recorder.clone());
     extensions.mcp_server_contributor(recorder.clone());
+    extensions.turn_lifecycle_contributor(recorder.clone());
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_exec_server_url(executor.url.clone())
-        .with_config(|config| {
+        .with_config(move |config| {
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "revoked".to_string(),
+                serde_json::from_value(json!({
+                    "url": format!("{}/api/codex/ps/mcp", apps.chatgpt_base_url),
+                    "environment_id": codex_exec_server::REMOTE_ENVIRONMENT_ID,
+                }))
+                .expect("test MCP config"),
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("unconstrained MCP config");
             config.update_plan_enabled = true;
             config
                 .features
@@ -426,6 +525,7 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
         })
         .build_with_auto_env(&model)
         .await?;
+    assert!(recorder.thread.set(Arc::downgrade(&test.codex)).is_ok());
     let first = responses::mount_sse_once(
         &model,
         responses::sse(vec![
@@ -451,12 +551,21 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
     first.single_request();
     second.single_request();
     {
+        let captured = recorder
+            .captured_before_invalidation
+            .lock()
+            .await
+            .clone()
+            .context("inventory captured before invalidation")?;
         let steps = recorder.steps.lock().await;
         let (initial, _) = steps.first().context("first captured inventory")?;
         assert!(
-            steps
-                .iter()
-                .any(|(inventory, _)| !Arc::ptr_eq(initial, inventory)),
+            Arc::ptr_eq(initial, &captured),
+            "catalog refresh must not reacquire the invalidated executor inventory within this step"
+        );
+        assert_eq!(steps.len(), 2);
+        assert!(
+            !Arc::ptr_eq(initial, &steps[1].0),
             "the next step must acquire a fresh inventory"
         );
         for (inventory, projected) in steps.iter() {
@@ -466,22 +575,515 @@ async fn v2_changed_inventory_refreshes_mcp_without_selection_changes() -> Resul
             );
         }
     }
-    let projections = recorder.projections.load(Ordering::SeqCst);
-    // Refresh before another step can discover the new inventory. This fixture has no Apps
-    // server, but the refresh must still publish exactly once before reporting that absence.
-    let error = test
-        .codex
-        .refresh_codex_apps_tools()
-        .await
-        .err()
-        .expect("no Apps server");
-    assert!(error.to_string().contains("unknown MCP server"));
-    assert_eq!(recorder.projections.load(Ordering::SeqCst), projections + 1);
+    assert!(recorder.invalidated_during_capture.load(Ordering::Relaxed));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_discovery_failures_retry_or_remain_cached_by_error_kind() -> Result<()> {
+async fn v2_refresh_during_discovery_applies_to_the_next_step() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
+    let second_executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
+    let model = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_exec_server_url(executor.url.clone())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ExecutorCapabilityDiscoveryV2)
+                .expect("enable discovery V2");
+        })
+        .build_with_auto_env(&model)
+        .await?;
+    let original_selection = test.codex.environment_selections().await.remove(0);
+    test.thread_manager
+        .environment_manager()
+        .upsert_environment(
+            "second".into(),
+            second_executor.url.clone(),
+            /*connect_timeout*/ None,
+        )?;
+    let mut second_selection = original_selection.clone();
+    second_selection.environment_id = "second".into();
+    second_selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(
+        environment_config_for_selection(&test.config, &second_selection),
+    );
+    test.codex
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                test.config.cwd.clone(),
+                vec![
+                    original_selection.clone().into_request(),
+                    second_selection.into_request(),
+                ],
+            )),
+            ..Default::default()
+        })
+        .await?;
+    responses::mount_sse_once(
+        &model,
+        responses::sse(vec![responses::ev_completed("ready")]),
+    )
+    .await;
+    test.submit_text_turn("Initialize both environments.")
+        .await?;
+    let _ = test.codex.current_mcp_config_and_runtime_context().await;
+    let second_before = second_executor.discovery_count().await;
+    let before = executor.discovery_count().await;
+    let (started, captured) = oneshot::channel();
+    let (resume, released) = oneshot::channel();
+    *second_executor.discovery_pause.lock().await = Some(DiscoveryPause {
+        started,
+        resume: released,
+    });
+    test.codex.invalidate_executor_discovery();
+    let (_, refreshed) = tokio::join!(test.codex.current_mcp_config_and_runtime_context(), async {
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), captured).await??;
+        // A has finished and B is still loading. Both readers may finish with their
+        // captured inventories; repeated refreshes must survive until the next lookup.
+        assert_eq!(executor.discovery_count().await, before + 1);
+        *executor.inventory.lock().await = Some(json!({"plugins":[],"skills":[],"warnings":[]}));
+        *second_executor.inventory.lock().await =
+            Some(json!({"plugins":[],"skills":[],"warnings":[]}));
+        for _ in 0..3 {
+            test.codex.invalidate_executor_discovery();
+        }
+        resume
+            .send(())
+            .map_err(|_| anyhow::anyhow!("discovery stopped before release"))?;
+        anyhow::Ok(())
+    },);
+    refreshed?;
+    let captured_snapshots = test
+        .codex
+        .thread_extension_data()
+        .get::<Vec<ExecutorCapabilityDiscoveryV2Snapshot>>()
+        .context("published inventory")?;
+    assert_eq!(captured_snapshots.len(), 2);
+    for snapshot in captured_snapshots.iter() {
+        assert!(
+            !snapshot
+                .result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .plugins
+                .is_empty(),
+            "an in-flight reader may finish with its captured inventory"
+        );
+    }
+    assert_eq!(
+        executor.discovery_count().await,
+        before + 1,
+        "refresh does not restart the current discovery"
+    );
+    assert_eq!(second_executor.discovery_count().await, second_before + 1);
+
+    let response = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![responses::ev_completed("after-refresh")]),
+    )
+    .await;
+    test.submit_text_turn("Use the refreshed inventories.")
+        .await?;
+    response.single_request();
+    let snapshots = test
+        .codex
+        .thread_extension_data()
+        .get::<Vec<ExecutorCapabilityDiscoveryV2Snapshot>>()
+        .context("refreshed inventory")?;
+    let _ = test.codex.current_mcp_config_and_runtime_context().await;
+    assert_eq!(executor.discovery_count().await, before + 2);
+    assert_eq!(second_executor.discovery_count().await, second_before + 2);
+    assert_eq!(snapshots.len(), 2);
+    for environment_id in [original_selection.environment_id.as_str(), "second"] {
+        let inventory = snapshots
+            .iter()
+            .find(|snapshot| snapshot.environment_id == environment_id)
+            .context("refreshed environment inventory")?
+            .result
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert!(inventory.plugins.is_empty(), "the next step must refresh");
+    }
+    Ok(())
+}
+
+pub(super) async fn check_discovery_readiness(failure: DiscoveryFailure) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let prewarm_failed = match failure {
+        DiscoveryFailure::None => false,
+        DiscoveryFailure::Server => true,
+        DiscoveryFailure::Disconnect | DiscoveryFailure::NoReply | DiscoveryFailure::TurnGrant => {
+            unreachable!("transport recovery and cancellation have separate coverage")
+        }
+    };
+    let executor = Executor::start(/*supports_v2*/ true, failure).await?;
+    let (discovery_started, discovery_captured) = oneshot::channel();
+    let (release_discovery, discovery_released) = oneshot::channel();
+    *executor.discovery_pause.lock().await = Some(DiscoveryPause {
+        started: discovery_started,
+        resume: discovery_released,
+    });
+    let (wait_started, wait_captured) = oneshot::channel();
+    struct WaitRecorder(Mutex<Option<oneshot::Sender<()>>>);
+    impl ToolLifecycleContributor for WaitRecorder {
+        fn on_tool_start<'a>(
+            &'a self,
+            input: codex_extension_api::ToolStartInput<'a>,
+        ) -> ToolLifecycleFuture<'a> {
+            Box::pin(async move {
+                if input.tool_name.name == "wait_for_environment"
+                    && let Some(started) = self.0.lock().await.take()
+                {
+                    let _ = started.send(());
+                }
+            })
+        }
+    }
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.tool_lifecycle_contributor(Arc::new(WaitRecorder(Mutex::new(Some(wait_started)))));
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new().with_executor_provider(Arc::new(
+            ExecutorSkillProvider::new_with_restriction_product(/*restriction_product*/ None),
+        )),
+        |_config: &Config| SkillsExtensionConfig {
+            include_instructions: true,
+            catalog_deltas_enabled: false,
+            omit_descriptions: false,
+            max_context_tokens: None,
+            bundled_skills_enabled: false,
+            cloud_skill_enabled: false,
+            shadow_selection_enabled: false,
+        },
+    );
+    let model = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_exec_server_url("none")
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            // Keep host-specific shell guidance out of this readiness snapshot.
+            assert!(config.features.disable(Feature::ShellTool).is_ok());
+            assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
+            assert!(
+                config
+                    .features
+                    .enable(Feature::ExecutorCapabilityDiscoveryV2)
+                    .is_ok()
+            );
+        })
+        .build_with_auto_env(&model)
+        .await?;
+    test.thread_manager
+        .environment_manager()
+        .upsert_environment(
+            "preparing-executor".to_string(),
+            executor.url.clone(),
+            /*connect_timeout*/ None,
+        )?;
+    let mut selection = test.executor_environment().selection().clone();
+    selection.environment_id = "preparing-executor".to_string();
+    selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(
+        environment_config_for_selection(&test.config, &selection),
+    );
+    // Control the prewarm deadline and retry cooldown without wall-clock races.
+    tokio::time::pause();
+    let clock_guard = AbortOnDropHandle::new(tokio::spawn(async {
+        // Keep paused time from automatically advancing while mock HTTP/socket I/O is pending.
+        loop {
+            tokio::task::yield_now().await;
+        }
+    }));
+    test.codex
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                test.config.cwd.clone(),
+                vec![selection.into_request()],
+            )),
+            ..Default::default()
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), discovery_captured)
+        .await
+        .context("environment preparation must start discovery")??;
+    let starting = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![
+            responses::ev_response_created("starting"),
+            responses::ev_function_call(
+                "wait-for-inventory",
+                "wait_for_environment",
+                r#"{"environment_id":"preparing-executor"}"#,
+            ),
+            responses::ev_completed("starting"),
+        ]),
+    )
+    .await;
+    let ready = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![
+            responses::ev_response_created("ready"),
+            responses::ev_completed("ready"),
+        ]),
+    )
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the environment's available skills once it is ready.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), wait_captured)
+        .await
+        .context("sampling must reach wait_for_environment while discovery is paused")??;
+    let request = starting.single_request();
+    assert!(
+        request
+            .message_input_texts("user")
+            .join("\n")
+            .contains("starting")
+    );
+    assert!(
+        !request
+            .message_input_texts("developer")
+            .join("\n")
+            .contains("inert-sentinel")
+    );
+    assert!(ready.requests().is_empty());
+    release_discovery
+        .send(())
+        .map_err(|_| anyhow::anyhow!("preparation stopped before release"))?;
+    core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let request = ready.single_request();
+    let output = request
+        .function_call_output_text("wait-for-inventory")
+        .context("readiness result")?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)
+            .with_context(|| format!("unexpected readiness output: {output}"))?,
+        json!({"environment_id":"preparing-executor","status":"ready"})
+    );
+    assert_eq!(
+        request
+            .message_input_texts("developer")
+            .join("\n")
+            .contains("inert-sentinel"),
+        !prewarm_failed,
+        "failed loads stay in cooldown"
+    );
+    assert_eq!(
+        executor.discovery_count().await,
+        1,
+        "failed prewarm must not retry before its cooldown expires"
+    );
+    let mut history = starting.requests();
+    history.extend(ready.requests());
+    let reused = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![
+            responses::ev_response_created("reused"),
+            responses::ev_completed("reused"),
+        ]),
+    )
+    .await;
+    test.submit_text_turn("Inspect the same environment again.")
+        .await?;
+    let request = reused.single_request();
+    assert_eq!(
+        request
+            .message_input_texts("developer")
+            .join("\n")
+            .contains("inert-sentinel"),
+        !prewarm_failed
+    );
+    assert_eq!(
+        executor.discovery_count().await,
+        1,
+        "unchanged turns reuse the inventory or the error during cooldown"
+    );
+    history.extend(reused.requests());
+    if prewarm_failed {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let recovered = responses::mount_sse_once(
+            &model,
+            responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ]),
+        )
+        .await;
+        test.submit_text_turn("Inspect the environment after discovery's cooldown.")
+            .await?;
+        assert!(
+            recovered
+                .single_request()
+                .message_input_texts("developer")
+                .join("\n")
+                .contains("inert-sentinel"),
+            "the first turn after cooldown recovers discovery"
+        );
+        assert_eq!(
+            executor.discovery_count().await,
+            2,
+            "recovery needs one discovery request"
+        );
+        history.extend(recovered.requests());
+    }
+    tokio::time::resume();
+    drop(clock_guard);
+    let snapshot_name = if prewarm_failed {
+        "v2_discovery_readiness_failure"
+    } else {
+        "v2_discovery_readiness"
+    };
+    insta::assert_snapshot!(
+        snapshot_name,
+        context_snapshot::format_request_history_snapshot(
+            "Readiness waits for prewarm; unchanged turns reuse inventory or errors, and failures recover after cooldown.",
+            &history,
+            &ContextSnapshotOptions::default(),
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_prewarm_retains_all_selected_environments_until_the_first_step() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
+    let model = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_exec_server_url("none")
+        .with_extensions(Arc::new(ExtensionRegistryBuilder::new().build()))
+        .with_config(|config| {
+            assert!(config.features.disable(Feature::DeferredExecutor).is_ok());
+            assert!(
+                config
+                    .features
+                    .enable(Feature::ExecutorCapabilityDiscoveryV2)
+                    .is_ok()
+            );
+        })
+        .build_with_auto_env(&model)
+        .await?;
+    let mut selections = Vec::new();
+    // Exceed the cache's initial capacity before any step can reserve more space.
+    for index in 0..17 {
+        let mut selection = test.executor_environment().selection().clone();
+        selection.environment_id = format!("prewarm-{index}");
+        test.thread_manager
+            .environment_manager()
+            .upsert_environment(
+                selection.environment_id.clone(),
+                executor.url.clone(),
+                /*connect_timeout*/ None,
+            )?;
+        selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(
+            environment_config_for_selection(&test.config, &selection),
+        );
+        selections.push(selection);
+    }
+    for response_id in ["first", "reused"] {
+        let response = responses::mount_sse_once(
+            &model,
+            responses::sse(vec![
+                responses::ev_response_created(response_id),
+                responses::ev_completed(response_id),
+            ]),
+        )
+        .await;
+        test.submit_turn_with_environments("Inspect the environments.", Some(selections.clone()))
+            .await?;
+        response.single_request();
+        assert_eq!(
+            executor.discovery_count().await,
+            selections.len(),
+            "the first step and later turns must reuse every prewarmed inventory"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_prewarm_timeout_does_not_block_session_configured() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::NoReply).await?;
+    let model = responses::start_mock_server().await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.mcp_server_contributor(Arc::new(DiscoveryRecorder {
+        mcp_projections: AtomicUsize::new(0),
+        snapshots: Arc::clone(&observed),
+        selected_plugins: Arc::new(Mutex::new(None)),
+    }));
+    let mut builder = test_codex()
+        .with_exec_server_url(&executor.url)
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            assert!(config.features.disable(Feature::DeferredExecutor).is_ok());
+            assert!(
+                config
+                    .features
+                    .enable(Feature::ExecutorCapabilityDiscoveryV2)
+                    .is_ok()
+            );
+        });
+    // Building the fixture waits for SessionConfigured, including initial environment readiness.
+    let test = tokio::time::timeout(Duration::from_secs(15), builder.build_with_auto_env(&model))
+        .await
+        .context("unanswered discovery must not block SessionConfigured")??;
+
+    for response_id in ["recovered", "reused"] {
+        responses::mount_sse_once(
+            &model,
+            responses::sse(vec![
+                responses::ev_response_created(response_id),
+                responses::ev_completed(response_id),
+            ]),
+        )
+        .await;
+        test.submit_text_turn("Inspect the environment.").await?;
+    }
+    {
+        let observed = observed.lock().await;
+        let inventory = observed
+            .last()
+            .context("discovery should retry after prewarm times out")?
+            .result
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(
+            inventory.skills.first().context("recovered skill")?.name,
+            "inert-sentinel"
+        );
+    }
+    let requests = executor.requests.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "capabilities/discoverV2")
+            .count(),
+        2,
+        "cancelled prewarm leaves discovery retryable; successful retries stay cached"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "initialize")
+            .count(),
+        1,
+        "timing out discovery must leave the otherwise usable executor connected"
+    );
+    Ok(())
+}
+
+#[test_case::test_case(false; "ordinary_load")]
+#[test_case::test_case(true; "forced_load")]
+#[tokio::test]
+async fn v2_discovery_caches_successes_and_retries_failed_loads(force_reload: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
     for failure in [DiscoveryFailure::Server, DiscoveryFailure::Disconnect] {
         let executor = Executor::start(/*supports_v2*/ true, failure).await?;
@@ -495,49 +1097,49 @@ async fn v2_discovery_failures_retry_or_remain_cached_by_error_kind() -> Result<
             .context("remote environment")?;
         let cache = codex_exec_server::ExecutorCapabilityDiscoveryV2Cache::default();
         let request = codex_exec_server::DiscoverV2CapabilitiesRequest {
+            force_reload: false,
             cwd: codex_utils_path_uri::PathUri::parse("file:///repo")?,
             sandbox: None,
         };
-        assert!(
-            cache
-                .discover("executor", &environment, request.clone())
-                .await
-                .is_err()
-        );
-        assert!(!cache.take_recovered_discovery());
+        let error = cache
+            .discover(
+                "executor",
+                &environment,
+                codex_exec_server::DiscoverV2CapabilitiesRequest {
+                    force_reload,
+                    ..request.clone()
+                },
+            )
+            .await
+            .expect_err("initial discovery fails");
+        let suppressed = cache
+            .discover("executor", &environment, request.clone())
+            .await
+            .expect_err("cooldown suppresses an immediate retry");
+        assert!(Arc::ptr_eq(&error, &suppressed));
+        // Advance only the cooldown; keep the socket fixture on real time.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
         let (first, concurrent) = tokio::join!(
             cache.discover("executor", &environment, request.clone()),
             cache.discover("executor", &environment, request.clone()),
         );
+        let first = first.map_err(anyhow::Error::msg)?;
+        let concurrent = concurrent.map_err(anyhow::Error::msg)?;
+        assert!(Arc::ptr_eq(&first, &concurrent));
+        let reused = cache
+            .discover("executor", &environment, request.clone())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(Arc::ptr_eq(&first, &reused));
         let expected_calls = match failure {
-            DiscoveryFailure::Server => {
-                assert!(first.is_err());
-                assert!(concurrent.is_err());
-                let next_turn = codex_exec_server::ExecutorCapabilityDiscoveryV2Cache::default();
-                next_turn
-                    .discover("executor", &environment, request.clone())
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                assert!(!next_turn.take_recovered_discovery());
-                assert!(!cache.take_recovered_discovery());
-                2
+            DiscoveryFailure::Server => 2,
+            // Two disconnected attempts, then one shared successful retry in the same cache.
+            DiscoveryFailure::Disconnect => 3,
+            DiscoveryFailure::None | DiscoveryFailure::NoReply | DiscoveryFailure::TurnGrant => {
+                unreachable!("the test only exercises startup failures")
             }
-            DiscoveryFailure::Disconnect => {
-                let first = first.map_err(anyhow::Error::msg)?;
-                let concurrent = concurrent.map_err(anyhow::Error::msg)?;
-                assert!(Arc::ptr_eq(&first, &concurrent));
-                assert!(cache.take_recovered_discovery());
-                assert!(!cache.take_recovered_discovery());
-                let reused = cache
-                    .discover("executor", &environment, request.clone())
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                assert!(Arc::ptr_eq(&first, &reused));
-                assert!(!cache.take_recovered_discovery());
-                // Two disconnected attempts, then one shared successful retry in the same cache.
-                3
-            }
-            DiscoveryFailure::None => unreachable!("the test only exercises failures"),
         };
         assert_eq!(
             executor
@@ -546,10 +1148,82 @@ async fn v2_discovery_failures_retry_or_remain_cached_by_error_kind() -> Result<
                 .await
                 .iter()
                 .filter(|request| request["method"] == "capabilities/discoverV2")
-                .count(),
-            expected_calls,
+                .map(|request| request["params"]["forceReload"].as_bool().unwrap_or(false))
+                .collect::<Vec<_>>(),
+            vec![force_reload; expected_calls],
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_discovery_recovery_reprojects_mcp_without_explicit_invalidation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
+    // Keep discovery failing until the test repairs the executor's response.
+    *executor.inventory.lock().await = Some(Value::Null);
+    let model = responses::start_mock_server().await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::new(DiscoveryRecorder {
+        mcp_projections: AtomicUsize::new(0),
+        snapshots: Arc::clone(&observed),
+        selected_plugins: Arc::new(Mutex::new(None)),
+    });
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.mcp_server_contributor(recorder.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_exec_server_url(executor.url.clone())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ExecutorCapabilityDiscoveryV2)
+                .expect("enable discovery V2");
+        })
+        .build_with_auto_env(&model)
+        .await?;
+    let first = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![responses::ev_completed("failed-discovery")]),
+    )
+    .await;
+    test.submit_turn("Hello.").await?;
+    first.single_request();
+    assert!(
+        observed
+            .lock()
+            .await
+            .last()
+            .context("failed MCP inventory")?
+            .result
+            .is_err()
+    );
+    let before = recorder.mcp_projections.load(Ordering::Relaxed);
+
+    *executor.inventory.lock().await = None;
+    // Expire even the maximum cooldown without sleeping or changing executor bindings.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let second = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![responses::ev_completed("recovered-discovery")]),
+    )
+    .await;
+    test.submit_turn("Hello again.").await?;
+    second.single_request();
+    assert!(recorder.mcp_projections.load(Ordering::Relaxed) > before);
+    let observed = observed.lock().await;
+    let recovered = observed
+        .last()
+        .context("recovered MCP inventory")?
+        .result
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(
+        recovered.plugins.first().context("recovered plugin")?.id,
+        "inert-sentinel@market"
+    );
     Ok(())
 }
 
@@ -558,34 +1232,36 @@ async fn v2_old_executor_retains_v1_selected_roots() -> Result<()> {
     check_acquisition(/*enabled*/ true, "0.163.0").await
 }
 
-async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
+pub(super) async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let executor =
         Executor::start_with_version(/*supports_v2*/ true, DiscoveryFailure::None, version).await?;
+    let acquires_v2 = enabled && version == "0.164.0";
+    if acquires_v2 {
+        *executor.inventory.lock().await = Some(json!({"plugins":[],"skills":[],"warnings":[]}));
+    }
     let model = responses::start_mock_server().await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let selected_plugins = Arc::new(Mutex::new(None));
-    let mcp_snapshots_per_step = Arc::new(Mutex::new(Vec::new()));
     let mut extensions = ExtensionRegistryBuilder::new();
     let recorder = Arc::new(DiscoveryRecorder {
+        mcp_projections: AtomicUsize::new(0),
         snapshots: Arc::clone(&observed),
         selected_plugins: Arc::clone(&selected_plugins),
-        mcp_snapshots_per_step: Arc::clone(&mcp_snapshots_per_step),
     });
-    extensions.prompt_contributor(recorder.clone());
     extensions.tool_contributor(recorder.clone());
-    extensions.mcp_server_contributor(recorder);
+    extensions.mcp_server_contributor(recorder.clone());
     codex_skills_extension::install_with_providers(
         &mut extensions,
         codex_skills_extension::SkillProviders::new().with_executor_provider(Arc::new(
             codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
-                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
                 /*restriction_product*/ None,
             ),
         )),
         |config: &Config| codex_skills_extension::SkillsExtensionConfig {
             include_instructions: true,
             catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+            omit_descriptions: false,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
@@ -596,7 +1272,6 @@ async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
         .with_extensions(Arc::new(extensions.build()))
         .with_exec_server_url(executor.url.clone())
         .with_config(move |config| {
-            config.update_plan_enabled = true;
             assert!(config.features.enable(Feature::Plugins).is_ok());
             assert!(
                 config
@@ -615,33 +1290,58 @@ async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
         })
         .build_with_auto_env(&model)
         .await?;
-    let calls = || async {
-        executor
-            .requests
-            .lock()
-            .await
-            .iter()
-            .filter(|request| request["method"] == "capabilities/discoverV2")
-            .count()
-    };
-    let acquires_v2 = enabled && version == "0.164.0";
     if acquires_v2 {
-        observed.lock().await.clear();
-        mcp_snapshots_per_step.lock().await.clear();
         let _ = test.codex.current_mcp_config_and_runtime_context().await;
-        let initial_calls = calls().await;
-        let _ = test.codex.current_mcp_config_and_runtime_context().await;
-        assert!(initial_calls > 0);
+        let before = executor.discovery_count().await;
+        assert!(before > 0);
+        {
+            let observed = observed.lock().await;
+            let inventory = observed
+                .last()
+                .context("initial inventory")?
+                .result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            assert!(inventory.plugins.is_empty());
+            assert!(inventory.skills.is_empty());
+        }
+
+        *executor.inventory.lock().await = None; // Serve the sentinel plugin and skill.
+        test.codex.invalidate_executor_discovery();
         assert_eq!(
-            calls().await,
-            initial_calls,
-            "idle acquisitions reuse the cache"
+            executor.discovery_count().await,
+            before,
+            "invalidation is lazy"
+        );
+        let _ = test.codex.current_mcp_config_and_runtime_context().await;
+        assert_eq!(executor.discovery_count().await, before + 1);
+        assert_eq!(
+            executor
+                .requests
+                .lock()
+                .await
+                .iter()
+                .rfind(|request| request["method"] == "capabilities/discoverV2")
+                .context("refreshed discovery request")?["params"]["forceReload"],
+            true,
         );
         let observed = observed.lock().await;
-        assert!(!observed.is_empty());
-        assert!(observed.iter().all(|snapshot| snapshot.result.is_ok()));
+        let inventory = observed
+            .last()
+            .context("refreshed inventory")?
+            .result
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(
+            inventory.plugins.first().context("refreshed plugin")?.id,
+            "inert-sentinel@market"
+        );
+        assert_eq!(
+            inventory.skills.first().context("refreshed skill")?.name,
+            "inert-sentinel"
+        );
     }
-    let initial_calls = calls().await;
+    let initial_calls = executor.discovery_count().await;
     let mut selection = test.executor_environment().selection().clone();
     selection.environment_id = codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string();
     let cwd = selection.cwd.clone();
@@ -673,138 +1373,102 @@ async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
                 }]
             },
         });
-    // Only the successful lifecycle case needs two turns and multiple model steps.
-    let turns = if acquires_v2 { 2 } else { 1 };
-    let mut previous_inventory = None;
-    for turn in 0..turns {
-        observed.lock().await.clear();
-        mcp_snapshots_per_step.lock().await.clear();
-        *selected_plugins.lock().await = None;
-        let before_turn = calls().await;
-        let mut bodies = Vec::new();
-        if acquires_v2 {
-            bodies.push(responses::sse(vec![
-                responses::ev_response_created("plan"),
-                responses::ev_function_call(
-                    "plan-call",
-                    "update_plan",
-                    r#"{"plan":[{"step":"Say hello","status":"completed"}]}"#,
-                ),
-                responses::ev_completed("plan"),
-            ]));
-        }
-        bodies.push(responses::sse(vec![
+    let response = responses::mount_sse_once(
+        &model,
+        responses::sse(vec![
             responses::ev_response_created("response"),
             responses::ev_completed("response"),
-        ]));
-        let mut responses = Vec::new();
-        for body in bodies {
-            responses.push(responses::mount_sse_once(&model, body).await);
-        }
+        ]),
+    )
+    .await;
+    test.submit_turn_with_environments(
+        "Use $inert-sentinel to say hello.",
+        Some(vec![selection.clone()]),
+    )
+    .await?;
+    let executor_root = if acquires_v2 {
+        format!("{}:inert-sentinel@market", selection.environment_id)
+    } else {
+        "legacy-root".to_string()
+    };
+    let local_identity = PluginIdentity::Local {
+        plugin_id: "inert-sentinel@market".to_string(),
+    };
+    // Both paths publish accepted Cloud packages and available installations only.
+    let expected_plugins = vec![
+        (Some(executor_root), local_identity),
+        (
+            None,
+            PluginIdentity::Remote {
+                remote_plugin_id: "plugin_sentinel".to_string(),
+            },
+        ),
+    ];
+    {
+        let selected_plugins = selected_plugins.lock().await;
+        let snapshot = selected_plugins.as_ref().context("step plugin snapshot")?;
+        assert_eq!(
+            snapshot
+                .plugins
+                .iter()
+                .map(|plugin| (plugin.selected_root_id.clone(), plugin.plugin_id.clone()))
+                .collect::<Vec<_>>(),
+            expected_plugins,
+        );
+        assert_eq!(snapshot.disabled_plugin_ids, Vec::<String>::new());
+    }
+    let request = response.single_request();
+    assert!(
+        request
+            .body_json()
+            .to_string()
+            .contains("Sentinel instructions from the captured executor")
+    );
+    let developer_text = request.message_input_texts("developer").join("\n");
+    assert!(
+        developer_text.contains("- inert-sentinel: Executor skill used by the acquisition test"),
+        "both discovery modes must render the skill catalog",
+    );
+    if acquires_v2 {
+        let discovery_calls = executor.discovery_count().await;
+        let mcp_projections = recorder.mcp_projections.load(Ordering::Relaxed);
+        let second_response = responses::mount_sse_once(
+            &model,
+            responses::sse(vec![
+                responses::ev_response_created("second-response"),
+                responses::ev_completed("second-response"),
+            ]),
+        )
+        .await;
         test.submit_turn_with_environments(
             "Use $inert-sentinel to say hello.",
             Some(vec![selection.clone()]),
         )
         .await?;
-        if acquires_v2 {
-            let counts = mcp_snapshots_per_step.lock().await;
-            let first = counts
-                .first()
-                .context("MCP snapshot count for the first step")?;
-            assert!(
-                counts.len() >= 2,
-                "the turn must prepare multiple model steps"
-            );
-            assert!(
-                counts.iter().all(|count| count == first),
-                "unchanged V2 read routes must not refresh MCP between steps: {counts:?}"
-            );
-        }
-        let executor_root = if acquires_v2 {
-            format!("{}:inert-sentinel@market", selection.environment_id)
-        } else {
-            "legacy-root".to_string()
-        };
-        let local_identity = PluginIdentity::Local {
-            plugin_id: "inert-sentinel@market".to_string(),
-        };
-        // Both paths publish accepted Cloud packages and available installations only.
-        let expected_plugins = vec![
-            (Some(executor_root), local_identity),
-            (
-                None,
-                PluginIdentity::Remote {
-                    remote_plugin_id: "plugin_sentinel".to_string(),
-                },
-            ),
-        ];
-        {
-            let selected_plugins = selected_plugins.lock().await;
-            let snapshot = selected_plugins.as_ref().context("step plugin snapshot")?;
-            assert_eq!(
-                snapshot
-                    .plugins
-                    .iter()
-                    .map(|plugin| (plugin.selected_root_id.clone(), plugin.plugin_id.clone()))
-                    .collect::<Vec<_>>(),
-                expected_plugins,
-            );
-            assert_eq!(snapshot.disabled_plugin_ids, Vec::<String>::new());
-        }
-        let model_requests = responses
-            .iter()
-            .flat_map(core_test_support::responses::ResponseMock::requests)
-            .collect::<Vec<_>>();
-        assert_eq!(model_requests.len(), if acquires_v2 { 2 } else { 1 });
-        for request in model_requests {
-            assert!(
-                request
-                    .body_json()
-                    .to_string()
-                    .contains("Sentinel instructions from the captured executor")
-            );
-            let developer_text = request.message_input_texts("developer").join("\n");
-            assert!(
-                developer_text
-                    .contains("- inert-sentinel: Executor skill used by the acquisition test"),
-                "both discovery modes must render the skill catalog",
-            );
-        }
-        let turn_calls = calls().await;
-        if acquires_v2 {
-            assert!(
-                turn_calls > before_turn,
-                "a new turn must acquire fresh inventory"
-            );
-            if turn > 0 {
-                assert_eq!(
-                    turn_calls,
-                    before_turn + 1,
-                    "steps share the new turn's cache"
-                );
-            }
-            let observed = observed.lock().await;
-            let inventory = observed
-                .last()
-                .context("ordinary turn must project its V2 inventory into MCP")?
-                .result
-                .as_ref()
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            assert_eq!(
-                inventory.plugins.first().context("inert plugin")?.id,
-                "inert-sentinel@market"
-            );
-            if let Some(previous) = &previous_inventory {
-                assert!(
-                    !Arc::ptr_eq(previous, inventory),
-                    "MCP contributors must receive the new turn's inventory"
-                );
-            }
-            previous_inventory = Some(Arc::clone(inventory));
-        } else {
-            assert_eq!(turn_calls, 0);
-            assert!(observed.lock().await.is_empty());
-        }
+        second_response.single_request();
+        assert_eq!(
+            executor.discovery_count().await,
+            discovery_calls,
+            "an unchanged turn must reuse the discovered inventory"
+        );
+        assert_eq!(
+            recorder.mcp_projections.load(Ordering::Relaxed),
+            mcp_projections,
+            "an unchanged turn must not reproject MCP"
+        );
+        let mut history = response.requests();
+        history.extend(second_response.requests());
+        insta::assert_snapshot!(
+            "v2_discovery_invalidation",
+            context_snapshot::format_request_history_snapshot(
+                "Invalidation makes the new skill available; an unchanged turn reuses discovery and MCP projection.",
+                &history,
+                &ContextSnapshotOptions::default(),
+            )
+        );
+    } else {
+        assert_eq!(executor.discovery_count().await, 0);
+        assert!(observed.lock().await.is_empty());
     }
     let requests = executor.requests.lock().await.clone();
     assert_eq!(
@@ -824,11 +1488,7 @@ async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
             "explicit mentions must read through the captured executor"
         );
         for read in reads {
-            assert!(read["params"]["sandbox"].is_object());
-            assert_eq!(
-                read["params"]["sandbox"]["policyContext"]["cwd"],
-                json!(cwd)
-            );
+            assert!(read["params"]["sandbox"].is_null());
         }
     }
     let discovery = requests
@@ -841,6 +1501,126 @@ async fn check_acquisition(enabled: bool, version: &'static str) -> Result<()> {
     for request in discovery {
         assert!(request["params"]["sandbox"].is_object());
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_reuses_session_and_turn_discovery_across_model_steps() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let executor = Executor::start(/*supports_v2*/ false, DiscoveryFailure::None).await?;
+    let model = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_exec_server_url(executor.url.clone())
+        .with_config(|config| {
+            config.update_plan_enabled = true;
+            config
+                .features
+                .enable(Feature::RequestPermissionsTool)
+                .unwrap();
+            config
+                .features
+                .disable(Feature::ExecutorCapabilityDiscoveryV2)
+                .unwrap();
+            config.permissions.approval_policy = codex_core::config::Constrained::allow_any(
+                codex_protocol::protocol::AskForApproval::OnRequest,
+            );
+            config
+                .permissions
+                .set_permission_profile(
+                    codex_protocol::models::PermissionProfile::from_runtime_permissions(
+                        &codex_protocol::permissions::FileSystemSandboxPolicy::restricted(
+                            Vec::new(),
+                        ),
+                        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                    ),
+                )
+                .unwrap();
+        })
+        .build_with_auto_env(&model)
+        .await?;
+    let selection = test.codex.environment_selections().await.remove(0);
+    let mut config =
+        core_test_support::test_codex::environment_config_for_selection(&test.config, &selection);
+    config.selected_capability_roots = vec![codex_protocol::capabilities::SelectedCapabilityRoot {
+        id: "legacy-root".to_string(),
+        location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+            environment_id: selection.environment_id.clone(),
+            path: selection.cwd.clone(),
+        },
+    }];
+    test.codex.environment_ready(&selection, config).await?;
+    let permissions = codex_protocol::request_permissions::RequestPermissionProfile {
+        file_system: Some(
+            codex_protocol::models::FileSystemPermissions::from_read_write_path_uris(
+                Some(vec![selection.cwd.join("approved")?]),
+                /*write*/ None,
+            ),
+        ),
+        ..Default::default()
+    };
+    let mut sequence = vec![responses::sse(vec![
+        responses::ev_function_call(
+            "grant",
+            "request_permissions",
+            &json!({
+                "permissions": permissions,
+            })
+            .to_string(),
+        ),
+        responses::ev_completed("grant"),
+    ])];
+    for id in ["first-step", "second-step"] {
+        sequence.push(responses::sse(vec![
+            responses::ev_function_call(
+                id,
+                "update_plan",
+                r#"{"plan":[{"step":"Inspect skills","status":"completed"}]}"#,
+            ),
+            responses::ev_completed(id),
+        ]));
+    }
+    sequence.push(responses::sse(vec![responses::ev_completed("done")]));
+    let responses = responses::mount_sse_sequence(&model, sequence).await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the approved skills across two steps.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let request = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestPermissions(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+    test.codex
+        .submit(Op::RequestPermissionsResponse {
+            id: request.call_id,
+            response: codex_protocol::request_permissions::RequestPermissionsResponse {
+                permissions,
+                scope: codex_protocol::request_permissions::PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            },
+        })
+        .await?;
+    core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(responses.requests().len(), 4);
+    let requests = executor.requests.lock().await;
+    let discovery = requests
+        .iter()
+        .filter(|request| request["method"] == "capabilityRoots/discoverV1")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        discovery.len(),
+        2,
+        "unchanged steps reuse both discovery scopes"
+    );
+    assert_ne!(
+        discovery[0]["params"]["roots"][0]["sandbox"],
+        discovery[1]["params"]["roots"][0]["sandbox"]
+    );
     Ok(())
 }
 
@@ -860,20 +1640,12 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .context("remote environment")?;
     let cache = codex_exec_server::ExecutorCapabilityDiscoveryV2Cache::default();
     let request = codex_exec_server::DiscoverV2CapabilitiesRequest {
+        force_reload: false,
         cwd: codex_utils_path_uri::PathUri::from_host_native_path(root.path())?,
         sandbox: None,
     };
-    let calls = || async {
-        executor
-            .requests
-            .lock()
-            .await
-            .iter()
-            .filter(|request| request["method"] == "capabilities/discoverV2")
-            .count()
-    };
     assert_eq!(
-        calls().await,
+        executor.discovery_count().await,
         0,
         "creating a cache must not request discovery"
     );
@@ -886,13 +1658,13 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         &first,
         &concurrent.map_err(anyhow::Error::msg)?
     ));
-    assert_eq!(calls().await, 1);
+    assert_eq!(executor.discovery_count().await, 1);
     let restricted = codex_exec_server::DiscoverV2CapabilitiesRequest {
         sandbox: Some(
-            codex_exec_server::FileSystemSandboxContext::from_legacy_sandbox_policy(
-                codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
+            codex_exec_server::FileSystemSandboxContext::from_permission_profile(
+                codex_protocol::models::PermissionProfile::read_only(),
                 request.cwd.clone(),
-            )?,
+            ),
         ),
         ..request.clone()
     };
@@ -905,7 +1677,7 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .await
         .map_err(anyhow::Error::msg)?;
     assert!(Arc::ptr_eq(&first, &original));
-    assert_eq!(calls().await, 2);
+    assert_eq!(executor.discovery_count().await, 2);
     cache
         .discover(
             "executor",
@@ -918,7 +1690,7 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(
-        calls().await,
+        executor.discovery_count().await,
         3,
         "another cwd must not reuse the same inventory"
     );
@@ -927,7 +1699,7 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .await
         .map_err(anyhow::Error::msg)?;
     assert!(Arc::ptr_eq(&first, &other));
-    assert_eq!(calls().await, 3);
+    assert_eq!(executor.discovery_count().await, 3);
     let replacement_manager = codex_exec_server::EnvironmentManager::create_for_tests(
         Some(executor.url.clone()),
         /*local_runtime_paths*/ None,
@@ -940,14 +1712,14 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .discover("executor", &replacement, request.clone())
         .await
         .map_err(anyhow::Error::msg)?;
-    assert_eq!(calls().await, 4);
+    assert_eq!(executor.discovery_count().await, 4);
     let other_reused = cache
         .discover("other-executor", &environment, request.clone())
         .await
         .map_err(anyhow::Error::msg)?;
     assert!(Arc::ptr_eq(&other, &other_reused));
     assert_eq!(
-        calls().await,
+        executor.discovery_count().await,
         4,
         "a new environment instance must not invalidate the original instance"
     );
@@ -972,7 +1744,7 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .await
         .map_err(anyhow::Error::msg)?;
     assert!(Arc::ptr_eq(&other, &oldest));
-    assert_eq!(calls().await, 17);
+    assert_eq!(executor.discovery_count().await, 17);
 
     cache
         .discover(
@@ -987,24 +1759,92 @@ async fn v2_discovery_cache_reuses_matching_requests_and_isolates_execution_cont
         .map_err(anyhow::Error::msg)?;
     // Reading the oldest entry did not promote it: eviction is FIFO, not LRU.
     let reloaded = cache
-        .discover("other-executor", &environment, request)
+        .discover("other-executor", &environment, request.clone())
         .await
         .map_err(anyhow::Error::msg)?;
-    assert_eq!(calls().await, 19);
+    assert_eq!(executor.discovery_count().await, 19);
     assert!(!Arc::ptr_eq(&other, &reloaded));
     assert_eq!(other.as_ref(), reloaded.as_ref());
+
+    // Explicit requests and invalidated entries reload once; ordinary reads reuse the result.
+    let mut previous = reloaded;
+    for (expected_calls, force_reload) in [(20, true), (21, false)] {
+        if !force_reload {
+            cache.invalidate();
+            assert_eq!(executor.discovery_count().await, expected_calls - 1);
+        }
+        let refreshed = cache
+            .discover(
+                "executor",
+                &environment,
+                codex_exec_server::DiscoverV2CapabilitiesRequest {
+                    force_reload,
+                    ..request.clone()
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(!Arc::ptr_eq(&previous, &refreshed));
+        let ordinary = cache
+            .discover("executor", &environment, request.clone())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(Arc::ptr_eq(&refreshed, &ordinary));
+        assert_eq!(executor.discovery_count().await, expected_calls);
+        assert_eq!(
+            executor
+                .requests
+                .lock()
+                .await
+                .iter()
+                .rfind(|request| request["method"] == "capabilities/discoverV2")
+                .context("forced discovery request")?["params"]["forceReload"],
+            true,
+        );
+        previous = refreshed;
+    }
+
+    // Reloading one invalidated entry preserves the others' reloads; new contexts load normally.
+    for (cwd, force_reload) in [("overflow", true), ("new-context", false)] {
+        cache
+            .discover(
+                "executor",
+                &environment,
+                codex_exec_server::DiscoverV2CapabilitiesRequest {
+                    cwd: request.cwd.join(cwd)?,
+                    ..request.clone()
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            executor
+                .requests
+                .lock()
+                .await
+                .iter()
+                .rfind(|request| request["method"] == "capabilities/discoverV2")
+                .context("discovery request")?["params"]["forceReload"]
+                .as_bool()
+                .unwrap_or(false),
+            force_reload,
+        );
+    }
 
     Ok(())
 }
 
 struct Cloud {
+    plugins: AtomicUsize,
     available: AtomicBool,
+    mcp_url: String,
     ready: mpsc::UnboundedSender<(Arc<McpResourceClient>, oneshot::Sender<()>)>,
 }
 
 impl PluginProvider for Cloud {
     fn list(&self, _query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
         Box::pin(async move {
+            self.plugins.fetch_add(1, Ordering::SeqCst);
             Ok(PluginCatalog {
                 entries: if !self.available.load(Ordering::SeqCst) {
                     Vec::new()
@@ -1016,11 +1856,19 @@ impl PluginProvider for Cloud {
                         enabled: true,
                         display_name: "Demo".into(),
                         version: "1".into(),
-                        mcp_servers: Default::default(),
+                        mcp_servers: [(
+                            "notes".into(),
+                            json!({
+                                "url": self.mcp_url,
+                                "default_tools_approval_mode": "approve",
+                            }),
+                        )]
+                        .into(),
                         connector_ids: Vec::new(),
                         locations: vec![PluginSourceLocation::Cloud {
                             resource_uri: "plugin://plugin_demo".into(),
                             bundle_uri: None,
+                            release_id: None,
                         }],
                     }]
                 },
@@ -1044,7 +1892,7 @@ impl ToolLifecycleContributor for Cloud {
     }
 }
 
-/// Auth refresh updates plugin acceptance before merging skills and capturing the next step.
+/// Merged installations route separately and share plugin acceptance across auth refreshes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1060,11 +1908,19 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
                 "discoveryRoot":{"id":"codex-home-skills","path":"file:///"},"metadata":null}]}],
         "skills":[],"warnings":[]
     }));
+    let second_executor = Executor::start(/*supports_v2*/ true, DiscoveryFailure::None).await?;
+    let inventory = executor.inventory.lock().await.clone();
+    *second_executor.inventory.lock().await = inventory;
     let server = responses::start_mock_server().await;
-    let apps = AppsTestServer::mount(&server).await?;
+    let apps = AppsTestServer::mount_with_tools(&server, Arc::new(std::sync::Mutex::new(vec![json!({
+        "name": "echo", "description": "Read a note.", "annotations": {"readOnlyHint": true},
+        "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
+    })]))).await?;
     let (ready, mut steps) = mpsc::unbounded_channel();
     let cloud = Arc::new(Cloud {
+        plugins: AtomicUsize::new(0),
         available: AtomicBool::new(true),
+        mcp_url: format!("{}/api/codex/ps/mcp", apps.chatgpt_base_url),
         ready,
     });
     let mut extensions = ExtensionRegistryBuilder::new();
@@ -1072,7 +1928,7 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
     let manager = Arc::new(codex_exec_server::EnvironmentManager::default_for_tests());
     install_plugin_providers(
         &mut extensions,
-        PluginProviders::new(Arc::new(ExecutorPluginProvider::new(manager.clone())))
+        PluginProviders::new(Arc::new(ExecutorPluginProvider::new(manager)))
             .with_cloud_provider(cloud.clone()),
     );
     install_with_providers(
@@ -1096,29 +1952,43 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
             }))
             .with_executor_provider(Arc::new(
                 ExecutorSkillProvider::new_with_restriction_product(
-                    manager, /*restriction_product*/ None,
+                    /*restriction_product*/ None,
                 ),
             )),
         |_config: &Config| SkillsExtensionConfig {
             include_instructions: true,
             catalog_deltas_enabled: false,
+            omit_descriptions: false,
             max_context_tokens: None,
             bundled_skills_enabled: false,
             cloud_skill_enabled: true,
             shadow_selection_enabled: false,
         },
     );
-    // Rotate auth, revoke the owning plugin, then reuse the revoked state.
+    // Call both installations, then preserve the skill-read/auth-rotation/revocation flow.
+    let installations = [
+        ("env-a", "mcp__74afdff5f493__notes", &executor),
+        ("env-b", "mcp__14afef09931d__notes", &second_executor),
+    ];
     let cases = [
+        ("initial", true),
+        ("initial", true),
         ("initial", true),
         ("rotated", true),
         ("removed", false),
         ("removed", false),
     ];
-    let model_responses = (0..cases.len())
+    let mut model_responses = (0..cases.len())
         .map(|step| {
             let mut events = vec![responses::ev_response_created(&format!("response-{step}"))];
-            if step + 1 < cases.len() {
+            if let Some((environment, namespace, _)) = installations.get(step) {
+                events.push(responses::ev_function_call_with_namespace(
+                    &format!("call-{environment}"),
+                    namespace,
+                    "echo",
+                    &json!({"title": environment}).to_string(),
+                ));
+            } else if step + 1 < cases.len() {
                 events.push(responses::ev_function_call_with_namespace(
                     &format!("read-{step}"),
                     "skills",
@@ -1130,9 +2000,14 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
             responses::sse(events)
         })
         .collect::<Vec<_>>();
+    model_responses.push(responses::sse(vec![
+        responses::ev_response_created("cached-turn"),
+        responses::ev_completed("cached-turn"),
+    ]));
     let model = responses::mount_sse_sequence(&server, model_responses).await;
     let test = apps_enabled_builder(apps.chatgpt_base_url)
         .with_exec_server_url(executor.url.clone())
+        .with_model_info_override("gpt-5.5", |model| model.supports_search_tool = false)
         .with_auth(CodexAuth::from_external_chatgpt_tokens(
             "header.e30.initial",
             "account",
@@ -1144,11 +2019,28 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
             config.features.enable(Feature::Plugins).unwrap();
             config
                 .features
+                .enable(Feature::MultiEnvironmentMcp)
+                .unwrap();
+            config
+                .features
                 .enable(Feature::ExecutorCapabilityDiscoveryV2)
                 .unwrap();
         })
         .build_with_auto_env(&server)
         .await?;
+    let mut selections = Vec::new();
+    for (environment, _, executor) in installations {
+        test.thread_manager
+            .environment_manager()
+            .upsert_environment(
+                environment.into(),
+                executor.url.clone(),
+                /*connect_timeout*/ None,
+            )?;
+        let mut selection = test.executor_environment().selection().clone();
+        selection.environment_id = environment.into();
+        selections.push(selection);
+    }
     let rotate = async {
         for (index, &(revision, available)) in cases.iter().enumerate().skip(1) {
             let (client, resume) = tokio::time::timeout(Duration::from_secs(15), steps.recv())
@@ -1176,11 +2068,17 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
         anyhow::Ok(())
     };
     tokio::try_join!(
-        test.submit_turn("Inspect the accepted plugin skill."),
+        test.submit_turn_with_environments(
+            "Read a note on each computer, then inspect the accepted plugin skill.",
+            Some(selections),
+        ),
         rotate
     )?;
+    // The next turn reuses the empty plugin catalog.
+    test.submit_turn("Check the same skills again.").await?;
+    assert_eq!(cloud.plugins.load(Ordering::SeqCst), 3);
     let requests = model.requests();
-    assert_eq!(requests.len(), cases.len());
+    assert_eq!(requests.len(), cases.len() + 1);
     for (request, (_, available)) in requests.iter().zip(cases) {
         let instructions = request.message_input_texts("developer");
         let skills = instructions
@@ -1188,6 +2086,26 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
             .rfind(|text| text.starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG))
             .expect("latest skill instructions");
         assert_eq!(skills.contains("Accepted plugin skill"), available);
+        for (_, namespace, _) in installations {
+            assert_eq!(request.tool_by_name(namespace, "echo").is_some(), available);
+        }
+    }
+    for (environment, _, executor) in installations {
+        let mut calls = Vec::new();
+        for request in executor.requests.lock().await.iter() {
+            if request["method"] == "http/request" {
+                let params: HttpRequestParams = serde_json::from_value(request["params"].clone())?;
+                let Some(body) = params.body else { continue };
+                let body: Value = serde_json::from_slice(body.as_ref())?;
+                if body["method"] == "tools/call" {
+                    calls.push((
+                        body["params"]["name"].clone(),
+                        body["params"]["arguments"].clone(),
+                    ));
+                }
+            }
+        }
+        assert_eq!(calls, vec![(json!("echo"), json!({"title": environment}))]);
     }
     let mut bodies = requests
         .iter()
@@ -1208,7 +2126,7 @@ async fn auth_rotation_refreshes_plugin_acceptance_before_merged_skills() -> Res
     insta::assert_snapshot!(
         "plugin_acceptance_auth_refresh",
         context_snapshot::format_context_snapshot(
-            "Mid-turn auth refresh preserves skill context and executor access. Revoking the plugin removes cloud skill instructions and denies executor reads.",
+            "Two installations of one cloud plugin route MCP calls through their own executors. Mid-turn auth refresh preserves skill context and executor access; revocation removes both MCPs and cloud skill instructions and denies executor reads. The next turn reuses the cached catalog.",
             &bodies
                 .iter()
                 .map(context_snapshot::SnapshotEntry::body)

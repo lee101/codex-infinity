@@ -1,6 +1,11 @@
 # Sandbox integrity: scope and review contract
 
-These checks currently emit telemetry only. Findings and preparation errors must
+Runtime integrity checks are paused at the shared runner entry point. Do not
+perform dependency discovery, policy preparation, checks, or telemetry during
+command execution. The checker implementation and isolated tests remain for now;
+the command-launch failure/timeout integration test is ignored while paused.
+
+When enabled, these checks emit telemetry only. Findings and preparation errors must
 not change sandbox construction, permissions, approvals, or command execution.
 Supported backends are Seatbelt, bubblewrap, and MXC; legacy Windows is out of scope.
 
@@ -29,11 +34,6 @@ additional write grants (such as Seatbelt scratch access) can produce false
 negatives. Backend glob/symlink nuances and writable hard-link aliases are not
 fully modeled. The separate glob scan can differ from enforcement's snapshot.
 Metrics describe observed checker outcomes, not accuracy or missed violations.
-
-MXC scanner discovery currently uses `which`, while enforcement uses
-`Command`. Their search-order and environment differences can select different
-executables or cause only one scan to use the internal walker. This is an accepted
-telemetry limitation for this phase; changing production scanner selection is deferred.
 
 These are accepted limitations of this phase, not requests to duplicate backend
 implementations. Review against this scope. Regressions in explicit policy

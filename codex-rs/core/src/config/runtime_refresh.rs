@@ -1,4 +1,4 @@
-//! Resolves refreshable MCP inputs without rebuilding unrelated session configuration.
+//! Resolves refreshable MCP inputs and operational controls without rebuilding session configuration.
 //! Existing sessions refresh ordinary MCP state without gaining enterprise authority.
 //! Validate the retained backend after applying the refreshable requirements.
 
@@ -32,6 +32,8 @@ pub(crate) enum RuntimeConfigRefresh {
 struct McpRefreshToml {
     features: Option<FeaturesToml>,
     plugins: codex_config::types::PluginsConfigToml,
+    #[serde(rename = "apps")]
+    _apps: Option<codex_config::types::AppsConfigToml>,
 }
 
 impl Config {
@@ -40,7 +42,7 @@ impl Config {
         incoming: &Self,
         scope: RuntimeConfigRefresh,
     ) -> std::io::Result<Self> {
-        let layers = match scope {
+        let mut layers = match scope {
             RuntimeConfigRefresh::User | RuntimeConfigRefresh::UserFiles => self
                 .config_layer_stack
                 .with_user_layer_from(&incoming.config_layer_stack),
@@ -50,6 +52,25 @@ impl Config {
             )?
             .with_user_layer_from(&self.config_layer_stack),
         };
+        if matches!(scope, RuntimeConfigRefresh::Mcp) {
+            let session_override = |key: &str| {
+                incoming
+                    .config_layer_stack
+                    .layers_low_to_high()
+                    .filter(|layer| layer.name == codex_config::ConfigLayerSource::SessionFlags)
+                    .filter_map(|layer| layer.config.get(key).cloned())
+                    .reduce(|mut value, overlay| {
+                        codex_config::merge_toml_values(&mut value, &overlay);
+                        value
+                    })
+            };
+            if let Some(plugins) = session_override("plugins") {
+                layers = layers.with_session_plugins(plugins)?;
+            }
+            if let Some(apps) = session_override("apps") {
+                layers = layers.with_session_apps(apps)?;
+            }
+        }
         // User refreshes retain the session's managed configuration.
         layers.ensure_config_server_applied()?;
         let cfg: McpRefreshToml = layers
@@ -68,8 +89,11 @@ impl Config {
         // Enterprise opt-in always comes from trusted layers instead.
         for feature in [
             Feature::McpConnectionSharing,
+            Feature::McpSharedReplCwd,
+            Feature::McpLazyStdioStartup,
             Feature::SecretAuthStorage,
             Feature::McpOAuthRefreshCoordination,
+            Feature::DaybreakProgramPropagation,
         ] {
             if matches!(scope, RuntimeConfigRefresh::UserFiles) {
                 let explicitly_configured = cfg.features.as_ref().is_some_and(|features| {
@@ -134,6 +158,15 @@ impl Config {
             .features
             .refresh_mcp_features(&features)
             .map_err(std::io::Error::other)?;
+        if matches!(scope, RuntimeConfigRefresh::UserFiles) {
+            config
+                .features
+                .set_enabled(
+                    Feature::DaybreakProgramPropagation,
+                    features.enabled(Feature::DaybreakProgramPropagation),
+                )
+                .map_err(std::io::Error::other)?;
+        }
         config.mcp_servers =
             constrain_mcp_servers(servers, layers.requirements().mcp_servers.as_ref())
                 .map_err(std::io::Error::other)?;
@@ -181,12 +214,30 @@ impl Config {
         }
         config.config_layer_stack = layers
             .with_mcp_ema_cancellation(self.config_layer_stack.mcp_ema_cancellation().clone());
+        // Startup and publication assign a revision when Guardian owns the policy.
+        if matches!(scope, RuntimeConfigRefresh::Mcp) && self.guardian_policy_revision != 0 {
+            config
+                .config_layer_stack
+                .retain_guardian_policy_from(&self.config_layer_stack);
+        }
         config.plugins = cfg.plugins;
         if enterprise_retired {
             config.disable_mcp_enterprise_auth();
         }
         config.validate_windows_mxc_requirement()?;
         Ok(config)
+    }
+
+    pub(crate) fn retain_guardian_policy_from(&mut self, current: &Self) {
+        self.config_layer_stack
+            .retain_guardian_policy_from(&current.config_layer_stack);
+        self.guardian_policy_config
+            .clone_from(&current.guardian_policy_config);
+        self.guardian_extra_policy
+            .clone_from(&current.guardian_extra_policy);
+        self.guardian_policy_revision = current.guardian_policy_revision;
+        self.requested_approvals_reviewer = current.requested_approvals_reviewer;
+        self.approvals_reviewer = current.approvals_reviewer;
     }
 
     /// Disables enterprise MCP authorization while preserving unrelated MCP servers.

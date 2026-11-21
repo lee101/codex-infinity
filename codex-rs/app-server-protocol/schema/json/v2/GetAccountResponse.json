@@ -36,6 +36,13 @@
               ],
               "title": "ChatgptAccountType",
               "type": "string"
+            },
+            "workspaceName": {
+              "description": "Display name of the selected ChatGPT workspace, when available.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -152,6 +159,14 @@
     },
     "requiresOpenaiAuth": {
       "type": "boolean"
+    },
+    "userId": {
+      "default": null,
+      "description": "ChatGPT user ID belonging to this account response, when available.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

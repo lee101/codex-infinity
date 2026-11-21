@@ -107,6 +107,14 @@ fn extract_apply_patch_from_shell(
     }
 }
 
+fn is_implicit_patch(argv: &[String], cwd: &PathUri) -> bool {
+    let body = match argv {
+        [body] => Some(body.as_str()),
+        _ => parse_shell_script(argv, cwd).map(|(_, script)| script),
+    };
+    body.is_some_and(|body| parse_patch(body).is_ok())
+}
+
 // TODO: make private once we remove tests in lib.rs
 /// `cwd` supplies the path convention used to interpret the shell executable in `argv`.
 pub fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
@@ -144,16 +152,7 @@ pub async fn maybe_parse_apply_patch_verified(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> MaybeApplyPatchVerified {
-    // Detect a raw patch body passed directly as the command or as the body of a shell
-    // script. In these cases, report an explicit error rather than applying the patch.
-    if let [body] = argv
-        && parse_patch(body).is_ok()
-    {
-        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
-    }
-    if let Some((_, script)) = parse_shell_script(argv, cwd)
-        && parse_patch(script).is_ok()
-    {
+    if is_implicit_patch(argv, cwd) {
         return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
     }
 

@@ -13,6 +13,9 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-thread-context-ids = { workspace = true }
+codex-agent-identity = { workspace = true }
+codex-runtime-agent-instance = { workspace = true }
 anyhow = { workspace = true }
 codex-analytics = { workspace = true }
 codex-api = { workspace = true }
@@ -39,6 +42,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+codex-thread-context-ids-test-support = { workspace = true }
+base64 = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-protocol-test-support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
@@ -46,6 +51,7 @@ core_test_support = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+test-case = "3.3.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
 zstd = { workspace = true }

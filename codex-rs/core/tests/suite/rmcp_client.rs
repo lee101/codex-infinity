@@ -25,9 +25,11 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_core::AgentMcpMetadataRecipient;
 use codex_core::EnvironmentConfig;
 use codex_core::EnvironmentMcpPolicy;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::config::Config;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -92,6 +94,7 @@ use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::turn_input::TurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -134,6 +137,8 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use wiremock::MockServer;
 
+#[path = "mcp_network_policy_compat_tests.rs"]
+mod network_policy_compat_tests;
 #[path = "mcp_oauth_refresh_tests.rs"]
 mod oauth_refresh_tests;
 #[path = "mcp_sandbox_tests.rs"]
@@ -413,7 +418,8 @@ async fn call_cwd_tool(
     server_name: &str,
     call_id: &str,
 ) -> anyhow::Result<Value> {
-    call_structured_tool(server, fixture, server_name, "cwd", call_id).await
+    let start = TurnStartOptions::default();
+    call_structured_tool(server, fixture, server_name, "cwd", call_id, start).await
 }
 
 async fn call_structured_tool(
@@ -422,6 +428,7 @@ async fn call_structured_tool(
     server_name: &str,
     tool_name: &str,
     call_id: &str,
+    start: TurnStartOptions,
 ) -> anyhow::Result<Value> {
     let namespace = format!("mcp__{server_name}");
     mount_sse_once(
@@ -442,10 +449,8 @@ async fn call_structured_tool(
     )
     .await;
 
-    fixture
-        .codex
-        .start_or_steer_turn(read_only_user_turn(fixture, "call the requested rmcp tool"))
-        .await?;
+    let input = read_only_user_turn(fixture, "call the requested rmcp tool").on_start(start);
+    fixture.codex.start_or_steer_turn(input).await?;
 
     wait_for_event(&fixture.codex, |ev| {
         matches!(ev, EventMsg::McpToolCallBegin(_))
@@ -469,6 +474,85 @@ async fn call_structured_tool(
 
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     Ok(structured_content)
+}
+
+enum AgentMetadataCase {
+    ApprovedPlugin,
+    NoHostOptIn,
+    UserOverride,
+}
+
+#[test_case(AgentMetadataCase::ApprovedPlugin, Some(CyberAccessProgram::Standard); "approved plugin")]
+#[test_case(AgentMetadataCase::ApprovedPlugin, None; "approved plugin without an explicit program")]
+#[test_case(AgentMetadataCase::UserOverride, Some(CyberAccessProgram::Standard); "same-name user override")]
+#[test_case(AgentMetadataCase::NoHostOptIn, Some(CyberAccessProgram::Standard); "matching plugin without host opt-in")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_metadata_is_only_sent_to_the_selected_plugin(
+    case: AgentMetadataCase,
+    cyber_access_program: Option<CyberAccessProgram>,
+) -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    let server = start_mock_server().await;
+    let home = Arc::new(tempdir()?);
+    let plugin_root = super::plugins::write_sample_plugin_manifest_and_config(&home);
+    let command = stdio_server_bin()?;
+    fs::write(
+        plugin_root.join(".mcp.json"),
+        serde_json::to_vec(&json!({ "mcpServers": { "sample": { "command": command } } }))?,
+    )?;
+    let transport = stdio_transport(command, /*env*/ None, Vec::new());
+    let recipient = AgentMcpMetadataRecipient {
+        plugin_id: "sample@test".into(),
+        plugin_root: PathUri::from_abs_path(&AbsolutePathBuf::try_from(plugin_root)?),
+        server_name: "sample".into(),
+        transport: transport.clone(),
+    };
+    let user_override = matches!(case, AgentMetadataCase::UserOverride);
+    let fixture = test_codex()
+        .with_home(home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            if user_override {
+                insert_mcp_server(config, "sample", transport, TestMcpServerOptions::default());
+            }
+        })
+        .build(&server)
+        .await?;
+    if !matches!(case, AgentMetadataCase::NoHostOptIn) {
+        fixture.codex.thread_extension_data().insert(recipient);
+    }
+    wait_for_mcp_server(&fixture.codex, "sample").await?;
+
+    let call_id = "call-agent-context";
+    let meta = call_structured_tool(
+        &server,
+        &fixture,
+        "sample",
+        "sandbox_meta",
+        call_id,
+        TurnStartOptions {
+            root_turn_id: Some("original-root".into()),
+            turn_trigger: Some("composer".into()),
+            cyber_access_program,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(meta["callId"], json!(call_id));
+    assert_eq!(meta["x-codex-turn-metadata"]["turn_trigger"], "composer");
+    let expect_private_metadata = matches!(case, AgentMetadataCase::ApprovedPlugin);
+    assert_eq!(
+        meta.get("x-codex-root-turn-id").cloned(),
+        expect_private_metadata.then(|| json!("original-root"))
+    );
+    assert_eq!(
+        meta.get("x-codex-cyber-access-program").cloned(),
+        expect_private_metadata.then(|| json!(cyber_access_program))
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -510,6 +594,7 @@ async fn assert_openai_form_capability_advertisement(expected: bool) -> anyhow::
         server_name,
         "client_capabilities",
         "call-client-capabilities",
+        Default::default(),
     )
     .await?;
     assert_eq!(
@@ -704,32 +789,6 @@ async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
         ])
     );
 
-    let request_body = request.body_json();
-    let first_turn_id = request_body["client_metadata"]["turn_id"].clone();
-    assert!(first_turn_id.is_string());
-    let expected_attribution = json!({
-        "status": "complete",
-        "sources": [{
-            "server_name": "rmcp",
-            "tool_name": "image_scenario",
-            "first_turn_id": first_turn_id,
-        }],
-    });
-    assert_eq!(
-        serde_json::to_value(codex_core::test_support::mcp_attribution_snapshot(
-            &fixture.codex
-        ))?,
-        expected_attribution,
-    );
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(
-            request_body["client_metadata"]["mcp_attribution"]
-                .as_str()
-                .context("MCP attribution should be included for the OpenAI provider")?,
-        )?,
-        expected_attribution,
-    );
-
     server.verify().await;
     Ok(())
 }
@@ -893,6 +952,7 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
         .codex
         .call_mcp_tool(
             "allowed",
+            /*environment_id*/ None,
             "echo",
             Some(json!({ "message": "ready" })),
             /*meta*/ None,
@@ -1343,23 +1403,17 @@ async fn stdio_server_round_trip(server_name: &'static str, namespace: &str) -> 
 
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let search_request = search_mock.single_request().body_json();
-    let search_description = search_request
-        .get("tools")
-        .and_then(Value::as_array)
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
-        })
-        .and_then(|tool| tool.get("description").and_then(Value::as_str))
-        .expect("the model should receive a tool search description");
+    let search_request = search_mock.single_request();
+    let tools_state = search_request
+        .message_input_texts("developer")
+        .into_iter()
+        .find(|text| text.starts_with("<tools>"))
+        .expect("the model should receive the deferred tools block");
     assert!(
-        search_description.len() < 513 * 1024,
-        "the complete tool search description must remain bounded"
+        tools_state.len() <= 4 * 1024,
+        "the deferred tools block must remain bounded"
     );
-    assert!(search_description.contains(&format!("- {server_name}: {expected_description}")));
-    assert!(search_description.contains("🦀keep the complete MCP metadata"));
+    assert!(tools_state.contains(&format!("- {namespace}: ")));
 
     let search_output = call_mock
         .single_request()
@@ -1575,10 +1629,25 @@ async fn mcp_pagination_preserves_valid_tools_and_rejects_oversized_cursors(
         .build_with_auto_env(&server)
         .await?;
 
+    let mut started = std::collections::BTreeSet::new();
     let startup = loop {
         let event = fixture.codex.next_event().await?;
-        if let EventMsg::McpStartupComplete(startup) = event.msg {
-            break startup;
+        match event.msg {
+            EventMsg::McpStartupUpdate(update)
+                if matches!(update.server.as_str(), "paginated" | "rejected") =>
+            {
+                if matches!(update.status, McpStartupStatus::Starting) {
+                    started.insert(update.server);
+                } else {
+                    assert_eq!(
+                        started.len(),
+                        2,
+                        "both eager starts precede the first terminal status"
+                    );
+                }
+            }
+            EventMsg::McpStartupComplete(startup) => break startup,
+            _ => {}
         }
     };
     assert!(startup.ready.iter().any(|name| name == "paginated"));
@@ -2249,6 +2318,7 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
         codex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
             catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+            omit_descriptions: false,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
             cloud_skill_enabled: config.cloud_skill_enabled,
@@ -2346,7 +2416,7 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
             .await?;
         fixture.codex = started.thread;
         fixture.session_configured = started.session_configured;
-        wait_for_mcp_server(&fixture.codex, server_name).await?;
+        // The catalog is warm; the optional server starts on its first tool call.
 
         // A fresh thread must still discover the primary executor's repository
         // skills; host routing must not silently replace them with local skills.
@@ -3274,6 +3344,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             call_id: call_id.to_string(),
             invocation: McpInvocation {
                 server: server_name.to_string(),
+                environment_id: None,
                 tool: "image".to_string(),
                 arguments: Some(json!({})),
             },
@@ -3301,6 +3372,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
         end.invocation,
         McpInvocation {
             server: server_name.to_string(),
+            environment_id: None,
             tool: "image".to_string(),
             arguments: Some(json!({})),
         }
@@ -3357,7 +3429,7 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let server_name = "rmcp";
     let namespace = format!("mcp__{server_name}");
 
-    let original_dimensions = (3000, 2000);
+    let original_dimensions = (6400, 320);
     let image = ImageBuffer::from_pixel(
         original_dimensions.0,
         original_dimensions.1,
@@ -3431,14 +3503,14 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let resized_url = output[1]["image_url"]
         .as_str()
         .expect("MCP image output should contain a data URL");
-    assert_eq!(output[1]["detail"], "high");
+    assert_eq!(output[1]["detail"], "original");
     let (_, resized_base64) = resized_url
         .split_once(',')
         .expect("resized image should contain a data URL prefix");
     let resized_bytes = BASE64_STANDARD.decode(resized_base64)?;
     let resized = image::load_from_memory(&resized_bytes)?;
     let resized_dimensions = resized.dimensions();
-    assert_eq!(resized_dimensions, (1920, 1280));
+    assert_eq!(resized_dimensions, (6000, 300));
 
     server.verify().await;
     Ok(())
@@ -3593,7 +3665,6 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 effective_context_window_percent: 95,
                 experimental_supported_tools: Vec::new(),
                 input_modalities: vec![InputModality::Text],
-                used_fallback_model_metadata: false,
                 supports_search_tool: false,
                 supports_experimental_context: false,
                 use_responses_lite: false,
@@ -3606,6 +3677,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 tool_mode: None,
                 multi_agent_version: None,
                 multi_agent_reasoning_effort: None,
+                multi_agent_tools_in_code_mode: None,
             }],
         },
     )

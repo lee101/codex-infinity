@@ -817,6 +817,140 @@ mod tests {
     }
 
     #[test]
+    fn vt100_spoken_prompt_keeps_its_marker_color_without_a_terminal_palette() {
+        use crate::history_cell::HistoryCell;
+        use crate::history_cell::new_spoken_user_prompt;
+
+        crate::terminal_palette::with_test_default_colors(
+            /*colors*/ None::<crate::terminal_probe::DefaultColors>,
+            || {
+                let width = 30;
+                let lines = new_spoken_user_prompt("hello from voice".into())
+                    .display_hyperlink_lines(width);
+                let mut snapshots = Vec::new();
+                for policy in [
+                    HistoryLineWrapPolicy::PreWrap,
+                    HistoryLineWrapPolicy::Terminal,
+                ] {
+                    let mut backend = VT100Backend::new(width, /*height*/ 1);
+                    let (wrapped, _) =
+                        wrap_history_hyperlink_lines(&lines[1..2], usize::from(width), policy);
+                    write_history_line(&mut backend, &wrapped[0], usize::from(width))
+                        .expect("write spoken prompt");
+                    let screen = backend.vt100().screen();
+                    let marker = screen.cell(/*row*/ 0, /*col*/ 0).unwrap();
+                    let text = screen.cell(/*row*/ 0, /*col*/ 2).unwrap();
+                    let margin = screen.cell(/*row*/ 0, width - 1).unwrap();
+                    snapshots.push(format!(
+                        "{policy:?}: {}\nmarker: {:?}, text: {:?}, background: {:?}",
+                        screen.rows(/*start*/ 0, width).next().unwrap().trim_end(),
+                        marker.fgcolor(),
+                        text.fgcolor(),
+                        margin.bgcolor(),
+                    ));
+                }
+                insta::assert_snapshot!(snapshots.join("\n"), @"
+                PreWrap: › hello from voice
+                marker: Idx(1), text: Rgb(238, 238, 238), background: Rgb(68, 68, 68)
+                Terminal: › hello from voice
+                marker: Idx(1), text: Rgb(238, 238, 238), background: Rgb(68, 68, 68)
+                ");
+            },
+        );
+    }
+
+    #[test]
+    fn vt100_preserves_bold_at_the_start_of_a_typed_prompt() {
+        use crate::history_cell::HistoryCell;
+        use crate::history_cell::new_user_prompt;
+
+        let width = 30;
+        let lines = new_user_prompt("**Bold** plain".into(), vec![], vec![], vec![])
+            .display_hyperlink_lines(width);
+        let row = lines
+            .iter()
+            .find(|line| line.line.to_string().starts_with("› "))
+            .expect("prompt row");
+        let mut backend = VT100Backend::new(width, /*height*/ 1);
+        write_history_line(&mut backend, row, usize::from(width)).unwrap();
+
+        let screen = backend.vt100().screen();
+        let row = screen.rows(/*start*/ 0, width).next().unwrap();
+        let marker = screen.cell(/*row*/ 0, /*col*/ 0).unwrap();
+        let first = screen.cell(/*row*/ 0, /*col*/ 2).unwrap();
+        let plain = screen.cell(/*row*/ 0, /*col*/ 7).unwrap();
+        let snapshot = format!(
+            "{}\nmarker dim: {}, first word bold: {}, trailing word bold: {}",
+            row.trim_end(),
+            marker.dim(),
+            first.bold(),
+            plain.bold(),
+        );
+        insta::assert_snapshot!(snapshot, @"
+        › Bold plain
+        marker dim: true, first word bold: true, trailing word bold: false
+        ");
+    }
+
+    #[test]
+    fn vt100_prompt_keeps_text_element_accent_without_a_terminal_palette() {
+        use crate::history_cell::HistoryCell;
+        use crate::history_cell::new_user_prompt;
+        use codex_protocol::user_input::TextElement;
+
+        crate::terminal_palette::with_test_default_colors(/*colors*/ None, || {
+            let message = "[Image #1] details";
+            let element = TextElement::new((0..10).into(), Some("[Image #1]".into()));
+            let lines = new_user_prompt(message.into(), vec![element], vec![], vec![])
+                .display_hyperlink_lines(/*width*/ 30);
+            for policy in [
+                HistoryLineWrapPolicy::PreWrap,
+                HistoryLineWrapPolicy::Terminal,
+            ] {
+                let (rows, _) =
+                    wrap_history_hyperlink_lines(&lines[1..2], /*wrap_width*/ 30, policy);
+                let mut backend = VT100Backend::new(/*width*/ 30, /*height*/ 1);
+                write_history_line(&mut backend, &rows[0], /*wrap_width*/ 30).unwrap();
+                let screen = backend.vt100().screen();
+                let element = screen.cell(/*row*/ 0, /*col*/ 2).unwrap();
+                let plain = screen.cell(/*row*/ 0, /*col*/ 13).unwrap();
+                assert_ne!(element.fgcolor(), plain.fgcolor());
+                assert_eq!(element.bgcolor(), plain.bgcolor());
+            }
+        });
+    }
+
+    #[test]
+    fn vt100_async_reply_keeps_inline_code_color_without_a_terminal_palette() {
+        use crate::async_question_reply::AsyncQuestionReply;
+        use crate::history_cell::HistoryCell;
+        use crate::history_cell::new_user_prompt;
+
+        crate::terminal_palette::with_test_default_colors(/*colors*/ None, || {
+            let answer = "Use `main`";
+            let reply = AsyncQuestionReply {
+                question_item_id: "ask".into(),
+                question: "Which branch?".into(),
+                answer: answer.into(),
+            };
+            let lines = new_user_prompt(answer.into(), vec![], vec![], vec![])
+                .with_async_replies(vec![reply], std::path::Path::new("."))
+                .display_hyperlink_lines(/*width*/ 30);
+            let row = lines
+                .iter()
+                .find(|row| row.line.to_string().contains("Use main"))
+                .unwrap();
+            let mut backend = VT100Backend::new(/*width*/ 30, /*height*/ 1);
+            write_history_line(&mut backend, row, /*wrap_width*/ 30).unwrap();
+            let screen = backend.vt100().screen();
+            let plain = screen.cell(/*row*/ 0, /*col*/ 2).unwrap();
+            let code = screen.cell(/*row*/ 0, /*col*/ 6).unwrap();
+            assert_eq!(plain.fgcolor(), vt100::Color::Rgb(238, 238, 238));
+            assert_ne!(code.fgcolor(), plain.fgcolor());
+        });
+    }
+
+    #[test]
     fn vt100_user_message_url_wrap_preserves_gutter_and_background() {
         use crate::history_cell::HistoryCell;
         use crate::history_cell::UserHistoryCell;

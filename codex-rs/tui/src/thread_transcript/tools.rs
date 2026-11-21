@@ -27,7 +27,9 @@ use ratatui::text::Line;
 /// Preserve status and output when replay cannot reconstruct a rich completed tool cell.
 /// Declined commands never ran, and historical terminal interactions do not carry stdin details.
 /// Pending items retain their last known state without starting a running clock.
-pub(crate) fn historical_tool_fallback(item: &ThreadItemPayload) -> Option<PlainHistoryCell> {
+pub(crate) fn historical_tool_fallback(
+    item: &ThreadItemPayload,
+) -> Option<crate::history_cell::LabeledToolCell> {
     let lines = match item {
         ThreadItemPayload::CommandExecution {
             command,
@@ -75,6 +77,7 @@ pub(crate) fn historical_tool_fallback(item: &ThreadItemPayload) -> Option<Plain
         }
         ThreadItemPayload::McpToolCall {
             server,
+            environment_id,
             tool,
             status,
             result,
@@ -86,6 +89,10 @@ pub(crate) fn historical_tool_fallback(item: &ThreadItemPayload) -> Option<Plain
                 McpToolCallStatus::Completed => "Completed · result unavailable",
                 McpToolCallStatus::Failed => "Failed · result unavailable",
             };
+            let server = crate::app_server_approval_conversions::mcp_server_label(
+                server,
+                environment_id.as_deref(),
+            );
             vec![format!("mcp tool: {server}/{tool} · {status}").dim().into()]
         }
         ThreadItemPayload::CollabAgentToolCall {
@@ -108,7 +115,16 @@ pub(crate) fn historical_tool_fallback(item: &ThreadItemPayload) -> Option<Plain
         }
         _ => return None,
     };
-    Some(PlainHistoryCell::new(lines))
+    let cell = PlainHistoryCell::new(lines);
+    Some(match item {
+        ThreadItemPayload::CommandExecution {
+            status: CommandExecutionStatus::Declined,
+            command,
+            ..
+        } => cell.with_tool_label(format!("Declined · {command}")),
+        ThreadItemPayload::CommandExecution { .. } => cell.with_tool_header(/*count*/ 2),
+        _ => cell.with_tool_header(/*count*/ 1),
+    })
 }
 
 // The protocol joins argv with shlex. Keep noncanonical legacy commands verbatim.
@@ -196,6 +212,7 @@ impl McpHistory {
         let ThreadItemPayload::McpToolCall {
             id,
             server,
+            environment_id,
             tool,
             status,
             arguments,
@@ -227,6 +244,7 @@ impl McpHistory {
             id,
             invocation: McpInvocation {
                 server,
+                environment_id,
                 tool,
                 arguments: Some(arguments),
             },

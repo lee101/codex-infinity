@@ -3,9 +3,11 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
+use crate::tools::executed_tool_calls::PendingResultBody;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::output::CapturedStream;
 use crate::unified_exec::resolve_max_tokens;
+use codex_extension_api::ToolCallOutcome;
 use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -13,10 +15,11 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ToolResultMetadata;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
-use codex_utils_audio::estimate_audio_token_count;
+use codex_utils_audio::estimate_tool_audio_tokens;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_function_output_payload;
 use codex_utils_output_truncation::with_serialization_allowance;
@@ -25,8 +28,8 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -46,8 +49,10 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 /// Delivery does not finish the call: post-tool hooks can still be cancelled.
 #[derive(Default)]
 pub(crate) struct ToolCallState {
-    pub(crate) terminal_outcome_reached: AtomicBool,
+    pub(crate) terminal_outcome: OnceLock<ToolCallOutcome>,
+    pub(crate) handler_started_at: OnceLock<Instant>,
     pub(crate) delivered_assistant_message: OnceLock<String>,
+    pub(crate) invocation: crate::agent::host::InvocationReservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,6 +122,8 @@ pub struct ToolInvocation {
     pub tool_name: ToolName,
     pub source: ToolCallSource,
     pub payload: ToolPayload,
+    /// Original function-call evidence owned by this invocation, independent of live history.
+    pub native_call: Option<Arc<ResponseItem>>,
     /// Captured before PreToolUse and retained across input rewrites.
     pub(crate) environments: ToolEnvironments,
 }
@@ -169,12 +176,17 @@ pub struct McpToolOutput {
     pub tool_input: JsonValue,
     // Keep the original metadata for hooks; this flag only controls analytics capture.
     pub(crate) result_metadata_capture_allowed: bool,
+    pub(crate) result_capture: Option<Arc<PendingResultBody>>,
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
     pub truncation_policy: TruncationPolicy,
 }
 
 impl ToolOutput for McpToolOutput {
+    fn output_budget_applied(&self) -> bool {
+        true
+    }
+
     fn log_output(&self) -> String {
         // Logging has its own budget; do not first apply the model-context budget.
         let output = self.result.log_output();
@@ -206,11 +218,21 @@ impl ToolOutput for McpToolOutput {
         self.result.code_mode_result(payload)
     }
 
-    fn tool_result_metadata(&self) -> Option<&JsonValue> {
+    fn tool_result_metadata(&self) -> ToolResultMetadata {
         if !self.result_metadata_capture_allowed {
-            return None;
+            return ToolResultMetadata::default();
         }
-        self.result.meta.as_ref()
+        let result_id = self
+            .result_capture
+            .as_ref()
+            .filter(|_| self.result.success())
+            .and_then(|capture| capture.accept());
+        self.result
+            .meta
+            .as_ref()
+            .map(ToolResultMetadata::new)
+            .unwrap_or_default()
+            .with_result_id(result_id)
     }
 
     fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
@@ -249,7 +271,7 @@ impl McpToolOutput {
         truncate_function_output_payload(
             &mut payload,
             with_serialization_allowance(self.truncation_policy),
-            estimate_audio_token_count,
+            estimate_tool_audio_tokens,
         );
         payload
     }
@@ -389,6 +411,10 @@ pub struct AbortedToolOutput {
 }
 
 impl ToolOutput for AbortedToolOutput {
+    fn was_aborted(&self) -> bool {
+        true
+    }
+
     fn log_output(&self) -> String {
         self.message.clone()
     }

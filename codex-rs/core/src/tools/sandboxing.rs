@@ -14,17 +14,24 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::WindowsSandboxSelection;
+use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 pub(crate) use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxCommand;
+use codex_sandboxing::SandboxExecRequest;
+use codex_sandboxing::SandboxExecutables;
 use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxNetwork;
+use codex_sandboxing::SandboxSelection;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
@@ -170,6 +177,8 @@ pub(crate) enum ExecApprovalRequirement {
         /// See core/src/exec_policy.rs for more details on how proposed_execpolicy_amendment is determined.
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
+    /// A fresh human decision is required for each execution attempt.
+    NeedsHumanApproval { reason: Option<String> },
     /// Execution forbidden for this tool call.
     Forbidden { reason: String },
 }
@@ -402,8 +411,8 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 
 pub(crate) struct SandboxAttempt<'a> {
     pub sandbox_override: SandboxOverride,
-    pub sandbox: SandboxType,
-    /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
+    pub(crate) local_selection: SandboxSelection,
+    /// Whether this attempt requests a sandbox, after applying any approved bypass.
     pub sandbox_requested: bool,
     pub permissions: &'a codex_protocol::models::PermissionProfile,
     /// Canonical permissions before this host materializes workspace roots.
@@ -496,68 +505,73 @@ impl<'a> SandboxAttempt<'a> {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let network = self.network_proxy(network);
-        let mut request = self
-            .manager
-            .transform(SandboxTransformRequest {
+        crate::sandboxing::ExecRequest::prepare_local_sandbox(
+            self.manager,
+            SandboxTransformRequest {
                 command,
                 permissions: self.permissions,
-                sandbox: self.sandbox,
-                enforce_managed_network: self.enforce_managed_network,
-                environment_id,
-                network,
+                workspace_roots: Some(self.workspace_roots),
+                selection: self.local_selection,
+                network: SandboxNetwork::new(self.enforce_managed_network, network, environment_id),
                 sandbox_policy_cwd: self.sandbox_cwd,
-                sandbox_exe: self.sandbox_exe.map(std::path::PathBuf::as_path),
+                executables: SandboxExecutables::Launcher(
+                    self.sandbox_exe.map(std::path::PathBuf::as_path),
+                ),
                 use_legacy_landlock: self.use_legacy_landlock,
                 windows_sandbox_level: self.windows_sandbox_level,
-            })
-            .map_err(CodexErr::from)?;
-        request.sandbox_override = self.sandbox_override;
-        let workspace_roots = self
-            .workspace_roots
-            .iter()
-            .map(PathUri::to_abs_path)
-            .collect::<std::io::Result<Vec<_>>>()?;
-        crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, workspace_roots)
-            .await
+            },
+            options,
+            self.sandbox_override,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn env_for_exec_server(
         &self,
-        command: SandboxCommand,
+        argv: Vec<String>,
+        cwd: PathUri,
+        env: HashMap<String, String>,
+        managed_network: Option<ManagedNetworkSandboxContext>,
+        network_proxy_launch: Option<RemoteNetworkProxyLaunchConfig>,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let managed_network = command.managed_network.clone();
-        let exec_server_permissions = effective_permission_profile(
-            self.exec_server_permissions,
-            command.additional_permissions.as_ref(),
-        );
-        let mut request = self
-            .manager
-            .transform(SandboxTransformRequest {
-                command,
-                permissions: self.permissions,
-                // The exec-server must receive the native command, not this host's wrapper.
-                sandbox: SandboxType::None,
-                enforce_managed_network: self.enforce_managed_network,
-                environment_id: None,
-                network: None,
-                sandbox_policy_cwd: self.sandbox_cwd,
-                sandbox_exe: None,
-                use_legacy_landlock: self.use_legacy_landlock,
-                windows_sandbox_level: self.windows_sandbox_level,
-            })
-            .map_err(CodexErr::from)?;
-        request.sandbox_override = self.sandbox_override;
+        let exec_server_permissions =
+            effective_permission_profile(self.exec_server_permissions, additional_permissions);
+        let request = SandboxExecRequest {
+            native_program: None,
+            command: argv,
+            cwd,
+            env,
+            network: None,
+            network_environment_id: None,
+            sandbox: SandboxType::None,
+            sandbox_override: self.sandbox_override,
+            sandbox_policy_cwd: self.sandbox_cwd.clone(),
+            windows_sandbox_level: self.windows_sandbox_level,
+            permission_profile: exec_server_permissions.clone(),
+            arg0: None,
+        };
         let mut exec_request =
-            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new())
+            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, &[])
                 .await?;
         exec_request.exec_server_managed_network = managed_network;
+        // A controller-only proxy may be disabled on the executor. With no launch config,
+        // a sandboxed attempt can still require managed networking.
+        let proxy_disabled = network_proxy_launch
+            .as_ref()
+            .is_some_and(|launch| !launch.proxy.enabled);
+        if !proxy_disabled {
+            exec_request.exec_server_network_proxy = network_proxy_launch;
+        }
         if self.sandbox_requested {
+            exec_request.exec_server_enforce_managed_network =
+                self.enforce_managed_network && !proxy_disabled;
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions,
                 sandbox_override: self.sandbox_override,
-                cwd: exec_request.windows_sandbox_policy_cwd.clone(),
+                cwd: exec_request.sandbox_policy_cwd().clone(),
                 workspace_roots: self.workspace_roots.to_vec(),
                 user_home_dir: None,
                 temporary_directories: None,
@@ -569,7 +583,6 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_proxy_settings_mode: None,
                 use_legacy_landlock: self.use_legacy_landlock,
             });
-            exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
         }
         Ok(exec_request)
     }

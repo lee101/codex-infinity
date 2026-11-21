@@ -1,18 +1,17 @@
 //! Capture publication state once; consume it independently for each delivery.
 
 use crate::ExtensionData;
-use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 
 /// State shared by all deliveries of a publication, including recipients resolved later.
+/// The model-visible item ID may still be unknown until the recipient records the message.
 pub struct MessageLifecycleInput {
-    pub message_id: ResponseItemId,
     pub sender: ThreadId,
     /// Capture contributor-specific state at publication; read it at consumption.
     pub data: ExtensionData,
 }
 
-/// Observes messages published through local agent control, where the sender is known.
+/// Observes messages from local agent control and the initial task of a host-spawned child.
 /// Callbacks are synchronous and must not block. Replaying history or submitting raw
 /// protocol input does not create a publication.
 pub trait MessageLifecycleContributor: Send + Sync {

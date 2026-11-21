@@ -14,10 +14,16 @@ use std::collections::HashMap;
 #[ts(export_to = "v2/")]
 pub struct ThreadSampleParams {
     pub thread_id: String,
-    /// The loaded source's latest completed, failed, or interrupted turn.
-    /// Stale or active sources are rejected.
+    /// The loaded source's latest turn, which must be finished (completed, failed, or interrupted) unless `allowInProgressTurn` is true.
     pub expected_turn_id: String,
+    /// Allow sampling the latest turn before it finishes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_in_progress_turn: bool,
     pub prompt: String,
+    /// Override the model for this sample.
+    /// Omit or pass `null` to inherit the source thread's model.
+    #[ts(optional = nullable)]
+    pub model: Option<String>,
     /// Applied only when the provider and model support cache-preserving reasoning-effort updates.
     #[ts(optional = nullable)]
     pub effort: Option<ReasoningEffort>,
@@ -31,6 +37,9 @@ pub struct ThreadSampleParams {
     /// Disable MCP servers when the inherited window uses incremental tools on Responses Lite.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_mcp: bool,
+    /// Override upstream interruption on cancellation for this sample; otherwise inherit the parent.
+    #[ts(optional = nullable)]
+    pub interrupt_on_cancel: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

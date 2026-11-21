@@ -8,6 +8,7 @@ use codex_guardian_context::PreviousReviews;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AgentIdentityAuthPolicy;
+use codex_login::AuthHeaders;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::ExternalAuth;
@@ -24,6 +25,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::turn_input::CyberAccessProgram;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
@@ -69,12 +71,14 @@ impl LunaSampler {
             .into_iter()
             .map(codex_history::ResponseItemEnvelope::new)
             .collect();
-        let (input, input_tokens) = Self::prepare_input(&request, /*history*/ None, evidence);
+        let (input, input_tokens) =
+            Self::finish_input(&request, LunaSampler::prepare_setup(&request), evidence);
         let (ready, score) = tokio::sync::oneshot::channel();
         let sample = super::ConversationSample {
             input: crate::async_scorer::request::PreparedRequest {
                 input,
                 input_tokens,
+                max_input_tokens: self.max_input_tokens(),
                 existing_context_tokens: 0,
                 cursor: codex_guardian_context::TranscriptCursor {
                     parent_history_version: 0,
@@ -240,6 +244,7 @@ pub(in crate::async_scorer) async fn proxy_websocket_servers_with_http(
 pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerConfig {
     LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -257,6 +262,7 @@ pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerCo
         originator: Some("guardian-v2-test".to_owned()),
 
         service_tier: None,
+        guardian_catalog: None,
         luna_compaction_hash: None,
         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
         metrics: None,
@@ -304,6 +310,7 @@ fn assert_classifier_instructions(request: &serde_json::Value) {
 
 pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSamplingRequest {
     LunaSamplingRequest {
+        context_ids: thread_context_ids(),
         cyber_access_program: None,
         parent_response_id: None,
         instructions: classifier_instructions(),
@@ -315,6 +322,7 @@ pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSampl
         parent_turn_id: parent_turn_id.to_owned(),
         root_turn_id: None,
         pending_score: None,
+        turn_id: Uuid::now_v7(),
     }
 }
 
@@ -541,10 +549,22 @@ async fn classifier_sends_guardian_header_only_with_codex_backend_auth() -> Resu
             None,
         ),
         (
-            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-            "/v1",
+            CodexAuth::Headers(AuthHeaders::new(http::HeaderMap::new())),
+            "/api/codex",
+            Some("classifier"),
+            None,
+        ),
+        (
+            CodexAuth::from_api_key("test-api-key"),
+            "/api/codex",
             None,
             Some("priority"),
+        ),
+        (
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            "/v1",
+            Some("classifier"),
+            None,
         ),
         (
             CodexAuth::from_api_key("test-api-key"),
@@ -643,6 +663,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
 
     let sampler = connect_sampler(LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -655,6 +676,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         originator: Some("guardian-v2-test".to_owned()),
 
         service_tier: None,
+        guardian_catalog: None,
         luna_compaction_hash: None,
         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
         metrics: None,
@@ -689,6 +711,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
 
     let first = sampler
         .sample(LunaSamplingRequest {
+            context_ids: thread_context_ids(),
             cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
@@ -713,6 +736,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             parent_turn_id: "turn-1".to_owned(),
             root_turn_id: Some("turn-1".to_owned()),
             pending_score: None,
+            turn_id: Uuid::now_v7(),
         })
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -735,6 +759,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
     sampler.prewarm().await;
     let second = sampler
         .sample(LunaSamplingRequest {
+            context_ids: thread_context_ids(),
             cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
@@ -746,6 +771,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             parent_turn_id: "turn-2".to_owned(),
             root_turn_id: Some("root-2".to_owned()),
             pending_score: None,
+            turn_id: Uuid::now_v7(),
         })
         .await?;
 
@@ -823,6 +849,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
     );
     let sampler = connect_sampler(LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -835,6 +862,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
         originator: None,
 
         service_tier: None,
+        guardian_catalog: None,
         luna_compaction_hash: None,
         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
         metrics: None,
@@ -842,9 +870,9 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
     .await?;
 
     let request = sample_request("turn-1");
-    let (input, input_tokens) = LunaSampler::prepare_input(
+    let (input, input_tokens) = LunaSampler::finish_input(
         &request,
-        /*history*/ None,
+        LunaSampler::prepare_setup(&request),
         request
             .input
             .iter()
@@ -856,6 +884,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
         input: crate::async_scorer::request::PreparedRequest {
             input,
             input_tokens,
+            max_input_tokens: sampler.max_input_tokens(),
             existing_context_tokens: 0,
             cursor: codex_guardian_context::TranscriptCursor {
                 parent_history_version: 0,

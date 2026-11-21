@@ -7,13 +7,16 @@ use crate::agent::api::SpawnRequest;
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::child_config::prepare_agent_spawn_config;
+use crate::agent::helper_daybreak::turn::explicit_program_for_spawn;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::types::AgentMessage;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::MessageDeliveryMode;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
+use crate::agent::types::SpawnProgramSource;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::config::Config;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -26,6 +29,15 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
 /// Child creation options; omitted overrides retain native MAv2 inheritance and role rules.
+pub struct ThreadCreateRequest {
+    pub task_name: String,
+    /// `None` starts fresh; `FullHistory` uses native fork preparation.
+    pub fork_mode: Option<SpawnAgentForkMode>,
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
 pub(crate) struct ThreadSpawnRequest {
     pub task_name: String,
     /// Explicit encoding: hosts normally provide plaintext; native tools can forward ciphertext.
@@ -37,8 +49,39 @@ pub(crate) struct ThreadSpawnRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// Accepted child and its effective configuration. Acceptance does not mean the turn completed.
-pub(crate) struct ThreadSpawnResult {
+impl ThreadSpawnRequest {
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<(ThreadCreateRequest, AgentMessage), ThreadSpawnError> {
+        let message_text = match &self.message {
+            AgentMessage::Plaintext(text) | AgentMessage::Encrypted(text) => text,
+        };
+        if message_text.trim().is_empty() {
+            return Err(ThreadSpawnError::Preparation(
+                "Empty message can't be sent to an agent".to_string(),
+            ));
+        }
+        Ok((
+            ThreadCreateRequest {
+                task_name: self.task_name,
+                fork_mode: self.fork_mode,
+                agent_type: self.agent_type,
+                model: self.model,
+                reasoning_effort: self.reasoning_effort,
+            },
+            self.message,
+        ))
+    }
+}
+
+pub(crate) struct ChildSpawnSettings {
+    pub(crate) config: Config,
+    pub(crate) source: SessionSource,
+    pub(crate) options: SpawnAgentOptions,
+}
+
+/// Child runtime and its effective configuration.
+pub struct ThreadSpawnResult {
     pub agent: LiveAgent,
     pub config: ThreadConfigSnapshot,
     pub task_name: AgentPath,
@@ -46,7 +89,7 @@ pub(crate) struct ThreadSpawnResult {
 
 /// Separates preparation errors from backend failures to preserve native tool error reporting.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ThreadSpawnError {
+pub enum ThreadSpawnError {
     #[error("{0}")]
     Preparation(String),
     #[error(transparent)]
@@ -59,8 +102,32 @@ pub(crate) async fn spawn(
     call_id: &str,
     request: ThreadSpawnRequest,
 ) -> Result<ThreadSpawnResult, ThreadSpawnError> {
-    let (request, task_name) = prepare(session, step_context, call_id, request).await?;
+    let (request, message) = request.into_parts()?;
+    let (settings, task_name) = prepare(session, step_context, call_id, request).await?;
+    let request = SpawnRequest {
+        caller: session.thread_id,
+        config: settings.config,
+        input: AgentInput::Message {
+            message,
+            mode: MessageDeliveryMode::TriggerTurn,
+            source_tool_call_id: session
+                .services
+                .rollout_thread_trace
+                .is_enabled()
+                .then(|| call_id.to_owned()),
+        },
+        source: settings.source,
+        options: settings.options,
+    };
     let (agent, config) = session.services.agent_control.spawn(request).await?;
+    step_context
+        .turn
+        .session_telemetry
+        .record_multi_agent_spawned(
+            session.session_id(),
+            &step_context.turn.sub_id,
+            agent.thread_id,
+        );
     Ok(ThreadSpawnResult {
         agent,
         config,
@@ -73,25 +140,16 @@ pub(crate) async fn prepare(
     session: &Session,
     step_context: &StepContext,
     call_id: &str,
-    request: ThreadSpawnRequest,
-) -> Result<(SpawnRequest, AgentPath), ThreadSpawnError> {
+    request: ThreadCreateRequest,
+) -> Result<(ChildSpawnSettings, AgentPath), ThreadSpawnError> {
     let turn = &step_context.turn;
-    let ThreadSpawnRequest {
+    let ThreadCreateRequest {
         task_name,
-        message,
         fork_mode,
         agent_type,
         model,
         reasoning_effort,
     } = request;
-    let message_text = match &message {
-        AgentMessage::Plaintext(text) | AgentMessage::Encrypted(text) => text,
-    };
-    if message_text.trim().is_empty() {
-        return Err(ThreadSpawnError::Preparation(
-            "Empty message can't be sent to an agent".to_string(),
-        ));
-    }
     let role_name = agent_type
         .as_deref()
         .map(str::trim)
@@ -149,25 +207,23 @@ pub(crate) async fn prepare(
         None
     };
     Ok((
-        SpawnRequest {
-            caller: session.thread_id,
+        ChildSpawnSettings {
             config,
-            input: AgentInput::Message {
-                message,
-                mode: MessageDeliveryMode::TriggerTurn,
-            },
             source: spawn_source,
             options: SpawnAgentOptions {
+                request_country: step_context.settings.request_country().clone(),
                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.to_string()),
                 fork_mode,
                 parent_thread_id: Some(session.thread_id),
                 parent_turn_id: Some(turn.sub_id.clone()),
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                inherited_client_metadata: turn.turn_metadata_state.client_metadata_for_child(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                 environments: Some(step_context.inherited_environments.clone()),
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
-                cyber_access_program: turn.cyber_access_program,
+                cyber_access_program: explicit_program_for_spawn(turn),
+                cyber_access_program_source: SpawnProgramSource::ParentTurn,
             },
         },
         task_name,

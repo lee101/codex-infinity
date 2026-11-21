@@ -40,6 +40,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
     let manager = CapabilityManager::new(LocalFileSystem::unsandboxed());
     manager.seed_prewarmed_locations(request.clone()).await?;
     let params = DiscoverV2CapabilitiesRequest {
+        force_reload: false,
         cwd: PathUri::from_host_native_path(&root)?,
         sandbox: None,
     };
@@ -136,10 +137,10 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
             .any(|skill| skill.path == demo_skill && skill.description == "ready")
     );
     let sandbox_params = DiscoverV2CapabilitiesRequest {
-        sandbox: Some(crate::FileSystemSandboxContext::from_legacy_sandbox_policy(
-            codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+        sandbox: Some(crate::FileSystemSandboxContext::from_permission_profile(
+            codex_protocol::models::PermissionProfile::Disabled,
             params.cwd.clone(),
-        )?),
+        )),
         ..params.clone()
     };
     manager.get_or_refresh_discovery(sandbox_params).await?;
@@ -279,6 +280,7 @@ async fn failed_watch_registration_reloads_locations_and_contents() -> anyhow::R
     )?;
     let request = request(&root)?;
     let params = DiscoverV2CapabilitiesRequest {
+        force_reload: false,
         cwd: PathUri::from_host_native_path(&root)?,
         sandbox: None,
     };

@@ -9,7 +9,6 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
 use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
-use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
 use crate::responses_metadata::NODE_REPL_AUTO_REVIEW_REQUIRED_KEY;
 use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
@@ -28,6 +27,8 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::TurnAnalyticsMetadata;
+use codex_git_utils::GitSha;
+use codex_git_utils::get_head_commit_hash;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -139,6 +140,7 @@ async fn create_clean_git_repo(repo_name: &str) -> (TempDir, AbsolutePathBuf) {
 }
 
 async fn wait_for_git_enrichment(state: &TurnMetadataState) -> Value {
+    state.admit_git_enrichment();
     tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
         .await
         .expect("git enrichment should complete");
@@ -266,6 +268,105 @@ async fn memory_workspaces_times_out_pending_git_discovery() {
     .expect("memory metadata should stop waiting for Git discovery");
 
     assert!(workspaces.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn memory_workspaces_keep_observed_refs_when_status_exceeds_the_deadline() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let url = "https://example.invalid/repo.git";
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin", url])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("add remote")
+            .success()
+    );
+
+    // Only status reads the index; block it without delaying HEAD or remote discovery.
+    let index = repo.join(".git/index");
+    std::fs::remove_file(&index).expect("remove index");
+    assert!(
+        Command::new("mkfifo")
+            .arg(index.as_path())
+            .status()
+            .await
+            .expect("create index FIFO")
+            .success()
+    );
+
+    let started = tokio::time::Instant::now();
+    let workspaces = memory_workspaces(
+        &repo,
+        std::future::ready(Some(repo.as_path().to_path_buf())),
+    )
+    .await;
+    assert!(started.elapsed() >= MEMORY_GIT_METADATA_TIMEOUT);
+    assert_eq!(
+        serde_json::to_value(workspaces).expect("serialize workspaces"),
+        serde_json::json!({
+            (repo.to_string_lossy().into_owned()): {
+                "associated_remote_urls": {"origin": url},
+                "latest_git_commit_hash": head.0,
+            }
+        }),
+    );
+}
+
+#[test_case::test_case(true, false; "pending remotes")]
+#[test_case::test_case(false, true; "pending HEAD")]
+#[tokio::test(start_paused = true)]
+async fn git_collection_keeps_independently_observed_refs_until_the_deadline(
+    head_ready: bool,
+    remotes_ready: bool,
+) {
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    let url = "https://example.invalid/repo.git";
+    let (send_head, head_probe) = tokio::sync::oneshot::channel();
+    let (send_remotes, remotes_probe) = tokio::sync::oneshot::channel();
+    let (send_status, status_probe) = tokio::sync::oneshot::channel();
+    if head_ready {
+        send_head.send(GitSha::new(head)).expect("send HEAD");
+    }
+    if remotes_ready {
+        let remotes =
+            BTreeMap::from([("origin".to_string(), url.try_into().expect("valid remote"))]);
+        send_remotes.send(remotes).expect("send remotes");
+    }
+
+    let start = tokio::time::Instant::now();
+    let mut latest = None;
+    let collect = collect_workspace_git_metadata(
+        async { GitHeadState::Commit(head_probe.await.expect("HEAD probe")) },
+        |updates| async move {
+            if let Ok(urls) = remotes_probe.await {
+                updates.send_replace(urls);
+            }
+        },
+        async { status_probe.await.ok() },
+        |workspace| latest = Some(workspace),
+    );
+    let _ = tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, collect).await;
+
+    assert_eq!(start.elapsed(), MEMORY_GIT_METADATA_TIMEOUT);
+    assert!(send_status.is_closed());
+    let workspace = latest.expect("workspace before deadline");
+    assert_eq!(
+        workspace.latest_git_commit_hash.as_deref(),
+        head_ready.then_some(head)
+    );
+    assert_eq!(
+        workspace
+            .associated_remote_urls
+            .as_ref()
+            .and_then(|urls| urls.get("origin"))
+            .map(SanitizedGitUrl::as_str),
+        remotes_ready.then_some(url),
+    );
+    assert_eq!(workspace.has_changes, None);
 }
 
 #[test]
@@ -608,6 +709,72 @@ async fn execution_metadata_applies_captured_settings_to_responses_metadata() {
     assert_eq!(metadata[NODE_REPL_DISABLED_KEY], true);
 }
 
+#[tokio::test]
+async fn guardian_affinity_requires_the_captured_parent_and_stays_out_of_metadata() {
+    let uri = "wss://metadata-affinity.chatgpt.com/backend-api/codex/responses"
+        .parse()
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_static("__oailb=private-parent-pin; Path=/; Secure; Max-Age=3600"),
+    );
+    let affinity =
+        codex_http_client::ChatGptRoutingAffinity::from_response(&uri, &headers).unwrap();
+    for (subagent, request_parent, expected) in [
+        (Some("guardian"), "parent", true),
+        (Some("guardian"), "other-parent", false),
+        (None, "parent", false),
+    ] {
+        let (session, mut turn) = make_session_and_context().await;
+        Arc::get_mut(&mut turn.turn_metadata_state)
+            .unwrap()
+            .subagent_header = subagent.map(str::to_owned);
+        turn.turn_metadata_state
+            .update_responsesapi_client_metadata(
+                codex_protocol::turn_input::ResponsesApiClientMetadataUpdate {
+                    replacement: Some(HashMap::from([(
+                        "parent_response_id".to_owned(),
+                        request_parent.to_owned(),
+                    )])),
+                    patch: None,
+                },
+            );
+        session
+            .services
+            .thread_extension_data
+            .insert(crate::guardian::PendingReviewRouting(Some(Arc::new(
+                crate::guardian::ParentResponse {
+                    id: "parent".to_owned(),
+                    routing_affinity: Some(affinity.clone()),
+                },
+            ))));
+        let step = StepContext::for_test(Arc::new(turn));
+        let metadata = session
+            .responses_metadata(&step, CodexResponsesRequestKind::Turn)
+            .await;
+        assert_eq!(
+            metadata
+                .parent_routing_affinity
+                .as_ref()
+                .and_then(|pin| pin.cookie_header(&uri)),
+            expected.then(|| http::HeaderValue::from_static("__oailb=private-parent-pin"))
+        );
+        assert!(
+            !metadata
+                .turn_metadata_json()
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(
+            !serde_json::to_string(&metadata.client_metadata(/*include_internal*/ true))
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(!format!("{:?}", metadata.compatibility_headers()).contains("private-parent-pin"));
+    }
+}
+
 #[test]
 fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_request_meta() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -660,6 +827,46 @@ fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_reque
         meta.get(USER_INPUT_REQUESTED_DURING_TURN_KEY)
             .and_then(Value::as_bool),
         Some(true)
+    );
+}
+
+#[tokio::test]
+async fn child_metadata_snapshot_excludes_parent_review_and_routing_fields() {
+    let (_, turn) = make_session_and_context().await;
+    let state = &turn.turn_metadata_state;
+    let client_metadata = HashMap::from([
+        ("cost_center".to_string(), "before".to_string()),
+        ("thread_id".to_string(), "parent-thread".to_string()),
+        ("turn_id".to_string(), "parent-turn".to_string()),
+        (
+            "mcp_request_meta".to_string(),
+            r#"{"selected_connector_ids":["parent-connector"]}"#.to_string(),
+        ),
+        (
+            "parent_response_id".to_string(),
+            "parent-response".to_string(),
+        ),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"parent-only"}"#.to_string(),
+        ),
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
+    let snapshot = state.client_metadata_for_child();
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        patch: Some(HashMap::from([(
+            "cost_center".to_string(),
+            "after".to_string(),
+        )])),
+        ..Default::default()
+    });
+    assert_eq!(
+        [snapshot, state.client_metadata_for_child()],
+        ["before", "after"]
+            .map(|value| HashMap::from([("cost_center".to_string(), value.to_string(),)])),
     );
 }
 
@@ -1156,7 +1363,6 @@ fn responses_api_metadata_rejects_reserved_keys() {
         TURN_TRIGGER_KEY,
         WINDOW_ID_KEY,
         CONTEXT_WINDOW_ID_KEY,
-        MCP_ATTRIBUTION_CLIENT_METADATA_KEY,
     ] {
         assert_eq!(
             validate_extra_metadata(
@@ -1181,6 +1387,310 @@ fn responses_api_metadata_accepts_previously_valid_reserved_keys() {
             Ok(())
         );
     }
+}
+
+#[tokio::test]
+async fn preparing_model_request_metadata_does_not_wait_for_pending_git_enrichment() {
+    let (session, turn) = make_session_and_context().await;
+    let (_updates, workspaces) = watch::channel(BTreeMap::new());
+    turn.turn_metadata_state
+        .set_git_enrichment(TurnGitEnrichment {
+            workspaces: Some(workspaces),
+            task: None,
+            admission: None,
+        });
+    let step = StepContext::for_test(Arc::new(turn));
+
+    let metadata = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.responses_metadata(&step, CodexResponsesRequestKind::Turn),
+    )
+    .await
+    .expect("generation must continue while optional Git discovery is pending");
+    assert!(metadata.workspaces.is_empty());
+}
+
+#[tokio::test]
+async fn turn_git_status_waits_for_admission() {
+    let (admission, request) = oneshot::channel();
+    let started = AtomicBool::new(false);
+    let status =
+        collect_git_status_after_admission(GitCollectionAdmission::Pending(request), async {
+            started.store(true, Ordering::SeqCst);
+            None
+        });
+    tokio::pin!(status);
+    assert!(futures::poll!(status.as_mut()).is_pending());
+    assert!(!started.load(Ordering::SeqCst));
+    admission.send(()).expect("admit");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), status)
+            .await
+            .expect("Git status should finish after admission")
+            .is_none()
+    );
+    assert!(started.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn git_enrichment_publishes_refs_before_status_is_available() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let url = "https://example.invalid/repo.git";
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin", url])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("add remote")
+            .success()
+    );
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let refs = serde_json::json!({
+        "associated_remote_urls": {"origin": url},
+        "latest_git_commit_hash": head.0,
+    });
+    let mut clean = refs.clone();
+    clean["has_changes"] = Value::Bool(false);
+
+    let updates =
+        collect_with_status_after_refs(&repo, get_worktree_status_in_repo(&repo, &repo)).await;
+    assert!(
+        updates
+            .first()
+            .expect("early refs")
+            .get("has_changes")
+            .is_none()
+    );
+    assert_eq!(updates.last(), Some(&clean));
+    assert_eq!(
+        collect_with_status_after_refs(&repo, std::future::ready(None))
+            .await
+            .last(),
+        Some(&refs),
+    );
+}
+
+#[tokio::test]
+async fn git_enrichment_keeps_verified_remotes_while_ambiguous_lookups_are_pending() {
+    let urls = BTreeMap::from([(
+        "origin".to_string(),
+        SanitizedGitUrl::try_from("https://example.invalid/repo").unwrap(),
+    )]);
+    let initial = urls.clone();
+    let mut all_urls = urls.clone();
+    all_urls.insert(
+        "upstream".to_string(),
+        SanitizedGitUrl::try_from("https://example.invalid/upstream").unwrap(),
+    );
+    let final_update = all_urls.clone();
+    let (resume_lookup, wait_for_publication) = oneshot::channel();
+    let mut resume_lookup = Some(resume_lookup);
+    let mut observed = Vec::new();
+    let collect = collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Unavailable),
+        |verified| async move {
+            verified.send_replace(initial);
+            wait_for_publication.await.unwrap();
+            verified.send_replace(final_update);
+        },
+        std::future::ready(None),
+        |workspace| {
+            observed.push(workspace.associated_remote_urls);
+            if let Some(ack) = resume_lookup.take() {
+                ack.send(()).unwrap();
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .unwrap();
+    assert_eq!(observed, vec![Some(urls), Some(all_urls)]);
+}
+
+#[tokio::test]
+async fn git_enrichment_publishes_verified_status_while_remotes_are_pending() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let (release_remotes, wait_for_status) = tokio::sync::oneshot::channel();
+    let mut release_remotes = Some(release_remotes);
+    let collect = collect_workspace_git_metadata(
+        get_head_state(&repo),
+        |updates| {
+            let repo = &repo;
+            async move {
+                wait_for_status.await.expect("verified worktree status");
+                observe_git_remote_urls(repo, &updates).await;
+            }
+        },
+        get_worktree_status_in_repo(&repo, &repo),
+        |workspace| {
+            if let Some(dirty) = workspace.has_changes
+                && let Some(release) = release_remotes.take()
+            {
+                assert_eq!(workspace.latest_git_commit_hash.as_ref(), Some(&head.0));
+                assert_eq!(workspace.associated_remote_urls, None);
+                assert!(!dirty);
+                release.send(()).expect("release remote lookup");
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .expect("verified status should be published before remotes return");
+}
+
+#[test_case::test_case(true; "confirmed unborn HEAD")]
+#[test_case::test_case(false; "HEAD still pending")]
+#[tokio::test(start_paused = true)]
+async fn git_enrichment_requires_confirmed_head_for_unborn_status(head_ready: bool) {
+    let mut published_dirty = None;
+    let collect = collect_workspace_git_metadata(
+        async {
+            if !head_ready {
+                std::future::pending::<()>().await;
+            }
+            GitHeadState::Missing
+        },
+        |_| std::future::ready(()),
+        std::future::ready(Some(GitWorktreeStatus {
+            head_commit_hash: None,
+            has_changes: true,
+        })),
+        |workspace| published_dirty = workspace.has_changes,
+    );
+    let _ = tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, collect).await;
+    assert_eq!(published_dirty, head_ready.then_some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_keeps_dirty_status_when_an_unborn_repo_contains_a_head_file() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let repo = temp_dir.path().abs();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("git init")
+            .success()
+    );
+    std::fs::write(repo.join("HEAD"), "untracked").expect("write HEAD file");
+    let mut workspaces = BTreeMap::new();
+    collect_git_workspaces(
+        &repo,
+        std::future::ready(Some(repo.as_path().to_path_buf())),
+        GitCollectionAdmission::Immediate,
+        |observed| workspaces = observed,
+    )
+    .await;
+    let workspace = workspaces
+        .get(repo.to_string_lossy().as_ref())
+        .expect("workspace");
+    assert_eq!(workspace.latest_git_commit_hash, None);
+    assert_eq!(workspace.has_changes, Some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_recovers_commit_and_status_when_independent_head_lookup_fails() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    std::fs::write(repo.join("untracked"), "dirty").expect("write untracked file");
+    let mut latest = None;
+    collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Unavailable),
+        |_| std::future::ready(()),
+        get_worktree_status_in_repo(&repo, &repo),
+        |workspace| latest = Some(workspace),
+    )
+    .await;
+    let workspace = latest.expect("workspace");
+    assert_eq!(
+        workspace.latest_git_commit_hash.as_deref(),
+        Some(head.0.as_str())
+    );
+    assert_eq!(workspace.has_changes, Some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_rejects_a_committed_status_when_head_is_missing() {
+    let head = GitSha::new("0123456789abcdef0123456789abcdef01234567");
+    let mut latest = None;
+    collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Missing),
+        |_| std::future::ready(()),
+        std::future::ready(Some(GitWorktreeStatus {
+            head_commit_hash: Some(head),
+            has_changes: false,
+        })),
+        |workspace| latest = Some(workspace),
+    )
+    .await;
+    assert!(latest.is_none());
+}
+
+#[test_case::test_case(false; "new HEAD is clean")]
+#[test_case::test_case(true; "new HEAD is dirty")]
+#[tokio::test]
+async fn git_enrichment_does_not_pair_old_head_with_new_status(expected_has_changes: bool) {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo)
+        .await
+        .expect("read original HEAD");
+    let status = async {
+        assert!(
+            Command::new("git")
+                .args(["commit", "--allow-empty", "-qm", "new HEAD"])
+                .current_dir(&repo)
+                .status()
+                .await
+                .expect("commit")
+                .success()
+        );
+        if expected_has_changes {
+            std::fs::write(repo.join("untracked.txt"), "dirty\n").expect("dirty worktree");
+        }
+        let new_head = get_head_commit_hash(&repo).await.expect("read new HEAD");
+        let status = get_worktree_status_in_repo(&repo, &repo)
+            .await
+            .expect("read successful status for the new HEAD");
+        assert_eq!(status.head_commit_hash, Some(new_head));
+        assert_eq!(status.has_changes, expected_has_changes);
+        Some(status)
+    };
+    assert_eq!(
+        collect_with_status_after_refs(&repo, status).await,
+        vec![serde_json::json!({"latest_git_commit_hash": head.0})],
+    );
+}
+
+async fn collect_with_status_after_refs(
+    repo: &AbsolutePathBuf,
+    status: impl Future<Output = Option<GitWorktreeStatus>>,
+) -> Vec<Value> {
+    let (send_refs_ready, refs_ready) = tokio::sync::oneshot::channel();
+    let mut send_refs_ready = Some(send_refs_ready);
+    let mut updates = Vec::new();
+    let status = async {
+        refs_ready.await.expect("refs published");
+        status.await
+    };
+    let collect = collect_workspace_git_metadata(
+        get_head_state(repo),
+        |updates| async move { observe_git_remote_urls(repo, &updates).await },
+        status,
+        |workspace| {
+            updates.push(serde_json::to_value(workspace).expect("serialize workspace"));
+            if let Some(ready) = send_refs_ready.take() {
+                ready.send(()).expect("release status scan");
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .expect("refs should be published while status is pending");
+    updates
 }
 
 #[tokio::test]
@@ -1263,9 +1773,10 @@ async fn turn_metadata_state_coalesces_concurrent_git_enrichment() {
                 barrier.wait().await;
                 state.spawn_git_enrichment_task(git_root_discovery);
                 state
-                    .enrichment_task
+                    .git_enrichment
                     .lock()
                     .expect("enrichment task lock")
+                    .task
                     .as_ref()
                     .expect("enrichment task")
                     .abort_handle()
@@ -1312,9 +1823,10 @@ async fn dropping_turn_metadata_aborts_unused_git_enrichment() {
     let weak_state = Arc::downgrade(&state);
     state.spawn_git_enrichment_task(Arc::default());
     let task = state
-        .enrichment_task
+        .git_enrichment
         .lock()
         .expect("enrichment task lock")
+        .task
         .as_ref()
         .expect("enrichment task")
         .abort_handle();
@@ -1391,9 +1903,10 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
     state.cancel_git_enrichment_task();
     assert!(
         state
-            .enrichment_task
+            .git_enrichment
             .lock()
             .expect("enrichment task lock")
+            .task
             .is_none()
     );
     tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
@@ -1431,6 +1944,7 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
         &model_info_from_slug("gpt-5.4"),
     ));
     invalid_state.spawn_git_enrichment_task(Arc::default());
+    invalid_state.admit_git_enrichment();
     tokio::time::timeout(
         Duration::from_secs(2),
         invalid_state.wait_for_git_enrichment(),

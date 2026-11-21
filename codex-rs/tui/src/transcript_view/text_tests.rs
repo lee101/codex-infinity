@@ -191,9 +191,15 @@ fn aligned_text_excludes_synthetic_leading_columns() {
     let mut line = HyperlinkLine::new(Line::default().right_aligned());
     line.push_span("wide".into(), Some("https://example.com"));
     let layout = TextLayout::new(vec![line], /*width*/ 8);
-    assert_eq!(layout.link_at(/*row*/ 0, /*column*/ 3), None);
     assert_eq!(
-        layout.link_at(/*row*/ 0, /*column*/ 4).as_deref(),
+        layout.reader_link_at(/*row*/ 0, /*column*/ 3, /*documents*/ false),
+        None
+    );
+    assert_eq!(
+        layout
+            .reader_link_at(/*row*/ 0, /*column*/ 4, /*documents*/ false)
+            .map(crate::terminal_hyperlinks::ReaderLink::into_destination)
+            .as_deref(),
         Some("https://example.com")
     );
     assert_eq!(
@@ -266,7 +272,9 @@ fn selected_revision_rewraps_both_directions_with_styles_and_indents() {
     restored.render(narrow_area, &mut restored_buffer, /*start_row*/ 0);
     assert_eq!(restored_buffer, original_buffer);
     assert_eq!(
-        wide.link_at(/*row*/ 0, /*column*/ 8).as_deref(),
+        wide.reader_link_at(/*row*/ 0, /*column*/ 8, /*documents*/ false)
+            .map(crate::terminal_hyperlinks::ReaderLink::into_destination)
+            .as_deref(),
         Some("https://example.com")
     );
 }
@@ -296,6 +304,29 @@ fn narrow_wrapping_keeps_joined_emoji_whole() {
     let mut buffer = Buffer::empty(area);
     layout.render(area, &mut buffer, /*start_row*/ 0);
     assert_eq!(buffer[(0, 0)].symbol(), "👩‍💻");
+}
+
+#[test]
+fn fullscreen_markdown_keeps_a_fitting_url_on_one_row() {
+    use crate::history_cell::AgentMarkdownCell;
+    use crate::history_cell::HistoryCell;
+    let cell = AgentMarkdownCell::new(
+        "See the documentation at https://example.com/docs/reference.".into(),
+        std::path::Path::new("."),
+    );
+    let layout = TextLayout::new(
+        cell.retained_hyperlink_lines(/*width*/ 44, /*detailed*/ false),
+        /*width*/ 44,
+    );
+    let rows = layout
+        .rows
+        .iter()
+        .map(|row| row.line.line.to_string())
+        .collect::<Vec<_>>();
+    insta::assert_snapshot!(rows.join("\n"), @"
+    • See the documentation at
+      https://example.com/docs/reference.
+    ");
 }
 
 #[test]
@@ -395,4 +426,58 @@ fn background_stdin_copy_preserves_indentation_and_newlines() {
     );
     assert!(layout.text().ends_with(stdin));
     assert_eq!(layout.rewrap(/*width*/ 48).text(), layout.text());
+}
+
+#[test]
+fn rendered_markdown_file_targets_are_only_interactive_in_the_workspace() {
+    let markdown = "[Guide](./guide.md)\n\n| File |\n| --- |\n| [Notes](./notes.md) |";
+    let lines = crate::markdown_render::render_markdown_lines_with_width_and_cwd(
+        markdown,
+        Some(40),
+        /*cwd*/ None,
+    );
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .all(|link| link.terminal_destination().is_none())
+    );
+    let layout = TextLayout::new(lines, /*width*/ 40);
+    let destinations = |documents| {
+        let layout = &layout;
+        (0..layout.row_count())
+            .flat_map(|row| {
+                (0..40).filter_map(move |column| {
+                    layout
+                        .reader_link_at(row, column, documents)
+                        .map(crate::terminal_hyperlinks::ReaderLink::into_destination)
+                })
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(destinations(false), std::collections::BTreeSet::new());
+    assert_eq!(
+        destinations(true),
+        ["./guide.md".to_owned(), "./notes.md".to_owned()].into()
+    );
+}
+
+#[test]
+fn document_link_navigation_preserves_occurrences_across_wraps() {
+    let markdown = "[first **link** wraps](./guide.md) [second link](./guide.md)";
+    for width in [10_u16, 17, 100] {
+        let lines = crate::markdown_render::render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+            markdown,
+            Some(usize::from(width)),
+            /*cwd*/ None,
+            &crate::markdown_render::hide_reader_link_destination,
+        );
+        let layout = TextLayout::new(lines, width);
+        let links = layout
+            .document_links()
+            .into_iter()
+            .map(|(range, _)| &layout.text()[range])
+            .collect::<Vec<_>>();
+        assert_eq!(links, ["first link wraps", "second link"]);
+    }
 }

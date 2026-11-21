@@ -1,10 +1,10 @@
-use codex_execpolicy::Decision;
-use codex_execpolicy::Policy;
-use codex_execpolicy::RequirementsExecPolicy;
-use codex_execpolicy::RuleRef;
-use codex_execpolicy::rule::PatternToken;
-use codex_execpolicy::rule::PrefixPattern;
-use codex_execpolicy::rule::PrefixRule;
+use codex_execpolicy_rules::Decision;
+use codex_execpolicy_rules::PatternToken;
+use codex_execpolicy_rules::Policy;
+use codex_execpolicy_rules::PrefixPattern;
+use codex_execpolicy_rules::PrefixRule;
+use codex_execpolicy_rules::RequirementsExecPolicy;
+use codex_execpolicy_rules::RuleRef;
 use multimap::MultiMap;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -18,9 +18,11 @@ pub struct RequirementsExecPolicyToml {
 
 /// A TOML representation of the `prefix_rule(...)` Starlark builtin.
 ///
-/// This mirrors the builtin defined in `execpolicy/src/parser.rs`.
+/// This shares the builtin's matching semantics and additionally supports managed `prompt-user` decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RequirementsExecPolicyPrefixRuleToml {
+    #[serde(default)]
+    pub canonical_matching: bool,
     pub pattern: Vec<RequirementsExecPolicyPatternTokenToml>,
     pub decision: Option<RequirementsExecPolicyDecisionToml>,
     pub justification: Option<String>,
@@ -42,6 +44,7 @@ pub struct RequirementsExecPolicyPatternTokenToml {
 pub enum RequirementsExecPolicyDecisionToml {
     Allow,
     Prompt,
+    PromptUser,
     Forbidden,
 }
 
@@ -50,6 +53,7 @@ impl RequirementsExecPolicyDecisionToml {
         match self {
             Self::Allow => Decision::Allow,
             Self::Prompt => Decision::Prompt,
+            Self::PromptUser => Decision::PromptUser,
             Self::Forbidden => Decision::Forbidden,
         }
     }
@@ -79,7 +83,7 @@ pub enum RequirementsExecPolicyParseError {
     MissingDecision { rule_index: usize },
 
     #[error(
-        "rules prefix_rule at index {rule_index} has decision 'allow', which is not permitted in requirements.toml: Codex merges these rules with other config and uses the most restrictive result (use 'prompt' or 'forbidden')"
+        "rules prefix_rule at index {rule_index} has decision 'allow', which is not permitted in requirements.toml: Codex merges these rules with other config and uses the most restrictive result (use 'prompt', 'prompt-user', or 'forbidden')"
     )]
     AllowDecisionNotAllowed { rule_index: usize },
 }
@@ -134,6 +138,7 @@ impl RequirementsExecPolicyToml {
             for head in first_token.alternatives() {
                 let rule: RuleRef = Arc::new(PrefixRule {
                     pattern: PrefixPattern {
+                        canonical_matching: rule.canonical_matching,
                         first: Arc::from(head.as_str()),
                         rest: rest.clone(),
                     },

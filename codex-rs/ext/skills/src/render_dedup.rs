@@ -5,9 +5,12 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
+use codex_protocol::protocol::SkillScope;
+
 use super::AvailableSkillsRender;
 use super::CatalogLines;
 use super::SkillCatalogRenderPolicy;
+use super::SkillCatalogRenderStyle;
 use super::SkillMetadataBudget;
 use super::aliased_render_is_better;
 use super::build_alias_plan;
@@ -16,7 +19,9 @@ use super::render_catalog;
 use crate::aliases::AliasPlan;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
+use crate::catalog::SkillSourceKind;
 use crate::catalog_delta::CatalogSkill;
+use crate::catalog_delta::GrantStatus;
 use crate::catalog_delta::SkillEntrySnapshot;
 use crate::catalog_prompt::SkillPromptKind;
 
@@ -81,6 +86,8 @@ impl<'a> PreparedSkillCatalog<'a> {
     pub(crate) fn entries_for_render(
         &self,
         rendered: &AvailableSkillsRender,
+        grants: Option<&crate::TurnSkillFilesystemGrants>,
+        primary_environment: Option<&str>,
     ) -> BTreeMap<String, CatalogSkill> {
         let lines = if rendered.skill_root_lines.is_empty() {
             self.unaliased()
@@ -117,10 +124,26 @@ impl<'a> PreparedSkillCatalog<'a> {
                     .and_then(|plan| plan.root_for_locator(locator))
                     .cloned();
                 let shown = shown.as_ref().is_none_or(|ids| ids.contains(&id));
+                let environment = match &entry.authority.kind {
+                    SkillSourceKind::Executor => entry.main_prompt.environment_id(),
+                    SkillSourceKind::Host if entry.prompt_scope() == Some(SkillScope::Repo) => {
+                        primary_environment
+                    }
+                    SkillSourceKind::Host | SkillSourceKind::Cloud | SkillSourceKind::Custom(_) => {
+                        None
+                    }
+                };
+                let granted = environment.is_some_and(|id| {
+                    grants.is_some_and(|grants| grants.environment_ids.contains(id))
+                });
                 (
                     id,
                     CatalogSkill {
-                        snapshot: SkillEntrySnapshot { fingerprint, shown },
+                        snapshot: SkillEntrySnapshot {
+                            fingerprint,
+                            shown,
+                            grant: granted.then_some(GrantStatus::Active),
+                        },
                         line: line.render_full(),
                         root,
                     },
@@ -141,7 +164,7 @@ impl<'a> PreparedSkillCatalog<'a> {
             self.unaliased().skills,
             budget,
             Vec::new(),
-            SkillPromptKind::Unaliased,
+            self.policy.prompt(SkillPromptKind::Unaliased),
             self.policy,
         );
         let selected = if let Some(aliased) = build_aliased_catalog(
@@ -161,12 +184,12 @@ impl<'a> PreparedSkillCatalog<'a> {
         };
 
         Some(AvailableSkillsRender {
-            prompt_kind: selected.prompt_kind,
+            prompt: selected.prompt,
             skill_root_lines: selected.skill_root_lines,
             skill_lines: selected.skill_lines,
             included_ids: selected.included_ids,
             entries: BTreeMap::new(),
-            preserve_empty_fragment: self.policy == SkillCatalogRenderPolicy::CoreCompatible,
+            preserve_empty_fragment: self.policy.style == SkillCatalogRenderStyle::CoreCompatible,
             report: selected.report,
         })
     }

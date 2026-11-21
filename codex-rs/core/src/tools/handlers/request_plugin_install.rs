@@ -8,6 +8,7 @@ use codex_analytics::build_track_events_context;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_core_plugins::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::McpServerKey;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use codex_tools::DiscoverableTool;
@@ -114,7 +115,7 @@ impl RequestPluginInstallHandler {
             }
         };
 
-        if turn.session_source.is_non_root_agent() {
+        if turn.root_capabilities_restricted {
             return Err(FunctionCallError::RespondToModel(
                 "request_plugin_install can only be used by the root thread".to_string(),
             ));
@@ -186,13 +187,22 @@ impl RequestPluginInstallHandler {
                     "{argument_name} must match one of {source}"
                 ))
             })?;
+        let install_auth = match &tool {
+            DiscoverableTool::Plugin(plugin) if plugin.remote_plugin_id.is_some() => {
+                session.services.auth_manager.auth().await
+            }
+            DiscoverableTool::Plugin(_) | DiscoverableTool::Connector(_) => None,
+        };
+        let install_auth = install_auth.as_ref();
         let tool = if self.presentation == ToolSuggestPresentation::RecommendationContext {
             let plugin_id = tool.id().to_string();
-            let auth = session.services.auth_manager.auth().await;
             let plugins_config = turn.config.plugins_config_input();
             match codex_core_plugins::hydrate_selected_recommended_plugin_install_metadata(
-                &plugins_config,
-                auth.as_ref(),
+                &session
+                    .services
+                    .plugins_manager
+                    .remote_plugin_service_config(&plugins_config),
+                install_auth,
                 tool,
             )
             .await
@@ -248,15 +258,14 @@ impl RequestPluginInstallHandler {
         let request =
             build_request_plugin_install_elicitation_request(suggest_reason, &tool, &suggestion_id);
         let request_id = RequestId::String(suggestion_id.into());
-        let elicitation = session
+        let response = session
             .request_mcp_server_elicitation(
                 turn.as_ref(),
-                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                McpServerKey::unscoped(CODEX_APPS_MCP_SERVER_NAME),
                 request_id,
                 request,
             )
             .await;
-        let response = elicitation.response;
         if let Some(response) = response.as_ref() {
             maybe_persist_disabled_install_request(&session, &turn, &tool, response).await;
         }
@@ -264,13 +273,17 @@ impl RequestPluginInstallHandler {
             .as_ref()
             .is_some_and(|response| response.action == ElicitationAction::Accept);
 
-        let auth = session.services.auth_manager.auth().await;
         let completed = if user_confirmed {
-            verify_request_plugin_install_completed(&session, &turn, mcp, &tool, auth.as_ref())
-                .await
+            verify_request_plugin_install_completed(&session, &turn, mcp, &tool, install_auth).await
         } else {
             false
         };
+
+        if completed {
+            // Skills-only installs have no connector tools to refresh. Dirty discovery too,
+            // so the next step can see the newly installed plugin and its skills.
+            session.request_mcp_runtime_refresh(crate::McpRefreshReason::PluginInstalled);
+        }
 
         if completed && let DiscoverableTool::Connector(connector) = &tool {
             session
@@ -278,29 +291,27 @@ impl RequestPluginInstallHandler {
                 .await;
         }
 
-        if elicitation.sent {
-            let tool_type = match tool_type {
-                DiscoverableToolType::Connector => "connector",
-                DiscoverableToolType::Plugin => "plugin",
-            };
-            let response_action = match response.as_ref().map(|response| &response.action) {
-                Some(ElicitationAction::Accept) => "accept",
-                Some(ElicitationAction::Decline) => "decline",
-                Some(ElicitationAction::Cancel) => "cancel",
-                Some(_) => "unknown",
-                None => "unavailable",
-            };
-            step_context
-                .session_telemetry
-                .record_plugin_install_suggestion(
-                    tool_type,
-                    tool.id(),
-                    tool.name(),
-                    response_action,
-                    user_confirmed,
-                    completed,
-                );
-        }
+        let telemetry_tool_type = match tool_type {
+            DiscoverableToolType::Connector => "connector",
+            DiscoverableToolType::Plugin => "plugin",
+        };
+        let response_action = match response.as_ref().map(|response| &response.action) {
+            Some(ElicitationAction::Accept) => "accept",
+            Some(ElicitationAction::Decline) => "decline",
+            Some(ElicitationAction::Cancel) => "cancel",
+            Some(_) => "unknown",
+            None => "unavailable",
+        };
+        step_context
+            .session_telemetry
+            .record_plugin_install_suggestion(
+                telemetry_tool_type,
+                tool.id(),
+                tool.name(),
+                response_action,
+                user_confirmed,
+                completed,
+            );
 
         let content = serde_json::to_string(&RequestPluginInstallResult {
             completed,
@@ -402,8 +413,10 @@ async fn verify_request_plugin_install_completed(
     turn: &crate::session::turn_context::TurnContext,
     mcp: &codex_mcp::McpBinding,
     tool: &DiscoverableTool,
-    auth: Option<&codex_login::CodexAuth>,
+    install_auth: Option<&codex_login::CodexAuth>,
 ) -> bool {
+    let current_auth = session.services.auth_manager.auth().await;
+    let auth = current_auth.as_ref();
     match tool {
         DiscoverableTool::Connector(connector) => refresh_missing_requested_connectors(
             session,
@@ -418,7 +431,15 @@ async fn verify_request_plugin_install_completed(
             verified_connector_install_completed(connector.id.as_str(), &accessible_connectors)
         }),
         DiscoverableTool::Plugin(plugin) => {
-            if is_remote_plugin_install_suggestion(&plugin.id) {
+            if plugin.remote_plugin_id.is_some() {
+                // The client can switch accounts while the install prompt is open.
+                session
+                    .services
+                    .plugins_manager
+                    .invalidate_recommendations_for_actors(
+                        &turn.config.chatgpt_base_url,
+                        install_auth.into_iter().chain(auth),
+                    );
                 let (_, accessible_connectors) = tokio::join!(
                     refresh_remote_installed_plugins_cache_after_install(
                         session,
@@ -485,12 +506,6 @@ async fn refresh_remote_installed_plugins_cache_after_install(
             "failed to refresh remote installed plugins cache after plugin install request for {tool_id}: {err:#}"
         );
     }
-}
-
-fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {
-    plugin_id
-        .rsplit_once('@')
-        .is_some_and(|(_, marketplace_name)| marketplace_name == REMOTE_GLOBAL_MARKETPLACE_NAME)
 }
 
 async fn refresh_missing_requested_connectors(

@@ -1,17 +1,9 @@
 name: rusty-v8-release
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Optional release tag. Defaults to rusty-v8-v<resolved_v8_version>.
-        required: false
-        type: string
-      publish:
-        description: Publish the staged musl artifacts to a GitHub release.
-        required: false
-        default: true
-        type: boolean
+  push:
+    tags:
+      - "rusty-v8-v*.*.*"
 
 # Cargo's libgit2 transport has been flaky when fetching git dependencies with
 # nested submodules. Prefer the system git CLI for Cargo smoke tests.
@@ -19,7 +11,7 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 concurrency:
-  group: ${{ github.workflow }}::${{ inputs.release_tag || github.run_id }}
+  group: ${{ github.workflow }}::${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -30,10 +22,12 @@ jobs:
       v8_version: ${{ steps.v8_version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
@@ -48,15 +42,17 @@ jobs:
       - name: Resolve release tag
         id: release_tag
         env:
-          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
           V8_VERSION: ${{ steps.v8_version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
-          release_tag="${RELEASE_TAG_INPUT}"
-          if [[ -z "${release_tag}" ]]; then
-            release_tag="rusty-v8-v${V8_VERSION}"
+          expected_release_tag="rusty-v8-v${V8_VERSION}"
+          release_tag="${GITHUB_REF_NAME}"
+          if [[ "${release_tag}" != "${expected_release_tag}" ]]; then
+            echo "Tag ${release_tag} does not match expected release tag ${expected_release_tag}." >&2
+            exit 1
           fi
 
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
@@ -99,13 +95,13 @@ jobs:
             sandbox: true
             target: aarch64-unknown-linux-gnu
             variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
+          - runner: macos-15-intel
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: false
             target: x86_64-apple-darwin
             variant: release
-          - runner: macos-15-xlarge
+          - runner: macos-15-intel
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: true
@@ -149,7 +145,9 @@ jobs:
             variant: ptrcomp-sandbox
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Prepare Bazel CI
         uses: ./.github/actions/prepare-bazel-ci
@@ -158,7 +156,7 @@ jobs:
           cache-scope: bazel-v8
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
@@ -166,10 +164,10 @@ jobs:
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           toolchain: "1.99.1"
+          targets: ${{ matrix.target }}
 
       - name: Build Bazel V8 release pair
         env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
@@ -193,7 +191,7 @@ jobs:
             --build_metadata=COMMIT_SHA=$(git rev-parse HEAD)
           )
 
-          ./.github/scripts/run_bazel_with_buildbuddy.py \
+          ./.github/scripts/run_bazel.py \
             --noexperimental_remote_repo_contents_cache \
             "${bazel_args[@]}" \
             "--config=${{ matrix.bazel_config }}"
@@ -201,7 +199,6 @@ jobs:
       - name: Stage release pair
         env:
           BAZEL_CONFIG: ${{ matrix.bazel_config }}
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
@@ -209,10 +206,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 .github/scripts/rusty_v8_bazel.py stage-release-pair \
-            --platform "${PLATFORM}" \
-            --target "${TARGET}" \
-            --compilation-mode opt \
+          stage_args=(
+            --platform "${PLATFORM}"
+            --target "${TARGET}"
+            --compilation-mode opt
             --output-dir "dist/${TARGET}"
             --bazel-config "${BAZEL_CONFIG}"
           )
@@ -220,8 +217,59 @@ jobs:
             stage_args+=(--sandbox)
           fi
 
-      - name: Upload staged musl artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+          python3 .github/scripts/rusty_v8_bazel.py stage-release-pair "${stage_args[@]}"
+
+      # Larger Linux runner images may omit the host linker used by Cargo build scripts.
+      - name: Install native Linux Cargo smoke dependencies
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(build-essential)
+          if [[ "${TARGET}" == *-musl ]]; then
+            packages+=(musl-tools)
+          fi
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+          if [[ "${TARGET}" == *-musl ]]; then
+            # Use musl only for target links; Cargo build scripts still link on the glibc host.
+            linker_var="CARGO_TARGET_${TARGET^^}_LINKER"
+            echo "${linker_var//-/_}=$(command -v musl-gcc)" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Smoke test staged artifact with Cargo
+        env:
+          SANDBOX: ${{ matrix.sandbox }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="$(find "dist/${TARGET}" -maxdepth 1 -type f -name 'librusty_v8_*.a.gz' -print -quit)"
+          binding="$(find "dist/${TARGET}" -maxdepth 1 -type f -name 'src_binding_*.rs' -print -quit)"
+          if [[ -z "${archive}" || -z "${binding}" ]]; then
+            echo "Missing staged archive or binding for ${TARGET}." >&2
+            exit 1
+          fi
+
+          cargo_args=(test -p codex-v8-poc --target "${TARGET}")
+          if [[ "${SANDBOX}" == "true" ]]; then
+            cargo_args+=(--features sandbox)
+          fi
+          cargo_args+=(-- --include-ignored)
+
+          (
+            cd codex-rs
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/rusty-v8-cargo-smoke-${TARGET}-${SANDBOX}" \
+            RUSTY_V8_ARCHIVE="${GITHUB_WORKSPACE}/${archive}" \
+            RUSTY_V8_SRC_BINDING_PATH="${GITHUB_WORKSPACE}/${binding}" \
+            cargo "${cargo_args[@]}"
+          )
+
+      - name: Upload staged artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: rusty-v8-${{ needs.metadata.outputs.v8_version }}-${{ matrix.variant }}-${{ matrix.target }}
           path: dist/${{ matrix.target }}/*
@@ -331,6 +379,11 @@ jobs:
 
       - name: Build upstream rusty_v8 sandbox release pair
         env:
+          # Stage ICU data for mksnapshot. Code mode registers its own copy at runtime.
+          GN_ARGS: >-
+            icu_use_data_file=true
+            icu_copy_icudata_to_root_build_dir=true
+            v8_depend_on_icu_data_file=true
           SCCACHE_IDLE_TIMEOUT: 0
           TARGET: ${{ matrix.target }}
           V8_FROM_SOURCE: "1"
@@ -378,7 +431,6 @@ jobs:
           path: dist/${{ matrix.target }}/*
 
   publish-release:
-    if: ${{ inputs.publish }}
     needs:
       - metadata
       - build
@@ -407,7 +459,7 @@ jobs:
             gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
           fi
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
 

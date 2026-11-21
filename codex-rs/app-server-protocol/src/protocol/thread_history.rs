@@ -5,6 +5,7 @@ use crate::protocol::item_builders::build_file_change_begin_item;
 use crate::protocol::item_builders::build_file_change_end_item;
 use crate::protocol::item_builders::build_item_from_guardian_event;
 use crate::protocol::item_builders::review_output_text;
+use crate::protocol::v2::AgentMessageModeration;
 use crate::protocol::v2::CollabAgentState;
 use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
@@ -17,6 +18,7 @@ use crate::protocol::v2::McpToolCallError;
 use crate::protocol::v2::McpToolCallResult;
 use crate::protocol::v2::McpToolCallStatus;
 use crate::protocol::v2::ThreadItem;
+use crate::protocol::v2::ThreadItemEntry;
 use crate::protocol::v2::ThreadItemPayload;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
@@ -59,6 +61,7 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageAudioKind;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::UserMessageImageKind;
 use codex_protocol::protocol::ViewImageToolCallEvent;
@@ -397,6 +400,63 @@ impl ThreadHistoryBuilder {
             .map(|turn| turn.rollout_start_index)
     }
 
+    /// Keeps the latest assistant item in memory for live summaries. Full reconnects
+    /// load older text from history. Rollout replay uses the regular reducer.
+    pub fn handle_live_paginated_event(&mut self, event: &EventMsg) {
+        let previous_len = self
+            .current_turn
+            .as_ref()
+            .map_or(0, |turn| turn.items.len());
+        self.handle_event_for_history_mode(event, ThreadHistoryMode::Paginated);
+        if let EventMsg::ItemCompleted(completed) = event
+            && let codex_protocol::items::TurnItem::AgentMessage(item) = &completed.item
+            && let Some(turn) = self
+                .current_turn
+                .as_mut()
+                .filter(|turn| turn.id == completed.turn_id)
+        {
+            if turn.items.len() > previous_len {
+                if let Some(index) = turn.evictable_agent_item.replace(previous_len)
+                    && let ThreadItemPayload::AgentMessage { text, .. } = &mut turn.items[index]
+                {
+                    *text = String::new();
+                }
+            } else if turn
+                .evictable_agent_item
+                .is_some_and(|index| turn.items[index].id() == item.id)
+            {
+                // A read by ID could still find the prior version of a corrected item.
+                turn.evictable_agent_item = None;
+            }
+        }
+    }
+
+    /// Drops only completed MCP results that the active turn can recover in full by ID.
+    pub fn release_saved_mcp_results(&mut self, entries: &[ThreadItemEntry]) {
+        let Some(turn) = self.current_turn.as_mut() else {
+            return;
+        };
+        for entry in entries {
+            if entry.turn_id == turn.id
+                && let ThreadItemPayload::McpToolCall {
+                    id,
+                    status: McpToolCallStatus::Completed,
+                    result: Some(saved),
+                    ..
+                } = &entry.item.payload
+                && let Some(index) = turn.item_index.position(&turn.items, id)
+                && let ThreadItemPayload::McpToolCall {
+                    status: McpToolCallStatus::Completed,
+                    result,
+                    ..
+                } = &mut turn.items[index]
+                && result.as_ref() == Some(saved)
+            {
+                *result = None;
+            }
+        }
+    }
+
     /// Shared reducer for persisted rollout replay and in-memory current-turn
     /// tracking used by running thread resume/rejoin.
     ///
@@ -491,6 +551,7 @@ impl ThreadHistoryBuilder {
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::SessionMeta(_) => {}
         }
     }
@@ -593,8 +654,19 @@ impl ThreadHistoryBuilder {
             return;
         }
 
-        let id = self.next_item_id();
+        let legacy_id = self.next_item_id();
+        let id = payload
+            .moderation
+            .as_ref()
+            .map_or(legacy_id, |decision| decision.item_id.clone());
         self.push_item_in_current_turn(ThreadItemPayload::AgentMessage {
+            moderation: payload
+                .moderation
+                .as_ref()
+                .map(|decision| AgentMessageModeration {
+                    moderated: decision.moderated,
+                    display: decision.display.clone(),
+                }),
             id,
             text: payload.message.clone(),
             phase: payload.phase.clone(),
@@ -916,6 +988,7 @@ impl ThreadHistoryBuilder {
         let item = ThreadItemPayload::McpToolCall {
             id: payload.call_id.clone(),
             server: payload.invocation.server.clone(),
+            environment_id: payload.invocation.environment_id.clone(),
             tool: payload.invocation.tool.clone(),
             status: McpToolCallStatus::InProgress,
             arguments: payload
@@ -974,6 +1047,7 @@ impl ThreadHistoryBuilder {
         let item = ThreadItemPayload::McpToolCall {
             id: payload.call_id.clone(),
             server: payload.invocation.server.clone(),
+            environment_id: payload.invocation.environment_id.clone(),
             tool: payload.invocation.tool.clone(),
             status,
             arguments: payload
@@ -1043,7 +1117,7 @@ impl ThreadHistoryBuilder {
             saved_path: payload.saved_path.clone(),
             input_images: payload.input_images.clone(),
             imagegen_request_id: None,
-            generation_id: None,
+            generation_id: payload.generation_id.clone(),
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -1380,12 +1454,7 @@ impl ThreadHistoryBuilder {
         let tracking_changes = self.is_tracking_changes();
         let changed_turn = if let Some(turn) = self.current_turn.as_mut() {
             turn.status = TurnStatus::Failed;
-            turn.error = Some(V2TurnError {
-                misalignment: payload.misalignment.clone().map(Into::into),
-                message: payload.message.clone(),
-                codex_error_info: payload.codex_error_info.clone().map(Into::into),
-                additional_details: None,
-            });
+            turn.error = Some(V2TurnError::from(payload.clone()));
             tracking_changes.then(|| ThreadHistoryTurnMetadata::from_pending_turn(turn))
         } else {
             None
@@ -1396,12 +1465,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_aborted(&mut self, payload: &TurnAbortedEvent) {
-        let terminal_error = payload.error.as_ref().map(|error| V2TurnError {
-            message: error.message.clone(),
-            codex_error_info: error.codex_error_info.clone().map(Into::into),
-            misalignment: error.misalignment.clone().map(Into::into),
-            additional_details: None,
-        });
+        let terminal_error = payload.error.clone().map(V2TurnError::from);
         let apply_abort = |turn: &mut PendingTurn| {
             turn.status = TurnStatus::Interrupted;
             if let Some(error) = terminal_error.as_ref() {
@@ -1416,6 +1480,7 @@ impl ThreadHistoryBuilder {
             if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
                 let changed_turn = apply_abort(turn);
                 self.record_changed_turn(changed_turn);
+                self.finish_current_turn();
                 return;
             }
 
@@ -1426,10 +1491,13 @@ impl ThreadHistoryBuilder {
             }
         }
 
-        // If the event has no ID (or refers to an unknown turn), fall back to the active turn.
-        if let Some(turn) = self.current_turn.as_mut() {
+        // Fall back only when the abort or the active turn lacks an explicit ID.
+        if let Some(turn) = self.current_turn.as_mut()
+            && (payload.turn_id.is_none() || turn.has_generated_id)
+        {
             let changed_turn = apply_abort(turn);
             self.record_changed_turn(changed_turn);
+            self.finish_current_turn();
         }
     }
 
@@ -1446,12 +1514,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_complete(&mut self, payload: &TurnCompleteEvent) {
-        let terminal_error = payload.error.as_ref().map(|error| V2TurnError {
-            misalignment: error.misalignment.clone().map(Into::into),
-            message: error.message.clone(),
-            codex_error_info: error.codex_error_info.clone().map(Into::into),
-            additional_details: None,
-        });
+        let terminal_error = payload.error.clone().map(V2TurnError::from);
         let apply_completion = |turn: &mut PendingTurn| {
             if let Some(error) = terminal_error.as_ref() {
                 turn.status = TurnStatus::Failed;
@@ -1547,6 +1610,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn new_turn(&mut self, id: Option<String>) -> PendingTurn {
+        let has_generated_id = id.is_none();
         let id = id.unwrap_or_else(|| {
             if self.next_rollout_index == 0 {
                 Uuid::now_v7().to_string()
@@ -1556,9 +1620,11 @@ impl ThreadHistoryBuilder {
         });
         PendingTurn {
             id,
+            has_generated_id,
             root_turn_id: None,
             items: Vec::new(),
             item_index: TurnItemIndex::default(),
+            evictable_agent_item: None,
             item_times: HashMap::new(),
             error: None,
             status: TurnStatus::Completed,
@@ -1748,8 +1814,48 @@ impl ThreadHistoryBuilder {
                 detail: payload.local_image_details.get(idx).copied().flatten(),
             });
         }
-        if let Some(audio) = &payload.audio {
-            content.extend(audio.iter().cloned().map(|url| UserInput::Audio { url }));
+        if payload.has_complete_audio_order() {
+            let mut inline_index = 0;
+            let mut file_index = 0;
+            for audio_kind in &payload.audio_order {
+                let audio = match audio_kind {
+                    UserMessageAudioKind::Inline => {
+                        let Some(url) = payload
+                            .audio
+                            .as_deref()
+                            .and_then(|audio| audio.get(inline_index))
+                        else {
+                            continue;
+                        };
+                        inline_index += 1;
+                        codex_protocol::models::AudioReference::Inline {
+                            audio_url: url.clone(),
+                        }
+                    }
+                    UserMessageAudioKind::File => {
+                        let Some(audio) = payload
+                            .audio_references
+                            .as_deref()
+                            .and_then(|audio| audio.get(file_index))
+                        else {
+                            continue;
+                        };
+                        file_index += 1;
+                        audio.clone()
+                    }
+                };
+                content.push(UserInput::from(
+                    codex_protocol::user_input::UserInput::Audio { audio },
+                ));
+            }
+        } else if let Some(audio) = &payload.audio_references {
+            content.extend(audio.iter().cloned().map(|audio| {
+                UserInput::from(codex_protocol::user_input::UserInput::Audio { audio })
+            }));
+        } else if let Some(audio) = &payload.audio {
+            content.extend(audio.iter().cloned().map(|url| UserInput::Audio {
+                audio: crate::AudioReference::Inline { url },
+            }));
         }
         content.extend(
             payload
@@ -1814,11 +1920,7 @@ impl TurnItemIndex {
         items.push(item);
     }
 
-    fn upsert<'a>(
-        &mut self,
-        items: &'a mut Vec<ThreadItemPayload>,
-        item: ThreadItemPayload,
-    ) -> &'a ThreadItemPayload {
+    fn position(&mut self, items: &[ThreadItemPayload], id: &str) -> Option<usize> {
         if self.positions.is_none() && items.len() >= TURN_ITEM_INDEX_THRESHOLD {
             let mut positions = HashMap::with_capacity(items.len());
             for (index, existing) in items.iter().enumerate() {
@@ -1827,11 +1929,18 @@ impl TurnItemIndex {
             self.positions = Some(positions);
         }
 
-        let existing_index = match &self.positions {
-            Some(positions) => positions.get(item.id()).copied(),
-            None => items.iter().position(|existing| existing.id() == item.id()),
-        };
-        if let Some(index) = existing_index {
+        match &self.positions {
+            Some(positions) => positions.get(id).copied(),
+            None => items.iter().position(|existing| existing.id() == id),
+        }
+    }
+
+    fn upsert<'a>(
+        &mut self,
+        items: &'a mut Vec<ThreadItemPayload>,
+        item: ThreadItemPayload,
+    ) -> &'a ThreadItemPayload {
+        if let Some(index) = self.position(items, item.id()) {
             items[index] = item;
             &items[index]
         } else {
@@ -1844,9 +1953,11 @@ impl TurnItemIndex {
 
 struct PendingTurn {
     id: String,
+    has_generated_id: bool,
     root_turn_id: Option<String>,
     items: Vec<ThreadItemPayload>,
     item_index: TurnItemIndex,
+    evictable_agent_item: Option<usize>,
     item_times: HashMap<String, ItemTimes>,
     error: Option<TurnError>,
     status: TurnStatus,
@@ -1947,6 +2058,7 @@ mod tests {
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
     use codex_protocol::items::build_hook_prompt_message;
     use codex_protocol::mcp::CallToolResult;
+    use codex_protocol::models::AudioReference as CoreAudioReference;
     use codex_protocol::models::ImageDetail;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
@@ -1975,6 +2087,7 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::protocol::WebSearchBeginEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
+    use codex_protocol::user_input::UserInput as CoreUserInput;
     use codex_rollout::CompactedItem;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
@@ -2058,6 +2171,7 @@ mod tests {
             };
             builder.handle_event_for_history_mode(&EventMsg::ItemStarted(started), mode);
             let completed = ItemCompletedEvent {
+                content_token_count: None,
                 thread_id: ThreadId::default(),
                 turn_id: turn_id.clone(),
                 item,
@@ -2086,6 +2200,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "Hi there".into(),
                 phase: None,
                 memory_citation: None,
@@ -2107,6 +2222,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "Reply two".into(),
                 phase: None,
                 memory_citation: None,
@@ -2148,6 +2264,7 @@ mod tests {
         assert_eq!(
             first.items[1].payload,
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-2".into(),
                 text: "Hi there".into(),
                 phase: None,
@@ -2183,6 +2300,7 @@ mod tests {
         assert_eq!(
             second.items[1].payload,
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-5".into(),
                 text: "Reply two".into(),
                 phase: None,
@@ -2259,13 +2377,25 @@ mod tests {
         });
         let events = vec![
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".into(),
                 item: entered,
                 started_at_ms: Some(0),
                 completed_at_ms: 0,
             }),
+            // A late abort for a discarded turn must preserve the review turn's explicit ID.
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
+                turn_id: Some("discarded-turn".into()),
+                started_at: None,
+                reason: TurnAbortReason::Replaced,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+            }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".into(),
                 item: exited,
@@ -2291,6 +2421,7 @@ mod tests {
         let turns = builder.finish();
 
         assert_eq!(turns[0].id, "turn-1");
+        assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(
             turns[0].item_payloads().collect::<Vec<_>>(),
             [
@@ -2322,6 +2453,8 @@ mod tests {
                 local_images: vec![local_image_path.clone()],
                 local_image_details: vec![Some(ImageDetail::Original)],
                 audio: Some(vec!["https://example.com/audio.mp3".into()]),
+                audio_references: None,
+                audio_order: Vec::new(),
                 local_audio: vec![local_audio_path.clone()],
                 text_elements: Vec::new(),
             },
@@ -2357,7 +2490,9 @@ mod tests {
                         detail: Some(ImageDetail::Original),
                     },
                     UserInput::Audio {
-                        url: "https://example.com/audio.mp3".into(),
+                        audio: crate::AudioReference::Inline {
+                            url: "https://example.com/audio.mp3".into()
+                        }
                     },
                     UserInput::LocalAudio {
                         path: local_audio_path,
@@ -2401,6 +2536,32 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn rebuilds_uploaded_and_inline_audio_in_order_from_legacy_events() {
+        let item = CoreUserMessageItem::new(&[
+            CoreUserInput::Audio {
+                audio: CoreAudioReference::File {
+                    file_id: "file_audio".into(),
+                },
+            },
+            CoreUserInput::Audio {
+                audio: CoreAudioReference::Inline {
+                    audio_url: "data:audio/wav;base64,YXVkaW8=".into(),
+                },
+            },
+        ]);
+        let turns =
+            build_turns_from_rollout_items(&[RolloutItem::EventMsg(item.as_legacy_event())]);
+
+        assert_eq!(
+            serde_json::to_value(&turns[0].items[0]).unwrap()["content"],
+            serde_json::json!([
+                {"type": "audio", "fileId": "file_audio"},
+                {"type": "audio", "url": "data:audio/wav;base64,YXVkaW8="},
+            ]),
         );
     }
 
@@ -2487,6 +2648,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: sleep_item,
@@ -2572,6 +2734,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: CoreTurnItem::Extension(CoreExtensionItem::ImageGeneration(
@@ -2690,6 +2853,7 @@ mod tests {
                 interaction_input: None,
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: command_item,
@@ -2864,6 +3028,7 @@ mod tests {
             },
         ];
         let events = vec![EventMsg::AgentMessage(AgentMessageEvent {
+            moderation: None,
             message: "Final reply".into(),
             phase: Some(CoreMessagePhase::FinalAnswer),
             memory_citation: None,
@@ -2880,6 +3045,7 @@ mod tests {
         assert_eq!(
             turns[0].items[0].payload,
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-1".into(),
                 text: "Final reply".into(),
                 phase: Some(CoreMessagePhase::FinalAnswer),
@@ -2929,6 +3095,7 @@ mod tests {
                     path: test_path_buf("/tmp/reference.png").abs(),
                     sha256: "ab".repeat(32),
                 }],
+                generation_id: None,
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 root_turn_id: None,
@@ -3009,6 +3176,7 @@ mod tests {
                 text: "first content".into(),
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "interlude".into(),
                 phase: None,
                 memory_citation: None,
@@ -3059,6 +3227,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "Working...".into(),
                 phase: None,
                 memory_citation: None,
@@ -3083,6 +3252,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "Second attempt complete.".into(),
                 phase: None,
                 memory_citation: None,
@@ -3115,6 +3285,7 @@ mod tests {
         assert_eq!(
             first_turn.items[1].payload,
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-2".into(),
                 text: "Working...".into(),
                 phase: None,
@@ -3141,6 +3312,7 @@ mod tests {
         assert_eq!(
             second_turn.items[1].payload,
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-4".into(),
                 text: "Second attempt complete.".into(),
                 phase: None,
@@ -3163,6 +3335,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "A1".into(),
                 phase: None,
                 memory_citation: None,
@@ -3178,6 +3351,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "A2".into(),
                 phase: None,
                 memory_citation: None,
@@ -3194,6 +3368,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "A3".into(),
                 phase: None,
                 memory_citation: None,
@@ -3225,6 +3400,7 @@ mod tests {
                     }],
                 },
                 &ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "item-2".into(),
                     text: "A1".into(),
                     phase: None,
@@ -3246,6 +3422,7 @@ mod tests {
                     }],
                 },
                 &ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "item-4".into(),
                     text: "A3".into(),
                     phase: None,
@@ -3269,6 +3446,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "A1".into(),
                 phase: None,
                 memory_citation: None,
@@ -3284,6 +3462,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "A2".into(),
                 phase: None,
                 memory_citation: None,
@@ -3428,6 +3607,7 @@ mod tests {
                 call_id: "mcp-1".into(),
                 invocation: McpInvocation {
                     server: "docs".into(),
+                    environment_id: None,
                     tool: "lookup".into(),
                     arguments: Some(serde_json::json!({"id":"123"})),
                 },
@@ -3493,6 +3673,7 @@ mod tests {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-1".into(),
                 server: "docs".into(),
+                environment_id: None,
                 tool: "lookup".into(),
                 status: McpToolCallStatus::Failed,
                 arguments: serde_json::json!({"id":"123"}),
@@ -3527,6 +3708,7 @@ mod tests {
                 call_id: "mcp-1".into(),
                 invocation: McpInvocation {
                     server: "docs".into(),
+                    environment_id: None,
                     tool: "lookup".into(),
                     arguments: Some(serde_json::json!({"id":"123"})),
                 },
@@ -3564,6 +3746,7 @@ mod tests {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-1".into(),
                 server: "docs".into(),
+                environment_id: None,
                 tool: "lookup".into(),
                 status: McpToolCallStatus::Completed,
                 arguments: serde_json::json!({"id":"123"}),
@@ -3965,6 +4148,7 @@ mod tests {
         use codex_protocol::protocol::HasLegacyEvent;
 
         let completion = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-a".into(),
             started_at_ms: None,
@@ -3972,6 +4156,7 @@ mod tests {
             item: CoreTurnItem::McpToolCall(McpToolCallItem {
                 id: "mcp-1".into(),
                 server: "slack".into(),
+                environment_id: None,
                 tool: "search".into(),
                 arguments: serde_json::json!({"query": "incident"}),
                 connector_id: None,
@@ -4270,6 +4455,45 @@ mod tests {
     }
 
     #[test]
+    fn live_paginated_turn_releases_superseded_agent_text() {
+        let mut builder = ThreadHistoryBuilder::new();
+        let turn_id = builder.ensure_turn().id.clone();
+        for (id, text) in [
+            ("a", "old"),
+            ("b", "draft"),
+            ("b", "corrected"),
+            ("c", "latest"),
+        ] {
+            builder.handle_live_paginated_event(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
+                thread_id: ThreadId::default(),
+                turn_id: turn_id.clone(),
+                item: CoreTurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
+                    moderation: None,
+                    id: id.into(),
+                    content: vec![codex_protocol::items::AgentMessageContent::Text {
+                        text: text.into(),
+                    }],
+                    phase: None,
+                    memory_citation: None,
+                    delivery: None,
+                    questions: None,
+                }),
+                started_at_ms: None,
+                completed_at_ms: 1,
+            }));
+        }
+        let mut texts = builder.current_turn.unwrap().items.into_iter().map(|item| {
+            let ThreadItemPayload::AgentMessage { text, .. } = item else {
+                panic!("expected assistant item")
+            };
+            text
+        });
+        assert_eq!(texts.next().unwrap().capacity(), 0);
+        assert_eq!(texts.collect::<Vec<_>>(), ["corrected", "latest"]);
+    }
+
+    #[test]
     fn active_turn_summary_preserves_selection_and_completed_metadata() {
         let mut builder = ThreadHistoryBuilder::new();
         assert_eq!(
@@ -4296,6 +4520,7 @@ mod tests {
         }));
         for message in ["draft", "answer"] {
             builder.handle_event(&EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: message.into(),
                 phase: None,
                 memory_citation: None,
@@ -4605,6 +4830,7 @@ mod tests {
                 time_to_first_token_ms: None,
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "still in b".into(),
                 phase: None,
                 memory_citation: None,
@@ -4679,7 +4905,8 @@ mod tests {
                 error: Some(ErrorEvent {
                     misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
-                    codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                    codex_error_info: Some(CodexErrorInfo::PolicyCapacityUnavailable),
+                    rejected_audio_file_ids: Vec::new(),
                 }),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
@@ -4713,7 +4940,7 @@ mod tests {
                         message: "Selected model is at capacity. Please try a different model."
                             .into(),
                         codex_error_info: Some(
-                            crate::protocol::v2::CodexErrorInfo::ServerOverloaded,
+                            crate::protocol::v2::CodexErrorInfo::PolicyCapacityUnavailable,
                         ),
                         additional_details: None,
                     }),
@@ -4800,6 +5027,7 @@ mod tests {
                 duration_ms: None,
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "still in b".into(),
                 phase: None,
                 memory_citation: None,
@@ -5079,6 +5307,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: "done".into(),
                 phase: None,
                 memory_citation: None,
@@ -5089,6 +5318,7 @@ mod tests {
                 misalignment: None,
                 message: "rollback failed".into(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                rejected_audio_file_ids: Vec::new(),
             }),
         ];
 
@@ -5136,6 +5366,7 @@ mod tests {
                 misalignment: None,
                 message: "request-level failure".into(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                rejected_audio_file_ids: Vec::new(),
             }),
         ];
 
@@ -5194,6 +5425,7 @@ mod tests {
                 codex_error_info: Some(CodexErrorInfo::ResponseStreamDisconnected {
                     http_status_code: Some(502),
                 }),
+                rejected_audio_file_ids: Vec::new(),
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 root_turn_id: None,
@@ -5259,6 +5491,7 @@ mod tests {
                     misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                    rejected_audio_file_ids: Vec::new(),
                 }),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
@@ -5301,11 +5534,14 @@ mod tests {
 
     #[test]
     fn rebuilds_hook_prompt_items_from_rollout_response_items() {
-        let hook_prompt = build_hook_prompt_message(&[
+        let mut hook_prompt = build_hook_prompt_message(&[
             CoreHookPromptFragment::from_single_hook("Retry with tests.", "hook-run-1"),
             CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
         ])
         .expect("hook prompt message");
+        hook_prompt.set_id(Some(codex_protocol::ResponseItemId::from_server(
+            "msg_hook".to_owned(),
+        )));
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_attribution: None,
@@ -5385,6 +5621,7 @@ mod tests {
         }));
         let changes =
             builder.handle_event_with_changes(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id: ThreadId::new(),
                 turn_id: "turn-a".into(),
                 item: hook_prompt,
@@ -5406,6 +5643,7 @@ mod tests {
             .join("worker")
             .expect("worker path");
         let spawn = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-a".into(),
             item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {
@@ -5456,6 +5694,7 @@ mod tests {
                     time_to_first_token_ms: None,
                 })),
                 RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                    content_token_count: None,
                     thread_id: ThreadId::new(),
                     turn_id: "turn-a".into(),
                     item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {

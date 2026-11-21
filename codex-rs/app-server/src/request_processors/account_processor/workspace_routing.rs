@@ -5,6 +5,7 @@
 
 use super::*;
 use codex_app_server_protocol::AccountRoutingOverride;
+use codex_app_server_protocol::AccountUpdateReason;
 use codex_backend_client::AccountEntry;
 use codex_config::ConfigLoadError;
 use codex_http_client::NetworkPolicyDenied;
@@ -37,17 +38,21 @@ pub(super) type WorkspaceRoutingFetches = HashMap<WorkspaceRoutingKey, Weak<Work
 
 pub(super) struct WorkspaceRoutingFetch {
     discovery: Semaphore,
-    routing: Mutex<Option<WorkspaceRouting>>,
+    routing: Mutex<Option<CachedWorkspaceRouting>>,
 }
 
+#[derive(Clone)]
 pub(super) struct CachedWorkspaceRouting {
     key: WorkspaceRoutingKey,
     routing: WorkspaceRouting,
+    name: Option<String>,
 }
 
 pub(super) struct AccountRead {
     account_state: ProviderAccountState,
+    user_id: Option<String>,
     pub(super) workspace_routing: Option<WorkspaceRouting>,
+    workspace_name: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -104,6 +109,8 @@ pub(super) enum WorkspaceRoutingError {
     BackendIsNotOrigin,
     #[error("required ChatGPT backend conflicts with workspace routing")]
     BackendConflict,
+    #[error("Sign in to a government workspace to use the configured government backend.")]
+    GovernmentWorkspaceRequired,
     #[error("invalid workspace backend URL")]
     InvalidBackendUrl,
     #[error("workspace backend must use an HTTPS origin without credentials")]
@@ -238,7 +245,8 @@ impl AccountRequestProcessor {
                 && response.workspace_routing.is_some()
                 && auth_changes.borrow().owner_generation == owner_generation
             {
-                let notification = processor.current_account_updated_notification();
+                let mut notification = processor.current_account_updated_notification();
+                notification.reason = Some(AccountUpdateReason::WorkspaceRoutingReady);
                 processor
                     .outgoing
                     .send_account_notification(
@@ -276,8 +284,20 @@ impl AccountRequestProcessor {
                     account_state: provider
                         .account_state()
                         .map_err(|error| invalid_request(error.to_string()))?,
+                    user_id: None,
                     workspace_routing: None,
+                    workspace_name: None,
                 }
+            }
+            Err(AccountReadError::Routing(
+                error @ WorkspaceRoutingError::GovernmentWorkspaceRequired,
+            )) => {
+                let mut error = invalid_request(error.to_string());
+                error.data = Some(serde_json::json!({
+                    "reason": "governmentWorkspaceRequired",
+                    "action": "relogin",
+                }));
+                return Err(error);
             }
             Err(error) => {
                 return Err(match error {
@@ -286,9 +306,14 @@ impl AccountRequestProcessor {
                 });
             }
         };
+        let mut account = read.account_state.account.map(Account::from);
+        if let Some(Account::Chatgpt { workspace_name, .. }) = &mut account {
+            *workspace_name = read.workspace_name;
+        }
         Ok(Some(
             GetAccountResponse {
-                account: read.account_state.account.map(Account::from),
+                account,
+                user_id: read.user_id,
                 requires_openai_auth: read.account_state.requires_openai_auth,
                 workspace_routing: read.workspace_routing.map(|routing| {
                     codex_app_server_protocol::WorkspaceRouting {
@@ -355,6 +380,15 @@ impl AccountRequestProcessor {
             let account_state = provider
                 .account_state()
                 .map_err(AccountReadError::InvalidAccount)?;
+            let user_id = auth
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        &account_state.account,
+                        Some(ProviderAccount::Chatgpt { .. })
+                    )
+                })
+                .and_then(CodexAuth::get_chatgpt_user_id);
             let mut workspace_routing = if let Some((auth, account_id)) = auth
                 .as_ref()
                 .filter(|auth| {
@@ -409,20 +443,28 @@ impl AccountRequestProcessor {
                         .await
                         .as_ref()
                         .filter(|cached| cached.key == key)
-                        .map(|cached| cached.routing.clone()),
+                        .cloned(),
                 };
                 let routing = if let Some(cached) = cached {
                     cached
                 } else {
+                    let runtime = self
+                        .thread_manager
+                        .runtime_auth_for_config(&config)
+                        .map_err(|_| WorkspaceRoutingError::DiscoveryFailed)?;
                     let mut recovery = self.auth_manager.unauthorized_recovery();
                     let mut discovery_auth = auth.clone();
                     let mut discovery_generation = auth_state.generation;
                     let response = loop {
-                        let client = BackendClient::from_auth(
+                        let client = BackendClient::from_auth_with_runtime(
                             &config.chatgpt_base_url,
                             &discovery_auth,
                             config.http_client_factory(),
-                        );
+                            runtime.as_ref(),
+                            /*headers*/ &Default::default(),
+                        )
+                        .await
+                        .map_err(|_| WorkspaceRoutingError::DiscoveryFailed)?;
                         match client.get_accounts_check().await {
                             Ok(response) => break response,
                             Err(error) => {
@@ -472,7 +514,7 @@ impl AccountRequestProcessor {
                         .accounts
                         .into_iter()
                         .filter(|account| account.id == account_id);
-                    let entry = accounts
+                    let mut entry = accounts
                         .next()
                         .ok_or(WorkspaceRoutingError::MissingWorkspace)?;
                     if accounts.next().is_some() {
@@ -493,6 +535,7 @@ impl AccountRequestProcessor {
                     {
                         return Err(WorkspaceRoutingError::ConfigurationChanged.into());
                     }
+                    let name = entry.name.take();
                     let routing = resolve_routing(
                         entry,
                         required_chatgpt_base_url.as_deref(),
@@ -503,15 +546,17 @@ impl AccountRequestProcessor {
                     {
                         return Err(WorkspaceRoutingError::AccountChanged.into());
                     }
+                    let routing = CachedWorkspaceRouting {
+                        key: WorkspaceRoutingKey {
+                            auth_generation: discovery_generation,
+                            ..key
+                        },
+                        routing,
+                        name,
+                    };
                     // Same-owner refresh can complete a newer discovery first.
                     if current_auth_changes.borrow().generation == discovery_generation {
-                        *cached = Some(CachedWorkspaceRouting {
-                            key: WorkspaceRoutingKey {
-                                auth_generation: discovery_generation,
-                                ..key
-                            },
-                            routing: routing.clone(),
-                        });
+                        *cached = Some(routing.clone());
                     }
                     routing
                 };
@@ -531,9 +576,9 @@ impl AccountRequestProcessor {
                 let session_bootstrap_origin = Url::parse(&request.chatgpt_base_url)
                     .map_err(|_| WorkspaceRoutingError::InvalidSessionBootstrapUrl)?
                     .origin();
-                let selected_backend = workspace_routing
-                    .as_ref()
-                    .is_some_and(|routing| routing.backend_origin == origin.ascii_serialization());
+                let selected_backend = workspace_routing.as_ref().is_some_and(|routing| {
+                    routing.routing.backend_origin == origin.ascii_serialization()
+                });
                 let workspace_bound = request.previously_routed
                     || request.provider_base_url == codex_model_provider::CHATGPT_CODEX_BASE_URL
                     || origin == session_bootstrap_origin
@@ -544,9 +589,14 @@ impl AccountRequestProcessor {
                     return Err(WorkspaceRoutingError::SessionBackendChanged.into());
                 }
             }
+            let (workspace_routing, workspace_name) = workspace_routing
+                .map(|workspace| (Some(workspace.routing), workspace.name))
+                .unwrap_or_default();
             Ok(AccountRead {
                 account_state,
+                user_id,
                 workspace_routing,
+                workspace_name,
             })
         });
         let result = tokio::select! {
@@ -594,19 +644,22 @@ fn resolve_routing(
         }
         Some(url)
     };
-    let origin = match (required, discovered) {
+    let selected = match (required, discovered) {
         (Some(required), Some(discovered)) => {
             if required.origin() != discovered.origin() {
                 return Err(WorkspaceRoutingError::BackendConflict.into());
             }
-            required.origin()
+            required
         }
-        (Some(url), None) | (None, Some(url)) => url.origin(),
-        (None, None) => parse_backend_url(effective_base_url)?.origin(),
+        (Some(url), None) | (None, Some(url)) => url,
+        (None, None) => parse_backend_url(effective_base_url)?,
     };
+    if backend == "NO_CONSTRAINT" && selected.host_str() == Some("gov.chatgpt.com") {
+        return Err(WorkspaceRoutingError::GovernmentWorkspaceRequired.into());
+    }
     Ok(WorkspaceRouting {
         chatgpt_account_id: entry.id,
-        backend_origin: origin.ascii_serialization(),
+        backend_origin: selected.origin().ascii_serialization(),
         account_routing_override,
     })
 }

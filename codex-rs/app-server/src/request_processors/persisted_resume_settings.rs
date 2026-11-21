@@ -43,7 +43,11 @@ impl From<&ThreadSettingsSnapshot> for PersistedResumeSettings {
     fn from(settings: &ThreadSettingsSnapshot) -> Self {
         Self {
             approval_policy: settings.approval_policy,
-            approvals_reviewer: Some(settings.approvals_reviewer),
+            approvals_reviewer: Some(
+                settings
+                    .requested_approvals_reviewer
+                    .unwrap_or(settings.approvals_reviewer),
+            ),
             active_permission_profile: settings.active_permission_profile.clone(),
             unnamed_permission_profile: settings
                 .active_permission_profile
@@ -78,28 +82,53 @@ fn latest_persisted_resume_settings(history: &[RolloutItem]) -> Option<Persisted
                 approvals_reviewer: turn_context.approvals_reviewer.or_else(|| {
                     history[..index].iter().rev().find_map(|item| match item {
                         RolloutItem::TurnContext(turn_context) => turn_context.approvals_reviewer,
-                        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-                            Some(event.thread_settings.approvals_reviewer)
-                        }
+                        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(
+                            event
+                                .thread_settings
+                                .requested_approvals_reviewer
+                                .unwrap_or(event.thread_settings.approvals_reviewer),
+                        ),
                         _ => None,
                     })
                 }),
                 active_permission_profile: turn_context.active_permission_profile.clone(),
-                unnamed_permission_profile: None,
+                unnamed_permission_profile: unattributed_read_only_profile(
+                    &turn_context.permission_profile,
+                    turn_context.active_permission_profile.as_ref(),
+                ),
             }),
             RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-                // History without an identifiable owner can supply a profile ID, but
-                // its raw filesystem grants may belong to another thread or executor.
                 let settings = &event.thread_settings;
                 Some(PersistedResumeSettings {
                     approval_policy: settings.approval_policy,
-                    approvals_reviewer: Some(settings.approvals_reviewer),
+                    approvals_reviewer: Some(
+                        settings
+                            .requested_approvals_reviewer
+                            .unwrap_or(settings.approvals_reviewer),
+                    ),
                     active_permission_profile: settings.active_permission_profile.clone(),
-                    unnamed_permission_profile: None,
+                    unnamed_permission_profile: if event.thread_id.is_none() {
+                        unattributed_read_only_profile(
+                            &settings.permission_profile,
+                            settings.active_permission_profile.as_ref(),
+                        )
+                    } else {
+                        None
+                    },
                 })
             }
             _ => None,
         })
+}
+
+fn unattributed_read_only_profile(
+    profile: &PermissionProfile,
+    active_profile: Option<&ActivePermissionProfile>,
+) -> Option<PermissionProfile> {
+    // Unattributed history can preserve built-in read-only access. Other concrete
+    // profiles may carry grants that belong to another thread or executor.
+    let read_only = PermissionProfile::read_only();
+    (active_profile.is_none() && *profile == read_only).then_some(read_only)
 }
 
 pub(super) fn latest_persisted_model_settings(

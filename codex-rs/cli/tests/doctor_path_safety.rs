@@ -153,6 +153,10 @@ wire_api = "responses"
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows doctor fixture does not discover the synthetic Git executable"
+)]
 fn startup_and_doctor_do_not_execute_path_helpers() -> Result<()> {
     let fixture = Fixture::new()?;
     // Non-TTY dumb-terminal startup exits immediately after terminal detection.
@@ -579,8 +583,8 @@ async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result
             output.chars().take(/*n*/ 4000).collect::<String>()
         )
     })??;
-    // The trust screen discards pending input after its first draw. Retry the quit key
-    // until that drain has finished, and keep consuming output during normal shutdown.
+    // The first Ctrl+C leaves the untrusted workspace for the command center.
+    // Keep sending Ctrl+C so the TUI exits even if the first draw discarded input.
     let mut quit_retry = tokio::time::interval(Duration::from_millis(/*millis*/ 250));
     let mut exit_rx = spawned.exit_rx;
     timeout(Duration::from_secs(/*secs*/ 10), async {
@@ -588,7 +592,7 @@ async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result
             tokio::select! {
                 result = &mut exit_rx => return result,
                 _ = quit_retry.tick() => {
-                    let _ = writer.send(b"2".to_vec()).await;
+                    let _ = writer.send(b"\x03".to_vec()).await;
                 }
                 Some(_) = output_rx.recv() => {}
             }

@@ -13,8 +13,8 @@
 //! Flow at a glance (open process)
 //! 1) Build a small request `{ command, cwd }`.
 //! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
-//! 3) Runtime: transform `SandboxTransformRequest` -> `ExecRequest` -> spawn PTY.
-//! 4) If denial, orchestrator retries with `SandboxType::None`.
+//! 3) Prepare the approved sandbox on the execution host, then spawn the PTY.
+//! 4) On sandbox denial, the orchestrator may authorize a retry with different permissions.
 //! 5) Process handle is returned with streaming output + metadata.
 //!
 //! This keeps policy logic and user interaction centralized while the PTY/process
@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use codex_network_proxy::NetworkProxy;
-use codex_protocol::models::AdditionalPermissionProfile;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::Rng;
@@ -37,16 +36,15 @@ use rand::rng;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
-use crate::shell::ShellInvocation;
+use crate::tools::handlers::unified_exec::preparation::PreparedExecCommand;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
+mod command_sessions;
 mod errors;
 mod oneshot;
 pub(crate) mod output;
@@ -61,6 +59,7 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
 
+pub(crate) use command_sessions::command_sessions_state;
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::UnifiedExecProcess;
 pub(crate) use stdin_approval::TerminalPermissions;
@@ -110,22 +109,9 @@ impl UnifiedExecContext {
 
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
-    pub command: Vec<String>,
-    pub shell: ShellInvocation,
-    pub hook_command: String,
+    pub prepared: PreparedExecCommand,
     pub process_id: i32,
-    pub yield_time_ms: u64,
-    pub max_output_tokens: Option<usize>,
-    pub cwd: PathUri,
-    pub sandbox_cwd: PathUri,
-    pub turn_environment: TurnEnvironment,
     pub network: Option<NetworkProxy>,
-    pub tty: bool,
-    pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
-    pub additional_permissions_preapproved: bool,
-    pub justification: Option<String>,
-    pub prefix_rule: Option<Vec<String>>,
 }
 
 /// The process and environment behind a terminal session ID at the time of lookup.

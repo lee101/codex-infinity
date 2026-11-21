@@ -33,12 +33,9 @@ async fn harness_authored_configuration_updates_preserve_metadata_and_resume() {
         )
         .await;
 
-    expected.metadata.as_mut().unwrap().mcp_attribution = Some(
-        session
-            .services
-            .executed_tool_calls
-            .mcp_attribution_snapshot(),
-    );
+    let metadata = expected.metadata.as_mut().unwrap();
+    metadata.history_sequence = Some(1);
+    metadata.sampled_through_sequence = Some(0);
 
     let recorded = session.clone_history().await.into_annotated_items();
     assert_eq!(recorded, vec![expected.clone()]);

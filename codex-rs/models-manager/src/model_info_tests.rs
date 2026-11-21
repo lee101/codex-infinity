@@ -3,6 +3,7 @@ use crate::ModelsManagerConfig;
 use codex_prompts::render_model_instructions;
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ApprovalMessages;
+use codex_protocol::openai_models::AppsMessages;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::CollaborationModeMessages;
 use codex_protocol::openai_models::ConfirmationPolicies;
@@ -61,7 +62,6 @@ fn deepseek_v4_has_native_context_and_reasoning_metadata() {
         assert_eq!(model.context_window, Some(1_000_000));
         assert_eq!(model.max_context_window, Some(1_000_000));
         assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
-        assert!(!model.used_fallback_model_metadata);
     }
 }
 
@@ -123,6 +123,7 @@ fn base_instruction_override_is_literal_and_preserves_catalog_messages() {
             prompted_categories: Some("Allowed: {{ categories }}".to_string()),
             rejected_categories: Some("Denied: {{ categories }}".to_string()),
         }),
+        ..Default::default()
     };
     let collaboration_modes = CollaborationModeMessages {
         default: Some("default instructions".to_string()),
@@ -171,6 +172,10 @@ fn base_instruction_override_is_literal_and_preserves_catalog_messages() {
         computer_use: Some("  # Native policy\r\n\n${native_markdown}\n".to_string()),
     };
     let mut messages = ModelMessages {
+        apps: Some(AppsMessages {
+            usage_instructions: Some("Catalog Apps instructions.".to_string()),
+        }),
+        plugins: None,
         content_filter_guidance: None,
         persistent_instructions: Some(persistent_instructions.to_string()),
         tools: Some(ToolMessages {
@@ -256,6 +261,7 @@ fn personality_none_strips_catalog_instruction_sources_through_the_next_h1() {
                 never: None,
                 unless_trusted: None,
                 granular: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -324,7 +330,6 @@ fn unknown_model_uses_builtin_instruction_template() {
     let model = model_info_from_slug("unknown-model");
 
     assert_eq!(render_model_instructions(&model), BASE_INSTRUCTIONS);
-    assert!(model.used_fallback_model_metadata);
 }
 
 #[test]

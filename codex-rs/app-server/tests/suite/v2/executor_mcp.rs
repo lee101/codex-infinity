@@ -818,10 +818,15 @@ async fn cached_executor_mcp_cannot_read_host_token_after_capability_downgrade()
             .as_array()
             .is_some_and(|items| items.iter().any(|item| {
                 item["type"] == "input_text"
-                    && item["text"]
-                        == "MCP tool `cached_executor/echo` is not available to the model"
+                    && item["text"].as_str().is_some_and(|text| {
+                        text.contains("requires executor-side environment credential resolution")
+                    })
             })),
-        "expected the failed MCP server to be unavailable: {output}"
+        "expected the executor credential startup error to reach the model: {output}"
+    );
+    assert!(
+        !output.to_string().contains(HOST_TOKEN),
+        "worker credentials reached the model"
     );
     proxy.abort();
     http_server.abort();
@@ -1377,6 +1382,7 @@ startup_timeout_sec = 10
 
     let request_id = app_server
         .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            environment_id: None,
             thread_id: selected_thread.clone(),
             server: HTTP_MCP_SERVER_NAME.to_string(),
             tool: "echo".to_string(),
@@ -1393,6 +1399,7 @@ startup_timeout_sec = 10
 
     let request_id = app_server
         .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            environment_id: None,
             thread_id: selected_thread.clone(),
             server: OAUTH_MCP_SERVER_NAME.to_string(),
             tool: "echo".to_string(),
@@ -1438,6 +1445,7 @@ startup_timeout_sec = 10
 
     let request_id = app_server
         .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            environment_id: None,
             thread_id: selected_thread.clone(),
             server: REFRESH_PROBE_SERVER_NAME.to_string(),
             tool: "echo".to_string(),
@@ -1557,6 +1565,7 @@ async fn mcp_server_statuses(
 ) -> Result<Vec<McpServerStatus>> {
     let request_id = app_server
         .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            environment_id: None,
             server_name: None,
             cursor: None,
             limit: None,

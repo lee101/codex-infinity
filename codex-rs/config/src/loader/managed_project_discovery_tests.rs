@@ -161,13 +161,24 @@ async fn managed_network_requirements_control_broker_project_discovery() -> anyh
     let requirements_path = fixture._temp.path().join("requirements.toml");
     fixture.overrides.system_requirements_path = Some(requirements_path.clone());
 
-    for table in ["network_proxy", "experimental_network"] {
+    for table in [
+        "network_proxy",
+        "experimental_network",
+        "permissions.network",
+    ] {
         for enabled in [false, true] {
             std::fs::write(
                 &requirements_path,
                 format!("[{table}]\nenabled = {enabled}\n"),
             )?;
             let (canonical, local) = fixture.load().await?;
+            let policy_only = crate::loader::load_managed_requirements_state(
+                &TestFileSystem,
+                &fixture.home,
+                fixture.overrides.clone(),
+            )
+            .await?;
+            assert_eq!(&policy_only, canonical.requirements_toml());
             let mut local_effective = TomlValue::Table(toml::map::Map::new());
             for layer in local.config.layers {
                 merge_toml_values(&mut local_effective, &layer.toml);
@@ -187,6 +198,88 @@ async fn managed_network_requirements_control_broker_project_discovery() -> anyh
                 (expected.clone(), expected),
                 "{table}, enabled = {enabled}"
             );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn executor_mcp_read_ignores_a_legacy_managed_credentials_profile() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let server = "[mcp_servers.docs]\nurl = 'http://127.0.0.1:8123/mcp'";
+    let requirement = "[mcp_servers.docs.identity]\nurl = 'http://127.0.0.1:8123/mcp'";
+    std::fs::write(fixture.home.join("config.toml"), server)?;
+    std::fs::write(
+        fixture.managed.with_file_name("requirements.toml"),
+        format!("[permissions.credentials]\nextends = ':workspace'\n{requirement}"),
+    )?;
+
+    let paths = [vec!["mcp_servers".to_string()]];
+    let mcp = load_local_config_layers_with_overrides(
+        &TestFileSystem,
+        &fixture.home,
+        &fixture.cwd,
+        &fixture.overrides,
+    )
+    .await?
+    .project(&paths, &paths);
+    assert_eq!(
+        mcp.config.layers[0].toml,
+        toml::from_str::<TomlValue>(server)?
+    );
+    assert_eq!(
+        mcp.requirements.layers[0].toml,
+        toml::from_str::<TomlValue>(requirement)?
+    );
+
+    let err = crate::loader::load_managed_requirements_state(
+        &TestFileSystem,
+        &fixture.home,
+        fixture.overrides,
+    )
+    .await
+    .expect_err("permission loading must reject the legacy managed profile");
+    assert!(err.to_string().contains("`permissions.credentials` in requirements.toml is reserved for shared credential policy; rename the managed profile"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn project_discovery_rejects_invalid_network_requirements() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let path = fixture._temp.path().join("requirements.toml");
+    fixture.overrides.system_requirements_path = Some(path.clone());
+    for table in ["network_proxy", "experimental_network"] {
+        for (nested, message) in [
+            ("http_port = 8090", "same network policy"),
+            ("enabled = false", "same network policy"),
+            ("review_domains = []", "same network policy"),
+            ("", "rename the managed profile"),
+            (
+                "extends = ':workspace'\nenabled = true",
+                "rename the managed profile",
+            ),
+        ] {
+            std::fs::write(&path, format!("[{table}]\n[permissions.network]\n{nested}"))?;
+            let local = load_local_config_layers_with_overrides(
+                &TestFileSystem,
+                &fixture.home,
+                &fixture.cwd,
+                &fixture.overrides,
+            )
+            .await
+            .expect_err("executor-local discovery must reject mixed network requirements");
+            let canonical = load_config_layers_state(
+                &TestFileSystem,
+                &fixture.home,
+                Some(fixture.cwd.clone()),
+                &[],
+                fixture.overrides.clone(),
+                &NoopThreadConfigLoader,
+            )
+            .await
+            .expect_err("startup must reject mixed network requirements");
+            assert_eq!(local.to_string(), canonical.to_string());
+            assert!(local.to_string().contains(message), "{local}");
         }
     }
     Ok(())
@@ -316,6 +409,8 @@ async fn project_cannot_define_or_rebind_credentials_via_permission_profiles() -
     let fixture = Fixture::new()?;
     let trusted = r#"
 [permissions.bridge]
+[permissions.network]
+extends = "bridge"
 [permissions.vault.network.mitm]
 version = 2
 [[permissions.vault.network.mitm.actions.token.inject_request_headers]]
@@ -333,8 +428,10 @@ action = ["token"]
         format!("{}{trusted}", fixture.trust("trusted")),
     )?;
     let managed = r#"
+[permissions.network]
+enabled = true
 [permissions.documents]
-extends = "bridge"
+extends = "network"
 [permissions.documents.network.mitm]
 version = 2
 [permissions.documents.network.mitm.hooks.public]
@@ -362,6 +459,11 @@ action = ["token"]"#,
             r#"[permissions.bridge]
 extends = "vault""#,
             "inheritance of MITM profile bridge",
+        ),
+        (
+            r#"[permissions.network]
+extends = "vault""#,
+            "inheritance of MITM profile network",
         ),
     ] {
         std::fs::write(&project_config, project)?;
@@ -411,6 +513,26 @@ extends = "vault"
     assert_eq!(
         network.denied_domains(),
         Some(vec!["other.example".to_string()])
+    );
+
+    // Old hosts can request the raw catalog and resolve a managed profile named credentials.
+    std::fs::write(
+        fixture.managed.with_file_name("requirements.toml"),
+        managed.replace("permissions.documents", "permissions.credentials"),
+    )?;
+    std::fs::write(&project_config, "[permissions.bridge]\nextends = 'vault'")?;
+    let err = load_local_config_layers_with_overrides(
+        &TestFileSystem,
+        &fixture.home,
+        &fixture.cwd,
+        &fixture.overrides,
+    )
+    .await
+    .expect_err("a project cannot rebind the legacy managed MITM profile's ancestor");
+    assert!(
+        err.to_string()
+            .contains("inheritance of MITM profile bridge"),
+        "{err}"
     );
     Ok(())
 }

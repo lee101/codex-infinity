@@ -40,6 +40,8 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent(
     let model_slug = "remote-catalog-permissions-model";
     let mut model = model_info_from_slug(model_slug);
     model.model_messages = Some(ModelMessages {
+        apps: None,
+        plugins: None,
         content_filter_guidance: None,
         persistent_instructions: None,
         tools: None,
@@ -50,6 +52,7 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent(
             never: None,
             unless_trusted: None,
             granular: None,
+            ..Default::default()
         }),
         collaboration_modes: None,
         auto_review: None,

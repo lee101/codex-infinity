@@ -94,6 +94,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
         catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+        omit_descriptions: false,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         cloud_skill_enabled: config.cloud_skill_enabled,
@@ -936,7 +937,13 @@ async fn thread_disabled_plugins_filter_skills_and_tools_without_changing_shared
             // Saving pending settings must not change the admitted runtime.
             for (server_name, tool, arguments) in &tool_calls {
                 test.codex
-                    .call_mcp_tool(server_name, tool, arguments.clone(), /*meta*/ None)
+                    .call_mcp_tool(
+                        server_name,
+                        /*environment_id*/ None,
+                        tool,
+                        arguments.clone(),
+                        /*meta*/ None,
+                    )
                     .await?;
             }
         }
@@ -1014,7 +1021,13 @@ async fn thread_disabled_plugins_filter_skills_and_tools_without_changing_shared
         for (server_name, tool, arguments) in &tool_calls {
             let result = test
                 .codex
-                .call_mcp_tool(server_name, tool, arguments.clone(), /*meta*/ None)
+                .call_mcp_tool(
+                    server_name,
+                    /*environment_id*/ None,
+                    tool,
+                    arguments.clone(),
+                    /*meta*/ None,
+                )
                 .await;
             assert_eq!(
                 result.is_ok(),
@@ -1597,7 +1610,7 @@ async fn curated_plugin_skills_follow_auth_switch() -> Result<()> {
         let skills_snapshot = test_codex
             .thread_manager
             .skills_service()
-            .snapshot_for_config(&skills_input, /*fs*/ None)
+            .snapshot_for_config(&skills_input, /*repository*/ None)
             .await;
         skills_snapshot
             .outcome()
@@ -1848,10 +1861,12 @@ async fn curated_agent_plugin_app_routing_reaches_turns(apps_enabled: bool) -> R
     Ok(())
 }
 
-#[test_case(true; "enabled app")]
-#[test_case(false; "disabled app")]
+#[test_case("[apps.calendar]\nenabled = true", true; "enabled app")]
+#[test_case("[apps.calendar]\nenabled = false", false; "disabled app")]
+#[test_case("[plugins.\"sample@test\".apps.calendar]\nenabled = false", false; "nested disabled app")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_plugin_mentions_use_apps_for_chatgpt_dual_surface_plugins(
+    app_config: &str,
     app_enabled: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1872,10 +1887,7 @@ async fn explicit_plugin_mentions_use_apps_for_chatgpt_dual_surface_plugins(
     write_plugin_app_plugin(codex_home.as_ref());
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        config_path,
-        format!("{config}\n[apps.calendar]\nenabled = {app_enabled}\n"),
-    )?;
+    std::fs::write(config_path, format!("{config}\n{app_config}\n"))?;
 
     let test_codex =
         build_apps_enabled_plugin_test_codex(&server, codex_home, apps_server.chatgpt_base_url)

@@ -44,6 +44,13 @@ impl From<&Config> for LocalSettings {
 }
 
 impl LocalSettings {
+    pub(crate) fn workspace_enabled(&self, config: &Config) -> bool {
+        self.transcript_mode.is_owned()
+            && config
+                .features
+                .enabled(codex_features::Feature::TuiWorkspace)
+    }
+
     fn with_accessibility_preferences(
         config: &Config,
         system_motion: crate::motion::MotionMode,
@@ -56,6 +63,7 @@ impl LocalSettings {
                 config.tui_alternate_screen != codex_config::types::AltScreenMode::Never,
             ),
             tui: Tui {
+                default_hosts: Default::default(),
                 notification_settings: config.tui_notifications.clone(),
                 animations: config.animations,
                 screen_reader_detection_done: None,
@@ -69,12 +77,15 @@ impl LocalSettings {
                 question_esc_back: config.tui_question_esc_back,
                 raw_output_mode: config.tui_raw_output_mode,
                 fullscreen_transcript: config.tui_fullscreen_transcript,
+                collapse_turn_details: config.tui_collapse_turn_details,
+                sidebar_width_percent: config.tui_sidebar_width_percent,
                 mouse_scroll_speed: config.tui_mouse_scroll_speed,
                 copy_on_select: config.tui_copy_on_select,
                 copy_on_select_clear_selection: config.tui_copy_on_select_clear_selection,
                 right_click_paste: config.tui_right_click_paste,
                 alternate_screen: config.tui_alternate_screen,
                 status_line: config.tui_status_line.clone(),
+                status_line_provider: config.tui_status_line_provider.clone(),
                 status_line_use_colors: config.tui_status_line_use_colors,
                 terminal_title: config.tui_terminal_title.clone(),
                 theme: config.tui_theme.clone(),
@@ -158,6 +169,15 @@ impl LocalSettings {
         system_motion: crate::motion::MotionMode,
         screen_reader_default: crate::motion::MotionMode,
     ) {
+        self.tui.default_hosts = layers
+            .effective_user_config()
+            .and_then(|config| {
+                config
+                    .get("tui")
+                    .and_then(|tui| tui.get("default_hosts"))
+                    .and_then(|value| value.clone().try_into().ok())
+            })
+            .unwrap_or_default();
         if screen_reader_default == crate::motion::MotionMode::Reduced {
             // Consult the current layers so preferences edited after startup still win.
             self.tui.animations &= layers
@@ -251,6 +271,7 @@ impl LocalSettings {
                         | TerminalName::Iterm2
                         | TerminalName::WarpTerminal
                         | TerminalName::WezTerm
+                        | TerminalName::Rex
                         | TerminalName::Alacritty
                         | TerminalName::Konsole
                         | TerminalName::GnomeTerminal

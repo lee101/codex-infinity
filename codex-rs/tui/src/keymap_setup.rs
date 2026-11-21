@@ -62,7 +62,7 @@ use crate::keymap::bindings_for_action;
 use crate::keymap::keymap_action_id;
 use crate::style::accent_color;
 use actions::KEYMAP_ACTIONS;
-use actions::action_label;
+pub(crate) use actions::action_label;
 use actions::binding_slot;
 use actions::format_action_binding_summary;
 #[cfg(test)]
@@ -822,6 +822,7 @@ mod tests {
     fn fast_mode_action_filter() -> KeymapActionFilter {
         KeymapActionFilter {
             fast_mode_enabled: true,
+            ..Default::default()
         }
     }
 
@@ -895,11 +896,16 @@ mod tests {
 
     #[test]
     fn picker_covers_every_replaceable_action() {
-        let runtime = RuntimeKeymap::defaults();
+        let keymap = TuiKeymap::default();
+        let runtime = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
         let params = build_keymap_picker_params_with_filter(
             &runtime,
-            &TuiKeymap::default(),
-            fast_mode_action_filter(),
+            &keymap,
+            KeymapActionFilter {
+                fast_mode_enabled: true,
+                multi_backend_enabled: true,
+                workspace_enabled: true,
+            },
         );
         let all_tab = selection_tab(&params, KEYMAP_ALL_TAB_ID);
 
@@ -1272,13 +1278,21 @@ mod tests {
 
     #[test]
     fn picker_all_tab_items_remain_searchable() {
-        let runtime = RuntimeKeymap::defaults();
-        let params = build_keymap_picker_params(&runtime, &TuiKeymap::default());
+        let keymap = TuiKeymap::default();
+        let runtime = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
+        let params = build_keymap_picker_params_with_filter(
+            &runtime,
+            &keymap,
+            KeymapActionFilter {
+                workspace_enabled: true,
+                ..Default::default()
+            },
+        );
         let all_tab = selection_tab(&params, KEYMAP_ALL_TAB_ID);
         let snapshot = all_tab
             .items
             .iter()
-            .take(12)
+            .take(13)
             .map(|item| {
                 format!(
                     "{} | {} | {}",

@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde::Serialize;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // Local and remote implementations must remain usable through the same handle.
@@ -32,12 +33,25 @@ const _: Option<&dyn AgentMessageBoard> = None;
 /// Implementations enforce hard input/output limits and return backend failures
 /// as errors. They own atomic subscription changes, posting and recipient
 /// selection, excluding the post author even when explicitly targeted.
-/// Notification delivery must neither wake finalized agents nor
-/// leave notifications for a later turn.
+/// Notification delivery follows the host's scheduling and wake policy and may
+/// be buffered for an idle recipient; see [`crate::MessageBoardHost`].
 ///
 /// Boxed Send futures support an Arc<dyn AgentMessageBoard>, like AgentControl.
 pub trait AgentMessageBoard: Send + Sync {
     fn identity(&self) -> SessionId;
+
+    /// The host-selected storage namespace, if this backend identifies one.
+    fn storage_namespace(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return a live handle with literal search inside JSON encoded at this JSON pointer.
+    /// Other handles retain their existing search behavior.
+    fn with_json_search(&self, _pointer: &'static str) -> Result<Arc<dyn AgentMessageBoard>> {
+        Err(CodexErr::UnsupportedOperation(
+            "searching nested JSON on a live message board".into(),
+        ))
+    }
 
     fn create_channel(
         &self,
@@ -75,6 +89,16 @@ pub trait AgentMessageBoard: Send + Sync {
         request: AppendRequest,
     ) -> BoxFuture<'_, Result<PostMetadata>>;
 
+    /// Like a silent append, also returns the subscribers at the moment of insertion.
+    /// An idempotent retry returns the existing post and no new deliveries.
+    fn append_with_subscribers(
+        &self,
+        _caller: ThreadId,
+        _request: AppendRequest,
+    ) -> BoxFuture<'_, Result<(PostMetadata, Vec<ThreadId>)>> {
+        unsupported("appending with subscribers")
+    }
+
     fn list_threads(
         &self,
         caller: ThreadId,
@@ -99,6 +123,16 @@ pub trait AgentMessageBoard: Send + Sync {
         request: ReadPostRequest,
     ) -> BoxFuture<'_, Result<PostContent>>;
 
+    /// Load original post bodies in caller-supplied ID order, bounded to one board page.
+    /// Trusted host consumers can batch evidence reads without reconstructing paged previews.
+    fn read_post_texts_by_id<'a>(
+        &'a self,
+        _caller: ThreadId,
+        _ids: &'a [Uuid],
+    ) -> BoxFuture<'a, Result<Vec<String>>> {
+        unsupported("reading a page of post bodies")
+    }
+
     /// Channel subscriptions concern new roots; thread subscriptions concern
     /// replies. Changing one does not change the other. Any member may change
     /// another member's subscription. Posting subscribes its author to the thread
@@ -108,6 +142,19 @@ pub trait AgentMessageBoard: Send + Sync {
         caller: ThreadId,
         request: SubscriptionRequest,
     ) -> BoxFuture<'_, Result<SubscriptionState>>;
+
+    /// List a caller's current channel subscriptions on a live board.
+    fn subscribed_channels(
+        &self,
+        _caller: ThreadId,
+        _page: PageRequest,
+    ) -> BoxFuture<'_, Result<Page<String>>> {
+        unsupported("listing channel subscriptions")
+    }
+}
+
+fn unsupported<T>(operation: &'static str) -> BoxFuture<'static, Result<T>> {
+    Box::pin(async move { Err(CodexErr::UnsupportedOperation(operation.into())) })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +260,7 @@ pub struct PostRequest {
 pub(crate) enum PostBehavior {
     Discussion,
     SilentAppend,
+    SilentAppendWithSubscribers,
 }
 
 /// Request to append evidence without subscribing its author or notifying anyone.

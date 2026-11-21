@@ -42,7 +42,7 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
-        cwd: Option<AbsolutePathBuf>,
+        cwd: Option<PathBuf>,
     ) -> Result<AppRunControl> {
         if self.reconnect.offline || self.windows_sandbox_blocks_thread_switch() {
             return Ok(AppRunControl::Continue);
@@ -56,16 +56,13 @@ impl App {
                 Box::new(StartupDraftPump::new(
                     tui,
                     StartupDraftInitialScreen::Composer,
-                    StartupDraftSessionAction::NewFromCommandCenter,
+                    StartupDraftSessionAction::NewWhileRunning,
                 ))
             });
-        let mut display_config = self.chat_widget.config_ref().clone();
-        if let Some(cwd) = cwd.as_ref() {
-            display_config.cwd = cwd.clone();
-        }
         draft.apply_settings(
-            &crate::local_settings::LocalSettings::from(&display_config),
-            display_config.cwd.as_path(),
+            &crate::local_settings::LocalSettings::from(self.chat_widget.config_ref()),
+            cwd.as_deref()
+                .unwrap_or(&self.chat_widget.session_cwd().to_path_buf()),
         );
         draft.show(tui)?;
         // Keep the large session-start future off the TUI's stack in dev builds.
@@ -97,7 +94,7 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
-        cwd: Option<AbsolutePathBuf>,
+        cwd: Option<PathBuf>,
         managed_worktree: Option<(
             codex_worktree::WorktreeManager,
             codex_worktree::ManagedWorktree,
@@ -114,9 +111,15 @@ impl App {
             }
             return Ok(AppRunControl::Continue);
         }
-        let Some((config, remote_cwd)) = self
-            .agents_overview_session_config(tui, app_server, cwd, startup_draft.as_deref_mut())
-            .await
+        self.cancel_cloud_inventory_refresh(app_server).await;
+        // Keep folder consent and config loading off the session-start stack frame.
+        let Some((config, remote_cwd)) = Box::pin(self.agents_overview_session_config(
+            tui,
+            app_server,
+            cwd,
+            startup_draft.as_deref_mut(),
+        ))
+        .await
         else {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
@@ -162,6 +165,7 @@ impl App {
                 /*session_start_source*/ None,
                 remote_cwd.as_deref(),
                 selected_profile.as_ref(),
+                self.backend_preference_context.local_cwd.as_deref(),
             )),
         )
         .await;
@@ -200,21 +204,24 @@ impl App {
                 .insert(thread_id, selected.profile_id);
         }
         if let Some((manager, checkout)) = &managed_worktree {
-            let result =
-                if crate::session_resume::cwds_differ(started.session.cwd.as_path(), &checkout.cwd)
-                {
-                    Err(anyhow::anyhow!(
-                        "The server did not apply the worktree directory."
-                    ))
-                } else {
-                    manager.bind_thread(&checkout.root, &thread_id.to_string())
-                };
+            let result = if crate::session_resume::cwds_differ(
+                &started.session.cwd.to_path_buf(),
+                &checkout.cwd,
+            ) {
+                Err(anyhow::anyhow!(
+                    "The server did not apply the worktree directory."
+                ))
+            } else {
+                manager.bind_thread(&checkout.root, &thread_id.to_string())
+            };
             if let Err(error) = result {
                 let _ = app_server.thread_unsubscribe(thread_id).await;
                 self.agents_overview_retained_worktree_error(checkout, /*title*/ None, error);
                 return Ok(AppRunControl::Continue);
             }
         }
+        self.backend_registry
+            .register_started(app_server.backend_id(), &started)?;
         self.agents_overview
             .blank_sessions
             .insert(thread_id, started.clone());
@@ -264,7 +271,12 @@ impl App {
             return;
         }
         let Some((config, _)) = self
-            .agents_overview_session_config(tui, app_server, cwd, /*startup_draft*/ None)
+            .agents_overview_session_config(
+                tui,
+                app_server,
+                cwd.map(Into::into),
+                /*startup_draft*/ None,
+            )
             .await
         else {
             return;

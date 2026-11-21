@@ -13,16 +13,22 @@ use codex_protocol::openai_models::ToolMessage;
 use permissions::ResolvedApprovalMessages;
 use permissions::ResolvedPermissionMessages;
 
+mod apps;
 mod collaboration;
 mod guardian;
 mod incremental_tools;
 mod multi_agent;
 pub(crate) mod permissions;
+mod plugins;
 
+pub use apps::ResolvedAppsInstructions;
 pub use collaboration::ResolvedCollaborationModeMessages;
 pub use guardian::ResolvedAutoReviewMessages;
 pub use incremental_tools::ResolvedIncrementalToolMessages;
 pub use multi_agent::ResolvedMultiAgentMessages;
+pub use plugins::ResolvedGenericPluginMessages;
+pub use plugins::ResolvedPluginRecommendationMessages;
+pub use plugins::ResolvedSelectedPluginMessages;
 
 /// Text together with whether it was supplied by the catalog, even when it equals the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +64,7 @@ const REMINDER_MESSAGE_TEMPLATE: &str = concat!(
 const PERSISTENT_INSTRUCTIONS: &str = include_str!("../templates/persistent_mode.md");
 const CONTENT_FILTER_GUIDANCE: &str = "Your previous response was blocked by a content filter. Do not treat this as a transient failure or try to reproduce or work around the blocked content through repeated attempts, altered formatting, splitting, encoding, tools, subagents, or later wakes. Briefly explain the limitation and offer a permitted alternative. Continue unrelated authorized work.";
 const MAX_CONTENT_FILTER_GUIDANCE_BYTES: usize = 512;
+const DEFAULT_DESCRIPTION_PREFIX_BUDGET_BYTES: usize = 512;
 
 /// Resolves model-owned text from catalog overrides or bundled defaults, one family at a time.
 ///
@@ -88,6 +95,15 @@ impl<'a> ResolvedModelMessages<'a> {
     pub fn instructions_template(&self) -> Option<&'a str> {
         self.catalog_messages
             .and_then(|messages| messages.instructions_template.as_deref())
+    }
+
+    /// Resolves bounded literal Apps wording; callers retain availability and feature gates.
+    pub fn apps_usage_instructions(&self, mcp_server_name: &str) -> ResolvedAppsInstructions {
+        ResolvedAppsInstructions::new(
+            self.catalog_messages
+                .and_then(|messages| messages.apps.as_ref()),
+            mcp_server_name,
+        )
     }
 
     /// Resolves approval messages and their bundled alternatives.
@@ -218,6 +234,39 @@ impl<'a> ResolvedModelMessages<'a> {
             .as_ref()
     }
 
+    /// Bound the selected model's configured prefix text before resolving tool availability.
+    pub fn validate_description_prefix_budget(&self) -> Result<(), String> {
+        let Some(tools) = self
+            .catalog_messages
+            .and_then(|messages| messages.tools.as_ref())
+        else {
+            return Ok(());
+        };
+        let indirect = tools.indirect_description_prefixes.as_ref();
+        let bytes: usize = [
+            tools
+                .functions_namespace_functions_description_prefixes
+                .as_ref(),
+            indirect.and_then(|prefixes| prefixes.namespaces.as_ref()),
+            indirect.and_then(|prefixes| prefixes.builtin_tool_namespaces.as_ref()),
+            indirect.and_then(|prefixes| prefixes.mcp_servers.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|map| map.values())
+        .map(|prefix| prefix.trim().len())
+        .sum();
+        let limit = tools
+            .description_prefix_budget_bytes
+            .unwrap_or(DEFAULT_DESCRIPTION_PREFIX_BUDGET_BYTES);
+        if bytes > limit {
+            return Err(format!(
+                "Model catalog tool description prefixes total {bytes} UTF-8 bytes, exceeding description_prefix_budget_bytes ({limit})"
+            ));
+        }
+        Ok(())
+    }
+
     /// Selects indirect tool guidance; tool rendering owns namespace mapping and normalization.
     pub fn indirect_description_prefixes(&self) -> Option<&'a IndirectDescriptionPrefixes> {
         self.catalog_messages?
@@ -279,3 +328,11 @@ impl<'a> ResolvedModelMessages<'a> {
             .unwrap_or(CONTENT_FILTER_GUIDANCE)
     }
 }
+
+#[cfg(test)]
+#[path = "model_messages/apps_tests.rs"]
+mod apps_tests;
+
+#[cfg(test)]
+#[path = "model_messages/plugins_tests.rs"]
+mod plugins_tests;

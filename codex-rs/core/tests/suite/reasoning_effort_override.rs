@@ -3,6 +3,7 @@
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::ForkSnapshot;
 use codex_core::RecoverTurnRequest;
+use codex_core::RequestCountry;
 use codex_core::StartIfIdleSubmission;
 use codex_core::StartThreadOptions;
 use codex_core::SuspendTurnOutcome;
@@ -193,11 +194,13 @@ async fn prediction_fork_pins_effort_from_parent_with_overrides_disabled(
     )
     .await;
     let mut test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model_info_override("gpt-5.4", |model| {
             model.use_responses_lite = true;
             model.supports_reasoning_effort_updates = true;
             model.default_reasoning_level = Some(ReasoningEffort::Low);
         })
+        .with_request_country(RequestCountry::from_iso_code("US")?)
         .with_config(|config| {
             config
                 .features
@@ -213,6 +216,7 @@ async fn prediction_fork_pins_effort_from_parent_with_overrides_disabled(
         &test.codex,
         ThreadSettingsOverrides {
             effort: Some(parent_effort),
+            request_country: Some(RequestCountry::from_iso_code("DE")?),
             ..Default::default()
         },
     )
@@ -251,6 +255,17 @@ async fn prediction_fork_pins_effort_from_parent_with_overrides_disabled(
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.body_json().get("request_country").cloned())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(Value::from("US")),
+            Some(Value::from("DE")),
+            Some(Value::from("DE"))
+        ]
+    );
     assert_eq!(requests[0].body_json()["reasoning"]["effort"], "high");
     assert_eq!(requests[1].body_json()["reasoning"]["effort"], "low");
     assert!(effort_updates(&requests[1]).is_empty());
@@ -518,6 +533,7 @@ async fn reasoning_effort_override_recovery_sends_latest_tail_update(
                     ..Default::default()
                 },
                 trace: None,
+                prompt_cache_ttl: None,
                 cyber_access_program: None,
             })
             .await?,

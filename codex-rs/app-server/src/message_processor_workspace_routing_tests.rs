@@ -82,6 +82,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
             &auth_manager,
         ))),
         auth_manager,
+        runtime_auth_slot: None,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         code_mode_session_provider: None,
         rpc_transport: AppServerRpcTransport::Stdio,
@@ -140,6 +141,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
     assert_eq!(
         response,
         GetAccountResponse {
+            user_id: None,
             account: api_key.map(|_| codex_app_server_protocol::Account::ApiKey {}),
             requires_openai_auth: true,
             workspace_routing: None,

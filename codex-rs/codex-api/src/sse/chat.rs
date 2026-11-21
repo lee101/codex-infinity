@@ -38,6 +38,7 @@ pub(crate) fn spawn_chat_stream(
         tool_mapping,
     ));
     ResponseStream {
+        routing_affinity: None,
         rx_event,
         upstream_request_id,
         interrupt: None,
@@ -229,6 +230,7 @@ pub(crate) async fn process_chat_sse<S>(
             token_usage: None,
             end_turn: None,
             usage_metadata: None,
+            reasoning_removals: None,
         }))
         .await;
 }

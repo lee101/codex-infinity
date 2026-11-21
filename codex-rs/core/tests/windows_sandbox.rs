@@ -7,6 +7,9 @@
 #![cfg(target_os = "windows")]
 #![allow(clippy::expect_used)]
 
+#[path = "windows_sandbox/repository_skills_tests.rs"]
+mod repository_skills_tests;
+
 use anyhow::Context;
 use codex_config::types::ApprovalsReviewer;
 use codex_core::TurnInputRequest;
@@ -35,11 +38,11 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::user_input::UserInput;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxDirectSpawnTransformRequest;
+use codex_sandboxing::SandboxExecutables;
 use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxSelection;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::WindowsSandboxProxySettingsMode;
 use codex_utils_path_uri::PathUri;
 use codex_windows_sandbox_test_support::WindowsSandboxAccountTestGuard;
 use core_test_support::PathExt;
@@ -51,8 +54,6 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use serial_test::serial;
@@ -500,31 +501,28 @@ async fn windows_elevated_temp_only_core_and_direct_spawn_enforce_carveouts() ->
         let command = format!("echo CHILD-TEMP:{child_var} & {command}");
         let (exit_code, stdout, stderr) = if direct_spawn {
             let cwd_uri = PathUri::from_abs_path(&cwd);
-            let request = SandboxManager::new().transform_for_direct_spawn(
-                SandboxDirectSpawnTransformRequest {
-                    workspace_roots: std::slice::from_ref(&cwd),
-                    windows_sandbox_proxy_settings_mode: WindowsSandboxProxySettingsMode::Preserve,
-                    transform: SandboxTransformRequest {
-                        command: SandboxCommand {
-                            program: "cmd.exe".into(),
-                            args: vec!["/D".into(), "/C".into(), command],
-                            cwd: cwd_uri.clone(),
-                            env,
-                            managed_network: None,
-                            additional_permissions: None,
-                        },
-                        permissions: &permission_profile,
-                        sandbox: SandboxType::WindowsRestrictedToken,
-                        enforce_managed_network: false,
-                        environment_id: None,
-                        network: None,
-                        sandbox_policy_cwd: &cwd_uri,
-                        sandbox_exe: Some(codex.as_path()),
-                        use_legacy_landlock: false,
-                        windows_sandbox_level: WindowsSandboxLevel::Elevated,
+            // Exec-server spawns the Windows sandbox wrapper returned by transform for filesystem
+            // helpers. Use cmd.exe as the inner command to probe file access through that wrapper.
+            let request = SandboxManager::for_file_system_helpers()
+                .transform(SandboxTransformRequest {
+                    command: SandboxCommand {
+                        program: "cmd.exe".into(),
+                        args: vec!["/D".into(), "/C".into(), command],
+                        cwd: cwd_uri.clone(),
+                        env,
+                        managed_network: None,
+                        additional_permissions: None,
                     },
-                },
-            )?;
+                    permissions: &permission_profile,
+                    workspace_roots: Some(std::slice::from_ref(&cwd_uri)),
+                    selection: SandboxSelection::Explicit(SandboxType::WindowsRestrictedToken),
+                    network: Default::default(),
+                    sandbox_policy_cwd: &cwd_uri,
+                    executables: SandboxExecutables::Launcher(Some(codex.as_path())),
+                    use_legacy_landlock: false,
+                    windows_sandbox_level: WindowsSandboxLevel::Elevated,
+                })?
+                .into_command_request()?;
             let output = Command::new(&request.command[0])
                 .args(&request.command[1..])
                 .current_dir(request.cwd.to_abs_path()?)
@@ -1269,6 +1267,7 @@ async fn windows_elevated_unified_exec_enforces_large_recursive_deny_reads() -> 
 #[serial(codex_home)]
 async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Result<()> {
     use EventMsg::ExecApprovalRequest;
+    use EventMsg::ExecCommandBegin;
     use EventMsg::ExecCommandEnd;
     use EventMsg::TurnComplete;
 
@@ -1351,6 +1350,19 @@ async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Res
     let bundle_path = bundle.to_str().context("UTF-8 bundle path")?;
     git(upstream, &["bundle", "create", bundle_path, "--all"])?;
 
+    // Provision the sandbox before starting the turn. Otherwise a setup/launch failure
+    // is delivered to the mock model as a tool result without any process to wait for.
+    let config = &harness.test().config;
+    eprintln!("approved Git pull: provisioning the elevated sandbox");
+    codex_core::windows_sandbox::prepare_elevated_sandbox(
+        &config.permissions.effective_permission_profile(),
+        &config.workspace_roots,
+        cwd,
+        &std::env::vars().collect(),
+        codex_home.path(),
+    )
+    .context("provision elevated sandbox for the approved Git pull")?;
+
     let args = json!({"cmd": concat!(
         "git pull --quiet --ff-only .\\upstream.bundle main || exit /b 10 & ",
         "type tracked.txt >NUL || exit /b 11 & ",
@@ -1362,7 +1374,7 @@ async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Res
         "yield_time_ms": 30_000, "tty": false, "login": false,
     });
     let call_id = "git-pull";
-    core_test_support::responses::mount_function_call_agent_response(
+    let mocks = core_test_support::responses::mount_function_call_agent_response(
         harness.server(),
         call_id,
         &args.to_string(),
@@ -1376,13 +1388,33 @@ async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Res
             text_elements: Vec::new(),
         }]))
         .await?;
-    let approval = wait_for_event(codex, |event| {
-        matches!(event, ExecApprovalRequest(_) | TurnComplete(_))
+    let tool_output = || mocks.completion.function_call_output_text(call_id);
+    // Account-lock contention before the turn counts against nextest's timeout. Report
+    // phase changes as they happen so the last one is visible even on a runner kill.
+    eprintln!("approved Git pull: waiting for the approval request");
+    let event_budget = Duration::from_secs(120);
+    let approval = tokio::time::timeout(event_budget, async {
+        loop {
+            match codex.next_event().await?.msg {
+                ExecApprovalRequest(request) => return anyhow::Ok(request),
+                event @ (TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::Error(_)) => {
+                    anyhow::bail!(
+                        "no Git approval before {event:?}; tool output: {:?}",
+                        tool_output()
+                    );
+                }
+                _ => {}
+            }
+        }
     })
-    .await;
-    let ExecApprovalRequest(approval) = approval else {
-        anyhow::bail!("expected approval before git ran: {approval:?}");
-    };
+    .await
+    .with_context(|| {
+        format!(
+            "waiting for Git approval; model requests: {}; tool output: {:?}",
+            mocks.function_call.requests().len(),
+            tool_output(),
+        )
+    })??;
     assert_eq!(approval.call_id, call_id);
     assert!(!fetch_head.exists());
     assert!(!cwd.join("git-and-denials-ok.txt").exists());
@@ -1390,16 +1422,52 @@ async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Res
     codex
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
-            turn_id: None,
+            turn_id: Some(approval.turn_id),
             decision: ReviewDecision::Approved,
         })
         .await?;
+    eprintln!("approved Git pull: approval submitted, waiting for the process");
     let mut process_end = None;
     let mut turn_completed = false;
+    let mut process_started = false;
+    // The approved launch can refresh Windows ACLs before it emits ExecCommandBegin.
+    let startup_budget = Duration::from_secs(300);
+    let mut deadline = tokio::time::Instant::now() + startup_budget;
     while process_end.is_none() || !turn_completed {
-        match wait_for_event_with_timeout(codex, |_| true, Duration::from_secs(120)).await {
-            ExecCommandEnd(event) if event.call_id == call_id => process_end = Some(event),
-            TurnComplete(_) => turn_completed = true,
+        let event = tokio::time::timeout_at(deadline, codex.next_event())
+            .await
+            .with_context(|| format!(
+                "waiting after Git approval: started={process_started}, exited={}, turn completed={turn_completed}; tool output: {:?}",
+                process_end.is_some(), tool_output(),
+            ))??;
+        match event.msg {
+            ExecCommandBegin(event) if event.call_id == call_id && !process_started => {
+                eprintln!("approved Git pull: process started");
+                process_started = true;
+                deadline = tokio::time::Instant::now() + event_budget;
+            }
+            ExecCommandEnd(event) if event.call_id == call_id => {
+                eprintln!("approved Git pull: process exited with {}", event.exit_code);
+                process_end = Some(event);
+            }
+            TurnComplete(turn) => {
+                anyhow::ensure!(turn.error.is_none(), "Git turn failed: {:?}", turn.error);
+                // A yielded process may finish after the turn. A launch failure cannot:
+                // no command started, so its ExecCommandEnd would never arrive.
+                anyhow::ensure!(
+                    process_started || process_end.is_some(),
+                    "Git did not launch after approval; tool output: {:?}",
+                    tool_output(),
+                );
+                eprintln!("approved Git pull: turn completed");
+                turn_completed = true;
+            }
+            event @ (EventMsg::TurnAborted(_) | EventMsg::Error(_)) => {
+                anyhow::bail!(
+                    "approved Git turn failed: {event:?}; tool output: {:?}",
+                    tool_output()
+                )
+            }
             ExecApprovalRequest(request) => {
                 anyhow::bail!("unexpected additional Git approval: {request:?}")
             }

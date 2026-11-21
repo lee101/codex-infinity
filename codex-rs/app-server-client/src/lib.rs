@@ -21,18 +21,24 @@
 //! unread notifications cannot prevent request responses from being delivered.
 
 mod cloud;
+pub mod cloud_backend;
+pub use codex_cloud_client::EnvironmentSelection;
+pub use codex_cloud_client::ProjectEnvironment;
+pub use codex_cloud_client::SavedEnvironment;
 mod path;
-mod remote;
-mod remote_websocket;
+use codex_app_server_remote_client as remote;
+mod remote_addr;
+pub use cloud::CLOUD_RECOVERY_NETWORK_BLOCKED;
 pub use cloud::CloudClient;
 pub use cloud::CloudCommand;
 pub use cloud::CloudOperation;
+pub use cloud::CloudRecoveryRelease;
 pub use cloud::CloudRequestHandle;
+pub use cloud::CloudUserMessageReceipt;
+pub use cloud_backend::CloudRecoverySignInChanged;
 mod server_request;
 pub use server_request::AppServerReplyHandle;
 
-use std::error::Error;
-use std::fmt;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
@@ -46,6 +52,8 @@ pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
 pub use codex_app_server::in_process::StateDbHandle;
+pub use codex_app_server::in_process::ThreadPermissions;
+use codex_app_server::in_process::ThreadPermissionsReader;
 pub use codex_app_server::verified_local_daemon_socket;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
@@ -56,7 +64,6 @@ use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
-use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -67,6 +74,7 @@ pub use codex_core::otel_init::build_provider as build_otel_provider;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::ExecServerRuntimeOptions;
 use codex_feedback::CodexFeedback;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
@@ -80,6 +88,8 @@ pub use crate::path::AppServerPath;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
+pub use crate::remote_addr::resolve_remote_addr;
+pub use crate::remote_addr::resolve_remote_endpoint;
 
 /// Transitional access to core-only embedded app-server types.
 ///
@@ -107,113 +117,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Covers the embedded drain, its analytics flush, and final task join.
 const IN_PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Raw app-server request result for typed in-process requests.
-///
-/// Even on the in-process path, successful responses still travel back through
-/// the same JSON-RPC result envelope used by socket/stdio transports because
-/// `MessageProcessor` continues to produce that shape internally.
-pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
-
-#[derive(Debug, Clone)]
-pub enum AppServerEvent {
-    Lagged { skipped: usize },
-    ServerNotification(Box<ServerNotification>),
-    ServerRequest(Box<ServerRequest>),
-    Disconnected { message: String },
-}
-
-impl From<InProcessServerEvent> for AppServerEvent {
-    fn from(value: InProcessServerEvent) -> Self {
-        match value {
-            InProcessServerEvent::Lagged { skipped } => Self::Lagged { skipped },
-            InProcessServerEvent::ServerNotification(notification) => {
-                Self::ServerNotification(notification)
-            }
-            InProcessServerEvent::ServerRequest(request) => Self::ServerRequest(request),
-        }
-    }
-}
-
-/// Layered error for [`InProcessAppServerClient::request_typed`].
-///
-/// This keeps transport failures, server-side JSON-RPC failures, and response
-/// decode failures distinct so callers can decide whether to retry, surface a
-/// server error, or treat the response as an internal request/response mismatch.
-#[derive(Debug)]
-pub enum TypedRequestError {
-    Transport {
-        method: String,
-        source: IoError,
-    },
-    Server {
-        method: String,
-        source: JSONRPCErrorError,
-    },
-    Deserialize {
-        method: String,
-        source: serde_json::Error,
-    },
-}
-
-impl fmt::Display for TypedRequestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport { method, source } => {
-                write!(f, "{method} transport error: {source}")
-            }
-            Self::Server { method, source } => {
-                write!(
-                    f,
-                    "{method} failed: {} (code {})",
-                    source.message, source.code
-                )?;
-                if let Some(data) = source.data.as_ref() {
-                    write!(f, ", data: {data}")?;
-                }
-                Ok(())
-            }
-            Self::Deserialize { method, source } => {
-                write!(f, "{method} response decode error: {source}")
-            }
-        }
-    }
-}
-
-impl Error for TypedRequestError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Transport { source, .. } => Some(source),
-            Self::Server { .. } => None,
-            Self::Deserialize { source, .. } => Some(source),
-        }
-    }
-}
-
-// Await transport in a separate statement before calling this: dropping the
-// completed future must precede any caller-provided Deserialize implementation.
-fn decode_typed_response<T>(
-    method: &str,
-    response: IoResult<RequestResult>,
-) -> Result<T, TypedRequestError>
-where
-    T: DeserializeOwned,
-{
-    let response = response.map_err(|source| TypedRequestError::Transport {
-        method: method.to_string(),
-        source,
-    })?;
-    let result = response.map_err(|source| TypedRequestError::Server {
-        method: method.to_string(),
-        source,
-    })?;
-    serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
-        method: method.to_string(),
-        source,
-    })
-}
+pub use codex_app_server_remote_client::AppServerEvent;
+pub use codex_app_server_remote_client::RequestResult;
+pub use codex_app_server_remote_client::TypedRequestError;
+use codex_app_server_remote_client::decode_typed_response;
 
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
+    /// This client collects fresh human decisions for managed command checkpoints.
+    pub required_human_approval: bool,
     /// Resolved argv0 dispatch paths used by command execution internals.
     pub arg0_paths: Arg0DispatchPaths,
     /// Shared config used to initialize app-server runtime.
@@ -260,6 +172,7 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            required_human_approval: self.required_human_approval,
             explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
@@ -347,6 +260,7 @@ enum ClientCommand {
 /// boundary.
 pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
+    thread_permissions_reader: ThreadPermissionsReader,
     event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
 }
@@ -361,6 +275,17 @@ pub enum AppServerRequestHandle {
     Cloud(CloudRequestHandle),
     InProcess(InProcessAppServerRequestHandle),
     Remote(crate::remote::RemoteAppServerRequestHandle),
+}
+
+impl AppServerRequestHandle {
+    /// Operating system reported by the app-server that serves these requests.
+    pub fn platform_os(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::OS),
+            Self::Remote(client) => client.platform_os.as_deref(),
+            Self::Cloud(_) => None,
+        }
+    }
 }
 
 pub enum AppServerClient {
@@ -379,6 +304,7 @@ impl InProcessAppServerClient {
         let mut handle =
             codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
         let request_sender = handle.sender();
+        let thread_permissions_reader = handle.thread_permissions_reader();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
         // deadlock a foreground request whose response is behind unread notifications.
@@ -398,13 +324,15 @@ impl InProcessAppServerClient {
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    // Device ceremonies belong to the waiting UI. Preserve
-                                    // its cancellation through this buffering task.
+                                    // Dropping the UI's request must drop the detached runtime
+                                    // future too: its drop guard cancels verification and search.
                                     let cancellable = matches!(*request,
                                         ClientRequest::UserVerificationStatus { .. }
                                         | ClientRequest::UserVerificationEnroll { .. }
                                         | ClientRequest::UserVerificationDelete { .. }
-                                        | ClientRequest::UserVerificationVerify { .. });
+                                        | ClientRequest::UserVerificationVerify { .. }
+                                        | ClientRequest::ThreadSearch { .. }
+                                        | ClientRequest::ThreadSearchStream { .. });
                                     let mut response_tx = response_tx;
                                     tokio::select! {
                                         _ = response_tx.closed(), if cancellable => {}
@@ -483,6 +411,7 @@ impl InProcessAppServerClient {
 
         Ok(Self {
             command_tx,
+            thread_permissions_reader,
             event_rx,
             worker_handle,
         })
@@ -492,6 +421,11 @@ impl InProcessAppServerClient {
         InProcessAppServerRequestHandle {
             command_tx: self.command_tx.clone(),
         }
+    }
+
+    /// Reads effective permissions for a thread loaded in this embedded server.
+    pub async fn thread_permissions(&self, thread_id: ThreadId) -> IoResult<ThreadPermissions> {
+        self.thread_permissions_reader.read(thread_id).await
     }
 
     /// Sends a typed client request and returns raw JSON-RPC result.
@@ -597,6 +531,7 @@ impl InProcessAppServerClient {
     pub async fn shutdown(self) -> IoResult<()> {
         let Self {
             command_tx,
+            thread_permissions_reader: _,
             event_rx,
             worker_handle,
         } = self;
@@ -715,6 +650,27 @@ impl InProcessAppServerRequestHandle {
 }
 
 impl AppServerRequestHandle {
+    /// Starts a native Cloud thread with a saved config or a default project checkout.
+    pub async fn start_cloud_thread_with_environment(
+        &self,
+        request_id: RequestId,
+        params: codex_app_server_protocol::ThreadStartParams,
+        environment: codex_cloud_client::EnvironmentSelection,
+    ) -> Result<codex_app_server_protocol::ThreadStartResponse, TypedRequestError> {
+        let response = match self {
+            Self::Cloud(handle) => {
+                handle
+                    .start_thread_with_environment(request_id, params, environment)
+                    .await
+            }
+            Self::InProcess(_) | Self::Remote(_) => Err(IoError::new(
+                std::io::ErrorKind::Unsupported,
+                "Selecting an environment requires the native Cloud transport.",
+            )),
+        };
+        decode_typed_response("thread/start", response)
+    }
+
     pub(crate) async fn resolve_server_request(
         &self,
         request_id: RequestId,
@@ -956,6 +912,7 @@ mod tests {
             .await
             .expect("state db should initialize for in-process test");
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            required_human_approval: false,
             arg0_paths: Arg0DispatchPaths::default(),
             config,
             cli_overrides: Vec::new(),
@@ -1147,6 +1104,7 @@ mod tests {
                 "thread".to_string(),
                 "turn".to_string(),
                 codex_app_server_protocol::ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "item".to_string(),
                     text: text.to_string(),
                     phase: None,
@@ -1179,6 +1137,7 @@ mod tests {
 
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: None,
@@ -1476,6 +1435,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1532,6 +1492,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1543,6 +1504,7 @@ mod tests {
             websocket.close(None).await.expect("close should succeed");
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
@@ -1609,6 +1571,7 @@ mod tests {
         assert_eq!(
             response,
             GetAccountResponse {
+                user_id: None,
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
@@ -1630,6 +1593,7 @@ mod tests {
         )
         .await;
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: Some(auth_token),
@@ -1650,6 +1614,7 @@ mod tests {
     #[tokio::test]
     async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
         let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: "ws://example.com:4500".to_string(),
                 auth_token: Some("remote-bearer-token".to_string()),
@@ -1713,6 +1678,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1767,6 +1733,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                user_id: None,
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
@@ -1785,6 +1752,7 @@ mod tests {
                 serde_json::from_value(
                     serde_json::to_value(ServerNotification::AccountUpdated(
                         AccountUpdatedNotification {
+                            reason: None,
                             auth_mode: None,
                             plan_type: None,
                         },
@@ -2152,6 +2120,7 @@ mod tests {
 
         let mut client = InProcessAppServerClient {
             command_tx,
+            thread_permissions_reader: ThreadPermissionsReader::default(),
             event_rx,
             worker_handle,
         };
@@ -2185,6 +2154,7 @@ mod tests {
         );
 
         let runtime_args = InProcessClientStartArgs {
+            required_human_approval: false,
             arg0_paths: Arg0DispatchPaths::default(),
             config: config.clone(),
             cli_overrides: Vec::new(),
@@ -2259,6 +2229,7 @@ mod tests {
         });
         let client = InProcessAppServerClient {
             command_tx,
+            thread_permissions_reader: ThreadPermissionsReader::default(),
             event_rx,
             worker_handle,
         };

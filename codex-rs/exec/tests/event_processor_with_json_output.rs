@@ -312,6 +312,7 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "message-1".to_string(),
                 text: "hello".to_string(),
                 phase: None,
@@ -561,6 +562,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "server_a".to_string(),
+                environment_id: None,
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: json!({ "key": "value" }),
@@ -583,6 +585,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "server_a".to_string(),
+                environment_id: None,
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: json!({ "key": "value" }),
@@ -659,6 +662,7 @@ fn mcp_tool_call_failure_sets_failed_status() {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-2".to_string(),
                 server: "server_b".to_string(),
+                environment_id: None,
                 tool: "tool_y".to_string(),
                 status: ApiMcpToolCallStatus::Failed,
                 arguments: json!({ "param": 42 }),
@@ -712,6 +716,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-3".to_string(),
                 server: "server_c".to_string(),
+                environment_id: None,
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: serde_json::Value::Null,
@@ -734,6 +739,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
             ThreadItemPayload::McpToolCall {
                 id: "mcp-3".to_string(),
                 server: "server_c".to_string(),
+                environment_id: None,
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: serde_json::Value::Null,
@@ -1014,6 +1020,7 @@ fn agent_message_item_updates_final_message() {
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-1".to_string(),
                 text: "hello".to_string(),
                 phase: None,
@@ -1052,6 +1059,7 @@ fn agent_message_item_started_is_ignored() {
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-1".to_string(),
                 text: "hello".to_string(),
                 phase: None,
@@ -1408,6 +1416,7 @@ fn turn_completion_recovers_final_message_from_turn_items() {
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
@@ -1545,6 +1554,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-stale".to_string(),
                 text: "stale answer".to_string(),
                 phase: None,
@@ -1565,6 +1575,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
@@ -1601,6 +1612,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-streamed".to_string(),
                 text: "streamed answer".to_string(),
                 phase: None,
@@ -1651,6 +1663,7 @@ fn failed_turn_clears_stale_final_message() {
             "thread-1".to_string(),
             "turn-1".to_string(),
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-1".to_string(),
                 text: "partial answer".to_string(),
                 phase: None,

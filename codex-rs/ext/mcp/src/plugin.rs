@@ -301,11 +301,14 @@ impl McpServerContributor<Config> for PluginContributor {
                             identity: entry.id.clone(),
                             enabled: entry.is_enabled(&configured),
                             mcp: Box::pin(async move {
-                                let metadata = discovery::v2_metadata_from_catalog(&captured)
-                                    .into_iter()
-                                    .find(|(id, _)| id == &root_id)
-                                    .map(|(_, metadata)| metadata)
-                                    .unwrap_or_default();
+                                let metadata = discovery::v2_metadata_from_catalog(
+                                    &captured,
+                                    &context.config().features,
+                                )
+                                .into_iter()
+                                .find(|(id, _)| id == &root_id)
+                                .map(|(_, metadata)| metadata)
+                                .unwrap_or_default();
                                 let contribution = SelectedPluginContribution {
                                     plugin_display_name: metadata.plugin_display_name,
                                     source_environment_id: environment_id,
@@ -343,7 +346,10 @@ impl McpServerContributor<Config> for PluginContributor {
                         &root.selected_root.location;
                     // Ownership survives capability parse failures; an unresolved root cannot
                     // bypass a denying policy.
-                    if !plugins_config.allows_plugin(&root.selected_root.id)
+                    if (!plugins_config.allows_plugin(&root.selected_root.id)
+                        || context
+                            .disabled_plugin_ids()
+                            .contains(&root.selected_root.id))
                         && discovery.error.is_none()
                         && !matches!(
                             self.ownership_for_root(
@@ -389,7 +395,9 @@ impl McpServerContributor<Config> for PluginContributor {
                 }
             } else {
                 for selected_root in selected_roots {
-                    if !plugins_config.allows_plugin(&selected_root.id) {
+                    if !plugins_config.allows_plugin(&selected_root.id)
+                        || context.disabled_plugin_ids().contains(&selected_root.id)
+                    {
                         if !matches!(
                             self.ownership_for_root(
                                 &state,

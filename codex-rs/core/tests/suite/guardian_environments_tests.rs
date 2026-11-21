@@ -3,8 +3,12 @@
 use super::*;
 use codex_core::context::UserGoalUpdate;
 use codex_history::RolloutItem;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::TurnEnvironmentRequests;
+use codex_utils_cargo_bin::cargo_bin;
+use codex_utils_path_uri::PathUri;
+use core_test_support::exec_server::ExecServerProcess;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
@@ -16,9 +20,129 @@ use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_mcp_approval_uses_the_server_owners_denied_paths() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let workspace = TempDir::new()?;
+    let owner_temp = TempDir::new()?;
+    let denied = PathUri::from_abs_path(&owner_temp.path().abs().canonicalize()?)
+        .inferred_native_path_string();
+    // Give the remote executor its own temp directory on both Unix and Windows.
+    let executor = ExecServerProcess::start_with_env(&[
+        ("TMPDIR", &denied),
+        ("TEMP", &denied),
+        ("TMP", &denied),
+    ])
+    .await?;
+    let mcp_servers = serde_json::from_value(json!({
+        "files": {
+            "command": cargo_bin("test_stdio_server")?,
+            "cwd": workspace.path(),
+            "environment_id": REMOTE_ENVIRONMENT_ID,
+            "default_tools_approval_mode": "prompt",
+        }
+    }))?;
+    let test = test_codex()
+        .with_exec_server_url(executor.websocket_url.clone())
+        .with_config(move |config| {
+            // This test reviews the denied paths without reading project documents under them.
+            config.project_doc_max_bytes = 0;
+            config.mcp_servers.set(mcp_servers).expect("set MCP server");
+            config.mcp_optional_startup_grace = Duration::ZERO;
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config
+                .features
+                .disable(Feature::GuardianV2)
+                .expect("use synchronous Guardian");
+        })
+        .build_with_remote_and_local_env(&server)
+        .await?;
+
+    let primary = local(workspace.path().abs());
+    let mut owner = primary.clone();
+    owner.environment_id = REMOTE_ENVIRONMENT_ID.to_string();
+    let mut owner_config = environment_config_for_selection(&test.config, &owner);
+    owner.config = EnvironmentConfigState::Ready(owner_config.clone());
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            environments: Some(TurnEnvironmentRequests::new(
+                test.config.cwd.clone(),
+                vec![primary.into_request(), owner.clone().into_request()],
+            )),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (parent, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(gate),
+        body: sse(vec![
+            ev_function_call_with_namespace("call", "mcp__files", "echo", r#"{"message":"hi"}"#),
+            ev_completed("parent"),
+        ]),
+    }]])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/v1/responses", parent.uri())),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("review", r#"{"outcome":"deny"}"#),
+                ev_completed("review"),
+            ]),
+            sse(vec![ev_completed("done")]),
+        ],
+    )
+    .await;
+    let mut policy = FileSystemSandboxPolicy::read_only();
+    policy.entries.push(FileSystemSandboxEntry::new(
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::Tmpdir,
+        },
+        FileSystemAccessMode::Deny,
+    ));
+    owner_config.permission_profile = PermissionProfileSnapshot::legacy(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+    );
+    // The step didn't see the deny rule. MCP receives it before preparing the call.
+    tokio::try_join!(test.submit_text_turn("Call the files tool."), async {
+        parent.wait_for_request_count(/*count*/ 1).await;
+        test.codex.environment_ready(&owner, owner_config).await?;
+        release.send(()).expect("let the model call the tool");
+        Ok(())
+    })?;
+    let review = responses
+        .requests()
+        .into_iter()
+        .find(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .context("expected a Guardian review")?;
+    let owner_label = format!("permission profile for environment {REMOTE_ENVIRONMENT_ID:?}");
+    let permissions = review
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.contains(&owner_label))
+        .context("expected the MCP server owner's permission rules")?;
+    assert!(permissions.contains(&denied), "{permissions}");
+    Ok(())
+}
+
 #[test_case("exec_command")]
 #[test_case("apply_patch")]
 #[test_case("request_permissions")]
+#[test_case("mcp_tool_call"; "mcp_owner_does_not_reuse_primary_score")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -32,7 +156,7 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
     attach.send(()).expect("attach secondary executor");
 
     let server = start_mock_server().await;
-    let test = test_codex()
+    let mut builder = test_codex()
         .with_pre_build_hook(|home| {
             std::fs::write(
                 home.join("config.toml"),
@@ -60,9 +184,23 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
                 .features
                 .disable(Feature::DeferredExecutor)
                 .expect("disable deferred executor");
-        })
-        .build_with_auto_env(&server)
-        .await?;
+        });
+    let test = if tool == "mcp_tool_call" {
+        // The MCP server runs on the host, not on the mock executor.
+        let servers = serde_json::from_value(json!({
+            "files": {
+                "command": cargo_bin("test_stdio_server")?,
+                "environment_id": LOCAL_ENVIRONMENT_ID,
+                "default_tools_approval_mode": "prompt",
+            }
+        }))?;
+        builder
+            .with_config(move |config| config.mcp_servers.set(servers).expect("set MCP server"))
+            .build(&server)
+            .await?
+    } else {
+        builder.build_with_auto_env(&server).await?
+    };
     let manager = test.thread_manager.environment_manager();
     let secondary_id = "guardian-secondary";
     manager.upsert_environment(
@@ -97,8 +235,13 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
     secondary.config = EnvironmentConfigState::Ready(secondary_config);
 
     let targets = [secondary_id, primary.environment_id.as_str()];
+    let tools = if tool == "mcp_tool_call" {
+        ["exec_command", tool]
+    } else {
+        [tool; 2]
+    };
     let mut events = Vec::new();
-    for (index, environment_id) in targets.iter().enumerate() {
+    for (index, (environment_id, tool)) in targets.iter().zip(tools).enumerate() {
         let call_id = format!("action-{index}");
         let action = match tool {
             "exec_command" => ev_function_call(
@@ -127,6 +270,12 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
                     "reason": "Review the target environment.",
                 })
                 .to_string(),
+            ),
+            "mcp_tool_call" => ev_function_call_with_namespace(
+                &call_id,
+                "mcp__files",
+                "echo",
+                r#"{"message":"hi"}"#,
             ),
             _ => unreachable!(),
         };
@@ -195,6 +344,11 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
     }
     let responses =
         mount_sse_sequence(&server, events.into_iter().skip(1).step_by(2).collect()).await;
+    let mut environments = vec![primary.clone().into_request(), secondary.into_request()];
+    if tool == "mcp_tool_call" {
+        // The primary produced the low score; the MCP server belongs to the other computer.
+        environments.reverse();
+    }
     test.codex.ensure_rollout_materialized().await;
     test.codex
         .start_or_steer_turn(
@@ -205,7 +359,7 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
             .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(TurnEnvironmentRequests::new(
                     test.config.cwd.clone(),
-                    vec![primary.clone().into_request(), secondary.into_request()],
+                    environments,
                 )),
                 ..Default::default()
             }),
@@ -227,7 +381,7 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
     .await??;
     advance
         .send(())
-        .expect("start action on the primary computer");
+        .expect("start action on the other computer");
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -239,7 +393,7 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
         .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .collect::<Vec<_>>();
     assert_eq!(reviews.len(), targets.len());
-    for (review, environment_id) in reviews.iter().zip(targets) {
+    for ((review, environment_id), tool) in reviews.iter().zip(targets).zip(tools) {
         let groups = review.message_input_text_groups("user");
         let latest = groups.last().context("current review input")?;
         assert_eq!(
@@ -266,10 +420,12 @@ async fn guardian_reviews_target_environment_and_reuses_prefix(tool: &str) -> Re
             .iter()
             .find_map(|text| serde_json::from_str::<Value>(text).ok())
             .context("planned action JSON")?;
-        assert_eq!(
-            (&action["tool"], &action["environment_id"]),
-            (&json!(tool), &json!(environment_id))
-        );
+        assert_eq!(action["tool"], json!(tool));
+        if tool == "mcp_tool_call" {
+            assert_eq!(action["server"], json!("files"));
+        } else {
+            assert_eq!(action["environment_id"], json!(environment_id));
+        }
     }
     assert_eq!(
         reviews[0].body_json()["client_metadata"]["thread_id"],
@@ -350,6 +506,7 @@ async fn guardian_reviews_with_offline_primary_executor() -> Result<()> {
             catalog_deltas_enabled: config
                 .features
                 .enabled(codex_features::Feature::SkillCatalogDeltas),
+            omit_descriptions: false,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,

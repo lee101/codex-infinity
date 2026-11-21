@@ -24,9 +24,6 @@ pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<Thread
         ServerRequest::DynamicToolCall { params, .. } => {
             ThreadId::from_string(&params.thread_id).ok()
         }
-        ServerRequest::CurrentTimeRead { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
-        }
         ServerRequest::ChatgptAuthTokensRefresh { .. }
         | ServerRequest::AttestationGenerate { .. }
         | ServerRequest::ApplyPatchApproval { .. }
@@ -185,6 +182,9 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::AuthRecoveryCompleted(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadReadStateChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::McpServerOauthLoginCompleted(notification) => {
@@ -202,7 +202,7 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ProjectChanged(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::AccountUpdated(_)
-        | ServerNotification::ThreadReadStateChanged(_)
+        | ServerNotification::ThreadSectionChanged(_)
         | ServerNotification::GatewayOAuthChanged(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
@@ -213,6 +213,7 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::ExternalAgentConfigImportCompleted(_)
         | ServerNotification::DeprecationNotice(_)
         | ServerNotification::ConfigWarning(_)
+        | ServerNotification::ThreadSearchPartial(_)
         | ServerNotification::FuzzyFileSearchSessionUpdated(_)
         | ServerNotification::FuzzyFileSearchSessionCompleted(_)
         | ServerNotification::CommandExecOutputDelta(_)
@@ -259,7 +260,8 @@ mod tests {
     fn test_thread_settings() -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
-            cwd: test_path_buf("/tmp/thread-settings").abs(),
+            environments: None,
+            cwd: test_path_buf("/tmp/thread-settings").abs().into(),
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
@@ -327,6 +329,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let notification =
             ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
+                environment_id: None,
                 thread_id: Some(thread_id.to_string()),
                 name: "sentry".to_string(),
                 status: McpServerStartupState::Failed,
@@ -343,6 +346,7 @@ mod tests {
     fn mcp_startup_notifications_without_threads_are_app_scoped() {
         let notification =
             ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
+                environment_id: None,
                 thread_id: None,
                 name: "sentry".to_string(),
                 status: McpServerStartupState::Failed,

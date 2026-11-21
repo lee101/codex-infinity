@@ -105,6 +105,7 @@ fn command_execution_event_serializes_expected_shape() {
             model_slug: None,
             reasoning_effort: None,
             base: CodexToolItemEventBase {
+                turn_trigger: None,
                 thread_id: "thread-1".to_string(),
                 session_id: "session-thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
@@ -236,6 +237,7 @@ async fn cua_tool_call_lifecycle_requires_a_start_and_deduplicates_replay() {
     let item = |status| ThreadItemPayload::McpToolCall {
         id: "cua-call".into(),
         server: "codex_apps".into(),
+        environment_id: None,
         tool: "js".into(),
         status,
         arguments: json!({"script": "synthetic-private-input"}),
@@ -771,7 +773,10 @@ async fn mcp_elicitation_classification_survives_turn_completion_and_preserves_c
     )
     .await;
 
-    let turn_metadata = test_turn_metadata(/*root_turn_id*/ None);
+    let mut turn_metadata = test_turn_metadata(/*root_turn_id*/ None);
+    std::sync::Arc::get_mut(&mut turn_metadata)
+        .expect("unique metadata")
+        .turn_trigger = Some("automation_cron_scheduled".to_string());
     reducer
         .ingest(
             AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
@@ -793,6 +798,7 @@ async fn mcp_elicitation_classification_survives_turn_completion_and_preserves_c
         let item = ThreadItemPayload::McpToolCall {
             id: item_id.to_string(),
             server: "server".to_string(),
+            environment_id: None,
             tool: "search".to_string(),
             status: McpToolCallStatus::Completed,
             arguments: json!({ "token": "synthetic-private-input" }),
@@ -870,6 +876,12 @@ async fn mcp_elicitation_classification_survives_turn_completion_and_preserves_c
     }
 
     let payload = serde_json::to_value(&events).expect("serialize analytics events");
+    for event in payload.as_array().expect("analytics events array") {
+        assert_eq!(
+            event["event_params"]["turn_trigger"],
+            "automation_cron_scheduled"
+        );
+    }
     let classifications = payload
         .as_array()
         .expect("analytics events array")

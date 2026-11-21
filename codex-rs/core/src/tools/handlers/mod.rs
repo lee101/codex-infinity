@@ -162,8 +162,8 @@ where
 }
 
 #[derive(Deserialize)]
-struct ToolEnvironmentArgs {
-    environment_id: Option<String>,
+pub(crate) struct ToolEnvironmentArgs {
+    pub(crate) environment_id: Option<String>,
 }
 
 fn function_tool_environment<T: serde::de::DeserializeOwned>(
@@ -183,7 +183,7 @@ fn function_tool_environment<T: serde::de::DeserializeOwned>(
     .map(ToolEnvironments::single_executor)
 }
 
-fn selected_executor<'a>(
+pub(crate) fn selected_executor<'a>(
     environments: &'a ToolEnvironments,
     snapshot: &'a TurnEnvironmentSnapshot,
 ) -> Result<&'a TurnEnvironment, FunctionCallError> {
@@ -197,7 +197,7 @@ fn selected_executor<'a>(
     }
 }
 
-fn resolve_tool_environment<'a>(
+pub(crate) fn resolve_tool_environment<'a>(
     environments: &'a TurnEnvironmentSnapshot,
     environment_id: Option<&str>,
 ) -> Result<&'a TurnEnvironment, FunctionCallError> {
@@ -284,7 +284,8 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     }
 }
 
-pub(super) struct EffectiveAdditionalPermissions {
+#[derive(Debug)]
+pub(crate) struct EffectiveAdditionalPermissions {
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,

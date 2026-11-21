@@ -80,12 +80,6 @@ pub(crate) fn codex_turn_trace_event(
                 },
             })
         }
-        EventMsg::RawResponseItem(event) => Some(CodexTurnTraceEvent {
-            context_turn_id: default_turn_id.to_string(),
-            payload: RawTraceEventPayload::HistoryItemAccepted {
-                item_id: event.item.id()?.to_string(),
-            },
-        }),
         _ => None,
     }
 }
@@ -156,8 +150,7 @@ impl Serialize for ToolRuntimePayload<'_> {
 
 /// Rollout-trace representation of an exec begin event.
 ///
-/// Rollout traces share the rollout compatibility requirement that paths remain path-flavored
-/// strings on disk, even though live events carry `PathUri` internally.
+/// The trace records filesystem paths as strings. Live events carry `PathUri`.
 #[derive(Serialize)]
 struct ExecCommandBeginTracePayload<'a> {
     call_id: &'a str,
@@ -416,6 +409,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::ElicitationRequest(_)
         | EventMsg::ElicitationAbandoned(_)
+        | EventMsg::NetworkApprovalResolved { .. }
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)
@@ -497,6 +491,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::ElicitationRequest(_)
         | EventMsg::ElicitationAbandoned(_)
+        | EventMsg::NetworkApprovalResolved { .. }
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)

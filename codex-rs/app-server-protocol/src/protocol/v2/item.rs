@@ -28,6 +28,8 @@ use codex_protocol::approvals::GuardianAssessmentDecisionSource as CoreGuardianA
 use codex_protocol::approvals::GuardianCommandSource as CoreGuardianCommandSource;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 pub use codex_protocol::items::AgentMessageDelivery;
+pub use codex_protocol::items::AgentMessageDisplay;
+use codex_protocol::items::AgentMessageModeration as CoreAgentMessageModeration;
 pub use codex_protocol::items::AsyncUserInputQuestion;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
@@ -152,6 +154,24 @@ pub enum CommandAction {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+#[serde(from = "CoreAgentMessageModeration")]
+pub struct AgentMessageModeration {
+    pub moderated: bool,
+    pub display: Option<AgentMessageDisplay>,
+}
+
+impl From<CoreAgentMessageModeration> for AgentMessageModeration {
+    fn from(value: CoreAgentMessageModeration) -> Self {
+        Self {
+            moderated: value.moderated,
+            display: value.display,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct MemoryCitation {
     pub entries: Vec<MemoryCitationEntry>,
     pub thread_ids: Vec<String>,
@@ -240,11 +260,11 @@ pub struct ThreadItem {
     pub payload: ThreadItemPayload,
     /// Unix timestamp in milliseconds when the item started, if recorded.
     #[serde(default)]
-    #[ts(type = "number | null")]
+    #[ts(type = "number | null", optional)]
     pub started_at_ms: Option<i64>,
     /// Unix timestamp in milliseconds when the item completed, if recorded.
     #[serde(default)]
-    #[ts(type = "number | null")]
+    #[ts(type = "number | null", optional)]
     pub completed_at_ms: Option<i64>,
 }
 
@@ -313,6 +333,8 @@ pub enum ThreadItemPayload {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     AgentMessage {
+        #[serde(default)]
+        moderation: Option<AgentMessageModeration>,
         id: String,
         text: String,
         #[serde(default)]
@@ -400,6 +422,8 @@ pub enum ThreadItemPayload {
     McpToolCall {
         id: String,
         server: String,
+        /// Registration scope, not necessarily the server's execution environment.
+        environment_id: Option<String>,
         tool: String,
         status: McpToolCallStatus,
         arguments: JsonValue,
@@ -958,6 +982,7 @@ impl From<CoreTurnItem> for ThreadItemPayload {
                     })
                     .collect::<String>();
                 Self::AgentMessage {
+                    moderation: agent.moderation.map(Into::into),
                     id: agent.id,
                     text,
                     phase: agent.phase,
@@ -1106,6 +1131,7 @@ impl From<CoreTurnItem> for ThreadItemPayload {
                 Self::McpToolCall {
                     id: mcp.id,
                     server: mcp.server,
+                    environment_id: mcp.environment_id,
                     tool: mcp.tool,
                     status: McpToolCallStatus::from(mcp.status),
                     arguments: mcp.arguments,
@@ -1505,6 +1531,12 @@ pub struct ItemCompletedNotification {
     pub item: ThreadItem,
     pub thread_id: String,
     pub turn_id: String,
+    /// Native content tokens for the completed assistant message, including a sampled footer.
+    /// Null when unavailable. Completion telemetry is not part of the stored thread item.
+    #[serde(default)]
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub content_token_count: Option<u64>,
     /// Unix timestamp (in milliseconds) when this item lifecycle completed.
     #[ts(type = "number")]
     pub completed_at_ms: i64,
@@ -1520,6 +1552,7 @@ impl ItemCompletedNotification {
         Self {
             thread_id,
             turn_id,
+            content_token_count: None,
             completed_at_ms,
             item: ThreadItem::completed(payload, started_at_ms, completed_at_ms),
         }
@@ -1644,6 +1677,10 @@ v2_enum_from_core! {
     pub enum CommandExecutionApprovalKind from CoreExecApprovalKind {
         #[default]
         Command,
+        /// A managed checkpoint requiring a fresh human decision. Only `accept`, `decline`, and
+        /// `cancel` are valid. Requires the `requiredHumanApproval` initialize capability.
+        /// This prompt does not itself start a command execution item.
+        HumanCommand,
         WriteStdin,
     }
 }

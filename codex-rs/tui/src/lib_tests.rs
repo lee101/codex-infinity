@@ -76,55 +76,94 @@ requires_openai_auth = {requires_openai_auth}
 }
 
 #[tokio::test]
-async fn bedrock_setup_wizard_requires_eligible_onboarding() -> color_eyre::Result<()> {
+async fn provider_setup_wizards_require_eligible_onboarding() -> color_eyre::Result<()> {
     let shared_endpoint = RemoteAppServerEndpoint::WebSocket {
         websocket_url: "ws://127.0.0.1:4500/".to_string(),
         auth_token: None,
     };
-    let enabled = "[features]\nbedrock_setup_wizard = true\n";
+    let enabled = "[features]\nbedrock_setup_wizard = true\ngcp_setup_wizard = true\ngateway_setup_wizard = true\n";
 
     for (label, config_toml, login_status, target, expected) in [
         (
-            "enabled by default",
+            "provider defaults",
             "",
             LoginStatus::NotAuthenticated,
             AppServerTarget::Embedded,
-            true,
+            [true, false, false],
         ),
         (
             "explicitly disabled",
-            "[features]\nbedrock_setup_wizard = false\n",
+            "[features]\nbedrock_setup_wizard = false\ngcp_setup_wizard = false\ngateway_setup_wizard = false\n",
             LoginStatus::NotAuthenticated,
             AppServerTarget::Embedded,
-            false,
+            [false, false, false],
+        ),
+        (
+            "only GCP enabled",
+            "[features]\nbedrock_setup_wizard = false\ngcp_setup_wizard = true\n",
+            LoginStatus::NotAuthenticated,
+            AppServerTarget::Embedded,
+            [false, true, false],
+        ),
+        (
+            "only custom gateway enabled",
+            "[features]\nbedrock_setup_wizard = false\ngateway_setup_wizard = true\n",
+            LoginStatus::NotAuthenticated,
+            AppServerTarget::Embedded,
+            [false, false, true],
         ),
         (
             "enabled for the default provider",
             enabled,
             LoginStatus::NotAuthenticated,
             AppServerTarget::Embedded,
-            true,
+            [true, true, true],
         ),
         (
-            "explicit provider",
-            "model_provider = \"openai\"\n[features]\nbedrock_setup_wizard = true\n",
+            "explicit OpenAI provider with default flags",
+            "model_provider = \"openai\"\n",
             LoginStatus::NotAuthenticated,
             AppServerTarget::Embedded,
-            false,
+            [true, false, false],
+        ),
+        (
+            "explicit OpenAI provider with wizards enabled",
+            "model_provider = \"openai\"\n[features]\nbedrock_setup_wizard = true\ngcp_setup_wizard = true\ngateway_setup_wizard = true\n",
+            LoginStatus::NotAuthenticated,
+            AppServerTarget::Embedded,
+            [true, true, true],
+        ),
+        (
+            "custom provider requiring OpenAI auth",
+            r#"
+model_provider = "test-provider"
+[model_providers.test-provider]
+name = "Test provider"
+base_url = "http://example.test/v1"
+wire_api = "responses"
+requires_openai_auth = true
+[features]
+bedrock_setup_wizard = true
+gcp_setup_wizard = true
+gateway_setup_wizard = true
+"#,
+            LoginStatus::NotAuthenticated,
+            AppServerTarget::Embedded,
+            [false, false, false],
         ),
         (
             "forced ChatGPT login",
-            "forced_login_method = \"chatgpt\"\n[features]\nbedrock_setup_wizard = true\n",
+            "forced_login_method = \"chatgpt\"\n[features]\nbedrock_setup_wizard = true\ngcp_setup_wizard = true\ngateway_setup_wizard = true\n",
             LoginStatus::NotAuthenticated,
             AppServerTarget::Embedded,
-            false,
+            [false, false, false],
         ),
         (
             "existing authentication",
             enabled,
             LoginStatus::AuthMode(AuthMode::Chatgpt),
             AppServerTarget::Embedded,
-            false,
+            [false, false, false],
         ),
         (
             "shared local daemon",
@@ -134,7 +173,7 @@ async fn bedrock_setup_wizard_requires_eligible_onboarding() -> color_eyre::Resu
                 allow_embedded_fallback: true,
                 endpoint: shared_endpoint.clone(),
             },
-            false,
+            [true, false, false],
         ),
         (
             "remote app server",
@@ -143,24 +182,60 @@ async fn bedrock_setup_wizard_requires_eligible_onboarding() -> color_eyre::Resu
             AppServerTarget::Remote {
                 endpoint: shared_endpoint,
             },
-            false,
+            [false, false, false],
         ),
     ] {
         let codex_home = TempDir::new()?;
         std::fs::write(codex_home.path().join("config.toml"), config_toml)?;
         let config = build_config(&codex_home).await?;
-
-        assert_eq!(
-            should_show_bedrock_setup_wizard(
+        for (feature, expected) in [
+            Feature::BedrockSetupWizard,
+            Feature::GcpSetupWizard,
+            Feature::GatewaySetupWizard,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(
+                should_show_provider_setup_wizard(
+                    login_status,
+                    /*requires_openai_auth*/ true,
+                    &config,
+                    &target,
+                    feature,
+                ),
+                expected,
+                "{label}: {feature:?}"
+            );
+            assert!(!should_show_provider_setup_wizard(
                 login_status,
-                /*requires_openai_auth*/ true,
+                /*requires_openai_auth*/ false,
                 &config,
-                &target
-            ),
-            expected,
-            "{label}"
-        );
+                &target,
+                feature,
+            ));
+        }
     }
+
+    let home = TempDir::new()?;
+    std::fs::write(home.path().join("config.toml"), enabled)?;
+    let requirements = home.path().join("requirements.toml");
+    std::fs::write(&requirements, "model_provider = 'openai'")?;
+    let config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            system_requirements_path: Some(requirements),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    assert!(!should_show_provider_setup_wizard(
+        LoginStatus::NotAuthenticated,
+        /*requires_openai_auth*/ true,
+        &config,
+        &AppServerTarget::Embedded,
+        Feature::GatewaySetupWizard,
+    ));
 
     Ok(())
 }
@@ -522,7 +597,7 @@ async fn startup_resume_and_fork_use_configured_or_explicit_cwd() -> color_eyre:
         };
 
         assert!(!session_resume::cwds_differ(
-            started.session.cwd.as_path(),
+            &started.session.cwd.to_path_buf(),
             &expected_cwd,
         ));
         app_server.shutdown().await?;
@@ -670,81 +745,6 @@ fn session_target_display_label_falls_back_to_thread_id() {
     };
 
     assert_eq!(target.display_label(), format!("thread {thread_id}"));
-}
-
-#[test]
-fn resolve_remote_addr_accepts_websocket_url() {
-    assert_eq!(
-        resolve_remote_addr("ws://127.0.0.1:4500").expect("ws URL should normalize"),
-        RemoteAppServerEndpoint::WebSocket {
-            websocket_url: "ws://127.0.0.1:4500/".to_string(),
-            auth_token: None,
-        }
-    );
-}
-
-#[test]
-fn resolve_remote_addr_accepts_secure_websocket_url() {
-    assert_eq!(
-        resolve_remote_addr("wss://example.com:443").expect("wss URL should normalize"),
-        RemoteAppServerEndpoint::WebSocket {
-            websocket_url: "wss://example.com/".to_string(),
-            auth_token: None,
-        }
-    );
-}
-
-#[test]
-fn resolve_remote_addr_accepts_default_socket() -> color_eyre::Result<()> {
-    let codex_home = find_codex_home().wrap_err("failed to resolve CODEX_HOME")?;
-    assert_eq!(
-        resolve_remote_addr("unix://")?,
-        RemoteAppServerEndpoint::UnixSocket {
-            socket_path: codex_app_server_client::app_server_control_socket_path(&codex_home)?,
-        }
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_remote_addr_accepts_relative_socket_path() -> color_eyre::Result<()> {
-    assert_eq!(
-        resolve_remote_addr("unix://codex.sock")?,
-        RemoteAppServerEndpoint::UnixSocket {
-            socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-        }
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_remote_addr_accepts_absolute_socket_path() -> color_eyre::Result<()> {
-    let temp_dir = TempDir::new()?;
-    let socket_path = temp_dir.path().join("codex.sock");
-    assert_eq!(
-        resolve_remote_addr(&format!("unix://{}", socket_path.display()))?,
-        RemoteAppServerEndpoint::UnixSocket {
-            socket_path: AbsolutePathBuf::from_absolute_path(&socket_path)?,
-        }
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_remote_addr_rejects_invalid_remote_addresses() {
-    for addr in [
-        "ws://127.0.0.1",
-        "wss://example.com",
-        "127.0.0.1:4500",
-        "https://127.0.0.1:4500",
-    ] {
-        let err = resolve_remote_addr(addr).expect_err("invalid remote addresses should fail");
-        assert!(
-            err.to_string().contains(
-                "expected `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`"
-            )
-        );
-    }
 }
 
 #[tokio::test]
@@ -943,13 +943,13 @@ async fn latest_session_lookup_params_keep_local_filters_for_embedded_sessions()
     let cwd = temp_dir.path().join("project");
 
     let params = latest_session_lookup_params(
-        /*model_provider*/ None,
+        Some(Vec::new()),
         Some(cwd.as_path()),
         /*include_non_interactive*/ false,
         LatestSessionLookupMode::StateDbOnly,
     );
 
-    assert_eq!(params.model_providers, None);
+    assert_eq!(params.model_providers, Some(vec![]));
     assert_eq!(
         params.cwd,
         Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
@@ -957,7 +957,7 @@ async fn latest_session_lookup_params_keep_local_filters_for_embedded_sessions()
     assert!(params.use_state_db_only);
 
     let scan_params = latest_session_lookup_params(
-        /*model_provider*/ None,
+        Some(Vec::new()),
         Some(cwd.as_path()),
         /*include_non_interactive*/ false,
         LatestSessionLookupMode::ScanAndRepair,
@@ -971,7 +971,7 @@ async fn latest_session_lookup_params_honor_explicit_provider() -> color_eyre::R
     let temp_dir = TempDir::new()?;
     let cwd = temp_dir.path().join("project");
     let params = latest_session_lookup_params(
-        Some("selected-provider".to_string()),
+        Some(vec!["selected-provider".to_string()]),
         Some(cwd.as_path()),
         /*include_non_interactive*/ false,
         LatestSessionLookupMode::StateDbOnly,
@@ -992,13 +992,13 @@ async fn latest_session_lookup_params_honor_explicit_provider() -> color_eyre::R
 async fn latest_session_lookup_params_omit_local_filters_for_remote_sessions() -> std::io::Result<()>
 {
     let params = latest_session_lookup_params(
-        /*model_provider*/ None,
+        Some(Vec::new()),
         /*cwd_filter*/ None,
         /*include_non_interactive*/ false,
         LatestSessionLookupMode::StateDbOnly,
     );
 
-    assert_eq!(params.model_providers, None);
+    assert_eq!(params.model_providers, Some(vec![]));
     assert_eq!(params.cwd, None);
     Ok(())
 }
@@ -1006,7 +1006,7 @@ async fn latest_session_lookup_params_omit_local_filters_for_remote_sessions() -
 #[tokio::test]
 async fn latest_session_lookup_params_can_include_non_interactive_sources() -> std::io::Result<()> {
     let params = latest_session_lookup_params(
-        /*model_provider*/ None,
+        Some(Vec::new()),
         /*cwd_filter*/ None,
         /*include_non_interactive*/ true,
         LatestSessionLookupMode::StateDbOnly,
@@ -1030,13 +1030,13 @@ async fn latest_session_lookup_params_keep_explicit_cwd_filter_for_remote_sessio
     let cwd = Path::new("repo/on/server");
 
     let params = latest_session_lookup_params(
-        /*model_provider*/ None,
+        Some(Vec::new()),
         Some(cwd),
         /*include_non_interactive*/ false,
         LatestSessionLookupMode::StateDbOnly,
     );
 
-    assert_eq!(params.model_providers, None);
+    assert_eq!(params.model_providers, Some(vec![]));
     assert_eq!(
         params.cwd,
         Some(ThreadListCwdFilter::One(String::from("repo/on/server")))
@@ -1159,6 +1159,7 @@ async fn fork_last_filters_latest_session_by_cwd_unless_show_all() -> color_eyre
         /*show_all*/ false,
     );
     let scoped_target = lookup_latest_session_target_with_app_server(
+        crate::resume_picker::SessionPickerAction::Fork,
         &mut app_server,
         &config,
         filter_cwd,
@@ -1171,6 +1172,7 @@ async fn fork_last_filters_latest_session_by_cwd_unless_show_all() -> color_eyre
         /*show_all*/ true,
     );
     let show_all_target = lookup_latest_session_target_with_app_server(
+        crate::resume_picker::SessionPickerAction::Fork,
         &mut app_server,
         &config,
         show_all_filter_cwd,
@@ -1213,11 +1215,12 @@ async fn latest_session_lookup_falls_back_for_rollout_missing_from_state_db()
         "2025-01-02T10-00-00",
         "2025-01-02T10:00:00Z",
         "legacy writer session",
-        config.model_provider_id.as_str(),
+        "previous-provider",
         &project_cwd,
     )?;
 
     let target = lookup_latest_session_target_with_app_server(
+        crate::resume_picker::SessionPickerAction::Resume,
         &mut app_server,
         &config,
         Some(project_cwd.as_path()),
@@ -1347,6 +1350,19 @@ async fn config_cwd_for_app_server_target_omits_cwd_for_remote_exec_server() -> 
         )?),
     )
     .await;
+
+    assert_eq!(
+        backend_preference_local_cwd(remote_only_cwd, &target, &environment_manager),
+        std::env::current_dir().ok(),
+    );
+    assert_eq!(
+        backend_preference_local_cwd(
+            remote_only_cwd,
+            &target,
+            &EnvironmentManager::default_for_tests(),
+        ),
+        Some(remote_only_cwd.to_path_buf()),
+    );
 
     let config_cwd = config_cwd_for_app_server_target(
         Some(remote_only_cwd),

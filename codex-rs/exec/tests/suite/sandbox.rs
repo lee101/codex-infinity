@@ -59,24 +59,23 @@ pub(super) async fn spawn_command_under_sandbox(
     .await
     .map_err(|err| io::Error::other(err.to_string()))?;
 
-    let (program, args) = exec_request
-        .command
-        .split_first()
+    let command = exec_request
+        .direct_command()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "command args are empty"))?;
 
-    let mut child = tokio::process::Command::new(program);
-    if let Some(arg0) = exec_request.arg0.as_deref() {
+    let mut child = tokio::process::Command::new(command.program);
+    if let Some(arg0) = command.arg0 {
         child.arg0(arg0);
     }
-    child.args(args);
+    child.args(command.args);
     // TODO(anp): Keep PathUri through the macOS sandbox process launch boundary.
-    let native_cwd = exec_request
+    let native_cwd = command
         .cwd
         .to_abs_path()
         .map_err(|err| io::Error::other(err.to_string()))?;
     child.current_dir(native_cwd);
     child.env_clear();
-    child.envs(exec_request.env);
+    child.envs(command.env);
 
     match stdio_policy {
         StdioPolicy::RedirectForShellTool => {
@@ -97,10 +96,8 @@ pub(super) async fn spawn_command_under_sandbox(
 #[cfg(target_os = "linux")]
 /// Determines whether Linux sandbox tests can run on this host.
 ///
-/// These tests require an enforceable filesystem sandbox. We run a tiny command
-/// under the production Landlock path and skip when enforcement is unavailable
-/// (for example on kernels or container profiles where Landlock is not
-/// enforced).
+/// The probe runs `/usr/bin/true` through the Linux sandbox with a read-only
+/// profile. The tests skip hosts where that command cannot start successfully.
 pub(super) async fn linux_sandbox_test_env() -> Option<HashMap<String, String>> {
     let command_cwd = AbsolutePathBuf::current_dir().ok()?;
     let sandbox_cwd = command_cwd.clone();
@@ -117,16 +114,13 @@ pub(super) async fn linux_sandbox_test_env() -> Option<HashMap<String, String>> 
         return Some(HashMap::new());
     }
 
-    eprintln!("Skipping test: Landlock is not enforceable on this host.");
+    eprintln!("Skipping test: the Linux sandbox could not run the read-only probe.");
     None
 }
 
 #[cfg(target_os = "linux")]
 /// Returns whether a minimal command can run successfully with the requested
 /// Linux sandbox policy applied.
-///
-/// This is used as a capability probe so sandbox behavior tests only run when
-/// Landlock enforcement is actually active.
 async fn can_apply_linux_sandbox_policy(
     permission_profile: &PermissionProfile,
     command_cwd: &AbsolutePathBuf,
@@ -158,7 +152,6 @@ async fn python_multiprocessing_lock_works_under_sandbox() {
     #[cfg(target_os = "linux")]
     let sandbox_env = match linux_sandbox_test_env().await {
         Some(env) => env,
-        // Skip on Linux hosts where Landlock cannot actually be enforced.
         None => return,
     };
     #[cfg(not(target_os = "linux"))]

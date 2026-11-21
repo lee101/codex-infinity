@@ -116,7 +116,16 @@ pub struct PermissionProfileToml {
     pub workspace_roots: Option<WorkspaceRootsToml>,
     pub filesystem: Option<FilesystemPermissionsToml>,
     pub network: Option<NetworkToml>,
+    pub credentials: Option<CredentialPermissionsToml>,
 }
+
+/// In `requirements.toml`, `[permissions.credentials]` sets shared credential policy and
+/// `[permissions.<profile>.credentials]` sets policy for a named profile.
+/// Omit the shared table until it contains a supported policy setting.
+/// In `config.toml`, credentials use the named-profile form alongside filesystem and network.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPermissionsToml {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PermissionProfileResolutionError {
@@ -331,6 +340,8 @@ pub struct NetworkToml {
     pub enabled: Option<bool>,
     pub proxy_url: Option<String>,
     pub enable_socks5: Option<bool>,
+    /// Route outbound TCP from managed Linux sandbox commands through the managed SOCKS5 proxy.
+    pub transparent_tcp: Option<bool>,
     pub socks_url: Option<String>,
     pub enable_socks5_udp: Option<bool>,
     pub allow_upstream_proxy: Option<bool>,
@@ -542,6 +553,9 @@ impl NetworkToml {
         }
         if let Some(proxy_url) = self.proxy_url.as_ref() {
             config.proxy_url = proxy_url.clone();
+        }
+        if let Some(transparent_tcp) = self.transparent_tcp {
+            config.transparent_tcp = transparent_tcp;
         }
         if let Some(enable_socks5) = self.enable_socks5 {
             config.enable_socks5 = enable_socks5;

@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use codex_core::ThreadManager;
+use codex_core::GuardianInferenceContext;
+use codex_core::SharedModelsManager;
 use codex_core::config::Config;
 use codex_core::cyber_access_program::ApiKeyCyberAccessPrograms;
 use codex_extension_api::ThreadOriginator;
@@ -11,9 +12,9 @@ use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
 use codex_login::AgentIdentityAuthPolicy;
 use codex_login::AuthManager;
-use codex_login::CodexAuth;
-use codex_model_provider::create_model_provider;
+use codex_model_provider::ProviderAuthContext;
 
+use super::decisions::DecisionsCredential;
 use super::decisions::DecisionsError;
 use super::decisions::DecisionsSampler;
 use super::decisions::URL;
@@ -23,21 +24,31 @@ use super::sampler::MODEL;
 // Decisions setup failures are telemetry only; they never affect the baseline sampler.
 pub(super) fn decisions_sampler(
     input: &ThreadStartInput<'_, Config>,
-    auth_manager: &AuthManager,
+    auth_manager: &Arc<AuthManager>,
 ) -> Option<DecisionsSampler> {
-    use codex_http_client::ClientRouteClass;
+    use codex_agent_identity::ChatGptEnvironment;
+    let auth_context = input.thread_store.get::<ProviderAuthContext>();
     let result = decisions_api_key(
         &input.config.model_provider_id,
         input.config.model_provider.base_url.as_deref(),
+        auth_context.as_deref(),
         auth_manager,
     )
     .and_then(|key| {
-        let client = input
-            .config
-            .http_client_factory()
-            .build_client_without_request_logging(URL, ClientRouteClass::Api)
-            .map_err(|_| DecisionsError::ClientSetup)?;
-        DecisionsSampler::new(client, key, URL.to_owned())
+        let url = if matches!(
+            ChatGptEnvironment::from_chatgpt_base_url(&input.config.chatgpt_base_url),
+            Ok(ChatGptEnvironment::Staging)
+        ) {
+            "https://api.openai.org/v1/decisions"
+        } else {
+            URL
+        };
+        DecisionsSampler::new(
+            input.config.http_client_factory(),
+            key,
+            url.to_owned(),
+            auth_context.as_deref(),
+        )
     });
     match result {
         Ok(sampler) => Some(sampler),
@@ -57,17 +68,33 @@ pub(super) fn decisions_sampler(
 pub(super) fn decisions_api_key(
     provider_id: &str,
     base_url: Option<&str>,
-    auth_manager: &AuthManager,
-) -> Result<String, DecisionsError> {
+    context: Option<&ProviderAuthContext>,
+    fallback: &Arc<AuthManager>,
+) -> Result<DecisionsCredential, DecisionsError> {
     match std::env::var("CODEX_GUARDIAN_DECISIONS_API_KEY") {
-        Ok(key) => Ok(key),
+        Ok(key) => Ok(DecisionsCredential::ApiKey(key)),
         Err(std::env::VarError::NotPresent) if provider_id == "openai" && base_url.is_none() => {
-            auth_manager
-                .auth_cached()
-                .as_ref()
-                .and_then(CodexAuth::api_key)
-                .map(str::to_owned)
-                .or_else(codex_login::read_openai_api_key_from_env)
+            let manager = context.map_or(fallback, |context| &context.credentials);
+            if let Some(auth) = manager.auth_cached()
+                && let Some(key) = auth.api_key()
+            {
+                if !valid_implicit_decisions_key(key) {
+                    return Err(DecisionsError::Credentials);
+                }
+                if context.is_some_and(|context| context.runtime_auth.is_some()) {
+                    let state = manager
+                        .auth_change_state_for(&auth)
+                        .ok_or(DecisionsError::Credentials)?;
+                    return Ok(DecisionsCredential::RuntimeLogin(
+                        Arc::clone(manager),
+                        state.source_generation,
+                    ));
+                }
+                return Ok(DecisionsCredential::SavedLogin(Arc::clone(manager)));
+            }
+            codex_login::read_openai_api_key_from_env()
+                .filter(|key| valid_implicit_decisions_key(key))
+                .map(DecisionsCredential::ApiKey)
                 .ok_or(DecisionsError::Credentials)
         }
         Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
@@ -76,20 +103,46 @@ pub(super) fn decisions_api_key(
     }
 }
 
+// Decisions uses a commercial endpoint. Reject padded keys without rewriting credentials.
+pub(super) fn valid_implicit_decisions_key(key: &str) -> bool {
+    !key.is_empty() && key.trim() == key && !codex_login::auth::is_fedramp_api_key(key)
+}
+
 pub(super) async fn sampler_config(
     input: &ThreadStartInput<'_, Config>,
-    auth_manager: Arc<AuthManager>,
-    manager: Option<Arc<ThreadManager>>,
-) -> LunaSamplerConfig {
-    let luna_model = if let Some(thread_manager) = manager {
+) -> anyhow::Result<LunaSamplerConfig> {
+    let inherit_parent_cyber_access_program =
+        codex_core::RequiredCyberAccessPrograms::for_thread(input.thread_store).is_none();
+    let inference = GuardianInferenceContext::for_config(input.config, input.thread_store)?;
+    let (provider_id, provider, http_client_factory, service_tier, guardian_catalog) =
+        if let Some(inference) = inference {
+            (
+                inference.provider_id.clone(),
+                Arc::clone(&inference.provider),
+                inference.http_client_factory.clone(),
+                inference.service_tier.clone(),
+                Some(Arc::clone(&inference.models_manager)),
+            )
+        } else {
+            #[expect(clippy::expect_used, reason = "Required thread startup invariant")]
+            let auth = input
+                .thread_store
+                .get::<ProviderAuthContext>()
+                .expect("Core installs provider auth before starting Guardian");
+            (
+                input.config.model_provider_id.clone(),
+                auth.model_provider(input.config.model_provider.clone()),
+                input.config.http_client_factory(),
+                input.config.service_tier.clone(),
+                None,
+            )
+        };
+    let luna_model = if guardian_catalog.is_none()
+        && let Some(catalog) = input.thread_store.get::<SharedModelsManager>()
+    {
         let mut model_config = input.config.to_models_manager_config();
         model_config.model_context_window = None;
-        Some(
-            thread_manager
-                .get_models_manager()
-                .get_model_info(MODEL, &model_config)
-                .await,
-        )
+        Some(catalog.get_model_info(MODEL, &model_config).await)
     } else {
         None
     };
@@ -101,16 +154,21 @@ pub(super) async fn sampler_config(
                     model, /*configured_window*/ None,
                 )
             });
-    let luna_compaction_hash = luna_model.and_then(|model| model.comp_hash);
-    LunaSamplerConfig {
-        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::from_config(input.config),
+    let luna_compaction_hash = luna_model.and_then(|model| model.comp_hash.clone());
+    Ok(LunaSamplerConfig {
+        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::for_provider(
+            provider.info(),
+            &provider_id,
+            &input.config.features,
+        ),
+        inherit_parent_cyber_access_program,
         workspace_routing: input
             .thread_store
             .get_or_init(|| input.config.workspace_routing_context())
             .as_ref()
             .clone(),
-        provider: create_model_provider(input.config.model_provider.clone(), Some(auth_manager)),
-        http_client_factory: input.config.http_client_factory(),
+        provider,
+        http_client_factory,
         agent_identity_policy: if input.config.features.enabled(Feature::UseAgentIdentity) {
             AgentIdentityAuthPolicy::ChatGptAuth
         } else {
@@ -123,9 +181,10 @@ pub(super) async fn sampler_config(
             .thread_store
             .get::<ThreadOriginator>()
             .map(|originator| originator.0.clone()),
-        service_tier: input.config.service_tier.clone(),
+        service_tier,
+        guardian_catalog,
         luna_compaction_hash,
         max_input_tokens,
         metrics: input.extension_metrics.clone(),
-    }
+    })
 }

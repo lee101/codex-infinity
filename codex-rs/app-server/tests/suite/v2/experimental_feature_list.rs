@@ -36,6 +36,10 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![
+            ("features.tool_suggest".to_string(), false.into()),
+            ("features.recommended_plugins".to_string(), false.into()),
+        ])
         .loader_overrides(LoaderOverrides::with_managed_config_path_for_tests(
             codex_home.path().join("managed_config.toml"),
         ))
@@ -275,28 +279,25 @@ async fn experimental_feature_enablement_set_applies_to_global_and_thread_config
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
-    let actual = set_experimental_feature_enablement(
-        &mut mcp,
-        BTreeMap::from([("auth_elicitation".to_string(), true)]),
-    )
-    .await?;
-    assert_eq!(
-        actual,
-        ExperimentalFeatureEnablementSetResponse {
-            enablement: BTreeMap::from([("auth_elicitation".to_string(), true)]),
-        }
-    );
+    let enablement = BTreeMap::from([
+        ("auth_elicitation".to_string(), true),
+        ("mcp_lazy_stdio_startup".to_string(), true),
+        ("daybreak_program_propagation".to_string(), true),
+    ]);
+    let actual = set_experimental_feature_enablement(&mut mcp, enablement.clone()).await?;
+    assert_eq!(actual.enablement, enablement);
 
     for cwd in [None, Some(project_cwd.display().to_string())] {
         let ConfigReadResponse { config, .. } = read_config(&mut mcp, cwd).await?;
-
-        assert_eq!(
-            config
-                .additional
-                .get("features")
-                .and_then(|features| features.get("auth_elicitation")),
-            Some(&json!(true))
-        );
+        for key in enablement.keys() {
+            assert_eq!(
+                config
+                    .additional
+                    .get("features")
+                    .and_then(|features| features.get(key)),
+                Some(&json!(true))
+            );
+        }
     }
 
     Ok(())

@@ -5,6 +5,7 @@ use crate::skills_load_input_from_config;
 use codex_config::CloudConfigBundleBindingStatus;
 use codex_config::CloudConfigBundlePolicy;
 use codex_config::CloudConfigBundleSnapshot;
+use codex_config::ConfigLayerSource;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_protocol::config_types::ServiceTier;
@@ -684,7 +685,11 @@ enabled = false
     let snapshot = skills_service
         .snapshot_for_config(
             &skills_input,
-            Some(Arc::clone(&codex_exec_server::LOCAL_FS)),
+            Some(
+                &codex_exec_server::FileSystemEnvironmentAccessor::unrestricted(
+                    &codex_exec_server::LOCAL_FS,
+                ),
+            ),
         )
         .await;
     let outcome = snapshot.outcome();

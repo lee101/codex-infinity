@@ -16,12 +16,13 @@ workspace = true
 chardetng = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-async-utils = { workspace = true }
-codex-execpolicy = { workspace = true }
+codex-execpolicy-rules = { workspace = true }
 codex-extension-items = { workspace = true }
 codex-http-client = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-image = { workspace = true }
+codex-utils-model-facing-id = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-utils-redacted-string = { workspace = true }
 codex-utils-string = { workspace = true }

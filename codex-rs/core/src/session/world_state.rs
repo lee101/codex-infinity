@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::session::Session;
 use super::step_context::StepContext;
+use super::turn_context::TurnContext;
+use crate::agent::host::AgentRuntimeServices;
+use crate::agent::host::AgentSessionReader;
 use crate::connectors;
 use crate::context::TokenBudgetContext;
 use crate::context::world_state::AgentsMdState;
@@ -16,6 +20,7 @@ use crate::context::world_state::ModelCatalogState;
 use crate::context::world_state::ModelInstructionsState;
 use crate::context::world_state::MultiAgentModeState;
 use crate::context::world_state::MultiAgentUsageHintState;
+use crate::context::world_state::PermissionDescription;
 use crate::context::world_state::PermissionsState;
 use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::PluginsInstructionsState;
@@ -23,11 +28,13 @@ use crate::context::world_state::RealtimeState;
 use crate::context::world_state::ToolsState;
 use crate::context::world_state::TopLevelToolsState;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::format_agent_paths;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_extension_api::WorldStateContributionInput;
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_prompts::ApprovalPromptContext;
 use codex_prompts::ResolvedModelMessages;
 use codex_prompts::render_model_instructions;
@@ -36,16 +43,28 @@ use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItemNamespace;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolName;
-
-const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
-const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
+use codex_tools::ToolSpec;
 
 impl Session {
+    pub(super) fn host_roster_reader(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<&Arc<dyn AgentSessionReader>> {
+        if turn_context.config.include_environment_context
+            && turn_context.multi_agent_version == MultiAgentVersion::V2
+            && let AgentRuntimeServices::Host(services) = &self.agent_runtime
+        {
+            services.session_reader.as_ref()
+        } else {
+            None
+        }
+    }
+
     pub(crate) async fn current_window_uses_incremental_tools(
         &self,
         step_context: &StepContext,
     ) -> bool {
-        if !step_context.settings.model_info.use_responses_lite {
+        if step_context.incremental_tools_feature().is_none() {
             return false;
         }
         let state = self.state.lock().await;
@@ -100,7 +119,14 @@ impl Session {
                 Some(BaseInstructionsProvenance::Model { .. }) => render_current_instructions(),
                 Some(BaseInstructionsProvenance::Custom) | None => base_instructions.text,
             };
-            ModelInstructionsState::for_incremental_tools(&model_info.slug, instructions)
+            ModelInstructionsState::for_incremental_tools(
+                &model_info.slug,
+                instructions,
+                turn_context
+                    .config
+                    .features
+                    .enabled(Feature::SuppressModelChangeAnnouncements),
+            )
         } else {
             let model_instructions = render_current_instructions();
             let base_instructions = self.get_prompt_base_instructions().await.text;
@@ -127,30 +153,17 @@ impl Session {
                 model_instructions,
             )
         };
-        let environment_subagents = if turn_context.config.include_environment_context {
+        let environment_subagents = if turn_context.config.include_environment_context
+            && matches!(self.agent_runtime, AgentRuntimeServices::Controller)
+        {
             match turn_context.multi_agent_version {
-                MultiAgentVersion::V2 => {
-                    let agent_paths = self
-                        .services
+                MultiAgentVersion::V2 => format_agent_paths(
+                    self.services
                         .agent_control
                         .child_agent_paths(self.thread_id)
-                        .await;
-                    let mut lines =
-                        Vec::with_capacity(agent_paths.len().min(MAX_ENVIRONMENT_SUBAGENTS));
-                    let mut rendered_bytes = "  <subagents>\n  </subagents>\n".len();
-                    for agent_path in agent_paths {
-                        if lines.len() == MAX_ENVIRONMENT_SUBAGENTS {
-                            break;
-                        }
-                        let line = format!(r#"<agent name="{agent_path}" />"#);
-                        let line_bytes = "    \n".len() + line.len();
-                        if rendered_bytes + line_bytes <= MAX_ENVIRONMENT_SUBAGENT_BYTES {
-                            rendered_bytes += line_bytes;
-                            lines.push(line);
-                        }
-                    }
-                    lines.join("\n")
-                }
+                        .await
+                        .into_iter(),
+                ),
                 MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
                     self.services
                         .local_agent_runtime
@@ -162,6 +175,29 @@ impl Session {
             String::new()
         };
         let mut world_state = WorldState::default();
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::CommandSessionsWorldState)
+        {
+            let mut sessions =
+                crate::unified_exec::command_sessions_state(&self.services.unified_exec_manager)
+                    .await;
+            if step_context
+                .tool_router
+                .exposes_tool(&ToolName::plain("write_stdin"))
+            {
+                world_state.add_section(sessions);
+            } else {
+                sessions.polling_unavailable = true;
+                world_state.add_section(crate::context::world_state::DisabledCommandSessionsState(
+                    sessions,
+                ));
+            }
+        } else {
+            world_state
+                .add_section(crate::context::world_state::DisabledCommandSessionsState::default());
+        }
         let extension_metrics = super::extension_metrics::from_session_telemetry(
             step_context.session_telemetry.clone(),
         );
@@ -169,12 +205,21 @@ impl Session {
             !new_window && self.preserve_parent_tool_declarations();
         if incremental_tools && !preserve_parent_tool_declarations {
             let specs = step_context.tool_router.model_visible_specs();
+            let specs = specs
+                .iter()
+                .filter(|tool| !matches!(tool, ToolSpec::WebSearch { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
             let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
-            world_state.add_section(TopLevelToolsState::new(
+            let mut top_level = TopLevelToolsState::new(
                 model_messages.incremental_tools(),
                 definitions,
                 Some(Arc::clone(&extension_metrics)),
-            )?);
+            )?;
+            if let Some(entries) = step_context.tool_router.exec_definitions() {
+                top_level = top_level.with_incremental_exec_tools(Some(entries));
+            }
+            world_state.add_section(top_level);
         }
         world_state.add_section(model_state);
         let token_budget_enabled = turn_context.config.features.enabled(Feature::TokenBudget)
@@ -184,15 +229,14 @@ impl Session {
                 .resolved_context_window()
                 .is_some();
         if token_budget_enabled {
-            let window_ids = self.state.lock().await.auto_compact_window_ids();
+            let window_ids = self.state.lock().await.auto_compact_window_ids().clone();
             world_state.add_section(TokenBudgetContext::new(
                 turn_context
                     .session_source
                     .get_agent_path()
                     .unwrap_or_else(codex_protocol::AgentPath::root),
-                window_ids.first_window_id,
-                window_ids.previous_window_id,
-                window_ids.window_id,
+                window_ids,
+                step_context.token_budget.as_ref(),
             ));
         }
         let guidance = step_context
@@ -222,42 +266,80 @@ impl Session {
             .services
             .exec_policy
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
+        let approval_context =
+            ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages);
         if turn_context.config.include_permissions_instructions {
-            let environment = step_context.environments.primary();
-            let sandbox = environment
-                .filter(|environment| environment.environment.is_remote())
-                .map(|environment| {
-                    environment.sandbox_context(/*additional_permissions*/ None)
-                });
-            let paths = sandbox
-                .as_ref()
-                .map(FileSystemSandboxContext::policy_context);
-            let permission_profile =
-                turn_context.permission_profile_for_environments(&step_context.environments);
-            #[allow(deprecated)]
-            let cwd = environment
-                .and_then(|environment| environment.cwd().to_abs_path().ok())
-                .unwrap_or_else(|| turn_context.cwd.clone());
-            let approval_context =
-                ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages);
+            let per_environment = turn_context
+                .config
+                .features
+                .enabled(Feature::PerEnvironmentContext);
+            let mut environments = step_context
+                .environments
+                .turn_environments()
+                .map(Some)
+                .collect::<Vec<_>>();
+            if !per_environment {
+                environments.truncate(1);
+            }
+            // Until a computer is ready, describe the thread defaults without assigning
+            // those permissions to a computer whose configuration is still unknown.
+            if environments.is_empty() {
+                environments.push(None);
+            }
+            let mut descriptions = BTreeMap::new();
+            for environment in environments {
+                let sandbox = environment
+                    .filter(|environment| per_environment || environment.environment().is_remote())
+                    .map(|environment| {
+                        environment.sandbox_context(/*additional_permissions*/ None)
+                    });
+                let paths = sandbox
+                    .as_ref()
+                    .map(FileSystemSandboxContext::policy_context);
+                let permission_profile = environment.map_or_else(
+                    || turn_context.permission_profile_for_environments(&step_context.environments),
+                    super::turn_context::TurnEnvironment::permission_profile_with_workspace_roots,
+                );
+                #[allow(deprecated)]
+                let cwd = environment
+                    .and_then(|environment| environment.cwd().to_abs_path().ok())
+                    .unwrap_or_else(|| turn_context.cwd.clone());
+                let id = if per_environment {
+                    environment.map(|environment| environment.selection.environment_id.clone())
+                } else {
+                    None
+                };
+                descriptions.insert(
+                    id,
+                    PermissionDescription::new(
+                        &permission_profile,
+                        settings.approval_policy(),
+                        approval_context,
+                        exec_policy.as_ref(),
+                        &cwd,
+                        paths.as_ref(),
+                        turn_context
+                            .config
+                            .features
+                            .enabled(Feature::ExecPermissionApprovals),
+                        turn_context
+                            .config
+                            .features
+                            .enabled(Feature::RequestPermissionsTool),
+                    ),
+                );
+            }
             world_state.add_section(PermissionsState::new(
-                &permission_profile,
-                settings.approval_policy(),
-                approval_context,
+                descriptions,
                 exec_policy.as_ref(),
-                &cwd,
-                paths.as_ref(),
-                turn_context
-                    .config
-                    .features
-                    .enabled(Feature::ExecPermissionApprovals),
-                turn_context
-                    .config
-                    .features
-                    .enabled(Feature::RequestPermissionsTool),
+                approval_context,
+                per_environment,
             ));
         } else {
-            world_state.add_section(CompactPermissionsState::new(exec_policy.as_ref()));
+            world_state.add_section(CompactPermissionsState::new(
+                exec_policy.as_ref(),
+                approval_context.approved_command_prefix_saved_heading(),
+            ));
         }
         if turn_context.config.include_collaboration_mode_instructions {
             world_state.add_section(CollaborationModeState::from_collaboration_mode(
@@ -268,14 +350,13 @@ impl Session {
             ));
         }
         if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
-            let send_user_message_async_available =
-                !turn_context.session_source.is_non_root_agent()
-                    && step_context
-                        .settings
-                        .model_info
-                        .experimental_supported_tools
-                        .iter()
-                        .any(|tool| tool == "send_user_message_async");
+            let send_user_message_async_available = !turn_context.root_capabilities_restricted
+                && step_context
+                    .settings
+                    .model_info
+                    .experimental_supported_tools
+                    .iter()
+                    .any(|tool| tool == "send_user_message_async");
             world_state.add_section(PersistentModeState::new(
                 turn_context.config.features.persistent_execution_enabled(
                     step_context.settings.effective_reasoning_effort().as_ref(),
@@ -285,14 +366,23 @@ impl Session {
             ));
         }
         if turn_context.config.include_environment_context {
+            world_state.host_roster_reader = self.host_roster_reader(turn_context).cloned();
             let current_date = if turn_context.config.include_environment_context_time {
                 self.read_clock_for_context(turn_context, "environment_date")
                     .await?
                     .map(|current_time| {
-                        current_time
-                            .with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d")
-                            .to_string()
+                        if turn_context
+                            .config
+                            .features
+                            .enabled(Feature::UtcEnvironmentDate)
+                        {
+                            current_time.format("%Y-%m-%d").to_string()
+                        } else {
+                            current_time
+                                .with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d")
+                                .to_string()
+                        }
                     })
             } else {
                 None
@@ -327,14 +417,30 @@ impl Session {
             };
         let apps_usage_instructions_available =
             apps_available && model_info.include_apps_usage_instructions;
+        let apps_messages = if turn_context
+            .config
+            .features
+            .enabled(Feature::CatalogAppsInstructions)
+        {
+            model_messages
+        } else {
+            ResolvedModelMessages::bundled()
+        };
         world_state.add_section(AppsInstructionsState::new(
             apps_usage_instructions_available,
+            apps_messages.apps_usage_instructions(CODEX_APPS_MCP_SERVER_NAME),
         ));
         let plugins_usage_instructions_available =
             step_context.mcp.plugins_available() && model_info.include_plugin_usage_instructions;
-        world_state.add_section(PluginsInstructionsState::new(
-            plugins_usage_instructions_available,
-        ));
+        let plugins_state = {
+            let state = self.state.lock().await;
+            PluginsInstructionsState::new(
+                plugins_usage_instructions_available,
+                model_messages.generic_plugin(),
+                state.history.raw_items(),
+            )
+        };
+        world_state.add_section(plugins_state);
         if turn_context
             .config
             .features

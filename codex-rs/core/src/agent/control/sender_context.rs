@@ -3,17 +3,16 @@
 //! quoted delegation text cannot establish sender provenance. Unloaded senders are read
 //! through the host's authenticated thread store, without resuming their runtime.
 
-use crate::context::GuardianSenderExchange;
 use crate::context::GuardianSenderMessages;
 use crate::context_manager::ContextManager;
-use codex_guardian_context::GuardianRootMessage;
-use codex_history::RetainedContextEntry;
-use codex_history::RetainedContextOrder;
 use codex_history::RolloutItem;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_utils_output_truncation::TruncationPolicy;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::LocalAgentRuntime;
@@ -51,10 +50,18 @@ impl LocalAgentRuntime {
                 .trim()
                 .strip_prefix("<source_thread_id>")?
                 .split_once("</source_thread_id>")?;
-            input
-                .trim()
-                .strip_prefix("<input>")?
-                .strip_suffix("</input>")?;
+            let input = input.trim();
+            // Cloud deliveries include Dot attribution, but authority comes from the source thread.
+            let input = if let Some(rest) = input.strip_prefix("<source_orbit_id>") {
+                let (orbit_id, input) = rest.split_once("</source_orbit_id>")?;
+                if orbit_id.contains('<') {
+                    return None;
+                }
+                input.trim()
+            } else {
+                input
+            };
+            input.strip_prefix("<input>")?.strip_suffix("</input>")?;
             ThreadId::from_string(source)
                 .ok()
                 .filter(|source| *source != receiver_thread_id)
@@ -85,64 +92,58 @@ impl LocalAgentRuntime {
                         }),
                     )
                     .await;
-                    match stored {
-                        Ok(Ok(stored)) if stored.thread_id == source_thread_id => {
-                            let meta = stored.items.iter().find_map(|item| match item {
-                                RolloutItem::SessionMeta(meta) => Some(&meta.meta),
-                                _ => None,
-                            });
-                            meta.filter(|meta| {
-                                meta.id == source_thread_id && !meta.source.is_internal()
-                            })
-                            .map(|meta| {
-                                fragment.from_storage = true;
-                                ContextManager::reconstruct_rollout(
-                                    &stored.items,
-                                    meta.history_mode,
-                                    ContextManager::new(),
-                                    // Tool bodies are not sender authorization evidence.
-                                    TruncationPolicy::Bytes(0),
-                                )
-                                .retained_context
-                            })
+                    let capture = || {
+                        let stored = stored.ok()?.ok()?;
+                        if stored.thread_id != source_thread_id {
+                            return None;
                         }
-                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => None,
-                    }
+                        let RolloutItem::SessionMeta(meta) = stored.items.first()? else {
+                            return None;
+                        };
+                        if meta.meta.id != source_thread_id || meta.meta.source.is_internal() {
+                            return None;
+                        }
+                        let history_mode = meta.meta.history_mode;
+                        let referenced_agent_fork = meta.meta.history_base.is_some()
+                            && meta.meta.session_id != SessionId::from(source_thread_id)
+                            && meta.meta.subagent_history_start_ordinal.is_none();
+                        let version = if referenced_agent_fork {
+                            if history_mode != ThreadHistoryMode::Paginated
+                                || meta.meta.forked_from_id.is_none()
+                            {
+                                return None;
+                            }
+                            Some(meta.meta.multi_agent_version?)
+                        } else {
+                            None
+                        };
+                        let mut history = Arc::new(stored.items);
+                        if let Some(version) = version {
+                            crate::agent::sanitize_referenced_agent_fork(
+                                source_thread_id,
+                                &mut history,
+                                version,
+                            )
+                            .ok()?;
+                        }
+                        let retention =
+                            codex_history::MessageRetention::saved(&history, source_thread_id);
+                        let context = ContextManager::reconstruct_rollout(
+                            &history,
+                            history_mode,
+                            |ids| ContextManager::new(ids, retention),
+                            // Tool bodies are not sender authorization evidence.
+                            TruncationPolicy::Bytes(0),
+                        )
+                        .retained_context;
+                        fragment.from_storage = true;
+                        Some(context)
+                    };
+                    capture()
                 }
             };
             if let Some(context) = context {
-                let mut exchanges = Vec::new();
-                let mut assistant = None;
-                for (order, entry) in context.ordered_entries() {
-                    match (order, entry) {
-                        (
-                            RetainedContextOrder::Local(_),
-                            RetainedContextEntry::UserMessage(message),
-                        ) => exchanges.push((message, assistant.take())),
-                        (
-                            RetainedContextOrder::Local(_),
-                            RetainedContextEntry::AssistantMessage(message),
-                        ) => assistant = Some(message),
-                        (RetainedContextOrder::Inherited(_), _)
-                        | (_, RetainedContextEntry::VerifiedAnswer(_)) => {}
-                    }
-                }
-                fragment.messages = exchanges
-                    .into_iter()
-                    .rev()
-                    .take(/*n*/ 3)
-                    .map(|(user, assistant)| GuardianSenderExchange {
-                        user: user.complete.then(|| user.text.clone()),
-                        assistant: assistant.map(|message| {
-                            if message.complete {
-                                GuardianRootMessage::Assistant(message.text.clone())
-                            } else {
-                                GuardianRootMessage::IncompleteAssistantContext
-                            }
-                        }),
-                    })
-                    .collect();
-                fragment.messages.reverse();
+                fragment.messages = codex_guardian_reviewer::guardian_sender_exchanges(&context);
             }
         }
         Some(fragment)

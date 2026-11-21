@@ -8,13 +8,30 @@ The spectrum is λ₁ ≤ λ₂ on ℝⁿ.
 x=────────────
        2a
 
+   Ĩ
+I'=─
+   ρ
+
+   Ĩ
+I'=─
+   ρ
+
 1 3
 ─ ─
 2 4
 
-          1
-∫₀¹ x² dx=─
-          3
+3.8%
+
+1        1
+∫ x² dx= ─
+0        3
+
+• Integral:
+
+  ∫₀¹ x dx
+
+> Integral:
+> ∫₀¹ x dx
 
 $$
 x

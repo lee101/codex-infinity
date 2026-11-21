@@ -1,4 +1,5 @@
 use super::*;
+use crate::McpRefreshReason;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::agents_md_manager::SessionInstructions;
 use crate::session::Submission;
@@ -32,14 +33,17 @@ use codex_models_manager::manager::ModelsManagerFuture;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_models_manager::model_info::with_config_overrides;
+use codex_protocol::RequestCountry;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::AsyncClassifierMode;
 use codex_protocol::openai_models::AutoReviewMessages;
+use codex_protocol::openai_models::CatalogModel;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
+use codex_protocol::openai_models::ModelOrigin;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -348,6 +352,7 @@ impl GatedModelsManager {
                 inner: StaticModelsManager::new(
                     /*auth_manager*/ None,
                     ModelsResponse { models },
+                    codex_models_manager::ModelOrigin::ExplicitConfig,
                 ),
                 first_b_lookup: StdMutex::new(Some(Arc::clone(&lookup))),
             }),
@@ -357,12 +362,16 @@ impl GatedModelsManager {
 }
 
 impl ModelsManager for GatedModelsManager {
-    fn raw_model_catalog(
+    fn ensure_initialized(&self, factory: HttpClientFactory) -> ModelsManagerFuture<'_, ()> {
+        self.inner.ensure_initialized(factory)
+    }
+
+    fn model_catalog_with_origins(
         &self,
         strategy: RefreshStrategy,
         factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ModelsResponse> {
-        self.inner.raw_model_catalog(strategy, factory)
+    ) -> ModelsManagerFuture<'_, Vec<codex_models_manager::CatalogModel>> {
+        self.inner.model_catalog_with_origins(strategy, factory)
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
@@ -393,7 +402,7 @@ impl ModelsManager for GatedModelsManager {
         &'a self,
         model: &'a str,
         config: &'a ModelsManagerConfig,
-    ) -> ModelsManagerFuture<'a, ModelInfo> {
+    ) -> ModelsManagerFuture<'a, CatalogModel> {
         Box::pin(async move {
             let pause = if model == MODEL_B {
                 self.first_b_lookup.lock().expect("lookup gate").take()
@@ -509,7 +518,8 @@ fn settings_submission(
                 turn_id: turn_id.to_string(),
                 update,
                 reply,
-            },
+            }
+            .into(),
             trace: None,
             parent_turn_id: None,
             root_turn_id: None,
@@ -596,7 +606,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         },
     );
     submissions
-        .send(submission)
+        .send(Box::new(submission))
         .await
         .expect("submit model update");
     lookup.wait_until_blocked().await;
@@ -605,7 +615,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         .acquire()
         .await
         .expect("MCP refresh lock");
-    session.mark_mcp_runtime_dirty();
+    session.mark_mcp_runtime_dirty(McpRefreshReason::ExplicitInvalidation);
     let capture_cancel = CancellationToken::new();
     let mut during = Box::pin(tokio::task::unconstrained(
         session.capture_step_context(Arc::clone(&turn), &capture_cancel),
@@ -635,7 +645,10 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         ),
     ] {
         let (submission, reply) = settings_submission(id, &turn.sub_id, update);
-        submissions.send(submission).await.expect("queue update");
+        submissions
+            .send(Box::new(submission))
+            .await
+            .expect("queue update");
         replies.push(reply);
     }
     lookup.release();
@@ -684,7 +697,13 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         ]
     );
     assert!(Arc::ptr_eq(&before.turn, &after.turn));
-    assert_eq!(after.settings.model_info.as_ref(), &expected_destination);
+    assert_eq!(
+        after.settings.model_info.as_ref(),
+        &CatalogModel {
+            model: expected_destination.into(),
+            origin: ModelOrigin::ExplicitConfig
+        }
+    );
     let initial_budget = turn
         .config
         .token_budget
@@ -742,6 +761,16 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
     assert_eq!(step_values(&retained), step_values(&after));
     assert_eq!(before.settings.model_info.slug, MODEL_A);
     assert_eq!(turn.model_info().slug, MODEL_A);
+    for step in [&before, &during, &after, &retained] {
+        let extension_model = step
+            .extension_data
+            .get::<ModelInfo>()
+            .expect("step metadata");
+        assert!(Arc::ptr_eq(
+            &step.settings.model_info.model,
+            &extension_model
+        ));
+    }
     drop(submissions);
     loop_task.await.expect("submission loop teardown");
 }
@@ -856,6 +885,62 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
 enum ManagedAuthorizationChange {
     ApprovalPolicy,
     ApprovalsReviewer,
+}
+
+#[tokio::test]
+async fn country_updates_preserve_captured_steps_without_model_switching() {
+    let (mut session, turn) = make_session_and_context().await;
+    session
+        .features
+        .disable(Feature::StepModelSwitching)
+        .unwrap();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            HeldStepTask {
+                kind: TaskKind::Compact,
+                finish: Arc::new(Notify::new()),
+            },
+        )
+        .await;
+    let original = turn.next_step_settings.load_full();
+    let defaults = desired_step_settings(&session).await;
+    for request_country in [
+        RequestCountry::from_iso_code("DE").unwrap(),
+        RequestCountry::UNKNOWN,
+    ] {
+        let captured = turn.next_step_settings.load_full();
+        let expected = captured.request_country().clone();
+        assert_eq!(
+            session
+                .apply_turn_settings(
+                    &turn.sub_id,
+                    TurnSettingsUpdate {
+                        request_country: Some(request_country.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            TurnSettingsUpdateOutcome::Applied,
+        );
+        assert_eq!(
+            turn.next_step_settings.load().request_country(),
+            &request_country
+        );
+        assert_eq!(captured.request_country(), &expected);
+    }
+    let issuing_step = session
+        .capture_step_context(Arc::clone(&turn), &CancellationToken::new())
+        .await
+        .unwrap();
+    let review = crate::guardian::GuardianReviewContext::from(&issuing_step);
+    assert_eq!(review.request_country, RequestCountry::UNKNOWN);
+    assert_eq!(original.request_country(), &RequestCountry::default());
+    assert_eq!(desired_step_settings(&session).await, defaults);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[test_case(false; "reviewer allow-list")]
@@ -1043,10 +1128,11 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
         });
         let model_info = Arc::make_mut(&mut settings.model_info);
         model_info.model_specialty = None;
-        model_info.used_fallback_model_metadata = false;
+        model_info.origin = ModelOrigin::Provider;
     });
     assert!(
         !turn
+            .permission_profile()
             .file_system_sandbox_policy()
             .has_full_disk_write_access()
     );
@@ -1147,7 +1233,7 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
     );
 }
 
-fn safety_models() -> (ModelInfo, ModelInfo) {
+fn safety_models() -> (CatalogModel, CatalogModel) {
     let [mut admitted, mut destination]: [ModelInfo; 2] = activation_models()
         .try_into()
         .expect("two activation models");
@@ -1156,12 +1242,20 @@ fn safety_models() -> (ModelInfo, ModelInfo) {
         model.node_repl_auto_review_required = false;
         model.node_repl_disabled = false;
         model.auto_review_model_override = None;
-        model.used_fallback_model_metadata = false;
         let messages = model.model_messages.as_mut().expect("model messages");
         messages.auto_review = None;
         messages.guardian_v2 = None;
     }
-    (admitted, destination)
+    (
+        CatalogModel {
+            model: admitted.into(),
+            origin: ModelOrigin::Provider,
+        },
+        CatalogModel {
+            model: destination.into(),
+            origin: ModelOrigin::Provider,
+        },
+    )
 }
 
 fn parent_review_messages(model: &mut ModelInfo) -> &mut AutoReviewMessages {
@@ -1221,7 +1315,7 @@ async fn model_safety_rejects_fallback_metadata() {
     let (_, turn) = make_session_and_context().await;
     let (admitted, destination) = safety_models();
     let mut fallback = admitted.clone();
-    fallback.used_fallback_model_metadata = true;
+    fallback.origin = ModelOrigin::Synthetic;
     for (old, current, next, reason) in [
         (
             &fallback,
@@ -1290,7 +1384,7 @@ async fn parent_fallback_preserves_explicit_empty_and_bundled_defaults() {
     let mut config = turn.config.as_ref().clone();
     config.guardian_policy_config = None;
     let (admitted, mut destination) = safety_models();
-    let check = |destination: &ModelInfo| {
+    let check = |destination: &CatalogModel| {
         check_legacy_model_safety(&admitted, &admitted, destination, &config, &config)
     };
     parent_review_messages(&mut destination).policy = Some(defaults.policy.to_string());

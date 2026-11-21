@@ -1,12 +1,14 @@
 //! Helpers for mapping config parse/validation failures to file locations and
 //! rendering them in a user-friendly way.
 
+use crate::CONFIG_TOML_FILE;
 use crate::ConfigLayerEntry;
 use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
+use crate::config_toml::ConfigToml;
 use crate::format_config_layer_source;
+use crate::shell_environment_policy::ShellEnvironmentPolicyFilterConfigToml;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
-use serde::de::DeserializeOwned;
 use serde_path_to_error::Path as SerdePath;
 use serde_path_to_error::Segment as SerdeSegment;
 use std::fmt;
@@ -129,75 +131,98 @@ pub(crate) fn config_error_from_toml_for_source(
     ConfigError::new(source.to_path_buf(), range, err.message())
 }
 
-pub fn config_error_from_typed_toml<T: DeserializeOwned>(
-    path: impl AsRef<Path>,
-    contents: &str,
-) -> Option<ConfigError> {
-    config_error_from_typed_toml_for_source::<T>(
-        ConfigDiagnosticSource::Path(path.as_ref()),
+#[derive(Clone, Copy)]
+enum DiagnosticSchema {
+    Config,
+    ShellEnvironmentFilters,
+}
+
+impl DiagnosticSchema {
+    fn deserialize_error<'de, D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Option<serde_path_to_error::Error<D::Error>> {
+        match self {
+            Self::Config => serde_path_to_error::deserialize::<_, ConfigToml>(deserializer).err(),
+            Self::ShellEnvironmentFilters => serde_path_to_error::deserialize::<
+                _,
+                ShellEnvironmentPolicyFilterConfigToml,
+            >(deserializer)
+            .err(),
+        }
+    }
+}
+
+pub fn config_error_from_typed_toml(path: &Path, contents: &str) -> Option<ConfigError> {
+    config_error_from_typed_toml_for_source(
+        DiagnosticSchema::Config,
+        ConfigDiagnosticSource::Path(path),
         contents,
+        /*layer*/ None,
     )
 }
 
-fn config_error_from_typed_toml_for_source<T: DeserializeOwned>(
+fn config_error_from_typed_toml_for_source(
+    schema: DiagnosticSchema,
     source: ConfigDiagnosticSource<'_>,
     contents: &str,
+    layer: Option<&ConfigLayerSource>,
 ) -> Option<ConfigError> {
     let deserializer = match toml::de::Deserializer::parse(contents) {
         Ok(deserializer) => deserializer,
         Err(err) => return Some(config_error_from_toml_for_source(source, contents, err)),
     };
 
-    let result: Result<T, _> = serde_path_to_error::deserialize(deserializer);
-    match result {
-        Ok(_) => None,
-        Err(err) => {
-            let path_hint = err.path().clone();
-            let toml_err: toml::de::Error = err.into_inner();
-            let range = span_for_config_path(contents, &path_hint)
-                .or_else(|| toml_err.span())
-                .map(|span| text_range_from_span(contents, span))
-                .unwrap_or_else(default_range);
-            Some(ConfigError::new(
-                source.to_path_buf(),
-                range,
-                toml_err.message(),
-            ))
-        }
+    let mut err = schema.deserialize_error(deserializer)?;
+    // Diagnose the same effective fields against the text we just read from disk.
+    if let Some(layer) = layer
+        && let Ok(raw) = toml::from_str(contents)
+        && let std::borrow::Cow::Owned(effective) = layer.effective_values(&raw)
+    {
+        err = schema.deserialize_error(effective)?;
     }
+    let path_hint = err.path().clone();
+    let toml_err: toml::de::Error = err.into_inner();
+    let range = span_for_config_path(contents, &path_hint)
+        .or_else(|| toml_err.span())
+        .map(|span| text_range_from_span(contents, span))
+        .unwrap_or_else(default_range);
+    Some(ConfigError::new(
+        source.to_path_buf(),
+        range,
+        toml_err.message(),
+    ))
 }
 
-pub async fn first_layer_config_error<T: DeserializeOwned>(
-    layers: &ConfigLayerStack,
-    config_toml_file: &str,
-) -> Option<ConfigError> {
+pub async fn first_layer_config_error(layers: &ConfigLayerStack) -> Option<ConfigError> {
     // When the merged config fails schema validation, we surface the first concrete
     // per-file error to point users at a specific file and range rather than an
     // opaque merged-layer failure.
-    first_layer_config_error_for_entries::<T, _>(layers.layers_low_to_high(), config_toml_file)
-        .await
+    first_layer_error(layers.layers_low_to_high(), DiagnosticSchema::Config).await
 }
 
-pub async fn first_layer_config_error_from_entries<T: DeserializeOwned>(
+pub async fn first_layer_config_error_from_entries(
     layers: &[ConfigLayerEntry],
-    config_toml_file: &str,
 ) -> Option<ConfigError> {
-    first_layer_config_error_for_entries::<T, _>(layers.iter(), config_toml_file).await
+    first_layer_error(layers, DiagnosticSchema::Config).await
 }
 
-async fn first_layer_config_error_for_entries<'a, T: DeserializeOwned, I>(
-    layers: I,
-    config_toml_file: &str,
-) -> Option<ConfigError>
-where
-    I: IntoIterator<Item = &'a ConfigLayerEntry>,
-{
+pub(crate) async fn first_layer_shell_environment_filter_error(
+    layers: &[ConfigLayerEntry],
+) -> Option<ConfigError> {
+    first_layer_error(layers, DiagnosticSchema::ShellEnvironmentFilters).await
+}
+
+async fn first_layer_error<'a>(
+    layers: impl IntoIterator<Item = &'a ConfigLayerEntry>,
+    schema: DiagnosticSchema,
+) -> Option<ConfigError> {
     for layer in layers {
         if layer.is_disabled() {
             continue;
         }
         if let Some(contents) = layer.raw_toml() {
-            let source_name = format_config_layer_source(&layer.name, config_toml_file);
+            let source_name = format_config_layer_source(&layer.name, CONFIG_TOML_FILE);
             let Some(base_dir) = layer.raw_toml_base_dir() else {
                 tracing::debug!(
                     "Skipping raw TOML diagnostics for {source_name} because it has no base directory"
@@ -208,16 +233,18 @@ where
             // parsed into the runtime layer so diagnostics resolve relative
             // path fields with the same semantics.
             let _absolute_path_base = AbsolutePathBufGuard::new(base_dir.as_path());
-            if let Some(error) = config_error_from_typed_toml_for_source::<T>(
+            if let Some(error) = config_error_from_typed_toml_for_source(
+                schema,
                 ConfigDiagnosticSource::DisplayName(&source_name),
                 contents,
+                Some(&layer.name),
             ) {
                 return Some(error);
             }
             continue;
         }
 
-        let Some(path) = config_path_for_layer(layer, config_toml_file) else {
+        let Some(path) = config_path_for_layer(layer, CONFIG_TOML_FILE) else {
             continue;
         };
         let contents = match tokio::fs::read_to_string(&path).await {
@@ -234,7 +261,12 @@ where
             continue;
         };
         let _guard = AbsolutePathBufGuard::new(parent);
-        if let Some(error) = config_error_from_typed_toml::<T>(&path, &contents) {
+        if let Some(error) = config_error_from_typed_toml_for_source(
+            schema,
+            ConfigDiagnosticSource::Path(&path),
+            &contents,
+            Some(&layer.name),
+        ) {
             return Some(error);
         }
     }

@@ -167,6 +167,7 @@ impl fmt::Debug for OutboundProxyRoute {
 pub struct HttpClientFactory {
     outbound_proxy_policy: OutboundProxyPolicy,
     system_proxy_fallback: bool,
+    protect_sensitive_headers: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
     network_policy: NetworkPolicy,
 }
@@ -175,6 +176,7 @@ impl PartialEq for HttpClientFactory {
     fn eq(&self, other: &Self) -> bool {
         self.outbound_proxy_policy == other.outbound_proxy_policy
             && self.system_proxy_fallback == other.system_proxy_fallback
+            && self.protect_sensitive_headers == other.protect_sensitive_headers
             && self.network_policy == other.network_policy
             && self
                 .chatgpt_cookie_store
@@ -194,6 +196,7 @@ impl fmt::Debug for HttpClientFactory {
         f.debug_struct("HttpClientFactory")
             .field("outbound_proxy_policy", &self.outbound_proxy_policy)
             .field("system_proxy_fallback", &self.system_proxy_fallback)
+            .field("protect_sensitive_headers", &self.protect_sensitive_headers)
             .field("network_policy", &self.network_policy)
             .finish()
     }
@@ -205,9 +208,22 @@ impl HttpClientFactory {
         Self {
             outbound_proxy_policy,
             system_proxy_fallback: false,
+            protect_sensitive_headers: false,
             chatgpt_cookie_store: None,
             network_policy: NetworkPolicy::unmanaged(),
         }
+    }
+
+    /// Follows redirects while keeping headers marked sensitive on the original origin.
+    /// Reqwest's default redirect handling only recognizes standard credential headers.
+    pub fn with_sensitive_header_protection(mut self) -> Self {
+        self.protect_sensitive_headers = true;
+        self
+    }
+
+    /// Whether redirect handling removes sensitive headers when the origin changes.
+    pub fn protects_sensitive_headers(&self) -> bool {
+        self.protect_sensitive_headers
     }
 
     /// Carries the account/configuration owner's application policy into every transport.
@@ -630,8 +646,11 @@ fn cache_system_proxy_decision(request_url: &str, decision: SystemProxyDecision)
 ///
 /// This is public only so tests in HTTP-client consumers can exercise system-proxy routing
 /// deterministically on every supported platform.
-pub fn cache_system_proxy_route_for_test(request_url: &str, proxy_url: String) {
-    cache_system_proxy_decision(request_url, SystemProxyDecision::Proxy { url: proxy_url });
+pub fn cache_system_proxy_route_for_test(request_url: &str, proxy_url: impl Into<Option<String>>) {
+    let decision = proxy_url.into().map_or(SystemProxyDecision::Direct, |url| {
+        SystemProxyDecision::Proxy { url }
+    });
+    cache_system_proxy_decision(request_url, decision);
 }
 
 fn insert_system_proxy_cache_entry(

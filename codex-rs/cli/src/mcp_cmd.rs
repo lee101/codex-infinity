@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use clap::ArgGroup;
 use clap::builder::TypedValueParser;
+use codex_config::ConfigLayerSource;
 use codex_config::types::AppToolApproval;
 use codex_config::types::McpServerAuth;
 use codex_config::types::McpServerConfig;
@@ -23,6 +24,7 @@ use codex_core::plugins_manager_for_config;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::HttpClient;
 use codex_exec_server::RouteAwareHttpClient;
+use codex_extension_api::McpServerContributionContext;
 use codex_login::AuthManager;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpRuntimeContext;
@@ -48,7 +50,6 @@ use codex_utils_redacted_string::RedactedString;
 use crate::cloud_config;
 use crate::mcp_login::McpLoginMode;
 use crate::mcp_login::perform_oauth_login_retry_without_scopes;
-use crate::plugin_cmd::load_cli_auth_manager;
 
 #[cfg(test)]
 #[path = "mcp_cmd_tests.rs"]
@@ -535,7 +536,7 @@ async fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveAr
 async fn load_mcp_manager(config: &Config) -> Result<McpManager> {
     let plugins_manager = Arc::new(plugins_manager_for_config(
         config,
-        load_cli_auth_manager(config).await?,
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?,
     ));
     Ok(McpManager::new(plugins_manager))
 }
@@ -693,7 +694,9 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?;
     let auth = auth_manager.auth().await;
     let mcp_servers = mcp_manager.configured_servers(config).await;
-    let runtime_config = mcp_manager.runtime_config(config).await;
+    let runtime_config = mcp_manager
+        .runtime_config(McpServerContributionContext::global(config))
+        .await;
     let effective_mcp_servers = codex_mcp::effective_mcp_servers(&runtime_config, auth.as_ref());
 
     let mut entries: Vec<_> = mcp_servers.iter().collect();
@@ -707,7 +710,12 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
         config.cwd.to_path_buf(),
     );
     let auth_statuses = compute_auth_statuses(
-        effective_mcp_servers.iter(),
+        mcp_servers.keys().filter_map(|name| {
+            runtime_config
+                .mcp_server_catalog
+                .resolve_server_name(name)
+                .and_then(|key| effective_mcp_servers.get_key_value(key))
+        }),
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
         auth.as_ref(),
@@ -715,7 +723,10 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
         &runtime_config.ema_state,
         &runtime_context,
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|(key, status)| (key.name().to_owned(), status))
+    .collect::<HashMap<_, _>>();
 
     if list_args.json {
         let json_entries: Vec<_> = entries
@@ -1121,7 +1132,23 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
         };
         println!("  default_tools_approval_mode: {approval_mode}");
     }
-    println!("  remove: codex mcp remove {}", get_args.name);
+    if let Some(layer) = config.config_layer_stack.get_active_user_layer()
+        && let ConfigLayerSource::User {
+            file,
+            profile: Some(_),
+        } = &layer.name
+        && !layer.is_disabled()
+        && layer
+            .config
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(&get_args.name))
+            .is_some()
+    {
+        println!("  profile settings: {}", file.as_path().display());
+        println!("  removal scope: `codex mcp remove` only edits the global config.");
+    } else {
+        println!("  remove: codex mcp remove {}", get_args.name);
+    }
 
     Ok(())
 }

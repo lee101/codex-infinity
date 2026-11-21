@@ -362,8 +362,7 @@ async fn returns_config_error_for_schema_error_in_user_config() {
     let config_error = config_error_from_io(&err);
     let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(tmp.path());
     let expected_config_error =
-        codex_config::config_error_from_typed_toml::<ConfigToml>(&config_path, contents)
-            .expect("schema error");
+        codex_config::config_error_from_typed_toml(&config_path, contents).expect("schema error");
     assert_eq!(config_error, &expected_config_error);
 }
 
@@ -487,7 +486,7 @@ exclude = ["LEGACY_*"]
 
     assert_eq!(
         config_error_from_io(&err),
-        &config_error_from_typed_toml::<ConfigToml>(&config_path, contents)
+        &config_error_from_typed_toml(&config_path, contents)
             .expect("mixed shell policy should produce a typed config error")
     );
 }
@@ -845,8 +844,8 @@ collaboration_modes = "true""#;
     std::fs::write(&config_path, contents).expect("write config");
 
     let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(tmp.path());
-    let error = codex_config::config_error_from_typed_toml::<ConfigToml>(&config_path, contents)
-        .expect("schema error");
+    let error =
+        codex_config::config_error_from_typed_toml(&config_path, contents).expect("schema error");
 
     let value_line = contents.lines().nth(1).expect("value line");
     let value_column = value_line.find("\"true\"").expect("value") + 1;
@@ -1191,13 +1190,20 @@ flag = false
 async fn managed_preferences_expand_home_directory_in_workspace_write_roots() -> anyhow::Result<()>
 {
     use base64::Engine;
-    use codex_protocol::protocol::SandboxPolicy;
 
     let Some(home) = dirs::home_dir() else {
         return Ok(());
     };
     let tmp = tempdir()?;
 
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"
+default_permissions = ":read-only"
+[sandbox_workspace_write]
+network_access = true
+"#,
+    )?;
     let mut loader_overrides =
         LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
     loader_overrides.managed_preferences_base64 = Some(
@@ -1215,23 +1221,24 @@ writable_roots = ["~/code"]
         .codex_home(tmp.path().to_path_buf())
         .fallback_cwd(Some(tmp.path().to_path_buf()))
         .loader_overrides(loader_overrides)
+        .cloud_config_bundle(CloudConfigBundleFixture::loader_with_enterprise_config(
+            "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true",
+        ))
         .build()
         .await?;
 
     let expected_root = AbsolutePathBuf::from_absolute_path(home.join("code"))?;
-    match &config.legacy_sandbox_policy() {
-        SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-            assert_eq!(
-                writable_roots
-                    .iter()
-                    .filter(|root| **root == expected_root)
-                    .count(),
-                1,
-            );
-        }
-        other => panic!("expected workspace-write policy, got {other:?}"),
-    }
+    assert_eq!(
+        config.permissions.permission_profile(),
+        &codex_protocol::models::PermissionProfile::workspace_write_with(
+            &[expected_root],
+            codex_protocol::permissions::NetworkSandboxPolicy::Enabled,
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ false,
+        )
+    );
 
+    assert_eq!(config.permissions.active_permission_profile(), None);
     Ok(())
 }
 
@@ -1431,6 +1438,7 @@ personality = true
             .map(|requirements| requirements.value.clone()),
         Some(codex_config::FeatureRequirementsToml {
             entries: BTreeMap::from([("personality".to_string(), true)]),
+            ..Default::default()
         })
     );
     let config_requirements: ConfigRequirements = config_requirements_toml.try_into()?;
@@ -1471,17 +1479,24 @@ personality = true
             .map(|requirements| requirements.value.clone()),
         Some(codex_config::FeatureRequirementsToml {
             entries: BTreeMap::from([("personality".to_string(), true)]),
+            ..Default::default()
         })
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn system_requirements_control_in_app_updates() -> anyhow::Result<()> {
+async fn system_requirements_control_update_features() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let codex_home = tmp.path().join("home");
     tokio::fs::create_dir_all(&codex_home).await?;
     let cwd = AbsolutePathBuf::from_absolute_path(tmp.path())?;
+
+    tokio::fs::write(
+        codex_home.join("config.toml"),
+        "[features]\ndaemon_updates = false\n",
+    )
+    .await?;
 
     let default_config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
@@ -1490,6 +1505,7 @@ async fn system_requirements_control_in_app_updates() -> anyhow::Result<()> {
         .build()
         .await?;
     assert!(default_config.features.enabled(Feature::InAppUpdates));
+    assert!(default_config.features.enabled(Feature::DaemonUpdates));
 
     let requirements_path = tmp.path().join("requirements.toml");
     tokio::fs::write(
@@ -1497,6 +1513,7 @@ async fn system_requirements_control_in_app_updates() -> anyhow::Result<()> {
         r#"
 [features]
 in_app_updates = false
+daemon_updates = false
 "#,
     )
     .await?;
@@ -1510,6 +1527,7 @@ in_app_updates = false
         .await?;
 
     assert!(!managed_config.features.enabled(Feature::InAppUpdates));
+    assert!(!managed_config.features.enabled(Feature::DaemonUpdates));
     Ok(())
 }
 
@@ -1870,6 +1888,8 @@ managed-standard = true
 [permissions.managed-standard]
 extends = ":workspace"
 
+[permissions.managed-standard.credentials]
+
 [permissions.managed-standard.network]
 enabled = true
 proxy_url = "http://127.0.0.1:43128"
@@ -1900,6 +1920,8 @@ enable_socks5 = false
         toml::from_str::<PermissionProfileToml>(
             r#"
 extends = ":workspace"
+
+[credentials]
 
 [filesystem]
 ":root" = "read"
@@ -1943,7 +1965,11 @@ async fn network_requirements_start_proxy_for_legacy_and_permission_configs() ->
         "default_permissions = 'dev'\n[permissions.dev]\nextends = ':workspace'\n[permissions.dev.network]\nenabled = true\n",
         "default_permissions = 'network'\n[permissions.network]\nextends = ':workspace'\n[permissions.network.network]\nenabled = true\n",
     ] {
-        for table in ["network_proxy", "experimental_network"] {
+        for table in [
+            "network_proxy",
+            "experimental_network",
+            "permissions.network",
+        ] {
             let requirements_toml = format!(
                 "[{table}]\nenabled = true\n[{table}.domains]\n'api.example.com' = 'allow'\n"
             );
@@ -2340,6 +2366,47 @@ extends = ":workspace"
         error.to_string(),
         "requirements.toml permissions profile `duplicate-profile` conflicts with a config-defined profile of the same name"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_managed_credentials_table_cannot_select_a_user_profile() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    tokio::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        "[permissions.credentials]\nextends = ':workspace'",
+    )
+    .await?;
+
+    for (selected, child) in [
+        ("credentials", ""),
+        ("build", "[permissions.build]\nextends = 'credentials'"),
+    ] {
+        let requirements = format!(
+            r#"
+default_permissions = "{selected}"
+
+[allowed_permission_profiles]
+{selected} = true
+
+[permissions.credentials]
+{child}
+"#
+        );
+        let err = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+            )
+            .build()
+            .await
+            .expect_err("an empty managed profile must not bind to the writable user profile");
+        assert!(
+            err.to_string().contains("`permissions.credentials` in requirements.toml is reserved for shared credential policy; rename the managed profile"),
+            "{selected}: {err}"
+        );
+    }
     Ok(())
 }
 
@@ -4619,6 +4686,7 @@ prefix_rules = [
             parsed,
             RequirementsExecPolicyToml {
                 prefix_rules: vec![RequirementsExecPolicyPrefixRuleToml {
+                    canonical_matching: false,
                     pattern: vec![RequirementsExecPolicyPatternTokenToml {
                         token: Some("rm".to_string()),
                         any_of: None,
@@ -4648,6 +4716,7 @@ prefix_rules = [
             RequirementsExecPolicyToml {
                 prefix_rules: vec![
                     RequirementsExecPolicyPrefixRuleToml {
+                        canonical_matching: false,
                         pattern: vec![RequirementsExecPolicyPatternTokenToml {
                             token: Some("rm".to_string()),
                             any_of: None,
@@ -4656,6 +4725,7 @@ prefix_rules = [
                         justification: None,
                     },
                     RequirementsExecPolicyPrefixRuleToml {
+                        canonical_matching: false,
                         pattern: vec![
                             RequirementsExecPolicyPatternTokenToml {
                                 token: Some("git".to_string()),

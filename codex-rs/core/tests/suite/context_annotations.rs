@@ -4,6 +4,7 @@ use codex_core::config::CurrentTimeReminderConfig;
 use codex_core::config::RolloutBudgetConfig;
 use codex_core::config::TokenBudgetConfig;
 use codex_features::Feature;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::ImageReference;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::AdditionalContextEntry;
@@ -50,7 +51,8 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
             });
             config.rollout_budget = Some(RolloutBudgetConfig {
                 enforce_limit: true,
-                limit_tokens: 100,
+                limit_budget: 100.0,
+                reminder_at_context_start: true,
                 reminder_at_remaining_tokens: Vec::new(),
                 sampling_token_weight: 1.0,
                 prefill_token_weight: 1.0,
@@ -119,9 +121,7 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
                     },
                     detail: None,
                 },
-                UserInput::Audio {
-                    audio_url: "data:audio/wav;base64,AAAA".to_string(),
-                },
+                UserInput::Audio { audio: AudioReference::Inline { audio_url: "data:audio/wav;base64,AAAA".to_string() } },
             ])
             .with_additional_context(BTreeMap::from([
                 (
@@ -215,7 +215,7 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
     message developer ["multi_agent.mode_instructions"]
     message user ["environments.environment_context"]
     message developer ["additional_content.automation_info"]
-    message user ["additional_content.browser_info"]
+    function_call_output - null
     message user ["user.text","user.image","user.audio"]
     message developer ["rollout_budget.remaining_tokens"]
     message developer ["current_time.reminder"]

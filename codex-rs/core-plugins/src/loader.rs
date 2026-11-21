@@ -56,6 +56,8 @@ use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
 use codex_utils_plugins::migrated_command_skills_root;
+use futures::StreamExt;
+use futures::stream;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -75,6 +77,7 @@ const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
 const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
 const CONFIG_TOML_FILE: &str = "config.toml";
 const CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN: usize = 8;
+const MAX_CONCURRENT_PLUGIN_LOADS: usize = 8;
 
 /// Hook declarations and warnings resolved without loading other plugin capabilities.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,7 +106,7 @@ enum PluginLoadScope<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NonCuratedCacheRefreshMode {
+pub(crate) enum NonCuratedCacheRefreshMode {
     IfVersionChanged,
     ForceReinstall,
 }
@@ -191,8 +194,16 @@ async fn load_plugins_from_layer_stack_with_scope(
 
     let mut plugins = Vec::with_capacity(configured_plugins.len());
     let mut seen_mcp_server_names = HashMap::<String, String>::new();
-    for (configured_name, plugin) in configured_plugins {
-        let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, &scope).await;
+    let scope = &scope;
+    // Overlap independent filesystem/skill loads, but consume them in configured-name order:
+    // that order determines duplicate MCP precedence and startup hook warning order.
+    let mut pending_plugins = stream::iter(configured_plugins)
+        .map(|(configured_name, plugin)| async move {
+            let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, scope).await;
+            (configured_name, loaded_plugin)
+        })
+        .buffered(MAX_CONCURRENT_PLUGIN_LOADS);
+    while let Some((configured_name, loaded_plugin)) = pending_plugins.next().await {
         for name in loaded_plugin.mcp_servers.keys() {
             if let Some(previous_plugin) =
                 seen_mcp_server_names.insert(name.clone(), configured_name.clone())
@@ -387,6 +398,7 @@ pub fn remote_installed_plugins_to_config(
                     release_id: None,
                     auto_provision: None,
                     mcp_servers: HashMap::new(),
+                    apps: HashMap::new(),
                 },
             ))
         })
@@ -522,67 +534,24 @@ pub(crate) fn refresh_non_curated_plugin_cache(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
 ) -> Result<bool, String> {
-    collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_detailed(
+    collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_with_mode(
         codex_home,
         additional_roots,
-        configured_plugin_keys,
-        PluginGitMode::Automatic,
-    ))
-}
-
-pub(crate) fn refresh_non_curated_plugin_cache_detailed(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-    git_mode: PluginGitMode,
-) -> Result<NonCuratedCacheRefreshOutcome, String> {
-    refresh_non_curated_plugin_cache_with_mode(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
+        configured_plugin_keys.iter().map(String::as_str),
         NonCuratedCacheRefreshMode::IfVersionChanged,
-        git_mode,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-) -> Result<bool, String> {
-    collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_force_reinstall_detailed(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
         PluginGitMode::Automatic,
     ))
 }
 
-pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
+pub(crate) fn refresh_non_curated_plugin_cache_with_mode<'a>(
     codex_home: &Path,
     additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-    git_mode: PluginGitMode,
-) -> Result<NonCuratedCacheRefreshOutcome, String> {
-    refresh_non_curated_plugin_cache_with_mode(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
-        NonCuratedCacheRefreshMode::ForceReinstall,
-        git_mode,
-    )
-}
-
-fn refresh_non_curated_plugin_cache_with_mode(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
+    configured_plugin_keys: impl IntoIterator<Item = &'a str>,
     mode: NonCuratedCacheRefreshMode,
     git_mode: PluginGitMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
-        .iter()
+        .into_iter()
         .filter_map(|plugin_key| match PluginId::parse(plugin_key) {
             Ok(plugin_id) if !is_openai_curated_marketplace_name(&plugin_id.marketplace_name) => {
                 Some(plugin_id)

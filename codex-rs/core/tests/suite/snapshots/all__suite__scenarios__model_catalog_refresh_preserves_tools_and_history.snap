@@ -1,6 +1,5 @@
 ---
 source: core/tests/suite/scenarios.rs
-assertion_line: 1685
 expression: "context_snapshot::format_request_history_snapshot(\"Catalog refreshes append the updated listing once while preserving tools and prior input.\",\n&requests, &ContextSnapshotOptions::default().include_request_settings(),)"
 ---
 Scenario: Catalog refreshes append the updated listing once while preserving tools and prior input.
@@ -15,12 +14,12 @@ Settings:
   store: false
   stream: true
   tool_choice: "auto"
-  tools (6; hash=70e3d78044e5268d):
-    - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=428201bf67fff5ff
-    - function/write_stdin: Writes characters to an existing unified exec session and returns recent output.; args=[chars, max_output_tokens, session_id, yield_time_ms]; hash=de1be2dbbbdb6243
+  tools (6; hash=6d27d4ee152c61c9):
+    - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=24f4b6739dd5d940
+    - function/write_stdin: Writes characters to an existing unified exec session and returns recent output.; args=[chars, max_output_tokens, session_id, yield_time_ms]; hash=7fb62d8a3e2df4e2
     - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
     - function/view_image: View a local image file from the filesystem when visual inspection is needed. Use this for images...; args=[path]; hash=1908de9c0be7118a
-    - namespace/multi_agent_v1: Tools for spawning and managing sub-agents.; hash=9ff8cbc5cfdbb5cb
+    - namespace/multi_agent_v1: Tools for spawning and managing sub-agents.; hash=94c598b3c6ca141b
       - function/close_agent
       - function/resume_agent
       - function/send_input

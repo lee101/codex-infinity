@@ -7,6 +7,7 @@ use crate::skills_helpers::skill_description;
 use crate::skills_helpers::skill_display_name;
 use crate::task_mentions::MAX_TASK_TITLE_CHARS;
 use crate::task_mentions::TaskMention;
+use crate::thread_label::ThreadLabelStyle;
 
 use super::candidate::Candidate;
 use super::candidate::MentionType;
@@ -48,12 +49,9 @@ pub(crate) fn build_search_catalog(
         Candidate {
             display_name: title.clone(),
             description: (!task.cwd.is_empty()).then(|| task.cwd.clone()),
-            search_terms: vec![
-                title.clone(),
-                task.cwd.chars().take(MAX_TASK_TITLE_CHARS).collect(),
-                task.snippet.chars().take(MAX_TASK_TITLE_CHARS).collect(),
-            ],
+            search_terms: Vec::new(),
             mention_type: MentionType::Task,
+            label_style: task.label_style,
             selection: Selection::Tool {
                 insert_text: format!("@{title}"),
                 path: Some(format!("thread://{}", task.thread_id)),
@@ -78,6 +76,7 @@ fn skill_candidate(skill: &SkillMetadata) -> Candidate {
         description,
         search_terms,
         mention_type: MentionType::Skill,
+        label_style: ThreadLabelStyle::Plain,
         selection: Selection::Tool {
             insert_text: format!("${skill_name}"),
             path: Some(skill.path.as_str().to_owned()),
@@ -104,6 +103,7 @@ fn plugin_candidate(plugin: &PluginCapabilitySummary) -> Candidate {
         description: plugin_description(plugin),
         search_terms,
         mention_type: MentionType::Plugin,
+        label_style: ThreadLabelStyle::Plain,
         selection: Selection::Tool {
             insert_text: format!("@{mention_name}"),
             path: Some(format!("plugin://{}", plugin.config_name)),

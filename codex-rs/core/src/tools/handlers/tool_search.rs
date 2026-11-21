@@ -15,7 +15,6 @@ use bm25::Embedder;
 use bm25::EmbedderBuilder;
 use bm25::Language;
 use bm25::Scorer;
-use codex_features::Feature;
 use codex_prompts::ResolvedModelMessages;
 use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::JsonToolOutput;
@@ -244,11 +243,10 @@ impl ToolSearchHandler {
         }
 
         let model_messages = ResolvedModelMessages::from_model(&step_context.settings.model_info);
-        let indirect_prefixes = IndirectNamespacePrefixes::new(
-            model_messages.indirect_description_prefixes(),
-            step_context.tool_router.mcp_namespaces(),
-        )
-        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+        let indirect_prefixes = step_context
+            .tool_router
+            .indirect_namespace_prefixes(model_messages.indirect_description_prefixes())
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
 
         if nested {
             let tools = self.search_code_mode(
@@ -260,11 +258,6 @@ impl ToolSearchHandler {
                     .config
                     .code_mode
                     .tool_input_schema_max_bytes,
-                step_context
-                    .turn
-                    .config
-                    .features
-                    .enabled(Feature::CodeModeToolDescriptionFirst),
                 &indirect_prefixes,
             );
             return Ok(boxed_tool_output(JsonToolOutput::new(serde_json::json!({
@@ -292,7 +285,6 @@ impl ToolSearchHandler {
         limit: usize,
         router: &ToolRouter,
         code_mode_input_schema_max_bytes: Option<usize>,
-        tool_description_first: bool,
         indirect_prefixes: &IndirectNamespacePrefixes<'_>,
     ) -> Vec<CodeModeSearchResult> {
         let mut tools = Vec::new();
@@ -320,7 +312,6 @@ impl ToolSearchHandler {
                     tool.cached_runtime().map(Arc::as_ref),
                     || Cow::Owned(Arc::unwrap_or_clone(tool.spec())),
                     code_mode_input_schema_max_bytes,
-                    tool_description_first,
                 );
                 let Some(definition) = definitions.iter().find(|definition| {
                     definition.tool_name.clone().with_default_namespace() == candidate_name
@@ -396,15 +387,12 @@ mod tests {
         let replacement = cache.get_or_build(&replacement_registry, ToolSearchSourceListing::Omit);
         assert!(!Arc::ptr_eq(&without_sources, &replacement));
 
-        registry
-            .apply_functions_namespace_function_prefixes(
-                Some(&std::collections::BTreeMap::from([(
-                    "create_event".to_string(),
-                    "Guidance.".to_string(),
-                )])),
-                [ToolName::plain("create_event")],
-            )
-            .expect("valid function prefixes");
+        registry.apply_functions_namespace_function_prefixes(Some(
+            &std::collections::BTreeMap::from([(
+                "create_event".to_string(),
+                "Guidance.".to_string(),
+            )]),
+        ));
         let prefixed = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
         let reused = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
         assert!(Arc::ptr_eq(&prefixed, &reused));
@@ -421,9 +409,7 @@ mod tests {
         };
         tool.description = format!("Guidance.\n\n{}", tool.description);
         assert_eq!(prefixed.search("Create events", /*limit*/ 1), expected);
-        registry
-            .apply_functions_namespace_function_prefixes(/*prefixes*/ None, [])
-            .expect("clear prefixes");
+        registry.apply_functions_namespace_function_prefixes(/*prefixes*/ None);
         let cleared = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
         assert_eq!(
             cleared.search("Create events", /*limit*/ 1),
@@ -596,7 +582,7 @@ mod tests {
 
     fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo {
         ToolInfo {
-            server_name: server_name.to_string(),
+            server_key: codex_mcp::McpServerKey::unscoped(server_name),
             supports_parallel_tool_calls: false,
             server_origin: None,
             callable_name: tool_name.to_string(),

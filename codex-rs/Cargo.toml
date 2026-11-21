@@ -4,6 +4,7 @@ members = [
     "analytics",
     "agent-graph-store",
     "agent-message-board-client",
+    "agent-message-board-host",
     "agent-identity",
     "agent-roles",
     "backend-client",
@@ -17,6 +18,7 @@ members = [
     "app-server-transport",
     "app-server-daemon",
     "app-server-client",
+    "app-server-remote-client",
     "app-server-protocol",
     "app-server-protocol-noop-macros",
     "app-server-test-client",
@@ -54,13 +56,16 @@ members = [
     "hooks",
     "history",
     "http-client",
+    "http-headers-helper",
     "secrets",
     "exec",
     "file-system",
     "exec-server-protocol",
     "exec-server",
+    "exec-server-cli",
     "exec-server/tests/support",
     "execpolicy",
+    "execpolicy-rules",
     "ext/agent",
     "ext/agent-message-board",
     "ext/connectors",
@@ -91,6 +96,7 @@ members = [
     "memories/write",
     "mermaid",
     "message-board",
+    "message-board-mcp",
     "model-provider-info",
     "mxc-sandbox",
     "models-manager",
@@ -109,11 +115,11 @@ members = [
     "runtime-agent-instance",
     "response-debug-context",
     "sandboxing",
-    "stdio-to-uds",
     "otel",
     "otel-trace-websocket",
     "tcp-tunnel",
     "tui",
+    "user-input",
     "user-verification",
     "tools",
     "v8-poc",
@@ -144,6 +150,7 @@ members = [
     "utils/cli",
     "utils/elapsed",
     "utils/sandbox-summary",
+    "utils/model-facing-id",
     "utils/sleep-inhibitor",
     "utils/approval-presets",
     "utils/oss",
@@ -159,6 +166,8 @@ members = [
     "terminal-detection",
     "test-binary-support",
     "thread-manager-sample",
+    "thread-context-ids",
+    "thread-context-ids/tests/support",
     "thread-store",
     "uds",
     "codex-experimental-api-macros",
@@ -192,6 +201,7 @@ codex-app-server = { path = "app-server" }
 codex-app-server-transport = { path = "app-server-transport" }
 codex-app-server-daemon = { path = "app-server-daemon" }
 codex-app-server-client = { path = "app-server-client" }
+codex-app-server-remote-client = { path = "app-server-remote-client" }
 codex-app-server-protocol = { path = "app-server-protocol" }
 codex-app-server-protocol-noop-macros = { path = "app-server-protocol-noop-macros" }
 codex-app-server-test-client = { path = "app-server-test-client" }
@@ -209,16 +219,19 @@ codex-cloud-tasks-mock-client = { path = "cloud-tasks-mock-client" }
 codex-code-mode = { path = "code-mode" }
 codex-code-mode-protocol = { path = "code-mode-protocol" }
 codex-code-mode-runtime = { path = "code-mode-runtime" }
+codex-plugin-host = { path = "plugin-host" }
 codex-home = { path = "codex-home" }
 codex-http-client = { path = "http-client" }
+codex-http-headers-helper = { path = "http-headers-helper" }
 codex-websocket-auth = { path = "websocket-auth" }
 codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
-codex-agent-extension = { path = "ext/agent" }
 codex-agent-message-board-client = { path = "agent-message-board-client" }
 codex-agent-message-board-extension = { path = "ext/agent-message-board" }
+codex-agent-message-board-host = { path = "agent-message-board-host" }
 codex-message-board = { path = "message-board" }
+codex-message-board-mcp = { path = "message-board-mcp" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
@@ -231,8 +244,10 @@ codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }
 codex-exec-server = { path = "exec-server" }
+codex-exec-server-cli = { path = "exec-server-cli" }
 codex-exec-server-test-support = { path = "exec-server/tests/support" }
 codex-execpolicy = { path = "execpolicy" }
+codex-execpolicy-rules = { path = "execpolicy-rules" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-multi-env-copy-file = { path = "ext/multi-env-copy-file" }
@@ -240,6 +255,7 @@ codex-goal-extension = { path = "ext/goal" }
 codex-git-attribution = { path = "ext/git-attribution" }
 codex-guardian-reviewer = { path = "ext/guardian-reviewer" }
 codex-guardian-v2 = { path = "ext/guardian-v2" }
+codex-guardian-v3 = { path = "ext/guardian-v3" }
 codex-history-notes-extension = { path = "ext/history-notes" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
@@ -291,9 +307,10 @@ codex-shell-command = { path = "shell-command" }
 codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
 codex-state = { path = "state" }
-codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-terminal-detection = { path = "terminal-detection" }
 codex-test-binary-support = { path = "test-binary-support" }
+codex-thread-context-ids = { path = "thread-context-ids" }
+codex-thread-context-ids-test-support = { path = "thread-context-ids/tests/support" }
 codex-thread-store = { path = "thread-store" }
 codex-tools = { path = "tools" }
 codex-tcp-tunnel = { path = "tcp-tunnel" }
@@ -313,6 +330,7 @@ codex-utils-head-tail-buffer = { path = "utils/head-tail-buffer" }
 codex-utils-home-dir = { path = "utils/home-dir" }
 codex-utils-image = { path = "utils/image" }
 codex-utils-json-to-toml = { path = "utils/json-to-toml" }
+codex-utils-model-facing-id = { path = "utils/model-facing-id" }
 codex-utils-oss = { path = "utils/oss" }
 codex-utils-output-truncation = { path = "utils/output-truncation" }
 codex-utils-path = { path = "utils/path-utils" }
@@ -328,8 +346,8 @@ codex-utils-sleep-inhibitor = { path = "utils/sleep-inhibitor" }
 codex-utils-stream-parser = { path = "utils/stream-parser" }
 codex-utils-string = { path = "utils/string" }
 codex-utils-template = { path = "utils/template" }
+codex-user-input = { path = "user-input" }
 codex-user-verification = { path = "user-verification" }
-codex-v8-poc = { path = "v8-poc" }
 codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 codex-windows-sandbox-test-support = { path = "windows-sandbox-rs/tests/support" }
@@ -389,7 +407,6 @@ ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 encoding_rs = "0.8.35"
 eventsource-stream = "0.2.3"
 file-id = "0.2.3"
-flatbuffers = "25"
 flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
@@ -400,12 +417,13 @@ globset = "0.4"
 hmac = "0.12.1"
 http = "1.3.1"
 httpdate = "1.0.3"
+hyper = { version = "1.8.1", features = ["http2", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 iana-time-zone = "0.1.64"
 icu_decimal = "2.1"
 icu_locale_core = "2.1"
 icu_provider = { version = "2.1", features = ["sync"] }
-ignore = "0.4.23"
+ignore = "0.4.30"
 image = { version = "^0.25.9", default-features = false }
 include_dir = "0.7.4"
 indexmap = "2.12.0"
@@ -420,7 +438,8 @@ lazy_static = "1"
 libc = "0.2.182"
 # Keep SQLx's bundled SQLite on a version containing the WAL-reset corruption fix:
 # https://www.sqlite.org/wal.html#the_wal_reset_bug
-libsqlite3-sys = { version = "0.37", default-features = false }
+# SQLite 3.54 also fixes RUSTSEC-2026-0459 when opening a database with a WAL.
+libsqlite3-sys = { version = "0.39.1", default-features = false }
 linkify = "0.11"
 log = "0.4"
 lru = "0.18.2"
@@ -428,7 +447,7 @@ maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
 multimap = "0.10.0"
-mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "b21120168d70befe12356411423266bfef168446" }
+mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "c66201839d63cae2239db5e92f1f1d6076cf5181" }
 notify = "8.2.0"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 once_cell = "1.20.2"
@@ -463,7 +482,7 @@ regex-automata = { version = "0.4.13", default-features = false, features = ["st
 regex-lite = "0.1.8"
 regex-syntax = "0.8.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "98a54789b80110ad210495c4ad845c89e1980471", version = "=3.5.1", default-features = false }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "b11a40d889e022087d7f2b8cd23aa28e19ceaf5b", version = "=3.6.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23.46", default-features = false, features = [
@@ -475,7 +494,6 @@ rustls-pki-types = "1.14.0"
 schemars = "0.8.22"
 seccompiler = "0.5.0"
 semver = "1.0"
-sentry = "0.46.0"
 serde = { version = "1", features = ["rc"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
@@ -489,6 +507,7 @@ sha2 = "0.10"
 shlex = "1.3.0"
 signal-hook = "0.3.18"
 similar = "2.7.0"
+spiffe = { version = "0.18.0", default-features = false, features = ["transport-grpc"] }
 symphonia = { version = "0.6.0", default-features = false, features = [
     "isomp4",
     "mkv",
@@ -515,7 +534,6 @@ starlark = { version = "0.14.2", default-features = false }
 strum = "0.27.2"
 strum_macros = "0.28.0"
 supports-color = "3.0.2"
-syntect = "5"
 sys-locale = "0.3.2"
 system-configuration = "0.7"
 tar = { version = "=0.4.45", default-features = false }
@@ -550,6 +568,9 @@ tree-sitter-powershell = "=0.26.4"
 ts-rs = "11"
 tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 uds_windows = "1.1.0"
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-normalization = "0.1.25"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
@@ -557,6 +578,7 @@ urlencoding = "2.1"
 uuid = "1"
 v8 = "=152.2.0"
 vt100 = "0.16.2"
+vtparse = "0.6.2"
 walkdir = "2.5.0"
 webbrowser = "1.2.2"
 which = "8"
@@ -582,8 +604,8 @@ zstd = "0.13"
 wiremock = "0.6"
 zeroize = "1.8.2"
 
-[workspace.lints]
-rust = {}
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codex_bazel)'] }
 
 [workspace.lints.clippy]
 await_holding_invalid_type = "deny"
@@ -629,7 +651,6 @@ unwrap_used = "deny"
 ignored = [
     "icu_provider",
     "openssl-sys",
-    "codex-v8-poc",
 ]
 
 [profile.dev]
@@ -668,12 +689,17 @@ opt-level = 0
 [patch.crates-io]
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
-crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "ed1cdab335221515706178d68495bba2aed1924f" }
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "37ca4a27a9424ec5dbe6451f48c339d7b45f8d63" }
+# SQLx 0.9.0 excludes libsqlite3-sys 0.39. Keep its driver and Core traits on
+# the same reviewed source until a release includes transact-rs/sqlx#4502.
+sqlx-core = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "7a920470d62138955446b64220c7609e46ad770e" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "e19950ef7828cb311e6d51a6bedcebf0192e055c" }
+v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }
 
 # Uncomment to debug local changes.
 # rmcp = { path = "../../rust-sdk/crates/rmcp" }
 
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "e19950ef7828cb311e6d51a6bedcebf0192e055c" }

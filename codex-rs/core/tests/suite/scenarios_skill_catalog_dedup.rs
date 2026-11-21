@@ -31,9 +31,15 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::super::skills_extension::CatalogSkillProvider;
+use super::super::skills_extension::RepositoryGrant;
+use super::super::skills_extension::repository_skill_grant_history;
 
+#[test_case::test_case(false; "descriptions")]
+#[test_case::test_case(true; "omit_descriptions")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cloud_preference_preserves_executor_aliases_and_description_budget() -> Result<()> {
+async fn cloud_preference_preserves_executor_aliases_and_description_budget(
+    omit_descriptions: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -86,6 +92,9 @@ async fn cloud_preference_preserves_executor_aliases_and_description_budget() ->
             .with_cloud_provider(provider(cloud_entries)),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            omit_descriptions: config
+                .features
+                .enabled(codex_features::Feature::OmitSkillDescriptions),
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: true,
@@ -111,12 +120,11 @@ async fn cloud_preference_preserves_executor_aliases_and_description_budget() ->
     let test = test_codex()
         .with_exec_server_url("none")
         .with_extensions(Arc::new(extensions.build()))
-        .with_model_info_override("gpt-6-astra", |model| {
-            model.context_window = Some(70_000);
-            model.max_context_window = None;
-            model.include_skills_usage_instructions = false;
-        })
-        .with_config(|config| {
+        .with_config(move |config| {
+            config
+                .features
+                .set_enabled(Feature::OmitSkillDescriptions, omit_descriptions)
+                .expect("set omit_skill_descriptions feature");
             super::configure_scenario_catalog(config);
             config.cloud_skill_enabled = true;
             config
@@ -124,6 +132,7 @@ async fn cloud_preference_preserves_executor_aliases_and_description_budget() ->
                 .enable(Feature::ExecutorCapabilityDiscovery)
                 .expect("enable executor capability discovery");
         })
+        .with_model("gpt-6-astra")
         .build_with_auto_env(&server)
         .await?;
     test.submit_turn("Which skills are available?").await?;
@@ -150,12 +159,23 @@ async fn cloud_preference_preserves_executor_aliases_and_description_budget() ->
                 index == 1
             );
         }
-        assert_eq!(body.matches("UNIQUE_DESCRIPTION_END").count(), 3);
+        assert_eq!(
+            body.matches("UNIQUE_DESCRIPTION_END").count(),
+            if omit_descriptions { 0 } else { 3 }
+        );
     }
     insta::assert_snapshot!(
-        "dedup_before_budgeting",
+        if omit_descriptions {
+            "dedup_without_descriptions"
+        } else {
+            "dedup_before_budgeting"
+        },
         context_snapshot::format_request_history_snapshot(
-            "Cloud skills replace duplicate executor listings before budgeting; unique executor skills retain their descriptions and e1 aliases across turns.",
+            if omit_descriptions {
+                "Cloud and executor skill catalogs retain names and aliases across turns with descriptions omitted."
+            } else {
+                "Cloud skills replace duplicate executor listings before budgeting; unique executor skills retain their descriptions and e1 aliases across turns."
+            },
             &requests,
             &ContextSnapshotOptions::default().include_request_settings(),
         )
@@ -193,6 +213,7 @@ async fn skill_catalog_deltas_survive_resume_and_rebuild_after_compaction() -> R
         SkillProviders::new().with_host_provider(Arc::new(HostSkillProvider::new())),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            omit_descriptions: config.features.enabled(Feature::OmitSkillDescriptions),
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
@@ -448,6 +469,60 @@ async fn skill_catalog_deltas_survive_resume_and_rebuild_after_compaction() -> R
         context_snapshot::format_request_history_snapshot(
             "Skill additions and edits share the remaining metadata budget across turns and resume. Removals stay silent and do not refund budget. Compaction rebuilds the current catalog and resets the allowance.",
             &requests,
+            &ContextSnapshotOptions::default().include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_skill_turn_grant() -> Result<()> {
+    let Some((requests, skill_root)) =
+        repository_skill_grant_history(RepositoryGrant::Turn).await?
+    else {
+        return Ok(());
+    };
+    let withdrawn = requests
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text.contains("Some previously listed skills are no longer available."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(withdrawn, [false, false, true, true]);
+    assert!(
+        requests[3]
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| {
+                text.contains("Some previously unavailable skills are available again.")
+            })
+    );
+    // Normalize the executor's temporary path before long tool arguments are clipped and hashed.
+    let skill_root = serde_json::to_string(&skill_root.inferred_native_path_string())?;
+    let mut bodies = requests
+        .iter()
+        .map(responses::ResponsesRequest::body_json)
+        .collect::<Vec<_>>();
+    for body in &mut bodies {
+        for item in body["input"].as_array_mut().expect("request input") {
+            for field in ["arguments", "output"] {
+                if let Some(serde_json::Value::String(text)) = item.get_mut(field) {
+                    *text = text.replace(&skill_root, r#""<CWD>/.agents/skills""#);
+                }
+            }
+        }
+    }
+    insta::assert_snapshot!(
+        "repository_skill_turn_grant",
+        context_snapshot::format_context_snapshot(
+            "A repository skill appears after approval. The next turn withdraws it, then restores it after reapproval.",
+            &bodies
+                .iter()
+                .map(context_snapshot::SnapshotEntry::body)
+                .collect::<Vec<_>>(),
             &ContextSnapshotOptions::default().include_request_settings(),
         )
     );

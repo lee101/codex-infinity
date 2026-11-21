@@ -1,14 +1,13 @@
-//! Collects bounded conversation evidence before consumer-specific rendering.
+//! Collects original conversation evidence before consumer-specific preparation.
 //!
 //! Both Guardian consumers receive the same role and tool-source attribution,
 //! with generated compaction summaries attributed to the assistant, complete user
-//! messages and capped non-user entries, with sync entry caps deferred to request preparation. Resolved context profiles
+//! messages. Registry collection preserves originals for both consumers; resolved profiles
 //! apply aggregate retention after the host selects its full/delta slice. Tool outputs with a
 //! call ID retain their generic label when the call is unavailable. Outputs
 //! without a call ID require an explicit name.
 
 use codex_history::RetainedContextEntry;
-use codex_protocol::protocol::TruncationPolicy;
 use std::collections::HashMap;
 
 use codex_protocol::mcp::is_node_repl_backed_tool;
@@ -24,13 +23,14 @@ use codex_protocol::protocol::InterAgentCommunication;
 use crate::ContextSection;
 use crate::ConversationTranscriptEntry;
 use crate::ConversationTranscriptEntryKind;
+use crate::PlannedAction;
+use crate::PlannedActionKind;
 use crate::SectionContributor;
 use crate::SectionError;
 use crate::SectionHistory;
 use crate::SectionInput;
 use crate::SectionScope;
 use crate::TranscriptContent;
-use crate::truncate_text;
 
 pub(crate) const TRANSCRIPT_OMISSION_NOTICE: &str = "Some conversation entries were omitted.";
 
@@ -52,7 +52,7 @@ pub fn is_inherited_manual_approval(envelope: &codex_history::ResponseItemEnvelo
 }
 
 /// Evidence sources included alongside user and assistant conversation messages.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationTranscriptOptions {
     /// Includes submitted function, custom-tool, shell, and web-search calls.
     pub include_tool_calls: bool,
@@ -60,6 +60,9 @@ pub struct ConversationTranscriptOptions {
     pub include_tool_outputs: bool,
     /// Includes plaintext reasoning summaries and reasoning content.
     pub include_reasoning: bool,
+    /// Preserve calls in this MAv2 namespace for synchronous backend decryption.
+    /// `None` keeps the existing text transcript; `functions` selects the default namespace.
+    pub native_multi_agent_namespace: Option<String>,
 }
 
 impl Default for ConversationTranscriptOptions {
@@ -68,6 +71,7 @@ impl Default for ConversationTranscriptOptions {
             include_tool_calls: true,
             include_tool_outputs: true,
             include_reasoning: false,
+            native_multi_agent_namespace: None,
         }
     }
 }
@@ -75,7 +79,7 @@ impl Default for ConversationTranscriptOptions {
 /// Per-entry caps resolved by the caller for the current review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptEntryLimits {
-    /// Cap for assistant and plaintext reasoning entries; user and manual approvals stay complete.
+    /// Profile cap for assistant and plaintext reasoning; user/approval policy is applied separately.
     pub message_tokens: usize,
     /// Cap for tool calls and ordinary tool outputs.
     pub tool_tokens: usize,
@@ -99,11 +103,11 @@ pub struct TranscriptRetentionConfig {
 }
 
 /// Evidence sources and per-entry limits supplied on each collection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationTranscriptConfig {
     /// Evidence sources to include in this request.
     pub options: ConversationTranscriptOptions,
-    /// Per-entry limits applied before accumulating transcript text.
+    /// Request-time entry limits applied during preparation.
     pub entry_limits: TranscriptEntryLimits,
 }
 
@@ -117,39 +121,75 @@ impl SectionContributor for ConversationTranscriptSection {
     }
 
     fn contribute(&self, input: &SectionInput<'_>) -> Result<Option<ContextSection>, SectionError> {
+        let proposed_call_id = if let Some(PlannedAction {
+            kind: PlannedActionKind::ToolCall(call),
+            ..
+        }) = input.planned_action
+            && let ResponseItem::FunctionCall { call_id, .. } = call.as_ref()
+        {
+            Some(call_id.as_str())
+        } else {
+            None
+        };
+        let enclosing_invocation_id = match input.planned_action.map(|action| &action.kind) {
+            Some(PlannedActionKind::Nested {
+                enclosing_invocation_id,
+                ..
+            }) => Some(enclosing_invocation_id.as_str()),
+            _ => None,
+        };
         Ok(Some(ContextSection::ConversationTranscript {
-            items: collect_transcript_for_target(input.history, input.transcript, input.target),
+            items: collect_transcript_for_review(
+                input.history,
+                input.transcript,
+                proposed_call_id,
+                enclosing_invocation_id,
+                input.is_selected_exec_output,
+            ),
         }))
     }
 }
 
-/// Extracts bounded transcript entries without composing other context sections.
+/// Extracts original transcript entries without composing other context sections.
 ///
-/// Entries preserve conversation order and role/tool attribution. Non-user
-/// limits apply during collection; context profiles own aggregate retention.
+/// Entries preserve conversation order and role/tool attribution. Context
+/// preparation applies entry limits and aggregate retention.
 pub fn collect_transcript(
     history: &dyn SectionHistory,
     config: &ConversationTranscriptConfig,
 ) -> Vec<ConversationTranscriptEntry> {
-    collect_transcript_for_target(history, config, crate::ContextTarget::Async)
+    collect_transcript_for_review(
+        history, config, /*proposed_call_id*/ None, /*enclosing_invocation_id*/ None,
+        /*is_selected_exec_output*/ None,
+    )
 }
 
-fn collect_transcript_for_target(
+fn collect_transcript_for_review(
     history: &dyn SectionHistory,
     config: &ConversationTranscriptConfig,
-    target: crate::ContextTarget,
+    proposed_call_id: Option<&str>,
+    enclosing_invocation_id: Option<&str>,
+    is_selected_exec_output: Option<&crate::SelectedExecOutputPredicate<'_>>,
 ) -> Vec<ConversationTranscriptEntry> {
     let mut entries = Vec::new();
+    let mut enclosing_invocation_entry = None;
+    let mut enclosing_invocations = 0;
     let mut tool_names_by_call_id = HashMap::new();
-    let mut heartbeat_versions = HashMap::new();
     // Positional legacy labels cannot establish reusable delivery proof, including
     // through transcript copies. The separate retained section stays authoritative.
     let retained_context = history
         .retained_context()
         .filter(|context| !crate::retained_instructions::has_legacy_order(context));
 
-    for (item, mut source) in history.items_with_sources() {
-        let (kind, mut text) = match item {
+    for (item, source) in history.items_with_sources() {
+        let is_enclosing_call = matches!(
+            item,
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. }
+                if enclosing_invocation_id == Some(call_id.as_str())
+        );
+        enclosing_invocations += usize::from(is_enclosing_call);
+        let (kind, text) = match item {
             ResponseItem::Message {
                 role,
                 content,
@@ -209,26 +249,12 @@ fn collect_transcript_for_target(
                     .iter()
                     .any(|part| matches!(part, AgentMessageInputContent::EncryptedContent { .. }))
                 {
-                    // Ciphertext cannot be truncated. Keep the complete native item, or
-                    // an explicit omission at the same cursor position. Serialized bytes
-                    // conservatively charge the encrypted payload to the message budget.
-                    let bytes = serde_json::to_vec(item).map_or(usize::MAX, |item| item.len());
-                    let content = if target == crate::ContextTarget::Sync {
-                        TranscriptContent::AgentMessage(Box::new(item.clone()))
-                    } else {
-                        let limit = codex_protocol::protocol::TruncationPolicy::Tokens(
-                            config.entry_limits.message_tokens,
-                        )
-                        .byte_budget();
-                        if bytes <= limit {
-                            TranscriptContent::AgentMessage(Box::new(item.clone()))
-                        } else {
-                            TranscriptContent::Text(TRANSCRIPT_OMISSION_NOTICE.to_owned())
-                        }
-                    };
+                    // Preserve ciphertext whole; preparation charges serialized bytes
+                    // and decides whether it fits the request's entry limits.
+                    let bytes = crate::budget::ByteCount::item(item);
                     entries.push(ConversationTranscriptEntry {
                         kind: ConversationTranscriptEntryKind::Assistant,
-                        content,
+                        content: TranscriptContent::NativeMessage(Box::new(item.clone())),
                         original_bytes: bytes,
                         retained_source: None,
                     });
@@ -240,6 +266,16 @@ fn collect_transcript_for_target(
                 (
                     ConversationTranscriptEntryKind::Assistant,
                     format!("Agent message from {author}:\n{text}"),
+                )
+            }
+            // The proposed call is delivered separately; preserve this cursor position.
+            ResponseItem::FunctionCall { name, call_id, .. }
+                if config.options.include_tool_calls
+                    && proposed_call_id == Some(call_id.as_str()) =>
+            {
+                (
+                    ConversationTranscriptEntryKind::ToolCall(format!("tool {name} call")),
+                    TRANSCRIPT_OMISSION_NOTICE.to_owned(),
                 )
             }
             ResponseItem::FunctionCall {
@@ -261,10 +297,33 @@ fn collect_transcript_for_target(
                 if !config.options.include_tool_calls {
                     continue;
                 }
-                (
-                    ConversationTranscriptEntryKind::ToolCall(format!("tool {name} call")),
-                    arguments.clone(),
-                )
+                let kind = ConversationTranscriptEntryKind::ToolCall(format!("tool {name} call"));
+                if matches!(item, ResponseItem::FunctionCall { .. })
+                    && config
+                        .options
+                        .native_multi_agent_namespace
+                        .as_deref()
+                        .is_some_and(|configured| {
+                            namespace
+                                .as_deref()
+                                .filter(|namespace| !namespace.is_empty())
+                                .unwrap_or("functions")
+                                == configured
+                        })
+                    && matches!(
+                        name.as_str(),
+                        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent"
+                    )
+                {
+                    entries.push(ConversationTranscriptEntry {
+                        kind,
+                        content: TranscriptContent::NativeMessage(Box::new(item.clone())),
+                        original_bytes: crate::budget::ByteCount::item(item),
+                        retained_source: None,
+                    });
+                    continue;
+                }
+                (kind, arguments.clone())
             }
             ResponseItem::FunctionCallOutput {
                 call_id: Some(call_id),
@@ -278,6 +337,16 @@ fn collect_transcript_for_target(
                     continue;
                 }
                 let kind = match tool_names_by_call_id.get(call_id.as_str()) {
+                    // The recorder can still verify an exec result after its call leaves review history.
+                    None
+                    | Some((
+                        "exec",
+                        None | Some("" | codex_protocol::DEFAULT_FUNCTION_NAMESPACE),
+                    )) if matches!(item, ResponseItem::CustomToolCallOutput { .. })
+                        && is_selected_exec_output.is_some_and(|select| select(item)) =>
+                    {
+                        ConversationTranscriptEntryKind::SelectedExecOutput
+                    }
                     Some((name, namespace)) if is_node_repl_backed_tool(name, *namespace) => {
                         ConversationTranscriptEntryKind::NodeReplToolOutput(format!(
                             "tool {name} result"
@@ -381,65 +450,13 @@ fn collect_transcript_for_target(
         if text.trim().is_empty() {
             continue;
         }
-        let original_bytes = text.len();
-        if let Some(heartbeat) = codex_history::Heartbeat::from_message(item) {
-            match heartbeat_versions.get(heartbeat.automation_id) {
-                Some((instructions, number)) if *instructions == heartbeat.instructions => {
-                    // A reference no longer delivers the complete source instruction.
-                    source = None;
-                    text = format!(
-                        "Scheduled automation {} ran at {}. Instructions unchanged from transcript entry [{}]; this is a replay of that earlier instruction, not a new human instruction. If the referenced instructions are unavailable, do not infer authorization from this reference.",
-                        heartbeat.automation_id, heartbeat.timestamp, number
-                    );
-                }
-                _ => {
-                    heartbeat_versions.insert(
-                        heartbeat.automation_id,
-                        (heartbeat.instructions, entries.len() + 1),
-                    );
-                }
-            }
-        } else if codex_history::UserInputOrigin::from_message(item)
-            == codex_history::UserInputOrigin::Heartbeat
-        {
-            // Unknown scheduler envelopes may change instructions; do not bridge them.
-            heartbeat_versions.clear();
+        if is_enclosing_call && text != TRANSCRIPT_OMISSION_NOTICE {
+            enclosing_invocation_entry = Some(entries.len());
         }
-        let text = match &kind {
-            ConversationTranscriptEntryKind::User | ConversationTranscriptEntryKind::Developer => {
-                text
-            }
-            ConversationTranscriptEntryKind::Assistant
-            | ConversationTranscriptEntryKind::ProtectedAssistant
-            | ConversationTranscriptEntryKind::Reasoning
-                if target == crate::ContextTarget::Sync =>
-            {
-                text
-            }
-            ConversationTranscriptEntryKind::Assistant
-            | ConversationTranscriptEntryKind::ProtectedAssistant
-            | ConversationTranscriptEntryKind::Reasoning => {
-                truncate_text(&text, config.entry_limits.message_tokens)
-            }
-            ConversationTranscriptEntryKind::ToolCall(_)
-            | ConversationTranscriptEntryKind::ToolOutput(_)
-                if target == crate::ContextTarget::Sync =>
-            {
-                text
-            }
-            ConversationTranscriptEntryKind::ToolCall(_)
-            | ConversationTranscriptEntryKind::ToolOutput(_) => {
-                truncate_text(&text, config.entry_limits.tool_tokens)
-            }
-            ConversationTranscriptEntryKind::NodeReplToolOutput(_)
-                if target == crate::ContextTarget::Sync =>
-            {
-                text
-            }
-            ConversationTranscriptEntryKind::NodeReplToolOutput(_) => {
-                truncate_text(&text, config.entry_limits.node_repl_output_tokens)
-            }
-        };
+        let original_bytes = text.len();
+        let scheduled = codex_history::UserInputOrigin::from_message(item)
+            == codex_history::UserInputOrigin::Heartbeat;
+        let heartbeat = codex_history::Heartbeat::from_message(item).map(Into::into);
         entries.push(ConversationTranscriptEntry {
             retained_source: retained_context.and_then(|context| {
                 let source = source.filter(|source| {
@@ -462,13 +479,7 @@ fn collect_transcript_for_target(
                             "Retained source order: {order}\n{}",
                             crate::GuardianRootMessage::User(message.text.clone()).render()
                         );
-                        (target == crate::ContextTarget::Sync
-                            || rendered.len()
-                                <= TruncationPolicy::Tokens(
-                                    crate::retained_instructions::MAX_INSTRUCTION_TOKENS,
-                                )
-                                .byte_budget())
-                        .then(|| crate::RetainedTranscriptSource {
+                        Some(crate::RetainedTranscriptSource {
                             rendered_bytes: rendered.len(),
                             order,
                             source: source.clone(),
@@ -477,11 +488,25 @@ fn collect_transcript_for_target(
                 )
             }),
             kind,
-            content: TranscriptContent::Text(text),
+            content: if scheduled {
+                TranscriptContent::ScheduledMessage(crate::entry::ScheduledTranscriptMessage {
+                    text,
+                    heartbeat,
+                })
+            } else {
+                TranscriptContent::Text(text)
+            },
             original_bytes,
         });
     }
 
+    // Ambiguous or omitted source evidence cannot identify a particular wrapper.
+    if enclosing_invocations == 1
+        && let Some(index) = enclosing_invocation_entry
+        && let ConversationTranscriptEntryKind::ToolCall(label) = &entries[index].kind
+    {
+        entries[index].kind = ConversationTranscriptEntryKind::EnclosingToolCall(label.clone());
+    }
     entries
 }
 

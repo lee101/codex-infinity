@@ -1,5 +1,7 @@
 //! Contributor integration tests use the normal catalog-backed lifecycle setup.
 
+use crate::async_scorer::conversation::ConversationBackend;
+
 use super::*;
 use crate::async_scorer::authorization::ScoreAuthorization;
 use codex_protocol::models::ImageReference;
@@ -42,6 +44,9 @@ async fn catalog_budget_fixture(base_url: String, window: i64) -> Result<Guardia
     );
     let registry = builder.build();
     let session_store = ExtensionData::new("session-1");
+    test.codex
+        .thread_extension_data()
+        .insert(test.config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
             config: &test.config,
@@ -195,6 +200,8 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
             }
         };
         let thread_store = fixture.test.codex.thread_extension_data();
+        let turn_store = ExtensionData::new("turn-1");
+        turn_store.insert_arc(thread_store.get::<Config>().expect("captured test config"));
         if matches!(evidence, BudgetEvidence::UserInstructions) {
             set_cached_score(
                 thread_store,
@@ -205,7 +212,9 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
                     sampled_at: None,
                 },
             );
-            let progress = thread_store.get::<GuardianV2ScoreProgress>().unwrap();
+            let progress = ConversationBackend::for_turn(thread_store, thread_store)
+                .map(|cache| Arc::clone(&cache.progress))
+                .unwrap();
             let authorization =
                 ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
             seed_cached_score(&progress, thread_store, /*index*/ 0, authorization);
@@ -213,6 +222,7 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
                 cached_approval(
                     &fixture.registry,
                     thread_store,
+                    &turn_store,
                     "review action",
                     /*metrics*/ None
                 )
@@ -220,13 +230,15 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
                 Some(ReviewDecision::Approved)
             );
         }
-        let turn_store = ExtensionData::new("turn-1");
         let tool_name = ToolName::plain("read_file");
         let payload = ToolPayload::Function {
             arguments: r#"{"path":"README.md"}"#.to_owned(),
         };
         fixture.registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
+                serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &fixture.session_store,
                 thread_store,
@@ -247,7 +259,7 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
                 // Raw injection supplies no live checkpoint provenance, regardless of the sample.
                 "incompatible_compaction"
             } else {
-                "elevated_risk"
+                "scoring_failure"
             };
             fixture.assert_fails_closed(reason).await?;
             assert!(
@@ -261,7 +273,9 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
             fixture.test.codex.shutdown_and_wait().await?;
             continue;
         }
-        let progress = thread_store.get::<GuardianV2ScoreProgress>().unwrap();
+        let progress = ConversationBackend::for_turn(thread_store, thread_store)
+            .map(|cache| Arc::clone(&cache.progress))
+            .unwrap();
         tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
             while progress.inspect(/*call_id*/ None).lag > 0 {
                 tokio::task::yield_now().await;
@@ -289,6 +303,7 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
             cached_approval(
                 &fixture.registry,
                 thread_store,
+                &turn_store,
                 "review action",
                 /*metrics*/ None
             )

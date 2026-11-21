@@ -16,6 +16,7 @@ use super::LocalThreadStore;
 use super::create_thread;
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
+use crate::InheritedHistoryVisibility;
 use crate::ResumeThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -27,7 +28,21 @@ pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
 ) -> ThreadStoreResult<()> {
+    if params.inherited_history_visibility == InheritedHistoryVisibility::ModelContextOnly {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "model_context_only_inherited_history",
+        });
+    }
     let thread_id = params.thread_id;
+    let inherited_cursor = if params.initial_window_id.allocation().is_some()
+        && let (Some(parent), Some(base)) = (params.forked_from_id, params.history_base)
+    {
+        let lineage = store.resolve_rollout_lineage_for_reference(parent).await?;
+        let prefix = super::model_context::load_for_fork(lineage, Some(base)).await?;
+        codex_rollout::next_model_id_ordinals(&prefix).0
+    } else {
+        0
+    };
     let attachment = if params.attached_thread {
         let parent = params
             .forked_from_id
@@ -53,7 +68,7 @@ pub(super) async fn create_thread(
     } else {
         None
     };
-    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let mut cursor = store.live_writer_locks.lock(thread_id).await;
     let history_mode = params.history_mode;
     store.ensure_live_recorder_absent(thread_id).await?;
     let writer_lock = store.acquire_writer_lock(thread_id)?;
@@ -69,14 +84,16 @@ pub(super) async fn create_thread(
     }
     store
         .insert_live_recorder(thread_id, recorder, thread_id, history_mode, writer_lock)
-        .await
+        .await?;
+    *cursor = inherited_cursor;
+    Ok(())
 }
 
 pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
-    let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    let mut cursor = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let writer_lock = store.acquire_writer_lock(params.thread_id)?;
     let rollout_path = match params.rollout_path {
@@ -167,6 +184,7 @@ pub(super) async fn resume_thread(
             writer_lock,
         )
         .await?;
+    *cursor = codex_rollout::next_model_id_ordinals(&history).0;
     Ok(history)
 }
 
@@ -185,6 +203,112 @@ pub(super) async fn append_items(
         RolloutWriteOp::AppendItems(params.items),
     )
     .await
+}
+
+pub(super) async fn seal_realtime_items(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: Vec<codex_protocol::realtime::RealtimeItem>,
+) -> ThreadStoreResult<()> {
+    let id = items
+        .last()
+        .filter(|item| {
+            matches!(
+                item.content,
+                codex_protocol::realtime::RealtimeItemContent::SessionInputSaved {
+                    reason: codex_protocol::realtime::SessionInputReason::SessionEnd,
+                    ..
+                }
+            )
+        })
+        .map(|item| item.id.clone());
+    let records = items.into_iter().map(RolloutItem::RealtimeItem).collect();
+    if let Some(id) = id {
+        seal_realtime_records(store, thread_id, id, records).await
+    } else {
+        append_items(
+            store,
+            AppendThreadItemsParams {
+                thread_id,
+                items: records,
+            },
+        )
+        .await?;
+        flush_thread(store, thread_id).await
+    }
+}
+
+pub(super) async fn seal_realtime_input(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    frames: Vec<codex_protocol::realtime::RealtimeItem>,
+    input: codex_rollout::ResponseItemEnvelope,
+) -> ThreadStoreResult<()> {
+    let id = input
+        .realtime_handoff_item()
+        .ok_or_else(|| ThreadStoreError::InvalidRequest {
+            message: "realtime input is missing handoff metadata".to_owned(),
+        })?
+        .id;
+    let records = frames
+        .into_iter()
+        .map(RolloutItem::RealtimeItem)
+        .chain(std::iter::once(RolloutItem::ResponseItem(input)))
+        .collect();
+    seal_realtime_records(store, thread_id, id, records).await
+}
+
+/// An uncertain flush keeps ownership of the already queued model-facing seal.
+/// Retrying confirms that batch instead of appending it again.
+async fn seal_realtime_records(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    id: String,
+    items: Vec<RolloutItem>,
+) -> ThreadStoreResult<()> {
+    let mut cursor = store.live_writer_locks.lock(thread_id).await;
+    let (recorder, rollout_id, history_mode, seals) = {
+        let entries = store.live_recorders.lock().await;
+        let entry = entries
+            .get(&thread_id)
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+        (
+            entry.recorder.clone(),
+            entry.rollout_id,
+            entry.history_mode,
+            entry.realtime_seals.clone(),
+        )
+    };
+    let mut seals = seals.lock_owned().await;
+    if let Some(pending) = seals.pending.clone() {
+        recorder.flush().await.map_err(thread_store_io_error)?;
+        seals.pending = None;
+        seals.committed.insert(pending);
+    }
+    if !seals.committed.contains(&id) {
+        let mut items = into_persisted_rollout_items(items, history_mode);
+        let next = codex_rollout::stamp_item_ordinals(*cursor, &mut items);
+        recorder
+            .record_canonical_items(&items)
+            .await
+            .map_err(thread_store_io_error)?;
+        *cursor = next;
+        seals.pending = Some(id.clone());
+        recorder.flush().await.map_err(thread_store_io_error)?;
+        seals.pending = None;
+        seals.committed.insert(id);
+    }
+    if history_mode == ThreadHistoryMode::Paginated
+        && let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+            store,
+            rollout_id,
+            recorder.rollout_path(),
+        )
+        .await
+    {
+        warn!("failed to project durable rollout for {thread_id}: {err}");
+    }
+    sync_materialized_rollout_path(store, thread_id, recorder.rollout_path()).await
 }
 
 pub(super) async fn persist_thread(
@@ -279,17 +403,18 @@ async fn index_attached_thread(
         .map_err(thread_store_io_error)?;
     let memory_mode = meta.meta.memory_mode.clone();
     let items = [RolloutItem::SessionMeta(Box::new(meta))];
-    let mut builder = codex_rollout::builder_from_items(&items, path).ok_or_else(|| {
+    let builder = codex_rollout::builder_from_items(&items, path).ok_or_else(|| {
         ThreadStoreError::Internal {
             message: format!("invalid attached thread metadata at {}", path.display()),
         }
     })?;
+    let mut metadata = Box::new(state.build_thread_metadata(&builder));
     if super::helpers::rollout_path_is_archived(&store.config.codex_home, path) {
-        builder.archived_at = Some(builder.updated_at.unwrap_or(builder.created_at));
+        metadata.archived_at = Some(metadata.created_at);
     }
     state
         .apply_rollout_items(
-            &builder,
+            metadata,
             &items,
             memory_mode.as_deref(),
             /*updated_at_override*/ None,
@@ -419,31 +544,46 @@ async fn write_and_project(
     // Every live write should have a recorder: create/resume installs one, while
     // shutdown/discard/delete removes it. Keep the lookup defensive so late writes fail after
     // teardown.
-    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let mut cursor = store.live_writer_locks.lock(thread_id).await;
     let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
-    let write_op = match write_op {
+    let is_flush = matches!(&write_op, RolloutWriteOp::Flush);
+    match write_op {
         RolloutWriteOp::AppendItems(items) => {
-            let items = into_persisted_rollout_items(items, history_mode);
+            let mut items = into_persisted_rollout_items(items, history_mode);
             if items.is_empty() {
                 return Ok(());
             }
-            RolloutWriteOp::AppendItems(items)
+            let next = codex_rollout::stamp_item_ordinals(*cursor, &mut items);
+            recorder
+                .record_canonical_items(&items)
+                .await
+                .map_err(thread_store_io_error)?;
+            // Once queued, the recorder owns the batch even if flush is cancelled or retried.
+            *cursor = next;
+            recorder.flush().await.map_err(thread_store_io_error)?;
         }
-        RolloutWriteOp::Persist => RolloutWriteOp::Persist,
-        RolloutWriteOp::Flush => RolloutWriteOp::Flush,
-    };
-    if matches!(history_mode, ThreadHistoryMode::Legacy) {
-        durable_write(&recorder, write_op).await?;
-    } else {
+        RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error)?,
+        RolloutWriteOp::Flush => recorder.flush().await.map_err(thread_store_io_error)?,
+    }
+    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+        // SQLite is a rebuildable view and must never get ahead of canonical history.
         let rollout_path = recorder.rollout_path();
-        // SQLite is a rebuildable view. The flush barrier must win before projection starts so it
-        // can lag JSONL after failure, but can never get ahead of canonical history.
-        durable_write(&recorder, write_op).await?;
-        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+        // Only the plain file's length is a decoded JSONL byte offset.
+        let flushed_len = if is_flush && store.state_db.is_some() {
+            tokio::fs::metadata(codex_rollout::plain_rollout_path(rollout_path))
+                .await
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|file| file.len())
+        } else {
+            None
+        };
+        if let Err(err) = super::thread_history_materialization::materialize_durable_suffix(
             store,
             rollout_id,
             rollout_path,
+            flushed_len,
         )
         .await
         {
@@ -454,18 +594,4 @@ async fn write_and_project(
         sync_materialized_rollout_path(store, thread_id, recorder.rollout_path()).await?;
     }
     Ok(())
-}
-
-async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> ThreadStoreResult<()> {
-    match write {
-        RolloutWriteOp::AppendItems(items) => {
-            recorder
-                .record_canonical_items(items.as_slice())
-                .await
-                .map_err(thread_store_io_error)?;
-            recorder.flush().await.map_err(thread_store_io_error)
-        }
-        RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error),
-        RolloutWriteOp::Flush => recorder.flush().await.map_err(thread_store_io_error),
-    }
 }

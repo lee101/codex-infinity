@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::tests::test_environment_id;
+use codex_mcp::McpServerKey;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use pretty_assertions::assert_eq;
@@ -128,6 +129,7 @@ async fn non_utf8_cwd_preserves_approval_routing(
     review_context.approval_policy = AskForApproval::OnRequest;
     review_context.approvals_reviewer = reviewer;
     let context = ApprovalContext {
+        exec_requirement: None,
         review_context,
         cancellation_token: None,
         call_id: "non-utf8-cwd".to_string(),
@@ -153,7 +155,8 @@ async fn non_utf8_cwd_preserves_approval_routing(
         tty: false,
         proposed_execpolicy_amendment: None,
     };
-    let approval = session.request_reviewer_approval(action, &context);
+    let prompt = session.request_user_approval(&action, &context);
+    let approval = session.request_reviewer_approval(&action, &context, prompt);
     tokio::pin!(approval);
     let expected = if reviewer == ApprovalsReviewer::User {
         tokio::select! {
@@ -193,6 +196,7 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         id: "mcp-override".to_string(),
         environment_id: test_environment_id(&turn).to_owned(),
         server: "example".to_string(),
+        server_key: McpServerKey::unscoped("example"),
         tool_name: "dangerous".to_string(),
         arguments: None,
         connector_id: None,
@@ -208,11 +212,13 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         approval_mode: AppToolApproval::Prompt,
         allow_session_remember: false,
         allow_persistent_approval: false,
+        prompt_permissions: None,
     };
     let mut review_context = GuardianReviewContext::from(&turn);
     review_context.approval_policy = AskForApproval::OnRequest;
     review_context.approvals_reviewer = ApprovalsReviewer::AutoReview;
     let context = ApprovalContext {
+        exec_requirement: None,
         review_context,
         cancellation_token: None,
         call_id: "mcp-override".to_string(),
@@ -223,8 +229,9 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         network_approval_context: None,
     };
 
+    let prompt = session.request_user_approval(&action, &context);
     tokio::select! {
-        resolution = session.request_reviewer_approval(action, &context) => {
+        resolution = session.request_reviewer_approval(&action, &context, prompt) => {
             panic!("expected a user approval request, got {resolution:?}");
         }
         event = events.recv() => {

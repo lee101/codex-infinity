@@ -3,11 +3,17 @@
 #[path = "code_mode_dynamic_tools_tests.rs"]
 mod dynamic_tools;
 
+#[cfg(unix)]
+#[path = "code_mode_host_recovery_tests.rs"]
+mod host_recovery;
+
+use super::image_rollout::RecordingFileAttachmentStore;
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_analytics::AnalyticsEventsClient;
+use codex_config::McpServerAuth;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::StartThreadOptions;
@@ -32,10 +38,12 @@ use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_http_client::DestinationPolicy;
 use codex_http_client::NetworkPolicyController;
+use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::codex_apps_mcp_server_config;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -57,6 +65,7 @@ use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -302,6 +311,17 @@ async fn run_code_mode_turn_with_builder(
 
     test.submit_turn(prompt).await?;
     Ok((test, second_mock))
+}
+
+fn code_mode_test_builder(disabled_features: &'static [Feature]) -> TestCodexBuilder {
+    test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            for &feature in disabled_features {
+                config.features.disable(feature).unwrap();
+            }
+        })
 }
 
 async fn run_unavailable_code_mode_turn(
@@ -708,7 +728,7 @@ async fn run_code_mode_turn_with_rmcp(
     run_code_mode_turn_with_rmcp_model(server, prompt, code, "test-gpt-5.1-codex").await
 }
 
-async fn run_code_mode_turn_with_rmcp_model(
+pub(super) async fn run_code_mode_turn_with_rmcp_model(
     server: &MockServer,
     prompt: &str,
     code: &str,
@@ -1222,7 +1242,8 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
             let mut test = base_test;
             test.codex = new_thread.thread;
             test.session_configured = new_thread.session_configured;
-            wait_for_mcp_server(&test.codex, "rmcp").await?;
+            // The base thread may already have warmed the catalog, so this thread can
+            // expose the cached tools without starting the optional server.
             test.submit_turn("inspect the directly callable MCP tool")
                 .await?;
 
@@ -1314,15 +1335,9 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> Result<()> {
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-    skip_if_no_network!(Ok(()));
-
-    for omit_tools_from in [
+// Give each independent MCP/session setup its own test identity and timeout budget.
+#[test_case::test_matrix(
+    [
         &["code_mode"][..],
         &["deferred"][..],
         &["direct"][..],
@@ -1331,139 +1346,144 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
         &["deferred", "direct"][..],
         &["code_mode", "deferred", "direct"][..],
         &[][..],
-    ] {
-        for (supports_search_tool, non_prefixed_mcp_tool_names, direct_only_namespace) in [
-            (false, false, false),
-            (false, false, true),
-            (false, true, false),
-            (false, true, true),
-            (true, false, false),
-            (true, false, true),
-            (true, true, false),
-            (true, true, true),
-        ] {
-            let namespace = if non_prefixed_mcp_tool_names {
-                "rmcp"
-            } else {
-                "mcp__rmcp"
-            };
-            let visible_directly = !omit_tools_from.contains(&"direct")
-                && (!supports_search_tool
-                    || omit_tools_from.contains(&"deferred")
-                    || direct_only_namespace);
-            let server = responses::start_mock_server().await;
-            let response = responses::mount_sse_once(
-                &server,
-                sse(vec![
-                    ev_response_created("resp-1"),
-                    if visible_directly {
-                        responses::ev_function_call_with_namespace(
-                            "call-1",
-                            namespace,
-                            "echo",
-                            r#"{"message":"ping"}"#,
-                        )
-                    } else {
-                        ev_assistant_message("msg-1", "done")
-                    },
-                    ev_completed("resp-1"),
-                ]),
-            )
-            .await;
-            let follow_up_response = if visible_directly {
-                Some(
-                    responses::mount_sse_once(
-                        &server,
-                        sse(vec![
-                            ev_assistant_message("msg-1", "done"),
-                            ev_completed("resp-2"),
-                        ]),
-                    )
-                    .await,
+    ],
+    [false, true],
+    [false, true],
+    [false, true]
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure(
+    omit_tools_from: &'static [&'static str],
+    supports_search_tool: bool,
+    non_prefixed_mcp_tool_names: bool,
+    direct_only_namespace: bool,
+) -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let namespace = if non_prefixed_mcp_tool_names {
+        "rmcp"
+    } else {
+        "mcp__rmcp"
+    };
+    let visible_directly = !omit_tools_from.contains(&"direct")
+        && (!supports_search_tool
+            || omit_tools_from.contains(&"deferred")
+            || direct_only_namespace);
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            if visible_directly {
+                responses::ev_function_call_with_namespace(
+                    "call-1",
+                    namespace,
+                    "echo",
+                    r#"{"message":"ping"}"#,
                 )
             } else {
-                None
-            };
-            let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
-            let environment_id = remote_aware_environment_id();
-            let mut builder = test_codex()
-                .with_model_info_override("gpt-5.4", move |model| {
-                    model.supports_search_tool = supports_search_tool;
-                })
-                .with_config(move |config| {
-                    if non_prefixed_mcp_tool_names {
-                        config
-                            .features
-                            .enable(Feature::NonPrefixedMcpToolNames)
-                            .expect("test config should allow unprefixed MCP tools");
-                    }
-                    if direct_only_namespace {
-                        config.code_mode.direct_only_tool_namespaces = vec![
-                            if non_prefixed_mcp_tool_names {
-                                "rmcp"
-                            } else {
-                                "mcp__rmcp"
-                            }
-                            .to_string(),
-                        ];
-                    }
-
-                    let mut servers = config.mcp_servers.get().clone();
-                    servers.insert(
-                        "rmcp".to_string(),
-                        serde_json::from_value(serde_json::json!({
-                            "command": rmcp_test_server_bin,
-                            "environment_id": environment_id,
-                            "cwd": config.cwd,
-                            "omit_tools_from": omit_tools_from,
-                        }))
-                        .expect("test MCP server config should be valid"),
-                    );
-                    config
-                        .mcp_servers
-                        .set(servers)
-                        .expect("test config should allow MCP servers");
-                });
-            let test = builder.build_with_auto_env(&server).await?;
-            wait_for_mcp_server(&test.codex, "rmcp").await?;
-            test.submit_turn("inspect ordinary direct-mode MCP tool exposure")
-                .await?;
-
-            let body = response.single_request().body_json();
-            assert_eq!(
-                namespace_child_tool(&body, namespace, "echo").is_some(),
-                visible_directly,
-                "MCP omissions must determine direct-mode tool exposure; \
-             omit_tools_from={omit_tools_from:?}, \
-             supports_search_tool={supports_search_tool}, \
-             direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
-                tool_names(&body)
-            );
-            assert_eq!(
-                tool_names(&body).iter().any(|name| name == "tool_search"),
-                supports_search_tool,
-                "MCP omissions must not disable tool search for other tools; \
-             omit_tools_from={omit_tools_from:?}, \
-             supports_search_tool={supports_search_tool}, \
-             direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
-                tool_names(&body)
-            );
-            if let Some(follow_up_response) = follow_up_response {
-                let output = follow_up_response
-                    .single_request()
-                    .function_call_output("call-1");
-                assert!(
-                    output["output"]
-                        .as_str()
-                        .is_some_and(|output| output.contains("ECHOING: ping")),
-                    "the advertised MCP tool must remain callable; \
-                     omit_tools_from={omit_tools_from:?}, \
-                     supports_search_tool={supports_search_tool}, \
-                     direct_only_namespace={direct_only_namespace}, \
-                     namespace={namespace}, output={output:?}"
-                );
+                ev_assistant_message("msg-1", "done")
+            },
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up_response = if visible_directly {
+        Some(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_assistant_message("msg-1", "done"),
+                    ev_completed("resp-2"),
+                ]),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let environment_id = remote_aware_environment_id();
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", move |model| {
+            model.supports_search_tool = supports_search_tool;
+        })
+        .with_config(move |config| {
+            if non_prefixed_mcp_tool_names {
+                config
+                    .features
+                    .enable(Feature::NonPrefixedMcpToolNames)
+                    .expect("test config should allow unprefixed MCP tools");
             }
-        }
+            if direct_only_namespace {
+                config.code_mode.direct_only_tool_namespaces = vec![
+                    if non_prefixed_mcp_tool_names {
+                        "rmcp"
+                    } else {
+                        "mcp__rmcp"
+                    }
+                    .to_string(),
+                ];
+            }
+
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "rmcp".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "command": rmcp_test_server_bin,
+                    "environment_id": environment_id,
+                    "cwd": config.cwd,
+                    "omit_tools_from": omit_tools_from,
+                }))
+                .expect("test MCP server config should be valid"),
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test config should allow MCP servers");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "rmcp").await?;
+    test.submit_turn("inspect ordinary direct-mode MCP tool exposure")
+        .await?;
+
+    let body = response.single_request().body_json();
+    assert_eq!(
+        namespace_child_tool(&body, namespace, "echo").is_some(),
+        visible_directly,
+        "MCP omissions must determine direct-mode tool exposure; \
+     omit_tools_from={omit_tools_from:?}, \
+     supports_search_tool={supports_search_tool}, \
+     direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
+        tool_names(&body)
+    );
+    assert_eq!(
+        tool_names(&body).iter().any(|name| name == "tool_search"),
+        supports_search_tool,
+        "MCP omissions must not disable tool search for other tools; \
+     omit_tools_from={omit_tools_from:?}, \
+     supports_search_tool={supports_search_tool}, \
+     direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
+        tool_names(&body)
+    );
+    if let Some(follow_up_response) = follow_up_response {
+        let output = follow_up_response
+            .single_request()
+            .function_call_output("call-1");
+        assert!(
+            output["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("ECHOING: ping")),
+            "the advertised MCP tool must remain callable; \
+             omit_tools_from={omit_tools_from:?}, \
+             supports_search_tool={supports_search_tool}, \
+             direct_only_namespace={direct_only_namespace}, \
+             namespace={namespace}, output={output:?}"
+        );
     }
 
     Ok(())
@@ -2053,10 +2073,17 @@ fn result_metadata_apps_builder(base_url: String, account_email: &str) -> TestCo
 async fn code_mode_mcp_metadata_keeps_originating_window_after_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
-    let apps_server = mount_result_metadata_app(
-        &server, /*result_metadata*/ None, /*is_error*/ false,
-    )
-    .await?;
+    let tools = Arc::new(Mutex::new(vec![serde_json::json!({
+        "name": RESULT_METADATA_TOOL,
+        "inputSchema": { "type": "object" },
+        "annotations": { "readOnlyHint": true },
+        "_meta": {
+            "connector_id": "test_connector",
+            "connector_name": "MessageSearch",
+            "_codex_apps": { "invocation_context": "original" },
+        },
+    })]));
+    let apps_server = AppsTestServer::mount_with_tools(&server, Arc::clone(&tools)).await?;
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let control = Arc::new(ResultMetadataTestControl {
@@ -2140,6 +2167,11 @@ text("done");"#,
         "wait",
     )
     .await;
+    tools.lock().unwrap()[0]["_meta"]["_codex_apps"] = serde_json::json!({
+        "invocation_context": "refreshed",
+        "resource_uri": "connector://messages/search",
+    });
+    test.codex.refresh_codex_apps_tools().await?;
     release_tx.send(()).unwrap();
     test.submit_turn("Finish the code-mode cell").await?;
     let resumed_request = resumed.function_call.single_request();
@@ -2160,8 +2192,13 @@ text("done");"#,
     );
     let calls = recorded_apps_tool_calls(&server).await;
     assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[1]["params"]["_meta"]["_codex_apps"]["resource_uri"],
+        "connector://messages/search"
+    );
     for call in calls {
         let meta = &call["params"]["_meta"];
+        assert_eq!(meta["_codex_apps"]["invocation_context"], "original");
         assert_eq!(
             serde_json::json!({
                 "sessionId": meta["sessionId"],
@@ -2348,14 +2385,357 @@ async fn direct_result_metadata_retained_budget_preserves_resource_access() -> R
     Ok(())
 }
 
-#[test_case(ToolMode::Direct; "direct")]
-#[test_case(ToolMode::CodeModeOnly; "code_mode")]
+fn hosted_result_auth(account: &'static str) -> CodexAuth {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("authorization", "Bearer session-token".parse().unwrap());
+    headers.insert("chatgpt-account-id", account.parse().unwrap());
+    CodexAuth::Headers(AuthHeaders::new(headers))
+}
+
+fn apps_rpc_call_id(rpc: &Value) -> &str {
+    rpc["params"]["_meta"]["_codex_apps"]["call_id"]
+        .as_str()
+        .expect("Apps request carries the executed call ID")
+}
+
+fn assert_nested_apps_call_ids(rpcs: &[Value]) {
+    let mut ids = std::collections::HashSet::new();
+    for rpc in rpcs {
+        let call_id = apps_rpc_call_id(rpc);
+        let suffix = call_id
+            .strip_prefix("exec-")
+            .expect("nested call ID prefix");
+        let uuid = uuid::Uuid::parse_str(suffix).expect("nested call UUID");
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+        assert_eq!(suffix, uuid.to_string());
+        assert!(ids.insert(call_id), "nested call IDs must be distinct");
+    }
+}
+
+#[tokio::test]
+async fn websocket_custom_provider_omits_private_exec_and_late_wait_results_on_retry() -> Result<()>
+{
+    let case = ResultBodyCase::Shared(None);
+    skip_if_no_network!(Ok(()));
+    use tracing_subscriber::util::SubscriberInitExt;
+    // Keep the socket pump on this thread so its trace subscriber is local to the test.
+    let trace = tempfile::NamedTempFile::new()?;
+    let _subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_env_filter("tungstenite::protocol=trace")
+        .with_writer(trace.reopen()?)
+        .finish()
+        .set_default();
+    let apps = responses::start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&apps).await?;
+    // Hold the third RPC until the model has already received its call inventory.
+    let (reached, admitted) = oneshot::channel();
+    let (release_result, held) = std::sync::mpsc::channel();
+    let gate = Mutex::new(Some((reached, held)));
+    let result = serde_json::json!({"content": [{"type":"text", "text":"late private result"}]});
+    Mock::given(body_partial_json(
+        serde_json::json!({"method":"tools/call","params":{"arguments":{"title":"late"}}}),
+    ))
+    .respond_with(move |request: &Request| {
+        let (reached, held) = gate.lock().unwrap().take().unwrap();
+        reached.send(()).unwrap();
+        held.recv_timeout(Duration::from_secs(30)).unwrap();
+        let rpc: Value = serde_json::from_slice(&request.body).unwrap();
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":rpc["id"], "result":result}))
+    })
+    .with_priority(/*p*/ 1)
+    .mount(&apps)
+    .await;
+    let code = "const t = ALL_TOOLS.find(t => t.name.endsWith('create_event')); \
+                for (const title of ['first', 'second']) await tools[t.name]({title, starts_at: 'noon'}); \
+                const pending = tools[t.name]({title:'late', starts_at:'noon'}); \
+                yield_control(); await pending; text('done')";
+    let mut exec = ev_custom_tool_call("call-events", "exec", code);
+    exec["item"]["id"] = "exec-events".into();
+    let wait = |id, ms| {
+        let args = serde_json::json!({"cell_id":"1", "yield_time_ms":ms});
+        let call = responses::ev_function_call(id, "wait", &args.to_string());
+        vec![ev_response_created(id), call, ev_completed(id)]
+    };
+    // Each of the first two sockets closes before completing the tool-output request.
+    let switch = ev_response_created("interrupted");
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warmup"), ev_completed("warmup")],
+            vec![ev_response_created("resp-1"), exec, ev_completed("resp-1")],
+            wait("poll", /*ms*/ 1),
+            wait("wait", /*ms*/ 10_000),
+            vec![],
+        ],
+        vec![vec![switch.clone()]],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+    let release = server.gate_response_event(&switch);
+    let poll = server.gate_response_event(&ev_response_created("poll"));
+    let mut builder = case
+        .builder(apps_server.chatgpt_base_url, AuthMode::Headers)
+        .with_config(|config| {
+            // This test isolates result authorization across retries with full inventory enabled.
+            config
+                .features
+                .enable(Feature::ExecutedToolCallMetadata)
+                .unwrap();
+            config.model_provider.stream_max_retries = Some(2);
+        });
+    let test = builder.build_with_websocket_server(&server).await?;
+    let rotate = async {
+        // Yield can precede admission. Poll while the admitted result is still held.
+        admitted.await?;
+        poll.send(()).unwrap();
+        server
+            .wait_for_request(/*connection_index*/ 0, /*request_index*/ 3)
+            .await;
+        release_result.send(())?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0),
+        )
+        .await?;
+        struct OtherAccount;
+        impl codex_login::ExternalAuth for OtherAccount {
+            fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+                Box::pin(async { Ok(hosted_result_auth("other-account")) })
+            }
+            fn refresh(
+                &self,
+                _: codex_login::ExternalAuthRefreshContext,
+            ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+                self.resolve()
+            }
+        }
+        test.thread_manager
+            .auth_manager()
+            .set_external_auth(Arc::new(OtherAccount))
+            .await?;
+        release.send(()).expect("release retry under second owner");
+        anyhow::Ok(())
+    };
+    tokio::try_join!(test.submit_turn("Create calendar events"), rotate)?;
+
+    let connections = server.connections();
+    assert_eq!(
+        connections.iter().map(Vec::len).collect::<Vec<_>>(),
+        [5, 1, 1]
+    );
+    assert_eq!(connections[0][0].body_json()["generate"], false);
+    let delta = connections[0][2].body_json();
+    assert_eq!(delta["previous_response_id"], "resp-1");
+    let retry = connections[1][0].body_json();
+    // Retrying across owners must preserve only the ordinary conversation on this provider.
+    let mut expected = connections[2][0].body_json();
+    assert!(expected.get("previous_response_id").is_none());
+    assert!(expected.get("tool_results").is_none());
+    let private_prefix = "called calendar_create_event for";
+    let log = fs::read_to_string(trace.path())?;
+    // Match each received request to its send. Clear server sends when their responses arrive.
+    let mut logged = false;
+    let mut received = 0;
+    for line in log.lines() {
+        logged |= line.starts_with("TRACE tungstenite::protocol: Sending frame: opcode=TEXT,");
+        if line.starts_with(
+            r#"TRACE tungstenite::protocol: Received message {"type":"response.create","#,
+        ) {
+            received += 1;
+            assert_eq!(std::mem::take(&mut logged), !line.contains(private_prefix));
+        } else if line.starts_with("TRACE tungstenite::protocol: Received message ") {
+            logged = false;
+        }
+    }
+    assert_eq!(received, connections.iter().map(Vec::len).sum::<usize>());
+    // The lower-level writer also emits metadata for each traced frame.
+    assert_eq!(
+        log.matches("TRACE tungstenite::protocol::frame: writing frame")
+            .count(),
+        log.matches("TRACE tungstenite::protocol: Sending frame:")
+            .count(),
+    );
+    assert!(!expected.to_string().contains(private_prefix));
+    assert!(!expected.to_string().contains("tool_result_call_id"));
+    let timestamp = "x-codex-ws-stream-request-start-ms";
+    expected["client_metadata"][timestamp] = retry["client_metadata"][timestamp].clone();
+    let input = expected["input"].as_array_mut().unwrap();
+    assert!(input.last().unwrap()["output"].to_string().contains("done"));
+    let output = input
+        .iter_mut()
+        .find(|item| item["type"] == "custom_tool_call_output")
+        .unwrap();
+    assert_eq!(output["call_id"], "call-events");
+    let calls = output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"]
+        .as_array_mut()
+        .unwrap();
+    let executed = recorded_apps_tool_calls(&apps).await;
+    assert_eq!(executed.len(), 3);
+    assert_nested_apps_call_ids(&executed);
+    for (call, title) in calls[..2].iter().zip(["first", "second"]) {
+        assert_eq!(
+            call["arguments"],
+            serde_json::json!({"title": title, "starts_at": "noon"})
+        );
+        assert!(call.get("tool_result").is_none());
+        assert!(call.get("tool_result_call_id").is_none());
+    }
+    let late_on_exec = calls.len() == 3;
+    assert_eq!(delta["input"], serde_json::json!([output]));
+    let polled = connections[0][3].body_json();
+    // A call first reported after the exec yields belongs to the poll output.
+    let before = if late_on_exec { &delta } else { &polled };
+    let bound = before["input"].as_array().unwrap().last().unwrap();
+    let origin = input
+        .iter_mut()
+        .find(|item| **item == *bound)
+        .expect("original pending output");
+    let calls = &mut origin["internal_chat_message_metadata_passthrough"]["executed_tool_calls"];
+    let call = calls.as_array_mut().unwrap().last_mut().unwrap();
+    assert_eq!(call["arguments"]["title"], "late");
+    assert!(call.get("tool_result").is_none());
+    assert!(call.get("tool_result_call_id").is_none());
+    assert!(!retry.to_string().contains("late private result"));
+    assert_eq!(retry, expected);
+    let completed = connections[0][4].body_json();
+    let wait_output = expected["input"].as_array().unwrap().last().unwrap();
+    assert_eq!(wait_output["call_id"], "wait");
+    if completed.get("previous_response_id").is_some() {
+        expected["input"] = serde_json::json!([wait_output]);
+        expected["previous_response_id"] = "wait".into();
+    }
+    expected["client_metadata"][timestamp] = completed["client_metadata"][timestamp].clone();
+    assert_eq!(completed, expected);
+    let accounts: Vec<_> = server
+        .handshakes()
+        .iter()
+        .map(|h| h.header("chatgpt-account-id").unwrap())
+        .collect();
+    assert_eq!(accounts, ["account_id", "account_id", "other-account"]);
+    test.codex.shutdown_and_wait().await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultBodyCase {
+    Ungranted,
+    Shared(Option<&'static str>),
+    ModelBearer,
+    AppsHeader(&'static str),
+    AppsEnvHeader(&'static str),
+    AppsHeaderHelper,
+    OAuth,
+    FeatureOff(Option<&'static str>),
+}
+
+impl ResultBodyCase {
+    fn builder(self, base_url: String, auth: AuthMode) -> TestCodexBuilder {
+        let mut builder = result_metadata_apps_builder(base_url, "user@example.com");
+        if self == Self::Ungranted {
+            return builder;
+        }
+        if auth == AuthMode::Headers {
+            builder = builder.with_auth(hosted_result_auth("account_id"));
+        }
+        builder.with_config(move |config| {
+            config.model_provider.include_internal_metadata = true;
+            config.model_provider.requires_openai_auth = true;
+            if let Self::Shared(Some(sku)) | Self::FeatureOff(Some(sku)) = self {
+                config.model_provider.http_headers =
+                    Some(HashMap::from([("X-OpenAI-Product-Sku".into(), sku.into())]));
+            }
+            if self == Self::ModelBearer {
+                config.model_provider.experimental_bearer_token =
+                    Some("independent-model-token".into());
+            }
+            if !matches!(self, Self::FeatureOff(_)) {
+                let features = &mut config.features;
+                features.disable(Feature::ExecutedToolCallMetadata).unwrap();
+                features
+                    .enable(Feature::ConnectorToolResultPassthrough)
+                    .unwrap();
+            }
+        })
+    }
+
+    fn apps_override(self, base_url: &str) -> Option<McpServerConfig> {
+        let mut config = codex_apps_mcp_server_config(
+            base_url, /*apps_mcp_product_sku*/ None, /*originator*/ None,
+        );
+        let McpServerTransportConfig::StreamableHttp {
+            http_headers,
+            env_http_headers,
+            http_headers_helper,
+            ..
+        } = &mut config.transport
+        else {
+            unreachable!("Apps uses streamable HTTP")
+        };
+        match self {
+            Self::OAuth => config.auth = McpServerAuth::OAuth,
+            Self::AppsHeader(name) => {
+                *http_headers = Some(HashMap::from([(name.into(), "Bearer apps".into())]))
+            }
+            // Exercise the configured header name even when the variable is currently unset.
+            Self::AppsEnvHeader(name) => {
+                *env_http_headers = Some(HashMap::from([(
+                    name.into(),
+                    "CODEX_TEST_APPS_TOKEN".into(),
+                )]))
+            }
+            Self::AppsHeaderHelper => {
+                *http_headers_helper = Some(if cfg!(windows) {
+                    r#"echo {"Authorization":"Bearer apps"}"#.into()
+                } else {
+                    r#"printf '{"Authorization":"Bearer apps"}'"#.into()
+                })
+            }
+            Self::Ungranted | Self::Shared(_) | Self::ModelBearer | Self::FeatureOff(_) => {
+                return None;
+            }
+        }
+        Some(config)
+    }
+}
+
+fn result_metadata_relay(
+    server: McpServerContribution,
+) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.mcp_server_contributor(Arc::new(ResultMetadataTestControl {
+        server: Mutex::new(server),
+        gate: Mutex::new(None),
+    }));
+    Arc::new(extensions.build())
+}
+
+#[test_case(ToolMode::Direct, ResultBodyCase::Ungranted, AuthMode::Chatgpt; "direct")]
+#[test_case(ToolMode::CodeModeOnly, ResultBodyCase::Ungranted, AuthMode::Chatgpt; "code_mode")]
+#[test_case(ToolMode::Direct, ResultBodyCase::Shared(None), AuthMode::Headers; "custom_direct")]
+#[test_case(ToolMode::CodeModeOnly, ResultBodyCase::Shared(None), AuthMode::Headers; "custom_code_mode")]
+#[test_case(ToolMode::CodeModeOnly, ResultBodyCase::OAuth, AuthMode::Headers; "hosted_oauth_gateway_headers")]
+#[test_case(ToolMode::CodeModeOnly, ResultBodyCase::OAuth, AuthMode::Chatgpt; "hosted_oauth_chatgpt")]
+#[test_case(ToolMode::Direct, ResultBodyCase::ModelBearer, AuthMode::Headers; "independent_model_bearer")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsHeader("Authorization"), AuthMode::Headers; "static_authorization")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsHeader("X-API-Key"), AuthMode::Headers; "static_api_key")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsEnvHeader("Authorization"), AuthMode::Headers; "env_authorization")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsEnvHeader("Cookie"), AuthMode::Headers; "unset_env_cookie")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsEnvHeader("Originator"), AuthMode::Headers; "env_originator")]
+#[test_case(ToolMode::Direct, ResultBodyCase::AppsHeaderHelper, AuthMode::Headers; "hosted_apps_headers_helper")]
+#[test_case(ToolMode::Direct, ResultBodyCase::FeatureOff(None), AuthMode::Headers; "private_results_disabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn result_metadata_preserves_results_within_request_budget(
     tool_mode: ToolMode,
+    case: ResultBodyCase,
+    auth: AuthMode,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
+    let apps = responses::start_mock_server().await;
     let arguments = [
         serde_json::json!({ "search": "large" }),
         serde_json::json!({ "search": "medium-1" }),
@@ -2398,12 +2778,23 @@ async fn result_metadata_preserves_results_within_request_budget(
     assert!(metadata_sizes.iter().sum::<usize>() > 2 * 1024 * 1024);
     assert!(metadata_sizes.iter().sum::<usize>() < 15 * 1024 * 1024);
     assert!(serde_json::to_vec(&result_metadata[6]["openai/resource_access"])?.len() > 32 * 1024);
-    for (arguments, metadata) in arguments.iter().zip(&result_metadata) {
-        let result = serde_json::json!({
+    let shared = matches!(case, ResultBodyCase::Shared(_));
+    let budget_case = case == ResultBodyCase::Ungranted || shared;
+    let count = if budget_case { arguments.len() } else { 1 };
+    let arguments = &arguments[..count];
+    let result_metadata = &result_metadata[..count];
+    let granted = case != ResultBodyCase::Ungranted;
+    let direct = tool_mode == ToolMode::Direct;
+    let count_only = granted && !direct;
+    for (arguments, metadata) in arguments.iter().zip(result_metadata) {
+        let mut result = serde_json::json!({
             "content": [{ "type": "text", "text": RESULT_METADATA_PRIVATE_RESULT }],
             "isError": false,
             "_meta": metadata,
         });
+        if count_only {
+            result["structuredContent"] = serde_json::json!({"matches": [arguments["search"]]});
+        }
         Mock::given(method("POST"))
             .and(path("/api/codex/ps/mcp"))
             .and(body_partial_json(serde_json::json!({
@@ -2411,6 +2802,18 @@ async fn result_metadata_preserves_results_within_request_budget(
                 "params": { "arguments": arguments },
             })))
             .respond_with(move |request: &Request| {
+                match case {
+                    ResultBodyCase::AppsHeader(name) => {
+                        assert_eq!(request.headers[name], "Bearer apps")
+                    }
+                    ResultBodyCase::AppsHeaderHelper => {
+                        assert_eq!(request.headers["authorization"], "Bearer apps")
+                    }
+                    ResultBodyCase::AppsEnvHeader("Cookie") => {
+                        assert!(!request.headers.contains_key("cookie"))
+                    }
+                    _ => {}
+                }
                 let request: Value = serde_json::from_slice(&request.body).unwrap();
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -2419,28 +2822,45 @@ async fn result_metadata_preserves_results_within_request_budget(
                 }))
             })
             .with_priority(/*p*/ 1)
-            .mount(&server)
+            .mount(&apps)
             .await;
     }
     // Exact argument matches take precedence over the shared fallback mounted afterward.
     let apps_server = mount_result_metadata_app(
-        &server, /*result_metadata*/ None, /*is_error*/ false,
+        &apps, /*result_metadata*/ None, /*is_error*/ false,
     )
     .await?;
-    let direct = tool_mode == ToolMode::Direct;
-    let mut builder =
-        result_metadata_apps_builder(apps_server.chatgpt_base_url, "user@example.com").with_config(
-            move |config| {
-                if direct {
-                    config.features.disable(Feature::CodeModeOnly).unwrap();
-                    config.features.disable(Feature::CodeMode).unwrap();
-                }
-            },
-        );
-    let test = builder.build_with_auto_env(&server).await?;
+    let builder = if let Some(config) = case.apps_override(&apps_server.chatgpt_base_url) {
+        // Only the override points at the gateway, so a compatibility fallback cannot pass.
+        case.builder(server.uri(), auth)
+            .with_extensions(result_metadata_relay(McpServerContribution::HostedApps {
+                config: Box::new(config),
+                protocol_mode: None,
+            }))
+    } else {
+        case.builder(apps_server.chatgpt_base_url, auth)
+    };
+    let mut builder = builder.with_config(move |config| {
+        // Keep the full-inventory budget coverage independent of connector-only capture.
+        config
+            .features
+            .enable(Feature::ExecutedToolCallMetadata)
+            .unwrap();
+        if direct {
+            config.features.disable(Feature::CodeModeOnly).unwrap();
+            config.features.disable(Feature::CodeMode).unwrap();
+        }
+    });
+    let test = if case == ResultBodyCase::AppsHeaderHelper {
+        builder.build(&server).await?
+    } else {
+        builder.build_with_auto_env(&server).await?
+    };
+    assert_eq!(test.thread_manager.auth_manager().auth_mode(), Some(auth));
     let call_ids = [
         "call-1", "call-2", "call-3", "call-4", "call-5", "call-6", "call-7", "call-8",
     ];
+    let call_ids = &call_ids[..count];
     let mut events = if direct {
         arguments
             .iter()
@@ -2455,7 +2875,7 @@ async fn result_metadata_preserves_results_within_request_budget(
             })
             .collect::<Vec<_>>()
     } else {
-        let arguments = serde_json::to_string(&arguments)?;
+        let arguments = serde_json::to_string(arguments)?;
         let code = format!(
             "const tool = ALL_TOOLS.find(({{ name }}) => name.endsWith(\"{RESULT_METADATA_TOOL}\")); \
              const results = []; \
@@ -2464,19 +2884,20 @@ async fn result_metadata_preserves_results_within_request_budget(
                  results.push({{ content: result.content, isError: Boolean(result.isError), \
                      hasMeta: Object.hasOwn(result, \"_meta\") }}); \
              }} \
-             text(JSON.stringify(results));"
+             text({count_only} ? results.length : JSON.stringify(results));"
         );
         vec![ev_custom_tool_call("call-1", "exec", &code)]
     };
     events.push(ev_completed("resp-1"));
     let initial = responses::mount_sse_once(&server, sse(events)).await;
     let follow_up = responses::mount_sse_once(&server, sse(vec![ev_completed("resp-2")])).await;
-    test.submit_turn("Search the connected app eight times")
-        .await?;
+    test.submit_turn("Search the connected app").await?;
     let initial = initial.single_request();
-    assert!(initial.has_message_with_input_texts("user", |texts| {
-        texts == ["Search the connected app eight times"]
-    }));
+    assert!(
+        initial.has_message_with_input_texts("user", |texts| {
+            texts == ["Search the connected app"]
+        })
+    );
     assert_eq!(
         tool_names(&initial.body_json())
             .iter()
@@ -2484,9 +2905,15 @@ async fn result_metadata_preserves_results_within_request_budget(
         !direct,
     );
     let request = follow_up.single_request();
-    let mut actual_arguments = recorded_apps_tool_calls(&server)
-        .await
-        .into_iter()
+    if case == ResultBodyCase::ModelBearer {
+        assert_eq!(
+            request.header("authorization").as_deref(),
+            Some("Bearer independent-model-token")
+        );
+    }
+    let executed = recorded_apps_tool_calls(&apps).await;
+    let mut actual_arguments = executed
+        .iter()
         .map(|call| {
             assert_eq!(call["params"]["name"], RESULT_METADATA_TOOL);
             call["params"]["arguments"].clone()
@@ -2495,7 +2922,12 @@ async fn result_metadata_preserves_results_within_request_budget(
     actual_arguments.sort_by_key(Value::to_string);
     assert_eq!(actual_arguments, arguments);
     if direct {
-        for call_id in call_ids {
+        for (call_id, args) in call_ids.iter().zip(arguments) {
+            let rpc = executed
+                .iter()
+                .find(|rpc| &rpc["params"]["arguments"] == args)
+                .expect("each direct call reached the Apps server");
+            assert_eq!(apps_rpc_call_id(rpc), *call_id);
             let output = request.function_call_output(call_id);
             assert_eq!(
                 &output["output"].as_array().expect("direct output content")[1..],
@@ -2507,10 +2939,12 @@ async fn result_metadata_preserves_results_within_request_budget(
             assert!(!output["output"].to_string().contains("payload"));
         }
     } else {
+        assert_nested_apps_call_ids(&executed);
         let (body, success) = custom_tool_output_body_and_success(&request, "call-1");
         assert_ne!(success, Some(false), "Code Mode failed: {body}");
-        assert_eq!(
-            serde_json::from_str::<Value>(&body)?,
+        let expected = if count_only {
+            serde_json::json!(arguments.len())
+        } else {
             serde_json::json!(vec![
                 serde_json::json!({
                     "content": [{ "type": "text", "text": RESULT_METADATA_PRIVATE_RESULT }],
@@ -2518,8 +2952,9 @@ async fn result_metadata_preserves_results_within_request_budget(
                     "hasMeta": false,
                 });
                 arguments.len()
-            ]),
-        );
+            ])
+        };
+        assert_eq!(serde_json::from_str::<Value>(&body)?, expected);
     }
     let captured = codex_core::test_support::history_with_tool_call_metadata(&test.codex).await;
     if direct {
@@ -2534,17 +2969,19 @@ async fn result_metadata_preserves_results_within_request_budget(
             .iter()
             .map(codex_protocol::models::executed_tool_call_metadata_bytes)
             .sum::<usize>()
-            > 2 * 1024 * 1024
+            >= metadata_sizes[..count].iter().sum::<usize>()
     );
     let captured = serde_json::to_value(captured)?;
-    for (input, expected_metadata) in [
-        // Ungranted custom inference endpoints strip raw metadata, including omission markers.
-        (request.input(), None),
-        (
-            captured.as_array().unwrap().clone(),
-            Some(result_metadata.clone()),
-        ),
-    ] {
+    let mut inputs = vec![
+        (request.input(), granted),
+        (captured.as_array().unwrap().clone(), true),
+    ];
+    if shared {
+        let next = responses::mount_sse_once(&server, sse(vec![ev_completed("resp-3")])).await;
+        test.submit_turn("Finish").await?;
+        inputs.push((next.single_request().input(), true));
+    }
+    for (input, include_metadata) in inputs {
         let mut calls = Vec::new();
         for output in &input {
             let metadata = &output["internal_chat_message_metadata_passthrough"];
@@ -2561,8 +2998,8 @@ async fn result_metadata_preserves_results_within_request_budget(
                 let name = calls[index]["name"].as_str().unwrap();
                 assert!(name.ends_with(RESULT_METADATA_TOOL));
                 let mut call = serde_json::json!({ "name": name, "arguments": arguments });
-                if let Some(metadata) = &expected_metadata {
-                    call["tool_result_metadata"] = metadata[index].clone();
+                if include_metadata {
+                    call["tool_result_metadata"] = result_metadata[index].clone();
                 }
                 call
             })
@@ -3656,15 +4093,12 @@ async fn code_mode_complete_calls_preserve_large_arguments() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(false, None, false; "control")]
-#[test_case(true, None, false; "ranked_search")]
-#[test_case(true, Some(30_000), false; "ranked_search_expanded_schema")]
-#[test_case(false, None, true; "tool_description_first")]
-#[test_case(true, None, true; "ranked_search_tool_description_first")]
+#[test_case(false, None; "catalog_search")]
+#[test_case(true, None; "ranked_search")]
+#[test_case(true, Some(30_000); "ranked_search_expanded_schema")]
 async fn code_mode_only_searches_and_calls_deferred_app_tools(
     ranked_search: bool,
     schema_max_bytes: Option<usize>,
-    tool_description_first: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3784,13 +4218,6 @@ if (!tool) {
                 .enable(Feature::CodeModeOnly)
                 .expect("test config should allow feature update");
             config.code_mode.tool_input_schema_max_bytes = schema_max_bytes;
-            config
-                .features
-                .set_enabled(
-                    Feature::CodeModeToolDescriptionFirst,
-                    tool_description_first,
-                )
-                .expect("test config should allow description order update");
             if ranked_search {
                 config
                     .features
@@ -3878,11 +4305,7 @@ if (!tool) {
             "hasDeclaration": true,
             "hasSchemaDescription": schema_max_bytes.is_some(),
             "hasNamespacePrefix": true,
-            "descriptionPrefix": if tool_description_first {
-                "Calendar search context.\n\nRead timezone option 99.\n\nPlan events and manage your calendar."
-            } else {
-                "Calendar search context.\n\nPlan events and manage your calendar.\n\nRead timezone option 99."
-            },
+            "descriptionPrefix": "Calendar search context.\n\nRead timezone option 99.\n\nPlan events and manage your calendar.",
             "matchesCatalog": true,
             "isError": false,
             "text": "called calendar_timezone_option_99 for  at  with ",
@@ -4000,10 +4423,8 @@ text(JSON.stringify({{
 }
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
-#[test_case(false; "legacy_stdio")]
-#[test_case(true; "grpc_stdio")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_only_can_call_nested_tools(grpc_stdio: bool) -> Result<()> {
+async fn code_mode_only_can_call_nested_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     #[cfg(unix)]
@@ -4041,11 +4462,8 @@ text(output.output);
     )
     .await;
 
-    let mut builder = test_codex().with_config(move |config| {
+    let mut builder = test_codex().with_config(|config| {
         let _ = config.features.enable(Feature::CodeModeOnly);
-        if grpc_stdio {
-            let _ = config.features.enable(Feature::CodeModeHostGrpc);
-        }
     });
     #[cfg(unix)]
     {
@@ -4066,12 +4484,8 @@ text(output.output);
     #[cfg(unix)]
     assert_eq!(
         recorder.invocations()?,
-        vec![if grpc_stdio {
-            "--listen grpc+stdio://".to_string()
-        } else {
-            String::new()
-        }],
-        "the feature flag must select the expected host transport"
+        vec!["--listen grpc+stdio://".to_string()],
+        "local Codex must use gRPC over stdio"
     );
     assert!(
         request
@@ -4617,12 +5031,16 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 // The outer directive limits output after JavaScript emits it; it does not
 // limit `result.output` returned by the nested command.
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[test_case(&[]; "default_grpc")]
+#[test_case(&[Feature::CodeModeHostOutputTruncation]; "client_grpc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
+async fn code_mode_exec_outer_limit_truncates_emitted_output(
+    disabled_features: &'static [Feature],
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
+    let (_test, second_mock) = run_code_mode_turn_with_builder(
         &server,
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 5}
@@ -4631,6 +5049,7 @@ const result = await tools.exec_command({
 });
 text(result.output);
 "#,
+        code_mode_test_builder(disabled_features),
     )
     .await?;
 
@@ -4687,6 +5106,50 @@ Error:\ boom\n
     Ok(())
 }
 
+// An overflow notice is outside the observation budget. This distinguishes
+// actual server formatting from Core silently repeating client truncation.
+#[test_case(None; "default")]
+#[test_case(Some(Feature::CodeModeHostOutputTruncation); "client_grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_zero_budget_reports_host_truncation(
+    disabled_feature: Option<Feature>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, follow_up) = run_code_mode_turn_with_config(
+        &server,
+        "emit enough text to overflow the collector",
+        r#"// @exec: {"max_output_tokens": 0}
+text("begin");
+text("x".repeat(2 * 1024 * 1024));
+text("end");
+"#,
+        move |config| {
+            if let Some(feature) = disabled_feature {
+                config.features.disable(feature).unwrap();
+            }
+        },
+    )
+    .await?;
+    let (output, success) =
+        custom_tool_output_body_and_success(&follow_up.single_request(), "call-1");
+    assert_ne!(success, Some(false), "{output}");
+    if disabled_feature == Some(Feature::CodeModeHostOutputTruncation) {
+        assert!(
+            !output.contains("Code Mode session output limit reached"),
+            "{output}"
+        );
+    } else {
+        assert!(
+            output.contains("Code Mode session output limit reached")
+                && output.contains("text segments, 0 images, 0 audio items"),
+            "host omission notice must survive Core's zero-token exec budget: {output}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_surfaces_handler_errors_as_exceptions() -> Result<()> {
@@ -4736,137 +5199,10 @@ try {
     Ok(())
 }
 
-/// A stalled host wait must return its timeout to the model and reconnect for the next exec.
-#[tokio::test(flavor = "current_thread")]
-async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::CodeMode)
-                .expect("code mode should be enabled");
-        });
-    let test = builder.build_with_auto_env(&server).await?;
-
-    let first_turn = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_custom_tool_call(
-                    "call-1",
-                    "exec",
-                    "yield_control(); await new Promise(() => {});",
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-1", "waiting"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn("start a stalled code-mode cell").await?;
-    let first_request = first_turn
-        .last_request()
-        .expect("initial exec should be returned to the model");
-    let first_items = custom_tool_output_items(&first_request, "call-1");
-    let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
-
-    let timeout_completion = responses::mount_function_call_agent_response(
-        &server,
-        "call-2",
-        &serde_json::to_string(&serde_json::json!({
-            "cell_id": cell_id,
-            "yield_time_ms": 60_000,
-        }))?,
-        "wait",
-    )
-    .await
-    .completion;
-
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "wait for the stalled cell".to_string(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::RawResponseItem(raw) => match &raw.item {
-            ResponseItem::FunctionCall { call_id, .. } if call_id == "call-2" => Some(()),
-            _ => None,
-        },
-        _ => None,
-    })
-    .await;
-
-    tokio::time::pause();
-    for _ in 0..130 {
-        tokio::time::advance(Duration::from_secs(1)).await;
-        if timeout_completion
-            .function_call_output_text("call-2")
-            .is_some()
-        {
-            break;
-        }
-    }
-    tokio::time::resume();
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let timeout_output = timeout_completion
-        .function_call_output_text("call-2")
-        .expect("timed-out wait should be returned to the model");
-    assert!(
-        timeout_output.contains("code-mode host timed out waiting for wait response"),
-        "unexpected wait output: {timeout_output}"
-    );
-
-    let reconnect_turn = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-5"),
-                ev_custom_tool_call(
-                    "call-3",
-                    "exec",
-                    r#"text("reconnected"); yield_control(); await new Promise(() => {});"#,
-                ),
-                ev_completed("resp-5"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-3", "reconnected"),
-                ev_completed("resp-6"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn("run a cell after the timeout").await?;
-    let reconnect_request = reconnect_turn
-        .last_request()
-        .expect("replacement exec should be returned to the model");
-    let reconnect_items = custom_tool_output_items(&reconnect_request, "call-3");
-    assert_eq!(
-        extract_running_cell_id(text_item(&reconnect_items, /*index*/ 0)),
-        "g2:1"
-    );
-    assert_eq!(text_item(&reconnect_items, /*index*/ 1), "reconnected");
-
-    Ok(())
-}
-
 #[derive(Default)]
 struct ResponseIdObserver {
     response_ids: Mutex<Vec<(String, Option<String>)>>,
+    guardian_probes: Mutex<Vec<Option<bool>>>,
     originating_items: Mutex<Vec<(String, Option<codex_protocol::ResponseItemId>)>>,
     wait_started: tokio::sync::Notify,
 }
@@ -4874,6 +5210,18 @@ struct ResponseIdObserver {
 impl ToolLifecycleContributor for ResponseIdObserver {
     fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
+            if input.tool_name.name == "exec_command"
+                && let codex_extension_api::ToolPayload::Function { arguments } = input.payload
+                && let Ok(arguments) = serde_json::from_str::<Value>(arguments)
+                && arguments["cmd"]
+                    .as_str()
+                    .is_some_and(|cmd| cmd.starts_with("printf 'phase "))
+            {
+                self.guardian_probes
+                    .lock()
+                    .unwrap()
+                    .push(input.guardian_probe);
+            }
             if matches!(input.tool_name.name.as_str(), "exec" | "exec_command") {
                 self.originating_items.lock().unwrap().push((
                     input.tool_name.name.clone(),
@@ -4897,18 +5245,45 @@ impl ToolLifecycleContributor for ResponseIdObserver {
 }
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[test_case::test_case(None; "without_probe")]
+#[test_case::test_case(Some(false); "low_risk_probe")]
+#[test_case::test_case(Some(true); "review_required_probe")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
+async fn code_mode_can_yield_and_resume_with_wait(requires_review: Option<bool>) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"model": "gpt-5.6-luna"}),
+        ))
+        .respond_with(responses::sse_response(sse(vec![
+            ev_assistant_message("score", "low"),
+            ev_completed("score"),
+        ])))
+        .with_priority(/*p*/ 1)
+        .mount(&server)
+        .await;
     let observer = Arc::new(ResponseIdObserver::default());
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions.tool_lifecycle_contributor(observer.clone());
     let mut builder = test_codex()
+        .with_model("guardian-probe-parent")
         .with_extensions(Arc::new(extensions.build()))
+        .with_pre_build_hook(move |home| {
+            if requires_review.is_some() {
+                fs::write(home.join("config.toml"), "[features.guardianv2]\nenabled = true\n[features.guardianv2.review_scope]\ncomputer_use_only = false\nsandboxed_exec_commands = true\n")
+                    .expect("enable Guardian scoring");
+            }
+        })
+        .with_model_info_override("guardian-probe-parent", |model| { model.guardian = None; })
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
+            if requires_review.is_some() {
+                config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+                config.permissions.set_permission_profile(PermissionProfile::read_only()).expect("read-only permissions");
+                config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            }
         });
     let test = builder.build(&server).await?;
     let phase_2_gate = test.workspace_path("code-mode-phase-2.ready");
@@ -4918,7 +5293,7 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
 
     let code = format!(
         r#"
-text("phase 1");
+text((await tools.exec_command({{cmd: "printf 'phase 1'"}})).output);
 yield_control();
 {phase_2_wait}
 text((await tools.exec_command({{cmd: "printf 'phase 2'"}})).output);
@@ -4928,15 +5303,17 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 "#
     );
 
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            responses::ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", &code),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
+    let mut tool = ev_custom_tool_call("call-1", "exec", &code);
+    tool["item"]["id"] = serde_json::json!("assessed-cell");
+    let mut events = vec![ev_response_created("resp-1")];
+    if let Some(requires_review) = requires_review {
+        events.push(serde_json::json!({
+            "type": "response.metadata", "response_id": "resp-1",
+            "metadata": {"guardian": {"item_id": "assessed-cell", "requires_review": requires_review}}
+        }));
+    }
+    events.extend([tool, ev_completed("resp-1")]);
+    responses::mount_sse_once(&server, sse(events)).await;
     let first_completion = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -5066,6 +5443,10 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
             .all(|(_, item)| item.as_ref() == Some(&wrapper_item))
     );
 
+    assert_eq!(
+        *observer.guardian_probes.lock().unwrap(),
+        vec![requires_review; 3]
+    );
     let observed = observer.response_ids.lock().unwrap();
     let mut nested_response_ids = observed
         .iter()
@@ -5548,23 +5929,49 @@ yield_control();
     Ok(())
 }
 
+// The cell emits its termination output before starting the nested command. Keep
+// the first turn's dispatch worker alive until that command has been dispatched.
+#[derive(Default)]
+struct TerminationOutputReady(tokio::sync::Notify);
+
+impl ToolLifecycleContributor for TerminationOutputReady {
+    fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(async move {
+            if input.tool_name.name == "exec_command" {
+                self.0.notify_one();
+            } else if input.tool_name.name == "exec" && input.call_id == "call-1" {
+                assert_eq!(input.outcome, ToolCallOutcome::Completed { success: true });
+                tokio::time::timeout(Duration::from_secs(10), self.0.notified())
+                    .await
+                    .expect("the yielded cell should reach its nested command");
+            }
+        })
+    }
+}
+
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[test_case(&[]; "default_grpc")]
+#[test_case(&[Feature::CodeModeHostOutputTruncation]; "client_grpc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
+async fn code_mode_wait_can_terminate_and_continue(
+    disabled_features: &'static [Feature],
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(Arc::new(TerminationOutputReady::default()));
+    let mut builder =
+        code_mode_test_builder(disabled_features).with_extensions(Arc::new(extensions.build()));
     let test = builder.build(&server).await?;
     let termination_gate = test.workspace_path("code-mode-terminate.ready");
     let termination_wait = wait_for_file_source(&termination_gate)?;
 
     let code = format!(
-        r#"
+        r#"// @exec: {{"max_output_tokens": 100}}
 text("phase 1");
 yield_control();
+text("0123456789012345678901234567890123456789");
 {termination_wait}
 text("phase 2");
 "#
@@ -5606,6 +6013,7 @@ text("phase 2");
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": cell_id.clone(),
                     "terminate": true,
+                    "max_tokens": 5,
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -5625,13 +6033,17 @@ text("phase 2");
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items.len(), 2);
     assert_regex_match(
         concat!(
             r"(?s)\A",
             r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
+    );
+    assert_eq!(
+        text_item(&second_items, /*index*/ 1),
+        "Warning: truncated output (original token count: 10)\nTotal output lines: 1\n\n0123456789…5 tokens truncated…0123456789"
     );
 
     responses::mount_sse_once(
@@ -5937,20 +6349,29 @@ async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Resu
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
     let test = builder.build(&server).await?;
     let resumed_file = test.workspace_path("code-mode-yield-resumed.txt");
     let resumed_file_quoted = shlex::try_join([resumed_file.to_string_lossy().as_ref()])?;
     let write_file_command = format!("printf resumed > {resumed_file_quoted}");
     let wait_for_file_command =
         format!("while [ ! -f {resumed_file_quoted} ]; do sleep 0.01; done; printf ready");
+    let barrier = serde_json::json!({"barrier": {
+        "id": "background-command-approval", "participants": 2, "timeout_ms": 60_000,
+    }});
     let code = format!(
         r#"
 text("before yield");
 yield_control();
-await tools.exec_command({{ cmd: {write_file_command:?} }});
+await tools.test_sync_tool({barrier});
+await tools.exec_command({{
+    cmd: {write_file_command:?}, sandbox_permissions: "require_escalated",
+    justification: "write the resumed file",
+}});
 text("after yield");
 "#
     );
@@ -5973,7 +6394,12 @@ text("after yield");
     )
     .await;
 
-    test.submit_turn("start yielded exec").await?;
+    test.submit_turn_with_approval_and_permission_profile(
+        "start yielded exec",
+        AskForApproval::OnRequest,
+        PermissionProfile::read_only(),
+    )
+    .await?;
 
     let first_request = first_completion.single_request();
     let first_items = custom_tool_output_items(&first_request, "call-1");
@@ -5991,6 +6417,7 @@ text("after yield");
         &server,
         sse(vec![
             ev_response_created("resp-3"),
+            responses::ev_function_call("release-cell", "test_sync_tool", &barrier.to_string()),
             responses::ev_function_call(
                 "call-2",
                 "exec_command",
@@ -6011,7 +6438,34 @@ text("after yield");
     )
     .await;
 
-    test.submit_turn("wait for resumed file").await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "wait for resumed file".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let servicing_turn = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(turn) => Some(turn.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    let approval = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::ExecApprovalRequest(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+    assert_ne!(approval.turn_id, servicing_turn);
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: Some(approval.turn_id),
+            decision: ReviewDecision::Approved,
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     let second_request = second_completion.single_request();
     assert!(
@@ -6226,19 +6680,20 @@ async fn code_mode_interrupt_terminates_active_cells_and_nested_tools() -> Resul
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[test_case(&[]; "default_grpc")]
+#[test_case(&[Feature::CodeModeHostOutputTruncation]; "client_grpc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
+async fn code_mode_wait_uses_its_own_max_tokens_budget(
+    disabled_features: &'static [Feature],
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
-    let test = builder.build(&server).await?;
+    let mut builder = code_mode_test_builder(disabled_features);
+    let test = builder.build_with_auto_env(&server).await?;
 
-    // An explicit yield separates the output batches without a nested shell call.
-    let code = r#"// @exec: {"max_output_tokens": 100}
+    // Exec accepts budgets above i32::MAX. The wait uses its own budget.
+    let code = r#"// @exec: {"max_output_tokens": 2147483648}
 text("phase 1");
 yield_control();
 text("token one token two token three token four token five token six token seven");
@@ -6308,15 +6763,10 @@ text("token one token two token three token four token five token six token seve
         ),
         text_item(&second_items, /*index*/ 0),
     );
-    let expected_pattern = r#"(?sx)
-\A
-Warning:\ truncated\ output\ \(original\ token\ count:\ \d+\)\n
-Total\ output\ lines:\ 1\n
-\n
-.*…\d+\ tokens\ truncated….*
-\z
-"#;
-    assert_regex_match(expected_pattern, text_item(&second_items, /*index*/ 1));
+    assert_eq!(
+        text_item(&second_items, /*index*/ 1),
+        "Warning: truncated output (original token count: 19)\nTotal output lines: 1\n\ntoken one to…13 tokens truncated… token seven"
+    );
 
     Ok(())
 }
@@ -6455,12 +6905,18 @@ text("after");
     );
 
     let server = responses::start_mock_server().await;
+    let store = Arc::new(RecordingFileAttachmentStore::default());
     let mut builder = test_codex()
+        .with_image_store(store.clone())
         .with_model_info_override("gpt-5.4", |model| {
             model.input_modalities.push(InputModality::Audio);
         })
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
+            config
+                .features
+                .disable(Feature::FileBackedToolAudio)
+                .unwrap();
         });
     let test = builder.build_with_auto_env(&server).await?;
     responses::mount_sse_once(
@@ -6484,6 +6940,7 @@ text("after");
     test.submit_turn("use exec to return short and valid audio with text")
         .await?;
 
+    assert!(store.uploads.lock().unwrap().is_empty());
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
     let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
@@ -6619,9 +7076,7 @@ image({{
         "emit images with legacy detail arguments and MCP metadata",
         &code,
         "gpt-5.5",
-        |config| {
-            let _ = config.features.enable(Feature::UnifiedImageBudget);
-        },
+        |_| {},
     )
     .await?;
 
@@ -6671,7 +7126,6 @@ async fn code_mode_unified_image_budget_preserves_legacy_contract_for_unsupporte
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
             let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
-            let _ = config.features.enable(Feature::UnifiedImageBudget);
         });
     let (_test, second_mock) = run_code_mode_turn_with_builder(
         &server,
@@ -6758,8 +7212,8 @@ async fn code_mode_can_use_view_image_result_with_image_helper(
         .with_model("gpt-5.5")
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
-            if unified_image_budget {
-                let _ = config.features.enable(Feature::UnifiedImageBudget);
+            if !unified_image_budget {
+                let _ = config.features.disable(Feature::UnifiedImageBudget);
             }
         });
     let test = builder.build(&server).await?;
@@ -7013,7 +7467,7 @@ async fn code_mode_records_mcp_completion_even_when_result_is_not_printed() -> R
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let (test, second_mock) = run_code_mode_turn_with_rmcp(
+    let (_, second_mock) = run_code_mode_turn_with_rmcp(
         &server,
         "call the rmcp echo tool without printing its result",
         r#"await tools.mcp__rmcp__echo({ message: "discarded" }); text("done");"#,
@@ -7025,21 +7479,6 @@ async fn code_mode_records_mcp_completion_even_when_result_is_not_printed() -> R
         "done"
     );
 
-    let first_turn_id = request.body_json()["client_metadata"]["turn_id"].clone();
-    assert!(first_turn_id.is_string());
-    assert_eq!(
-        serde_json::to_value(codex_core::test_support::mcp_attribution_snapshot(
-            &test.codex
-        ))?,
-        serde_json::json!({
-            "status": "complete",
-            "sources": [{
-                "server_name": "rmcp",
-                "tool_name": "echo",
-                "first_turn_id": first_turn_id,
-            }],
-        })
-    );
     Ok(())
 }
 
@@ -7266,7 +7705,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     let check_detail = enhanced_transcripts && transcript_images && reviewer_constraint.is_none();
     let mut large_image = Cursor::new(Vec::new());
     if check_detail {
-        DynamicImage::new_rgba8(/*w*/ 2049, /*h*/ 32)
+        DynamicImage::new_rgba8(/*w*/ 6001, /*h*/ 32)
             .write_to(&mut large_image, ImageFormat::Png)?;
     }
     let mut builder = test_codex()
@@ -7323,6 +7762,13 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .features
                 .set_enabled(Feature::GuardianNodeReplTranscriptImages, transcript_images)
                 .expect("configure Guardian transcript images");
+            if check_detail {
+                // The invalid image and its valid successor exceed the modern stdio frame limit.
+                config
+                    .features
+                    .disable(Feature::McpConnectionSharing)
+                    .expect("use legacy stdio for the oversized image response");
+            }
             let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
@@ -7491,11 +7937,11 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             .position(|item| item.get("image_url").and_then(Value::as_str) == Some(PRIVATE_IMAGE))
             .expect("private reviewer image should be present");
         if check_detail {
-            assert_eq!(reviewer_user_content[image_index]["detail"], "high");
+            assert_eq!(reviewer_user_content[image_index]["detail"], "original");
             let payload = reviewer_image_urls[1].split_once(',').unwrap().1;
             let dimensions =
                 image::load_from_memory(&BASE64_STANDARD.decode(payload)?)?.dimensions();
-            assert_eq!(dimensions, (2048, 32));
+            assert_eq!(dimensions, (6000, 32));
         }
         for (index, marker) in [(image_index - 1, "before"), (image_index + 1, "after")] {
             let text = reviewer_user_content[index]["text"].as_str().unwrap();
@@ -7955,7 +8401,7 @@ text(JSON.stringify({
         exec_output,
         serde_json::json!({
             "name": "editor__apply_patch",
-            "description": format!("Editing tools.\n\n{second_description}"),
+            "description": format!("Apply a raw editor patch (step 2).\n\nEditing tools.\n\nexec tool declaration:\n```ts\n{declaration}\n```"),
             "result": {
                 "namespace": "editor",
                 "name": "apply_patch",
@@ -8101,8 +8547,8 @@ text(JSON.stringify(tool));
         serde_json::json!({
             "name": "mcp__rmcp__echo",
             "description": concat!(
-                "Use these tools to exercise the rmcp test server.\n\n",
                 "Echo back the provided message and include environment data.\n\n",
+                "Use these tools to exercise the rmcp test server.\n\n",
                 "exec tool declaration:\n",
                 "```ts\n",
                 "declare const tools: { mcp__rmcp__echo(args: { env_var?: string; message: string; }): ",
@@ -8454,12 +8900,18 @@ async fn code_mode_search_normalizes_and_calls_deferred_dynamic_tools(
         .with_model_info_override("gpt-5.5", |model_info| {
             model_info.supports_search_tool = true;
             model_info.tool_mode = Some(ToolMode::CodeMode);
-            model_info
+            let tools = model_info
                 .model_messages
                 .get_or_insert_default()
                 .tools
-                .get_or_insert_default()
-                .functions_namespace_functions_description_prefixes =
+                .get_or_insert_default();
+            tools.indirect_description_prefixes = Some(
+                serde_json::from_value(serde_json::json!({
+                    "builtin_tool_namespaces": {"functions": "Builtin."}
+                }))
+                .unwrap(),
+            );
+            tools.functions_namespace_functions_description_prefixes =
                 Some(std::collections::BTreeMap::from([(
                     "hidden-dynamic-tool".to_string(),
                     "Function guidance.".to_string(),
@@ -8527,6 +8979,9 @@ const out = await tools[tool.name]({ city: "Paris" });
 text(
   JSON.stringify({
     name: tool?.name ?? null,
+    builtinLabel: ALL_TOOLS.find(t => t.name === "view_image").description.startsWith("Builtin.\n\n"),
+    dynamicLabel: ALL_TOOLS.find(t => t.name === tool.name).description.includes("Builtin."),
+    searchLabel: tool.description.includes("Builtin."),
     description: tool?.description ?? null,
     out,
     recoveredFromInvalidArguments: errors.length === 2,
@@ -8646,6 +9101,9 @@ text(
         Some(&Value::String("hidden-ok".to_string()))
     );
     assert_eq!(parsed["recoveredFromInvalidArguments"], true);
+    assert_eq!(parsed["builtinLabel"], false);
+    assert_eq!(parsed["dynamicLabel"], false);
+    assert_eq!(parsed["searchLabel"], false);
     let loaded = search_response.single_request().tool_search_output("find");
     let loaded = loaded["tools"]
         .as_array()
@@ -8653,6 +9111,14 @@ text(
         .iter()
         .find(|tool| tool["name"] == namespace)
         .expect("loaded namespace");
+    assert_eq!(
+        loaded["description"],
+        if namespace == "functions" {
+            "Builtin.\n\nCodex app tools."
+        } else {
+            "Codex app tools."
+        }
+    );
     assert_eq!(
         loaded["tools"][0]["description"],
         if namespace == "functions" {

@@ -122,6 +122,7 @@ impl TranscriptView {
             mode.search_origin = Some(SelectSearchOrigin {
                 mark: mode.mark,
                 preferred_column: mode.preferred_column,
+                table_caret: mode.table_caret.take(),
                 start: selection.start,
                 end: selection.end,
             });
@@ -321,7 +322,7 @@ impl TranscriptView {
         self.move_select_cursor_to_search_match(anchor, &layout, cells);
     }
 
-    pub(super) fn restore_select_search_origin(&mut self) {
+    pub(super) fn restore_select_search_origin(&mut self, cells: &[Arc<dyn HistoryCell>]) {
         let (Some(mode), Some(selection)) = (&mut self.select_mode, &mut self.selection) else {
             return;
         };
@@ -329,8 +330,12 @@ impl TranscriptView {
             return;
         };
         mode.mark = origin.mark;
+        mode.table_caret = origin.table_caret;
         mode.preferred_column = origin.preferred_column;
         selection.set_keyboard_range(origin.start, origin.end);
+        if self.table_mark().is_some() {
+            self.sync_select_range(cells);
+        }
     }
 
     pub(super) fn cancel_pending_select_search(&mut self) {
@@ -591,6 +596,16 @@ impl TranscriptView {
         cells: &[Arc<dyn HistoryCell>],
         inserted: Range<usize>,
     ) {
+        self.history_page_loaded(cells, inserted, /*inserted_images*/ None);
+    }
+
+    pub(crate) fn history_page_loaded(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        inserted: Range<usize>,
+        inserted_images: Option<Range<usize>>,
+    ) {
+        self.invalidate_turn_details_from(/*index*/ 0);
         // With only a header and live output, the first older page extends the canonical tail.
         if !inserted.is_empty()
             && inserted.end == cells.len()
@@ -598,7 +613,17 @@ impl TranscriptView {
         {
             self.last_tail = cells.last().map(EntryKey::cell);
         }
-        self.prepend_snapshot_history(cells, inserted.clone());
+        let image_span = inserted_images.map(|images| {
+            // The older-page prepend shifts the separately inserted images.
+            let len = inserted.len();
+            self.prepend_snapshot_history(cells, images.start + len..images.end + len)
+        });
+        let inserted = self.prepend_snapshot_history(cells, inserted);
+        let inserted = if inserted.is_empty() {
+            image_span.unwrap_or(inserted)
+        } else {
+            inserted
+        };
         if let Position::Reading(anchor) = self.position {
             let index = self.resolve(cells, anchor);
             self.position = Position::Reading(Anchor {

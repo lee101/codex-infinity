@@ -167,7 +167,14 @@ pub struct TestAppServer {
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
-pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
+const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
+pub const DEFAULT_APP_SERVER_TEST_ARGS: [&str; 5] = [
+    DISABLE_PLUGIN_STARTUP_TASKS_ARG,
+    "-c",
+    "features.tool_suggest=false",
+    "-c",
+    "features.recommended_plugins=false",
+];
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 #[cfg(windows)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
@@ -183,7 +190,7 @@ impl TestAppServer {
             environment: TestAppServerEnvironment::Auto,
             program: None,
             env_overrides: Vec::new(),
-            args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
+            args: DEFAULT_APP_SERVER_TEST_ARGS.map(str::to_owned).into(),
             exec_server_delay: None,
             mock_chatgpt_backend: false,
         }
@@ -242,6 +249,11 @@ impl TestAppServer {
             cwd: selection.cwd.clone().into(),
             runtime_workspace_roots: None,
         })
+    }
+
+    /// Waits for a substring in the child's captured stderr, including plain-text warnings.
+    pub async fn wait_for_stderr_line(&self, text: &str, timeout: Duration) -> anyhow::Result<()> {
+        self.json_logs.wait_for_stderr_line(text, timeout).await
     }
 
     /// Waits up to `timeout` for a JSON stderr event whose structured `event.name` field matches.
@@ -1651,7 +1663,7 @@ impl TestAppServer {
         .await
     }
 
-    async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
+    pub async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
         eprintln!("writing message to stdin: {message:?}");
         let Some(stdin) = self.stdin.as_mut() else {
             anyhow::bail!("mcp stdin closed");
@@ -1969,7 +1981,8 @@ impl TestAppServerBuilder {
 
     /// Builds a server and completes its standard initialization handshake.
     pub async fn build_initialized(self) -> anyhow::Result<TestAppServer> {
-        self.build_initialized_with_timeout(DEFAULT_REQUEST_TIMEOUT)
+        // The first handshake includes cold subprocess startup on the CI runner.
+        self.build_initialized_with_timeout(Duration::from_secs(60))
             .await
     }
 

@@ -35,6 +35,8 @@ use crate::with_chatgpt_cloudflare_cookie_store;
 #[derive(Clone)]
 pub struct HttpClientBuilder {
     http2_prior_knowledge: bool,
+    http2_keep_alive: Option<(Duration, Duration)>,
+    disable_pool_idle_timeout: bool,
     pub(crate) default_headers: Option<HeaderMap>,
     follow_redirects: bool,
     pub(crate) redirect_observed: Option<Arc<AtomicBool>>,
@@ -108,6 +110,13 @@ impl HttpClientBuilder {
         self.http2_prior_knowledge = true;
         self
     }
+
+    /// Keep pooled connections reusable during long gaps between requests.
+    pub fn without_pool_idle_timeout(mut self) -> Self {
+        self.disable_pool_idle_timeout = true;
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -140,6 +149,12 @@ impl HttpClientBuilder {
 
     pub(crate) fn with_rustls_tls(mut self) -> Self {
         self.tls_backend = TlsBackend::Rustls;
+        self
+    }
+
+    /// Sends HTTP/2 keepalive pings while a request stream is open.
+    pub fn http2_keep_alive(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.http2_keep_alive = Some((interval, timeout));
         self
     }
 
@@ -178,7 +193,9 @@ impl HttpClientBuilder {
         request_url: &str,
         route_class: ClientRouteClass,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-        if http_client_factory.network_policy().is_managed() {
+        if http_client_factory.network_policy().is_managed()
+            || http_client_factory.protects_sensitive_headers()
+        {
             return Ok(crate::RouteAwareClientPool::with_builder(
                 http_client_factory.clone(),
                 route_class,
@@ -384,8 +401,16 @@ impl HttpClientBuilder {
         if let Some(path) = self.windows_proxy_pipe_path {
             builder = builder.windows_named_pipe(path);
         }
+        if self.disable_pool_idle_timeout {
+            builder = builder.pool_idle_timeout(None);
+        }
         if self.http2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
+        }
+        if let Some((interval, timeout)) = self.http2_keep_alive {
+            builder = builder
+                .http2_keep_alive_interval(interval)
+                .http2_keep_alive_timeout(timeout);
         }
         if self.tls_backend == TlsBackend::Rustls || self.tls.client_identity.is_some() {
             ensure_rustls_crypto_provider();
@@ -424,6 +449,8 @@ impl Default for HttpClientBuilder {
     fn default() -> Self {
         Self {
             http2_prior_knowledge: false,
+            http2_keep_alive: None,
+            disable_pool_idle_timeout: false,
             default_headers: None,
             follow_redirects: true,
             redirect_observed: None,

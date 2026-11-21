@@ -192,6 +192,7 @@ impl EmptyStateAnimation {
     /// on clear, without restarting or scheduling animation.
     pub(crate) fn render_first_screen(
         &mut self,
+        screen: Rect,
         available: Rect,
         buffer: &mut Buffer,
         composer: Option<ComposerState>,
@@ -199,7 +200,6 @@ impl EmptyStateAnimation {
     ) -> Option<Duration> {
         const STAGE_ROWS: u16 = 21;
         const MIN_STAGE_ROWS: u16 = 14;
-        let screen = buffer.area;
         let width = screen.width.saturating_sub(/*rhs*/ 4).min(MAX_COLUMNS);
         let height = width * STAGE_ROWS / MAX_COLUMNS;
         if motion == MotionMode::Reduced

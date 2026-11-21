@@ -1,5 +1,3 @@
-use std::fmt;
-
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
@@ -8,15 +6,7 @@ use codex_app_server_protocol::ServerRequest;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-/// Stable identifier for a transport connection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ConnectionId(pub u64);
-
-impl fmt::Display for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use codex_app_server_remote_client::ConnectionId;
 
 /// Outgoing message from the server to the client.
 #[derive(Debug, Clone, Serialize)]
@@ -32,9 +22,9 @@ pub enum OutgoingMessage {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct OutgoingResponse {
+pub struct OutgoingResponse<T = Box<ClientResponsePayload>> {
     pub id: RequestId,
-    pub result: Box<ClientResponsePayload>,
+    pub result: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

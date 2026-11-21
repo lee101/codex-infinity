@@ -39,6 +39,8 @@ fn environment(id: &str, cwd: PathUri, shell: impl Into<String>) -> (String, Env
             error: None,
             shell: Some(shell.into()),
             is_primary: false,
+            filesystem: None,
+            network_access: None,
         },
     )
 }
@@ -60,8 +62,10 @@ fn environment_state(
         .collect();
     EnvironmentsState {
         environments,
+        per_environment: false,
         shell_version: None,
         current_date,
+        current_date_is_utc: false,
         timezone,
         network,
         filesystem: None,
@@ -110,17 +114,28 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
         /*network*/ None,
         /*subagents*/ None,
     );
-    context.filesystem = Some(FileSystemContext::from_permission_profile(
-        &PermissionProfile::Disabled,
-        &[PathUri::parse("file:///D:/workspace").expect("Windows workspace root URI")],
-    ));
+    context.per_environment = true;
+    let environment = context.environments.get_mut("remote").unwrap();
+    environment.network_access = Some(NetworkAccess::Enabled);
+    environment.filesystem = Some(
+        FileSystemContext::from_permission_profile(
+            &PermissionProfile::Disabled,
+            &[PathUri::parse("file:///D:/workspace").expect("Windows workspace root URI")],
+        )
+        .render(),
+    );
 
     assert_eq!(
         context.render().expect_text(),
         r#"<environment_context>
-  <cwd>C:\windows</cwd>
-  <shell>powershell</shell>
-  <filesystem><workspace_roots><root>D:\workspace</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
+  <environments>
+    <environment id="remote">
+      <cwd>C:\windows</cwd>
+      <shell>powershell</shell>
+      <network access="enabled" />
+      <filesystem><workspace_roots><root>D:\workspace</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
+    </environment>
+  </environments>
 </environment_context>"#
     );
 }
@@ -411,11 +426,18 @@ fn shell_version_diff_clears_previously_visible_version() {
     );
 }
 
-#[test]
-fn current_date_diff_clears_once_and_recovers() {
+#[test_case::test_case(false; "local")]
+#[test_case::test_case(true; "utc")]
+fn current_date_diff_clears_once_and_recovers(current_date_is_utc: bool) {
     let available = EnvironmentsState {
         current_date: Some("2026-06-17".to_string()),
+        current_date_is_utc,
         ..Default::default()
+    };
+    let tag = if current_date_is_utc {
+        "current_date_utc"
+    } else {
+        "current_date"
     };
     let unavailable = EnvironmentsState::default();
     assert_eq!(
@@ -430,7 +452,9 @@ fn current_date_diff_clears_once_and_recovers() {
             .expect("removed current date")
             .render()
             .expect_text(),
-        "<environment_context>\n  <current_date status=\"unavailable\" />\n</environment_context>"
+        format!(
+            "<environment_context>\n  <{tag} status=\"unavailable\" />\n</environment_context>"
+        )
     );
     assert!(
         unavailable
@@ -455,6 +479,6 @@ fn current_date_diff_clears_once_and_recovers() {
             .expect("restored current date")
             .render()
             .expect_text(),
-        "<environment_context>\n  <current_date>2026-06-17</current_date>\n</environment_context>"
+        format!("<environment_context>\n  <{tag}>2026-06-17</{tag}>\n</environment_context>")
     );
 }

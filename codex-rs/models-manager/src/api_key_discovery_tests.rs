@@ -1,6 +1,7 @@
 //! API-key discovery opt-outs must gate network requests and cached catalog authority.
 
 use super::*;
+use codex_protocol::openai_models::ModelOrigin;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -47,6 +48,34 @@ async fn api_key_discovery_flag_controls_fetches_and_cached_catalogs() {
     let bundled = load_remote_models_from_file().unwrap();
     let config = ModelsManagerConfig::default();
 
+    // Per-request overrides must not change the shared bundled fallback used by later lookups.
+    let bundled_model = bundled.first().expect("bundled model");
+    let overrides = ModelsManagerConfig {
+        base_instructions: Some("Instructions for this request only".to_string()),
+        ..Default::default()
+    };
+    let mut expected_model = bundled_model.clone();
+    expected_model
+        .model_messages
+        .get_or_insert_default()
+        .instructions_template = overrides.base_instructions.clone();
+    assert_eq!(
+        manager
+            .get_model_info(&bundled_model.slug, &overrides)
+            .await,
+        CatalogModel {
+            model: expected_model.into(),
+            origin: ModelOrigin::Bundled,
+        }
+    );
+    assert_eq!(
+        manager.get_model_info(&bundled_model.slug, &config).await,
+        CatalogModel {
+            model: bundled_model.clone().into(),
+            origin: ModelOrigin::Bundled,
+        }
+    );
+
     for strategy in [
         RefreshStrategy::Online,
         RefreshStrategy::OnlineIfUncached,
@@ -73,7 +102,13 @@ async fn api_key_discovery_flag_controls_fetches_and_cached_catalogs() {
         models.clone()
     );
     assert_eq!(endpoint.fetch_count(), 1);
-    assert_eq!(manager.get_model_info("dynamic", &config).await, models[0]);
+    assert_eq!(
+        manager.get_model_info("dynamic", &config).await,
+        CatalogModel {
+            model: models[0].clone().into(),
+            origin: ModelOrigin::Provider
+        }
+    );
 
     // A runtime rollback must also suppress the already-loaded catalog.
     manager.set_api_key_model_discovery_enabled(/*enabled*/ false);
@@ -85,11 +120,9 @@ async fn api_key_discovery_flag_controls_fetches_and_cached_catalogs() {
         bundled
     );
     assert_eq!(manager.try_get_remote_models().unwrap(), bundled);
-    assert!(
-        manager
-            .get_model_info("dynamic", &config)
-            .await
-            .used_fallback_model_metadata
+    assert_eq!(
+        manager.get_model_info("dynamic", &config).await.origin,
+        ModelOrigin::Synthetic
     );
     assert_eq!(endpoint.fetch_count(), 1);
 

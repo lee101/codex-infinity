@@ -2,6 +2,7 @@ use super::THREAD_USAGE_RETRY_DELAYS;
 use super::THREAD_USAGE_SETTLEMENT_DELAYS;
 use super::ThreadUsageOutcome;
 use crate::app_event::AppEvent;
+use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use crate::status::format_estimated_usd_micros;
@@ -21,8 +22,9 @@ use pretty_assertions::assert_eq;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
+use uuid::Uuid;
 
-fn thread_usage_request_id(events: &mut UnboundedReceiver<AppEvent>) -> u64 {
+fn thread_usage_request_id(events: &mut UnboundedReceiver<AppEvent>) -> Uuid {
     match events.try_recv() {
         Ok(AppEvent::RefreshThreadUsage { request_id, .. }) => request_id,
         event => panic!("expected a thread usage request, got {event:?}"),
@@ -41,6 +43,139 @@ fn thread_usage(
         estimated_usage_usd_micros,
         groups: Vec::new(),
     }
+}
+
+async fn widget_with_pending_billing_read(thread_id: ThreadId) -> (ChatWidget, Uuid) {
+    let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
+    chat.thread_id = Some(thread_id);
+    chat.has_chatgpt_account = true;
+    chat.has_codex_backend_auth = true;
+    chat.plan_type = Some(PlanType::Business);
+    chat.ensure_thread_usage_requested();
+    let request_id = thread_usage_request_id(&mut events);
+    (chat, request_id)
+}
+
+#[tokio::test]
+async fn replacement_widget_rejects_a_previous_widgets_read_for_the_same_thread() {
+    let thread = ThreadId::new();
+    let (_, old_request) = widget_with_pending_billing_read(thread).await;
+    let (mut replacement, current) = widget_with_pending_billing_read(thread).await;
+    assert!(!replacement.finish_thread_usage_refresh(
+        thread,
+        old_request,
+        Ok(ThreadUsageOutcome::Disabled)
+    ));
+    assert!(replacement.is_pending_thread_usage(thread, current));
+}
+
+#[tokio::test]
+async fn billing_prefers_a_known_quota_plan_in_either_reply_order() {
+    for (account, quota_plan, expected) in [
+        (PlanType::Plus, PlanType::Business, PlanType::Business),
+        (PlanType::Unknown, PlanType::Business, PlanType::Business),
+        (PlanType::Business, PlanType::Unknown, PlanType::Business),
+    ] {
+        for quota_first in [true, false] {
+            let (mut chat, ..) = make_chatwidget_manual_with_sender().await;
+            chat.status_account_display = Some(crate::status::StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: None,
+                workspace: None,
+            });
+            let quota =
+                serde_json::from_value(serde_json::json!({"planType": quota_plan})).unwrap();
+            let account_read = |chat: &mut ChatWidget| {
+                chat.on_account_email_loaded(
+                    /*current_email*/ None, /*current_workspace*/ None, account,
+                );
+            };
+            if quota_first {
+                chat.on_rate_limit_snapshot(Some(quota));
+                account_read(&mut chat);
+            } else {
+                account_read(&mut chat);
+                assert_eq!(chat.current_plan_type(), Some(account));
+                chat.on_rate_limit_snapshot(Some(quota));
+            }
+            assert_eq!(chat.current_plan_type(), Some(expected));
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_status_card_uses_the_corrected_plan_for_its_usage_reply() {
+    let mut rows = Vec::new();
+    for original_plan in [PlanType::Business, PlanType::Plus] {
+        let (mut chat, _, mut events, _) = make_chatwidget_manual_with_sender().await;
+        let thread = ThreadId::new();
+        chat.thread_id = Some(thread);
+        chat.has_codex_backend_auth = true;
+        chat.plan_type = Some(original_plan);
+        let status_request = 1;
+        chat.add_status_output(/*refreshing_rate_limits*/ true, Some(status_request));
+        let AppEvent::InsertHistoryCell(card) = events.try_recv().unwrap() else {
+            panic!("expected a /status card");
+        };
+        let corrected_ent26 =
+            serde_json::from_value(serde_json::json!({"planType": PlanType::Ent26})).unwrap();
+        chat.finish_status_rate_limit_refresh(status_request, vec![corrected_ent26]);
+        let usage = ThreadUsage {
+            native_usage_usd_micros: Some(1_800_000),
+            ..thread_usage(
+                thread,
+                /*estimated_usage_credits_micros*/ 50_000_000,
+                Some(2_000_000),
+            )
+        };
+        let request = thread_usage_request_id(&mut events);
+        assert!(chat.finish_thread_usage_refresh(
+            thread,
+            request,
+            Ok(ThreadUsageOutcome::Available(usage))
+        ));
+        let row = card
+            .display_lines(/*width*/ 90)
+            .into_iter()
+            .map(|line| line.to_string())
+            .find(|line| line.contains("Thread usage:"))
+            .unwrap();
+        rows.push(format!("{original_plan:?} → Ent26: {}", row.trim()));
+    }
+    insta::assert_snapshot!(rows.join("\n"), @r"
+    Business → Ent26: Thread usage:        ~$1.80
+    Plus → Ent26: Thread usage:        ~$1.80
+    ");
+}
+
+#[tokio::test]
+async fn rolling_quota_cannot_restore_an_obsolete_billing_plan() {
+    let (mut chat, _, mut events, _) = make_chatwidget_manual_with_sender().await;
+    let thread = ThreadId::new();
+    chat.thread_id = Some(thread);
+    chat.has_codex_backend_auth = true;
+    chat.local_settings.tui.status_line = Some(vec!["estimated-thread-cost".into()]);
+    chat.status_account_display = Some(crate::status::StatusAccountDisplay::ChatGpt {
+        email: None,
+        plan: None,
+        workspace: None,
+    });
+    chat.on_account_email_loaded(
+        /*current_email*/ None,
+        /*current_workspace*/ None,
+        PlanType::Business,
+    );
+    let pending = thread_usage_request_id(&mut events);
+    chat.on_account_email_loaded(
+        /*current_email*/ None,
+        /*current_workspace*/ None,
+        PlanType::Plus,
+    );
+    let rolling = serde_json::from_value(serde_json::json!({"planType": "business"})).unwrap();
+    chat.on_rolling_rate_limit_snapshot(rolling);
+
+    assert_eq!(chat.current_plan_type(), Some(PlanType::Plus));
+    assert!(!chat.finish_thread_usage_refresh(thread, pending, Ok(ThreadUsageOutcome::Disabled)));
 }
 
 #[test]
@@ -687,6 +822,13 @@ async fn billing_surfaces_render_for_every_supported_enterprise_plan() {
         ));
 
         assert!(rx.try_recv().is_err(), "billing surfaces share a request");
+        let snapshot = serde_json::to_value(chat.statusline_state()).unwrap();
+        let expected_cost = if plan_type == PlanType::Ent26 {
+            serde_json::json!({"total_cost_usd": 0.75})
+        } else {
+            serde_json::json!({"total_cost_usd": 0.21, "total_credits": 5.2})
+        };
+        assert_eq!(snapshot["thread"]["usage"]["cost"], expected_cost);
         if plan_type == PlanType::Ent26 {
             insta::assert_snapshot!(chat.status_line_text().unwrap(), @"~$0.75");
             insta::assert_snapshot!(chat.last_terminal_title.as_ref().unwrap(), @"~$0.75");

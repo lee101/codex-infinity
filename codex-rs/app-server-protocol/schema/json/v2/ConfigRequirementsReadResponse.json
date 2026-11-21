@@ -654,6 +654,16 @@
             }
           ]
         },
+        "otel": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OtelRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sqliteHome": {
           "type": [
             "string",
@@ -662,6 +672,13 @@
         }
       },
       "type": "object"
+    },
+    "ConfiguredHookFailurePolicy": {
+      "enum": [
+        "continue",
+        "block"
+      ],
+      "type": "string"
     },
     "ConfiguredHookHandler": {
       "oneOf": [
@@ -686,6 +703,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "onFailure": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ConfiguredHookFailurePolicy"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "statusMessage": {
@@ -723,6 +750,16 @@
             "input": {
               "additionalProperties": true,
               "type": "object"
+            },
+            "onFailure": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ConfiguredHookFailurePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "server": {
               "type": "string"
@@ -1136,6 +1173,252 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "OtelExporter": {
+      "oneOf": [
+        {
+          "enum": [
+            "none",
+            "statsig"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "otlp-http": {
+              "properties": {
+                "endpoint": {
+                  "type": "string"
+                },
+                "headers": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Header names are retained; values are redacted by the server.",
+                  "type": "object"
+                },
+                "protocol": {
+                  "$ref": "#/definitions/OtelHttpProtocol"
+                },
+                "tls": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/OtelTlsConfig"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "endpoint",
+                "headers",
+                "protocol"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "otlp-http"
+          ],
+          "title": "OtlpHttpOtelExporter",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "otlp-grpc": {
+              "properties": {
+                "endpoint": {
+                  "type": "string"
+                },
+                "headers": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Header names are retained; values are redacted by the server.",
+                  "type": "object"
+                },
+                "tls": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/OtelTlsConfig"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "endpoint",
+                "headers"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "otlp-grpc"
+          ],
+          "title": "OtlpGrpcOtelExporter",
+          "type": "object"
+        }
+      ]
+    },
+    "OtelHttpProtocol": {
+      "enum": [
+        "binary",
+        "json"
+      ],
+      "type": "string"
+    },
+    "OtelRequirements": {
+      "properties": {
+        "environment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exporter": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OtelExporter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "headers_helper": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers_helper_refresh_interval_ms": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "log_agent_responses": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "log_guardian_assessments": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "log_sse_deltas": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "log_user_prompt": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "metrics_exporter": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OtelExporter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "span_attributes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "tool_result": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OtelToolResultLogConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trace_exporter": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OtelExporter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tracestate": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OtelTlsConfig": {
+      "properties": {
+        "ca-certificate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client-certificate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client-private-key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OtelToolResultLogConfig": {
+      "properties": {
+        "max_bytes": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_bytes"
+      ],
       "type": "object"
     },
     "ReasoningEffort": {

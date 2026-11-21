@@ -164,8 +164,7 @@ async fn thread_initialized_classifies_validated_linked_worktrees() {
         let ClientResponsePayload::ThreadStart(start) = &mut response else {
             panic!("expected thread/start response");
         };
-        start.thread.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(cwd)
-            .expect("absolute checkout path");
+        start.thread.cwd = codex_utils_path_uri::LegacyAppPathString::from_path(cwd);
         reducer
             .ingest(
                 AnalyticsFact::ClientResponse {
@@ -217,6 +216,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                         version: "1.0.0".to_string(),
                     },
                     capabilities: Some(InitializeCapabilities {
+                        required_human_approval: false,
                         explicit_gateway_oauth: false,
                         experimental_api: false,
                         request_attestation: false,

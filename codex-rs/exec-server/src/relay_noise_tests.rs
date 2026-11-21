@@ -164,6 +164,7 @@ async fn missing_pong_disconnects_physical_relay() -> Result<()> {
             calls: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Notify::new()),
         },
+        /*admission*/ None,
     ));
 
     assert_eq!(
@@ -195,6 +196,7 @@ async fn pong_keeps_physical_relay_connected() -> Result<()> {
             calls: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Notify::new()),
         },
+        /*admission*/ None,
     ));
 
     timeout(Duration::from_secs(1), async {
@@ -307,6 +309,7 @@ async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
             calls: Arc::new(AtomicUsize::new(0)),
             release,
         },
+        /*admission*/ None,
     )));
     let mut connection = noise_harness_connection_from_websocket_with_readiness(
         harness_websocket,
@@ -375,6 +378,7 @@ async fn pending_harness_key_validation_does_not_block_new_handshakes() -> Resul
             calls: Arc::clone(&calls),
             release: Arc::new(Notify::new()),
         },
+        /*admission*/ None,
     ));
 
     for stream_id in ["stream-1", "stream-2"] {
@@ -429,6 +433,7 @@ async fn duplicate_handshakes_pause_admission_without_disconnecting() -> Result<
             calls: Arc::clone(&calls),
             release: Arc::clone(&release),
         },
+        /*admission*/ None,
     ));
 
     let stream_id = "stream-1";
@@ -538,6 +543,7 @@ async fn oversized_harness_authorization_is_rejected_before_validation() -> Resu
             calls: Arc::clone(&calls),
             release: Arc::new(Notify::new()),
         },
+        /*admission*/ None,
     ));
 
     let stream_id = "stream-1";
@@ -569,20 +575,14 @@ async fn oversized_harness_authorization_is_rejected_before_validation() -> Resu
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -> Result<()> {
-    tokio::time::pause();
-    // Socket I/O must not auto-advance the paused cooldown or keepalive clocks.
-    let (_clock_guard, clock_released) = std::sync::mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || {
-        let _ = clock_released.recv();
-    });
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let websocket_url = format!("ws://{}", listener.local_addr()?);
-    let harness_connection = tokio::spawn(connect_async(websocket_url));
-    let (socket, _peer_addr) = listener.accept().await?;
-    let environment_websocket = accept_async(socket).await?;
-    let (mut harness_websocket, _response) = harness_connection.await??;
+    // In-memory I/O lets Tokio advance to deadlines only after both peers are idle.
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let ((mut harness_websocket, _response), environment_websocket) = tokio::try_join!(
+        tokio_tungstenite::client_async("ws://localhost", client),
+        accept_async(server),
+    )?;
 
     let environment_identity = NoiseChannelIdentity::generate()?;
     let harness_identity = NoiseChannelIdentity::generate()?;
@@ -623,6 +623,7 @@ async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -
                 },
                 timeout_started: Arc::clone(&timeout_started),
             },
+            /*admission*/ None,
         )
         .with_subscriber(subscriber),
     ));
@@ -739,7 +740,15 @@ async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -
             JsonRpcMessageDecoder::default().push(&healthy_transport.decrypt(&data.payload)?)?;
         assert_eq!(messages, vec![message]);
 
-        tokio::time::advance(NOISE_HANDSHAKE_FAILURE_COOLDOWN / 2).await;
+        // Service keepalive pings while waiting for the next admission attempt.
+        assert!(
+            timeout(
+                NOISE_HANDSHAKE_FAILURE_COOLDOWN / 2,
+                next_relay_frame(&mut harness_websocket),
+            )
+            .await
+            .is_err()
+        );
     }
 
     release.notify_one();
@@ -785,19 +794,11 @@ async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -
                 .await?;
             continue;
         }
-        if authorization == "timeout-authorization-secret" {
-            // Keep servicing pings while the real validation timeout runs.
-            tokio::time::resume();
-        }
         let reset = timeout(
             HARNESS_KEY_VALIDATION_TIMEOUT + Duration::from_secs(1),
             next_relay_frame(&mut harness_websocket),
         )
         .await??;
-        if authorization == "timeout-authorization-secret" {
-            // Diagnostic inspection does not poll the harness socket for pings.
-            tokio::time::pause();
-        }
         assert_eq!(reset.stream_id, stream_id);
         assert_eq!(reset.validate()?, RelayFrameBodyKind::Reset);
     }
@@ -820,8 +821,6 @@ async fn malformed_handshakes_preserve_active_streams_and_admission_recovers() -
             })
     }));
 
-    // Keep the close handshake and its timeout on a running clock.
-    tokio::time::resume();
     harness_websocket.close(None).await?;
     assert_eq!(
         timeout(Duration::from_secs(1), environment_task).await??,
@@ -904,6 +903,7 @@ async fn early_data_during_validation_pauses_admission_without_disconnecting() -
             calls: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Notify::new()),
         },
+        /*admission*/ None,
     ));
 
     for attempt in 0..MAX_FAILED_NOISE_HANDSHAKES {

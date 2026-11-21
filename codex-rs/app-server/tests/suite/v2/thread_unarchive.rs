@@ -264,8 +264,9 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
             multi_agent_version: None,
             history_mode: Default::default(),
             history_base: None,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal: None,
-            initial_window_id: Uuid::now_v7().to_string(),
+            initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: None,

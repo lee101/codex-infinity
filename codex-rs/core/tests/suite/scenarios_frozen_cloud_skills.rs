@@ -29,12 +29,12 @@ async fn frozen_cloud_skills_with_named_executor_request_history() -> Result<()>
             .with_cloud_provider(Arc::new(provider))
             .with_executor_provider(Arc::new(
                 ExecutorSkillProvider::new_with_restriction_product(
-                    Arc::new(EnvironmentManager::default_for_tests()),
                     /*restriction_product*/ None,
                 ),
             )),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: true,
+            omit_descriptions: false,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: true,
@@ -87,8 +87,13 @@ async fn frozen_cloud_skills_with_named_executor_request_history() -> Result<()>
         })
         .build(&server)
         .await?;
-    let executor =
-        core_test_support::exec_server::ExecServerProcess::start_with_version("0.164.0").await?;
+    test.codex
+        .refresh_cloud_plugins()
+        .await
+        .expect("explicit startup discovery");
+    let executor = core_test_support::exec_server::ExecServerProcess::start_with_version("0.164.0")
+        .await
+        .expect("executor fixture");
     test.thread_manager
         .environment_manager()
         .upsert_environment(

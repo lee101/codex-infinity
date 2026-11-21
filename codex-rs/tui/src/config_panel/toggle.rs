@@ -14,6 +14,7 @@ use codex_config::types::Tui;
 pub(crate) enum ConfigToggle {
     Animations,
     AutomaticRecaps,
+    CollapseTurnDetails,
     ComposerStars,
     CopyOnSelectClearSelection,
     Notifications,
@@ -23,13 +24,14 @@ pub(crate) enum ConfigToggle {
     Tips,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ConfigPreference {
     Toggle {
         setting: ConfigToggle,
         enabled: bool,
     },
     CopyOnSelect(CopyOnSelect),
+    MouseScrollSpeed(f64),
     NotificationCondition(NotificationCondition),
     RightClickPaste(RightClickPaste),
     SessionPickerLayout(SessionPickerViewMode),
@@ -47,6 +49,10 @@ impl ConfigPreference {
                     CopyOnSelect::Always => "always",
                     CopyOnSelect::Never => "never",
                 }),
+            },
+            Self::MouseScrollSpeed(speed) => ConfigEdit::SetPath {
+                segments: vec!["tui".into(), "mouse_scroll_speed".into()],
+                value: toml_edit::value(speed),
             },
             Self::NotificationCondition(condition) => ConfigEdit::SetPath {
                 segments: vec!["tui".to_string(), "notification_condition".to_string()],
@@ -76,6 +82,7 @@ impl ConfigPreference {
         match self {
             Self::Toggle { setting, .. } => setting.adopt(target, source),
             Self::CopyOnSelect(_) => target.copy_on_select = source.copy_on_select,
+            Self::MouseScrollSpeed(_) => target.mouse_scroll_speed = source.mouse_scroll_speed,
             Self::NotificationCondition(_) => {
                 target.notification_settings.condition = source.notification_settings.condition;
             }
@@ -102,6 +109,7 @@ impl ConfigToggle {
             }
             Self::Animations => ("animations", enabled),
             Self::AutomaticRecaps => ("auto_recap", enabled),
+            Self::CollapseTurnDetails => ("collapse_turn_details", enabled),
             Self::CopyOnSelectClearSelection => ("copy_on_select_clear_selection", enabled),
             Self::PasteDetection => ("disable_paste_burst", !enabled),
             Self::StartInVimMode => ("vim_mode_default", enabled),
@@ -118,6 +126,7 @@ impl ConfigToggle {
         match self {
             Self::Animations => tui.animations,
             Self::AutomaticRecaps => tui.auto_recap,
+            Self::CollapseTurnDetails => tui.collapse_turn_details,
             Self::ComposerStars => tui.effects.starfield,
             Self::CopyOnSelectClearSelection => tui.copy_on_select_clear_selection,
             Self::Notifications => !matches!(
@@ -136,6 +145,9 @@ impl ConfigToggle {
         match self {
             Self::Animations => target.animations = source.animations,
             Self::AutomaticRecaps => target.auto_recap = source.auto_recap,
+            Self::CollapseTurnDetails => {
+                target.collapse_turn_details = source.collapse_turn_details
+            }
             Self::ComposerStars => target.effects.starfield = source.effects.starfield,
             Self::CopyOnSelectClearSelection => {
                 target.copy_on_select_clear_selection = source.copy_on_select_clear_selection;

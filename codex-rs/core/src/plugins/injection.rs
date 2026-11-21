@@ -17,11 +17,13 @@ pub(crate) fn build_plugin_injections(
     mcp_tools: &[ToolInfo],
     available_connectors: &[connectors::AppInfo],
     features: &Features,
+    model_messages: codex_prompts::ResolvedModelMessages<'_>,
 ) -> Vec<ResponseItem> {
     if mentioned_plugins.is_empty() {
         return Vec::new();
     }
 
+    let messages = model_messages.selected_plugin();
     // Turn each explicit plugin mention with available capabilities into a developer hint.
     mentioned_plugins
         .iter()
@@ -29,13 +31,13 @@ pub(crate) fn build_plugin_injections(
             let available_mcp_servers = mcp_tools
                 .iter()
                 .filter(|tool| {
-                    tool.server_name != CODEX_APPS_MCP_SERVER_NAME
+                    tool.server_name() != CODEX_APPS_MCP_SERVER_NAME
                         && tool
                             .plugin_display_names
                             .iter()
                             .any(|plugin_name| plugin_name == &plugin.display_name)
                 })
-                .map(|tool| tool.server_name.clone())
+                .map(|tool| tool.server_name().to_owned())
                 .collect::<BTreeSet<String>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -57,6 +59,7 @@ pub(crate) fn build_plugin_injections(
                 &available_mcp_servers,
                 &available_apps,
                 features,
+                &messages,
             )
             .map(PluginInstructions::new)
             .map(ContextualUserFragment::into)

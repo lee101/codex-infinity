@@ -24,8 +24,8 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::turn_input::TurnStartOptions;
-use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::ThreadTraceContext;
+use codex_user_input::ResolvedUserInput;
 use futures::future::BoxFuture;
 
 // Keep dynamic dispatch a compile-time property of the contract.
@@ -39,6 +39,12 @@ const _: Option<&dyn AgentControl> = None;
 /// remote ownership, retries and recovery are separate backend work.
 /// Boxed Send futures allow callers to use `Arc<dyn AgentControl>`.
 pub trait AgentControl: Send + Sync {
+    /// Expose the account only when this controller actually owns native billing.
+    /// External controllers keep their own ledger and need not provide a numeric read.
+    fn native_rollout_budget(&self) -> Option<std::sync::Arc<crate::RolloutBudget>> {
+        None
+    }
+
     fn identity(&self) -> SessionId;
 
     /// Resolve an ID or a name relative to the caller's captured source, without loading.
@@ -124,7 +130,8 @@ pub trait AgentControl: Send + Sync {
     /// Account for one inference response, including compaction. Each call records usage;
     /// callers report it once. `SessionBudgetExceeded` means the usage was recorded and
     /// the shared budget is now exhausted.
-    fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>>;
+    fn record_usage(&self, usage: Option<TokenUsage>, hook_units: f64)
+    -> BoxFuture<'_, Result<()>>;
 
     /// Report the terminal result to the parent and completion activity to the task
     /// initiator. Local delivery remains best effort and uses the reporting runtime's
@@ -199,10 +206,12 @@ impl AgentInfo {
 
 /// User input starts or steers a turn; agent messages retain their sender and wake mode.
 pub enum AgentInput {
-    UserInput(Vec<UserInput>),
+    UserInput(Vec<ResolvedUserInput>),
     Message {
         message: AgentMessage,
         mode: MessageDeliveryMode,
+        /// Native tool invocation to link when the recipient commits this message to history.
+        source_tool_call_id: Option<String>,
     },
 }
 
@@ -232,6 +241,7 @@ pub struct DeliveryReceipt {
     pub submission_id: String,
 }
 
+#[derive(Clone)]
 pub struct AgentTurnOutcome {
     pub thread_id: ThreadId,
     pub turn_id: String,

@@ -206,7 +206,7 @@ pub enum McpServerAuth {
     /// still fall back to stored OAuth credentials.
     #[serde(rename = "chatgpt")]
     ChatGpt,
-    /// Exchange an enterprise IdP refresh token for resource-specific authorization.
+    /// Exchange an enterprise IdP refresh token or, if none was issued, a current ID token for resource-specific authorization.
     /// Alternate credentials and ordinary OAuth fallback are not permitted.
     #[serde(rename = "ema_auth")]
     EmaAuth,
@@ -327,6 +327,12 @@ impl McpServerConfig {
         } else {
             McpServerDisabledReason::Requirements { source }
         });
+    }
+
+    /// Whether a regular chat may defer this server when its tool catalog is cached.
+    pub fn can_defer_stdio_startup(&self) -> bool {
+        matches!(&self.transport, McpServerTransportConfig::Stdio { .. })
+            && (!self.required || self.startup_readiness == McpStartupReadiness::Catalog)
     }
 
     pub fn is_local_environment(&self) -> bool {

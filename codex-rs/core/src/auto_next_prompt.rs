@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_otel::SessionTelemetry;
@@ -24,6 +25,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_thread_context_ids::ThreadContextIds;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -34,7 +36,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::content_items_to_text;
 use crate::config::Config;
-use crate::installation_id::resolve_installation_id;
+use crate::resolve_installation_id;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 
@@ -95,12 +97,15 @@ pub async fn generate_auto_next_prompt(
 
     let installation_id = resolve_installation_id(&config.codex_home).await.ok()?;
     let conversation_id = ThreadId::new();
-    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-    let client = ModelClient::new(
+    let provider = create_model_provider(
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None),
         Some(auth_manager),
+    );
+    let client = ModelClient::new(
+        provider,
         AgentIdentityAuthPolicy::JwtOnly,
         conversation_id,
-        provider,
+        ThreadContextIds::for_thread(),
         SessionSource::Cli,
         "codex-auto-next".to_string(),
         /*model_verbosity*/ None,
@@ -129,7 +134,7 @@ pub async fn generate_auto_next_prompt(
         SessionSource::Cli,
     );
 
-    let prompt = Prompt {
+    let prompt = std::sync::Arc::new(Prompt {
         input: vec![ResponseItem::Message {
             encrypted_content: None,
             status: None,
@@ -152,7 +157,7 @@ pub async fn generate_auto_next_prompt(
             "additionalProperties": false
         })),
         ..Default::default()
-    };
+    });
 
     let responses_metadata = CodexResponsesMetadata {
         request_kind: Some(CodexResponsesRequestKind::Turn),

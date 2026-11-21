@@ -1,11 +1,11 @@
 //! Discover bubblewrap dependencies separately from resolving configured policy rules.
 
 use super::dependencies::Dependency;
+use super::dependencies::IntegrityCommand;
 use super::dependencies::codex_and_launcher_dependencies;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
-use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::shell_detect::get_user_home_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -18,7 +18,7 @@ pub(super) const SANDBOX_TYPE: SandboxType = SandboxType::LinuxSeccomp;
 pub(super) const NAME: &str = "bubblewrap";
 
 pub(super) fn critical_dependencies(
-    request: &SandboxExecRequest,
+    request: &IntegrityCommand,
     policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
 ) -> io::Result<Vec<Dependency>> {
@@ -34,7 +34,7 @@ pub(super) fn critical_dependencies(
         .transpose()
         .map_err(io::Error::other)?;
     let mut dependencies = codex_and_launcher_dependencies(request);
-    if let Some(exe) = request.command.first()
+    if let Some(exe) = request.launcher.as_deref()
         && let Some(bwrap) = codex_linux_sandbox::find_bundled_bwrap_for_exe(
             &command_cwd.as_path().join(exe),
             command_cwd.as_path(),
@@ -55,25 +55,11 @@ pub(super) fn critical_dependencies(
         // The launcher probes this executable even if it later uses its bundled copy.
         dependencies.push(("system_bwrap_candidate", Ok(bwrap)));
     }
-    if !policy
-        .get_unreadable_globs_with_cwd(cwd.as_path())
-        .is_empty()
-        && let Some(path) = &path
-        && let Some(scanner) = codex_sandboxing::find_executable_in_search_paths(
-            codex_linux_sandbox::GLOB_SCAN_PROGRAM,
-            std::env::split_paths(path),
-            command_cwd.as_path(),
-            policy,
-            cwd.as_path(),
-        )
-    {
-        dependencies.push(("glob_scanner", Ok(scanner)));
-    }
     Ok(dependencies)
 }
 
 pub(super) fn prepare_policy(
-    request: &SandboxExecRequest,
+    request: &IntegrityCommand,
     mut policy: FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
 ) -> io::Result<FileSystemSandboxPolicy> {
@@ -107,13 +93,10 @@ pub(super) fn prepare_policy(
         });
         let patterns = policy.get_unreadable_globs_with_cwd(cwd.as_path());
         if !patterns.is_empty() {
-            let paths = codex_linux_sandbox::expand_unreadable_globs_in_environment(
+            let paths = codex_linux_sandbox::expand_unreadable_globs(
                 &patterns,
                 cwd.as_path(),
-                &policy,
                 policy.glob_scan_max_depth,
-                &request.env,
-                command_cwd.as_path(),
             )
             .map_err(io::Error::other)?;
             policy = policy.with_expanded_deny_globs(paths);

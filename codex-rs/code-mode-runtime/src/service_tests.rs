@@ -547,6 +547,63 @@ fn echo_tool() -> ToolDefinition {
     }
 }
 
+#[test]
+fn catalog_revisions_freeze_each_cells_tools_and_isolate_sessions() {
+    let service = InProcessCodeModeSession::new();
+    let register = |service: &InProcessCodeModeSession, revision, description: &str| {
+        let mut request = execute_request("");
+        request.enabled_tools = vec![ToolDefinition {
+            description: description.to_string(),
+            ..echo_tool()
+        }];
+        service.runtime_request(request, Some(revision))
+    };
+    let first = register(&service, 1, "first").unwrap();
+    let hit = service
+        .runtime_request(execute_request(""), Some(1))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first.enabled_tools, &hit.enabled_tools));
+    let second = register(&service, 2, "second").unwrap();
+    let late = register(&service, 1, "late").unwrap();
+    assert_eq!(late.enabled_tools[0].description, "late");
+    assert_eq!(first.enabled_tools[0].description, "first");
+    assert!(register(&service, 2, "conflict").is_err());
+    assert!(
+        service
+            .runtime_request(execute_request(""), Some(1))
+            .is_err()
+    );
+    let hit = service
+        .runtime_request(execute_request(""), Some(2))
+        .unwrap();
+    assert!(Arc::ptr_eq(&second.enabled_tools, &hit.enabled_tools));
+    let other = InProcessCodeModeSession::new();
+    assert!(other.runtime_request(execute_request(""), Some(2)).is_err());
+    let shared = register(&other, 1, "second").unwrap();
+    assert!(Arc::ptr_eq(
+        &second.enabled_tools[0],
+        &shared.enabled_tools[0]
+    ));
+    assert!(other.runtime_request(execute_request(""), Some(2)).is_err());
+    let distinct = register(&other, 2, "distinct").unwrap();
+    assert!(!Arc::ptr_eq(
+        &second.enabled_tools[0],
+        &distinct.enabled_tools[0]
+    ));
+    let weak = Arc::downgrade(&distinct.enabled_tools[0]);
+    drop(other);
+    assert!(weak.upgrade().is_some());
+    drop(distinct);
+    assert!(weak.upgrade().is_none());
+    assert!(
+        service
+            .runtime_request(execute_request(""), /*revision*/ None)
+            .unwrap()
+            .enabled_tools
+            .is_empty()
+    );
+}
+
 async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
     service
         .execute(
@@ -999,7 +1056,7 @@ store("healthy", {[keys[0]]: "null"});
                 vec![FunctionCallOutputContentItem::InputText {
                     text: expected_text.to_string()
                 }],
-                expected_error.map(str::to_string)
+                expected_error.map(str::to_string),
             )
         );
     }
@@ -1364,6 +1421,96 @@ text("done");
 }
 
 #[tokio::test]
+async fn catalog_globals_preserve_mutations_within_each_cell() {
+    let service = InProcessCodeModeSession::new();
+    let source = r#"
+const entry = ALL_TOOLS[0];
+const name = entry.name;
+entry.name = "local";
+const callback = tools[name];
+tools[name] = null;
+text(JSON.stringify([name, typeof callback, ALL_TOOLS[0].name, tools[name]]));
+"#;
+    for _ in 0..2 {
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                yield_time_ms: None,
+                ..execute_request(source)
+            },
+        )
+        .await;
+        let RuntimeResponse::Result {
+            content_items,
+            error_text: None,
+            ..
+        } = response
+        else {
+            panic!("catalog lookup failed: {response:?}");
+        };
+        assert_eq!(
+            content_items,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: r#"["echo","function","local",null]"#.into(),
+            }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_globals_ignore_inherited_setters() {
+    let service = InProcessCodeModeSession::new();
+    let source = r#"
+let setterCalls = 0;
+Object.defineProperty(Object.prototype, "name", {
+  configurable: true,
+  set(value) { setterCalls++; globalThis.ALL_TOOLS = []; }
+});
+for (const key of ["description", "echo"]) {
+  Object.defineProperty(Object.prototype, key, {
+    configurable: true,
+    set(value) { setterCalls++; }
+  });
+}
+Object.defineProperty(Array.prototype, "0", {
+  configurable: true,
+  set(value) { setterCalls++; }
+});
+const entry = ALL_TOOLS[0];
+const callback = tools.echo;
+delete Object.prototype.name;
+delete Object.prototype.description;
+delete Object.prototype.echo;
+delete Array.prototype[0];
+text(JSON.stringify([entry.name, entry.description, typeof callback, setterCalls]));
+"#;
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            yield_time_ms: None,
+            ..execute_request(source)
+        },
+    )
+    .await;
+    let RuntimeResponse::Result {
+        content_items,
+        error_text: None,
+        ..
+    } = response
+    else {
+        panic!("catalog lookup failed: {response:?}");
+    };
+    assert_eq!(
+        content_items,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: r#"["echo","","function",0]"#.into(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn global_scope_contains_only_allowed_items() {
     let service = InProcessCodeModeSession::new();
 
@@ -1450,6 +1597,7 @@ async fn global_scope_contains_only_allowed_items() {
         "add_content",
         "as_settled",
         "audio",
+        "content",
         "decodeURI",
         "decodeURIComponent",
         "encodeURI",
@@ -1644,13 +1792,17 @@ text(JSON.stringify(returnsUndefined));
 }
 
 #[tokio::test]
-async fn text_helper_serializes_objects() {
+async fn text_serializes_objects_and_content_forwards_mcp_text() {
     let service = InProcessCodeModeSession::new();
 
     let response = execute(
         &service,
         ExecuteRequest {
-            source: "text({ json: true });".to_string(),
+            source: r#"const block = {type: "text", text: "caption", json: true};
+text(block);
+text(block.text);
+content(block);"#
+                .to_string(),
             yield_time_ms: None,
             ..execute_request("")
         },
@@ -1662,9 +1814,13 @@ async fn text_helper_serializes_objects() {
         RuntimeResponse::Result {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: r#"{"json":true}"#.to_string(),
-            }],
+            content_items: [
+                r#"{"type":"text","text":"caption","json":true}"#,
+                "caption",
+                "caption"
+            ]
+            .map(|text| FunctionCallOutputContentItem::InputText { text: text.into() })
+            .into(),
             result_buffered_for: Duration::ZERO,
             error_text: None,
         }
@@ -1672,7 +1828,7 @@ async fn text_helper_serializes_objects() {
 }
 
 #[tokio::test]
-async fn output_helpers_surface_serialization_errors() {
+async fn output_helpers_surface_input_errors() {
     for (source, expected_error) in [
         (
             "const circular = {}; circular.self = circular; text(circular);",
@@ -1685,6 +1841,14 @@ async fn output_helpers_surface_serialization_errors() {
         (
             "image({type: 'image', get data() { throw new Error('MCP getter failed'); }});",
             "MCP getter failed",
+        ),
+        (
+            "image({type: 'image', data: ''});",
+            "image expected MCP image data",
+        ),
+        (
+            "image({type: 'audio'});",
+            r#"image only accepts MCP image blocks, got "audio""#,
         ),
     ] {
         let service = InProcessCodeModeSession::new();
@@ -1803,17 +1967,19 @@ async fn audio_helper_rejects_non_data_urls() {
 }
 
 #[tokio::test]
-async fn image_helper_accepts_raw_mcp_image_block_with_original_detail() {
+async fn image_and_content_forward_the_same_raw_mcp_image() {
     let service = InProcessCodeModeSession::new();
 
     let response = execute(&service, ExecuteRequest {
                 source: r#"
-image({
+const block = {
   type: "image",
   data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-  mimeType: "image/png",
+  mime_type: "image/png",
   _meta: { "codex/imageDetail": "original" },
-});
+};
+image(block);
+content(block);
 "#
                 .to_string(),
                 yield_time_ms: None,
@@ -1829,11 +1995,219 @@ image({
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::Original),
-                }],
+                }; 2],
                 result_buffered_for: Duration::ZERO,
                 error_text: None,
             }
         );
+}
+
+#[tokio::test]
+async fn media_helpers_preserve_legacy_mime_inputs_and_detail_overrides() {
+    let response = execute(
+        &InProcessCodeModeSession::new(),
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request(
+                r#"
+image({type: "image", data: "YQ==", mimeType: "image/png", mime_type: "image/jpeg"});
+audio({type: "audio", data: "YQ==", mimeType: 1, mime_type: "audio/wav"});
+image({type: "image", data: "DaTa:image/png;base64,YQ==", mimeType: ""}, "LOW");
+"#,
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,YQ==".into(),
+                    detail: Some(crate::DEFAULT_IMAGE_DETAIL),
+                },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:application/octet-stream;base64,YQ==".into(),
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "DaTa:image/png;base64,YQ==".into(),
+                    detail: Some(crate::ImageDetail::Low),
+                },
+            ],
+            result_buffered_for: Duration::ZERO,
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn content_helper_forwards_mixed_mcp_blocks_in_order() {
+    let link = serde_json::json!({
+        "type": "resource_link", "name": "notes", "uri": "file:///notes",
+    });
+    let resource = serde_json::json!({
+        "type": "resource", "resource": {"uri": "file:///notes", "text": "notes"},
+    });
+    let blob = serde_json::json!({
+        "type": "resource", "resource": {"uri": "file:///sample", "blob": "YWJj"},
+    });
+    let blocks = serde_json::json!([
+        {"type": "text", "text": "caption", "annotations": {"priority": 0.5}},
+        {
+            "type": "image",
+            "data": "aW1hZ2U=",
+            "mimeType": "image/png",
+            "_meta": {"codex/imageDetail": "original"},
+        },
+        {"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/mpeg"},
+        link, resource, blob,
+    ]);
+    let response = execute(
+        &InProcessCodeModeSession::new(),
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request(&format!("content({blocks})"))
+        },
+    )
+    .await;
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "caption".into()
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,aW1hZ2U=".into(),
+                    detail: Some(crate::ImageDetail::Original),
+                },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/mpeg;base64,YXVkaW8=".into(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: link.to_string()
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: resource.to_string()
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: blob.to_string()
+                },
+            ],
+            result_buffered_for: Duration::ZERO,
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn content_helper_consumes_iterables_in_order_and_closes_on_error() {
+    let response = execute(
+        &InProcessCodeModeSession::new(),
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request(
+                r#"
+const block = (text) => ({type: "text", text});
+content([]);
+[block("single")].forEach(content);
+content(new Set([block("set")]));
+
+const failure = new Error("iterator failed");
+function* generator() { yield block("generator"); throw failure; }
+try { content(generator()); } catch (error) {
+  if (error !== failure) throw error;
+  text("caught iterator error");
+}
+
+let reads = 0;
+const iterable = {
+  get [Symbol.iterator]() {
+    if (++reads !== 1) throw new Error("iterator getter read twice");
+    return function () {
+      if (this !== iterable) throw new Error("wrong iterator receiver");
+      const items = [block("first"), {type: "image"}, block("past error")].values();
+      return {
+        next() { text("next"); return items.next(); },
+        return() { text("closed"); return {}; },
+      };
+    };
+  },
+};
+try { content(iterable); } catch (error) { text(error); }
+"#,
+            )
+        },
+    )
+    .await;
+    let expected = [
+        "single",
+        "set",
+        "generator",
+        "caught iterator error",
+        "next",
+        "first",
+        "next",
+        "closed",
+        "content expects one MCP ContentBlock",
+    ];
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: expected
+                .into_iter()
+                .map(|text| FunctionCallOutputContentItem::InputText { text: text.into() })
+                .collect(),
+            result_buffered_for: Duration::ZERO,
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn content_helper_rejects_invalid_blocks_and_encrypted_text_without_emitting_them() {
+    let response = execute(
+        &InProcessCodeModeSession::new(),
+        ExecuteRequest {
+            yield_time_ms: None,
+            ..execute_request(
+                r#"
+for (const block of [
+  undefined, "", {content: []}, [[{type: "text", text: "nested"}]], ["text", "nested"],
+  {type: "unknown"}, {type: "text", text: 1}, {type: "image"},
+  {type: "resource", resource: {uri: "file:///notes"}}, {type: "resource_link"},
+  {type: "text", text: "opaque", _meta: {"codex/encryptedContent": true}},
+]) {
+  try { content(block); } catch (error) {
+    const expected = block?._meta?.["codex/encryptedContent"]
+      ? "content cannot emit encrypted MCP text"
+      : "content expects one MCP ContentBlock";
+    if (error === expected) continue;
+    throw error;
+  }
+  throw new Error("expected content to reject the block");
+}
+"#,
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            result_buffered_for: Duration::ZERO,
+            error_text: None,
+        }
+    );
 }
 
 #[tokio::test]

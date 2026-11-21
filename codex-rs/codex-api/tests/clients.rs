@@ -21,16 +21,26 @@ use codex_client::RequestBody;
 use codex_client::Response;
 use codex_client::StreamResponse;
 use codex_client::TransportError;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ExecutedToolCall;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ToolResultBody;
+use codex_protocol::models::ToolResultMetadata;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
+use http::header::AUTHORIZATION;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::value::RawValue;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
 
 fn assert_path_ends_with(requests: &[Request], suffix: &str) {
     assert_eq!(requests.len(), 1);
@@ -362,6 +372,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let transport = RecordingTransport::new(state.clone());
     let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
     let request = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-test".into(),
         input: vec![ResponseItem::Message {
             status: None,
@@ -382,6 +393,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
         text: None,
         client_metadata: None,
         access_programs: None,
@@ -418,6 +430,7 @@ async fn responses_client_stream_request_sends_routing_fields_ahead_of_large_inp
     // buffering a potentially multi-megabyte prompt first.
     let large_input = "x".repeat(2 * 1024 * 1024);
     let request = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-test".into(),
         input: vec![ResponseItem::Message {
             status: None,
@@ -438,6 +451,7 @@ async fn responses_client_stream_request_sends_routing_fields_ahead_of_large_inp
         include: Vec::new(),
         service_tier: Some("priority".into()),
         prompt_cache_key: None,
+        prompt_cache_options: None,
         text: None,
         client_metadata: None,
         access_programs: None,
@@ -508,16 +522,11 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn streaming_client_retries_on_transport_error() -> Result<()> {
-    let transport = FlakyTransport::new();
-
-    let mut provider = provider("openai");
-    provider.retry.max_attempts = 2;
-
-    let request = ResponsesApiRequest {
+fn sampling_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
+    ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-test".into(),
-        input: Vec::new(),
+        input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
@@ -528,10 +537,96 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
         text: None,
         client_metadata: None,
         access_programs: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn responses_retry_keeps_tool_results_and_redirect_omits_them() -> Result<()> {
+    let mut item: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "function_call_output", "call_id": "read", "output": "one match",
+    }))?;
+    let mut call = ExecutedToolCall::new("search".into(), serde_json::json!({"query": "test"}));
+    call.set_tool_result_metadata(ToolResultMetadata::new(&serde_json::json!({"matches": 1})));
+    item.append_executed_tool_calls(vec![call]);
+    let request = sampling_request(vec![item]);
+    let private = serde_json::json!({"content": [{"type": "text", "text": "private match"}]});
+    let result = serde_json::from_value(private.clone())?;
+    let body = Arc::new(ToolResultBody::from_mcp_result(&result).expect("eligible Apps result"));
+    let canonical = serde_json::to_value(&request)?;
+    let mut enriched = canonical.clone();
+    enriched["input"][0]["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]
+        ["tool_result"] = private;
+
+    for status in [307, 308] {
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(/*p*/ 1)
+            .up_to_n_times(1)
+            .mount(&origin)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status).insert_header("location", destination.uri()),
+            )
+            .mount(&origin)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+            .mount(&destination)
+            .await;
+        let mut provider = provider("openai");
+        provider.base_url = origin.uri();
+        provider.retry.retry_5xx = true;
+        let transport = codex_client::ReqwestTransport::from_http_client(
+            HttpClientBuilder::new().build_direct()?,
+        );
+        let client = ResponsesClient::new(
+            transport,
+            provider,
+            Arc::new(StaticAuth::new("test-secret", "account")),
+        );
+        let mut observed = Bytes::new();
+        let _stream = client
+            .stream_request_with_observer(
+                request.clone(),
+                ResponsesOptions {
+                    tool_results: vec![(0, 0, Arc::clone(&body))],
+                    ..Default::default()
+                },
+                |json| observed = json.clone(),
+            )
+            .await?;
+        assert_eq!(serde_json::from_slice::<Value>(&observed)?, canonical);
+
+        let sent = origin.received_requests().await.unwrap();
+        let forwarded = destination.received_requests().await.unwrap();
+        assert_eq!((sent.len(), forwarded.len()), (3, 1));
+        assert_eq!(sent[0].body, sent[1].body);
+        for (actual, expected, authenticated) in [
+            (&sent[0], &enriched, true),
+            (&sent[1], &enriched, true),
+            (&sent[2], &canonical, true),
+            (&forwarded[0], &canonical, false),
+        ] {
+            assert_eq!(&actual.body_json::<Value>()?, expected);
+            assert_eq!(actual.headers.contains_key(AUTHORIZATION), authenticated);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streaming_client_retries_on_transport_error() -> Result<()> {
+    let transport = FlakyTransport::new();
+    let mut provider = provider("openai");
+    provider.retry.max_attempts = 2;
+    let request = sampling_request(Vec::new());
     let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
 
     let _stream = client
@@ -633,6 +728,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
     let client = ResponsesClient::new(transport, provider("azure"), Arc::new(NoAuth));
 
     let request = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-test".into(),
         input: vec![ResponseItem::Message {
             status: None,
@@ -653,6 +749,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
         text: None,
         client_metadata: None,
         access_programs: None,
@@ -669,6 +766,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
                 extra_headers,
                 compression: Compression::None,
+                tool_results: Vec::new(),
                 turn_state: None,
             },
         )

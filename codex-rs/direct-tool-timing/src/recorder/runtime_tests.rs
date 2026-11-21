@@ -6,6 +6,7 @@ use super::super::ToolBatchTiming;
 use super::*;
 use codex_utils_critical_path::CriticalPath;
 use codex_utils_critical_path::PathDurations;
+use codex_utils_critical_path::ReviewExecution;
 use codex_utils_critical_path::WorkKind;
 use pretty_assertions::assert_eq;
 use std::future::Future;
@@ -21,7 +22,7 @@ use tokio_util::either::Either;
 async fn lock_handoff_publishes_review_history_before_admitting_waiter(admission: ToolAdmission) {
     let start = Instant::now() - Duration::from_secs(10);
     let tool_start = start + Duration::from_secs(1);
-    let shared_initial_path = CriticalPath::default().work(start, tool_start, WorkKind::Inference);
+    let shared_initial_path = CriticalPath::default().work(start, tool_start, WorkKind::Sampling);
     let timings = DirectToolTimings::default();
     let batch = ToolBatchTiming::default();
     let gate = ToolGateTiming::default();
@@ -43,9 +44,9 @@ async fn lock_handoff_publishes_review_history_before_admitting_waiter(admission
         let mut state = timings.state();
         let work = state.unique_work("releasing").unwrap();
         work.record_until(start + Duration::from_secs(2));
-        work.active_auto_reviews = 1;
+        work.active_auto_reviews = vec![ReviewExecution::default()];
         work.record_until(start + Duration::from_secs(5));
-        work.active_auto_reviews = 0;
+        work.active_auto_reviews.clear();
     }
     let waiting_work = timings.start_turn_direct_call(
         "waiting",
@@ -89,8 +90,9 @@ async fn lock_handoff_publishes_review_history_before_admitting_waiter(admission
     assert_eq!(
         completed.path.unwrap().durations(start, completed.ended_at),
         PathDurations {
-            inference: Duration::from_secs(1),
+            sampling: Duration::from_secs(1),
             auto_review: Duration::from_secs(3),
+            auto_review_overhead: None,
             tools: completed.ended_at.duration_since(start) - Duration::from_secs(4),
             ..PathDurations::default()
         }

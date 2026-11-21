@@ -1,4 +1,5 @@
-//! Emits Guardian metrics with bounded tags and the existing telemetry schema.
+//! Calculates per-review token usage and emits Guardian metrics with bounded tags
+//! and the existing telemetry schema.
 
 use std::time::Duration;
 
@@ -21,11 +22,26 @@ use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::TokenUsage;
 
+pub fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: (end.input_tokens - start.input_tokens).max(0),
+        cached_input_tokens: (end.cached_input_tokens - start.cached_input_tokens).max(0),
+        cache_write_input_tokens: (end.cache_write_input_tokens - start.cache_write_input_tokens)
+            .max(0),
+        output_tokens: (end.output_tokens - start.output_tokens).max(0),
+        reasoning_output_tokens: (end.reasoning_output_tokens - start.reasoning_output_tokens)
+            .max(0),
+        total_tokens: (end.total_tokens - start.total_tokens).max(0),
+        codex_rollout_budget_units: None,
+    }
+}
+
 pub(crate) fn emit_guardian_review_metrics(
     session_telemetry: &SessionTelemetry,
     result: &GuardianReviewAnalyticsResult,
     approval_request_source: GuardianApprovalRequestSource,
     reviewed_action: &GuardianReviewedAction,
+    turn_origin: &'static str,
     elapsed: Duration,
 ) {
     let tags = guardian_review_metric_tags(result, approval_request_source, reviewed_action);
@@ -47,6 +63,7 @@ pub(crate) fn emit_guardian_review_metrics(
     let mut counter_tag_refs = tag_refs.clone();
     counter_tag_refs.extend(mcp_tags.iter().map(|(key, value)| (*key, value.as_str())));
     counter_tag_refs.push(("context_changed", bool_tag(result.context_changed)));
+    counter_tag_refs.push(("turn_origin", turn_origin));
     session_telemetry.counter(
         GUARDIAN_REVIEW_COUNT_METRIC,
         /*inc*/ 1,
@@ -216,6 +233,7 @@ fn approval_request_source_tag(source: GuardianApprovalRequestSource) -> &'stati
 
 fn reviewed_action_tag(action: &GuardianReviewedAction) -> &'static str {
     match action {
+        GuardianReviewedAction::NativeToolCall {} => "native_tool_call",
         GuardianReviewedAction::Shell { .. } => "shell",
         GuardianReviewedAction::UnifiedExec { .. } => "unified_exec",
         GuardianReviewedAction::WriteStdin { .. } => "write_stdin",
@@ -293,6 +311,41 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use test_case::test_case;
+
+    #[test]
+    fn token_usage_delta_never_reports_negative_usage() {
+        let start = TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 8,
+            cache_write_input_tokens: 8,
+            output_tokens: 6,
+            reasoning_output_tokens: 4,
+            total_tokens: 28,
+            codex_rollout_budget_units: None,
+        };
+        let end = TokenUsage {
+            input_tokens: 15,
+            cached_input_tokens: 7,
+            cache_write_input_tokens: 7,
+            output_tokens: 10,
+            reasoning_output_tokens: 2,
+            total_tokens: 34,
+            codex_rollout_budget_units: None,
+        };
+
+        assert_eq!(
+            token_usage_delta(&start, &end),
+            TokenUsage {
+                input_tokens: 5,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 4,
+                reasoning_output_tokens: 0,
+                total_tokens: 6,
+                codex_rollout_budget_units: None,
+            }
+        );
+    }
 
     fn test_session_telemetry() -> SessionTelemetry {
         let exporter = InMemoryMetricExporter::default();
@@ -448,6 +501,7 @@ mod tests {
             &result,
             GuardianApprovalRequestSource::DelegatedSubagent,
             &reviewed_action,
+            "unknown",
             Duration::from_millis(456),
         );
 
@@ -478,6 +532,7 @@ mod tests {
         let mut expected_counter_tags = expected_base_tags.clone();
         expected_counter_tags.extend(expected_mcp_tags);
         expected_counter_tags.insert("context_changed".to_string(), "false".to_string());
+        expected_counter_tags.insert("turn_origin".to_string(), "unknown".to_string());
         assert_eq!((attrs, value), (expected_counter_tags, 1));
 
         let AggregatedMetrics::F64(MetricData::Histogram(histogram)) =

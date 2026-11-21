@@ -43,7 +43,6 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         effective_context_window_percent: 95,
         experimental_supported_tools: vec![],
         input_modalities: vec![],
-        used_fallback_model_metadata: false,
         supports_search_tool: false,
         supports_experimental_context: false,
         use_responses_lite: false,
@@ -56,6 +55,7 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         tool_mode: None,
         multi_agent_version: None,
         multi_agent_reasoning_effort: None,
+        multi_agent_tools_in_code_mode: None,
     }
 }
 

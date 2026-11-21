@@ -1,4 +1,4 @@
-//! Text assertions for protocol content, shared only by test targets.
+//! Protocol fixtures and text assertions shared by test targets.
 
 use codex_protocol::models::ContentItem;
 

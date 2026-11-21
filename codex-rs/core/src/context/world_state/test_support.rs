@@ -22,8 +22,8 @@ pub(super) fn render_section_cases<'a, S: WorldStateSection>(
             } else {
                 updates
                     .into_iter()
-                    .map(|update| match update.content {
-                        WorldStateUpdateContent::Fragment(fragment) => {
+                    .map(|update| match update.content.into_fragment() {
+                        Ok(fragment) => {
                             let rendered = match fragment.render() {
                                 ContentItem::InputText { text }
                                 | ContentItem::OutputText { text, .. } => text,
@@ -31,7 +31,7 @@ pub(super) fn render_section_cases<'a, S: WorldStateSection>(
                             };
                             format!(" (role - {})\n{rendered}", fragment.role())
                         }
-                        WorldStateUpdateContent::Item(item) => {
+                        Err(item) => {
                             let placement = match update.placement {
                                 Placement::Prefix => "prefix",
                                 Placement::Standalone => "standalone",
@@ -81,7 +81,7 @@ fn render_diff<S: WorldStateSection>(
             PreviousSectionState::Known(&previous_snapshot)
         }
     };
-    ErasedWorldStateSection::render_diff(*after, previous).1
+    ErasedWorldStateSection::render_diff(*after, previous, /*retained*/ None).1
 }
 
 fn render_snapshot<S: WorldStateSection>(section: &S) -> String {
@@ -109,9 +109,13 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 }
 
 fn snapshot_value<S: WorldStateSection>(section: &S) -> serde_json::Value {
-    ErasedWorldStateSection::render_diff(section, PreviousSectionState::Absent)
-        .0
-        .expect("world-state section snapshot should serialize to a non-null value")
+    ErasedWorldStateSection::render_diff(
+        section,
+        PreviousSectionState::Absent,
+        /*retained*/ None,
+    )
+    .0
+    .expect("world-state section snapshot should serialize to a non-null value")
 }
 
 /// Keeps text-only section assertions explicit when a section gains item output.
@@ -125,9 +129,9 @@ pub(crate) fn expect_fragments(
 }
 
 fn expect_fragment(content: WorldStateUpdateContent) -> Box<dyn ContextualUserFragment> {
-    match content {
-        WorldStateUpdateContent::Fragment(fragment) => fragment,
-        WorldStateUpdateContent::Item(item) => panic!("expected a context fragment, got {item:?}"),
+    match content.into_fragment() {
+        Ok(fragment) => fragment,
+        Err(item) => panic!("expected a context fragment, got {item:?}"),
     }
 }
 
@@ -165,7 +169,7 @@ impl WorldState {
     pub(crate) fn render_history_fragment_diff<'a>(
         &self,
         previous: Option<&WorldStateSnapshot>,
-        items: impl IntoIterator<Item = &'a ResponseItem> + Clone,
+        items: impl IntoIterator<Item = &'a ResponseItem, IntoIter: DoubleEndedIterator> + Clone,
     ) -> (WorldStateSnapshot, Vec<Box<dyn ContextualUserFragment>>) {
         let (snapshot, updates) = self.render_history_diff(previous, items);
         (snapshot, expect_fragments(updates))
